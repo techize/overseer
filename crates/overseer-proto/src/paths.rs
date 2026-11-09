@@ -3,6 +3,9 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+/// LaunchAgent label.
+pub const AGENT_LABEL: &str = "uk.co.techize.overseer";
+
 const HOME_VAR: &str = "OVERSEER_HOME";
 
 fn non_empty(v: Option<OsString>) -> Option<PathBuf> {

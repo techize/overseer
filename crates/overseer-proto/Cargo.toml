@@ -8,7 +8,8 @@ license.workspace = true
 bytes.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["io-util"] }
+tokio = { workspace = true, features = ["io-util", "net", "sync", "time", "rt"] }
+anyhow.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["io-util", "macros", "rt"] }

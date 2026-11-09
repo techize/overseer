@@ -6,3 +6,12 @@ license.workspace = true
 
 [dependencies]
 overseer-gui = { path = "../overseer-gui" }
+overseer-proto = { path = "../overseer-proto" }
+overseer-daemon = { path = "../overseer-daemon" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time"] }
+clap.workspace = true
+anyhow.workspace = true
+libc = "0.2"
+
+[dev-dependencies]
+assert_cmd = "2"
