@@ -140,6 +140,9 @@ pub struct Snapshot {
     pub cursor: Cursor,
     /// Lines scrolled back from the bottom; 0 means following live output.
     pub display_offset: usize,
+    /// Lines of scrollback above the live screen. `line + history_size` is a
+    /// position that stays put while new output scrolls the screen.
+    pub history_size: usize,
 }
 
 impl Snapshot {
@@ -334,6 +337,16 @@ impl TermBridge {
         self.term.scroll_display(Scroll::Delta(delta_lines));
     }
 
+    /// Lines of scrollback above the live screen (see `Snapshot::history_size`).
+    pub fn history_size(&self) -> usize {
+        self.term.grid().history_size()
+    }
+
+    /// Lines the viewport is scrolled back from live output.
+    pub fn display_offset(&self) -> usize {
+        self.term.grid().display_offset()
+    }
+
     /// Return the viewport to live output.
     pub fn scroll_to_bottom(&mut self) {
         self.term.scroll_display(Scroll::Bottom);
@@ -402,6 +415,7 @@ impl TermBridge {
                 visible: in_view && shape != CursorShape::Hidden,
             },
             display_offset: offset,
+            history_size: grid.history_size(),
         }
     }
 
@@ -614,6 +628,23 @@ mod tests {
             }),
             "line 5"
         );
+    }
+
+    #[test]
+    fn history_and_offset_track_scrolling() {
+        let mut b = TermBridge::new(80, 10, DEFAULT_SCROLLBACK);
+        for i in 0..30 {
+            b.feed(format!("line {i}\r\n").as_bytes());
+        }
+        // 31 lines used (30 plus the empty cursor line), 10 on screen.
+        assert_eq!(b.history_size(), 21);
+        assert_eq!(b.snapshot().history_size, 21);
+        assert_eq!(b.display_offset(), 0);
+        b.scroll(5);
+        assert_eq!(b.display_offset(), 5);
+        assert_eq!(b.snapshot().display_offset, 5);
+        b.scroll_to_bottom();
+        assert_eq!(b.display_offset(), 0);
     }
 
     #[test]

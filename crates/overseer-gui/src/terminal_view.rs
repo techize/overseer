@@ -12,11 +12,22 @@
 //! the client's socket reader, and if parsing starved it during an output
 //! burst the daemon would drop the connection as a slow client.
 //!
+//! Input fidelity: mouse events are reported to the app in mouse mode and
+//! otherwise (or with Shift) make a local selection by cell, word or line.
+//! Cmd+C copies it, Cmd+V pastes (an image-only clipboard sends Ctrl+V so
+//! Claude Code reads the image itself), Cmd+F opens a find bar, Cmd+click
+//! opens links and the IME composes dead keys and accents. Selections and
+//! matches are kept in `AbsPos`, which output scrolling does not move.
+//!
 //! The pure helpers (cell styling, row layout, pixel to grid, scroll
-//! accumulation, key and wheel routing) are free functions with unit tests.
+//! accumulation, key, wheel and mouse routing, paste, find bar state and
+//! link commands) are free functions with unit tests.
 
-use std::cell::Cell as StdCell;
+use std::cell::{Cell as StdCell, RefCell};
+use std::ffi::OsString;
 use std::future::Future;
+use std::ops::Range;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -25,15 +36,19 @@ use std::task::{Context as TaskContext, Poll, Waker};
 use bytes::Bytes;
 use gpui::{
     canvas, div, fill, font, outline, point, prelude::*, px, size, App, BorderStyle, Bounds,
-    Context, Entity, FocusHandle, Focusable, Font, FontStyle, FontWeight, Hsla, KeyDownEvent,
-    Keystroke, MouseButton, Pixels, Rgba, ScrollWheelEvent, StrikethroughStyle, Subscription, Task,
-    TextRun, TouchPhase, UnderlineStyle, Window,
+    ClipboardEntry, ClipboardItem, Context, DispatchPhase, ElementInputHandler, Entity,
+    EntityInputHandler, FocusHandle, Focusable, Font, FontStyle, FontWeight, Hsla, KeyDownEvent,
+    Keystroke, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    Pixels, Rgba, ScrollWheelEvent, StrikethroughStyle, Subscription, Task, TextRun, TouchPhase,
+    UTF16Selection, UnderlineStyle, WeakEntity, Window,
 };
 use overseer_proto::{Client, Request, Response, SlotId, SlotState};
 use overseer_term::{
-    encode_key, encode_mouse, Cell, CursorShape, Key, KeyInput, MouseEvent, MouseInput, MouseMode,
-    Rgb, TermBridge, TermModes, DEFAULT_SCROLLBACK,
+    encode_key, encode_mouse, encode_paste, find_link_span_at, Cell, CursorShape, GridPos, Key,
+    KeyInput, Link, MouseButton as TermButton, MouseEvent, MouseInput, MouseMode, Rgb, Selection,
+    Snapshot, TermBridge, TermModes, DEFAULT_SCROLLBACK,
 };
+use serde::Deserialize;
 use tokio::sync::mpsc;
 
 use crate::theme::Theme;
@@ -521,6 +536,617 @@ fn poll_once<F: Future>(fut: F) -> Poll<F::Output> {
 }
 
 // ---------------------------------------------------------------------------
+// Pure logic: selection, mouse routing, paste, find, links, composition
+// ---------------------------------------------------------------------------
+
+/// A grid position that stays put while output scrolls: `line` counts from
+/// the top of scrollback (`GridPos::line + history_size`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AbsPos {
+    pub line: i64,
+    pub col: usize,
+}
+
+impl AbsPos {
+    pub fn new(line: i64, col: usize) -> AbsPos {
+        AbsPos { line, col }
+    }
+
+    /// The position of viewport cell (`row`, `col`).
+    pub fn from_viewport(row: usize, col: usize, display_offset: usize, history: usize) -> AbsPos {
+        AbsPos::new(top_line(display_offset, history) + row as i64, col)
+    }
+
+    pub fn from_grid(p: GridPos, history: usize) -> AbsPos {
+        AbsPos::new(p.line as i64 + history as i64, p.col)
+    }
+
+    pub fn to_grid(self, history: usize) -> GridPos {
+        let line = (self.line - history as i64).clamp(i32::MIN as i64, i32::MAX as i64);
+        GridPos {
+            line: line as i32,
+            col: self.col,
+        }
+    }
+}
+
+/// The absolute line shown on viewport row 0.
+pub fn top_line(display_offset: usize, history: usize) -> i64 {
+    history as i64 - display_offset as i64
+}
+
+/// Columns of `line` covered by the inclusive range `start..=end`, if any.
+pub fn span_cols_in_row(
+    start: AbsPos,
+    end: AbsPos,
+    line: i64,
+    cols: usize,
+) -> Option<(usize, usize)> {
+    if cols == 0 || line < start.line || line > end.line {
+        return None;
+    }
+    let s = if line == start.line { start.col } else { 0 };
+    let e = if line == end.line { end.col } else { cols - 1 }.min(cols - 1);
+    (s <= e).then_some((s, e))
+}
+
+/// How many lines to scroll (positive is toward older output) so that
+/// absolute `line` is on screen. Zero when it already is.
+pub fn scroll_delta_to_show(line: i64, display_offset: usize, history: usize, rows: usize) -> i32 {
+    let top = top_line(display_offset, history);
+    let bottom = top + rows.max(1) as i64 - 1;
+    if (top..=bottom).contains(&line) {
+        return 0;
+    }
+    let new_top = if line < top {
+        line
+    } else {
+        line - (rows.max(1) as i64 - 1)
+    };
+    let new_offset = (history as i64 - new_top).clamp(0, history as i64);
+    (new_offset - display_offset as i64).clamp(i32::MIN as i64, i32::MAX as i64) as i32
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionMode {
+    /// Cell by cell, as the pointer drags.
+    Simple,
+    Word,
+    Line,
+}
+
+/// Selection unit for the platform's click count: one click selects cell by
+/// cell, a double click by word, a triple (or more) click by line.
+pub fn selection_mode(click_count: usize) -> SelectionMode {
+    match click_count {
+        0 | 1 => SelectionMode::Simple,
+        2 => SelectionMode::Word,
+        _ => SelectionMode::Line,
+    }
+}
+
+fn is_word_char(c: char) -> bool {
+    !(c.is_whitespace() || c == '\0' || "\"'`()[]{}<>|,;\u{2502}".contains(c))
+}
+
+/// Inclusive columns of the word at `col`. A separator selects just itself.
+pub fn word_span(chars: &[char], col: usize) -> (usize, usize) {
+    if chars.is_empty() {
+        return (0, 0);
+    }
+    let col = col.min(chars.len() - 1);
+    if !is_word_char(chars[col]) {
+        return (col, col);
+    }
+    let mut start = col;
+    while start > 0 && is_word_char(chars[start - 1]) {
+        start -= 1;
+    }
+    let mut end = col;
+    while end + 1 < chars.len() && is_word_char(chars[end + 1]) {
+        end += 1;
+    }
+    (start, end)
+}
+
+/// The cells one selection unit covers at (`line`, `col`), given the row's
+/// characters.
+pub fn unit_span(mode: SelectionMode, chars: &[char], line: i64, col: usize) -> (AbsPos, AbsPos) {
+    match mode {
+        SelectionMode::Simple => (AbsPos::new(line, col), AbsPos::new(line, col)),
+        SelectionMode::Word => {
+            let (s, e) = word_span(chars, col);
+            (AbsPos::new(line, s), AbsPos::new(line, e))
+        }
+        SelectionMode::Line => (
+            AbsPos::new(line, 0),
+            AbsPos::new(line, chars.len().saturating_sub(1)),
+        ),
+    }
+}
+
+/// A selection made locally with the mouse (not reported to the app).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalSelection {
+    pub mode: SelectionMode,
+    anchor: (AbsPos, AbsPos),
+    head: (AbsPos, AbsPos),
+}
+
+impl LocalSelection {
+    /// Starts at the unit under the press.
+    pub fn new(mode: SelectionMode, unit: (AbsPos, AbsPos)) -> LocalSelection {
+        LocalSelection {
+            mode,
+            anchor: unit,
+            head: unit,
+        }
+    }
+
+    /// Moves the dragged end to the unit under the pointer.
+    pub fn extend(&mut self, unit: (AbsPos, AbsPos)) {
+        self.head = unit;
+    }
+
+    /// Inclusive bounds. None for a plain click that has not been dragged.
+    pub fn bounds(&self) -> Option<(AbsPos, AbsPos)> {
+        if self.mode == SelectionMode::Simple && self.anchor == self.head {
+            return None;
+        }
+        Some((
+            self.anchor.0.min(self.head.0),
+            self.anchor.1.max(self.head.1),
+        ))
+    }
+}
+
+/// Where a mouse event goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseRoute {
+    /// Encoded and sent to the app.
+    Report,
+    /// Drives the local selection.
+    Local,
+}
+
+/// Mouse events are reported when the app enabled mouse mode, unless Shift
+/// is held, which always keeps them local.
+pub fn mouse_route(modes: &TermModes, shift: bool) -> MouseRoute {
+    if modes.mouse != MouseMode::Off && !shift {
+        MouseRoute::Report
+    } else {
+        MouseRoute::Local
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownAction {
+    OpenLink,
+    Report,
+    Select(SelectionMode),
+    Ignore,
+}
+
+/// What a mouse press does. Cmd+click on a link opens it whatever the mouse
+/// mode; otherwise the press is reported or starts a local selection.
+pub fn mouse_down_action(
+    modes: &TermModes,
+    button: TermButton,
+    shift: bool,
+    cmd: bool,
+    on_link: bool,
+    click_count: usize,
+) -> DownAction {
+    if cmd && on_link && button == TermButton::Left {
+        return DownAction::OpenLink;
+    }
+    match mouse_route(modes, shift) {
+        MouseRoute::Report => DownAction::Report,
+        MouseRoute::Local if button == TermButton::Left => {
+            DownAction::Select(selection_mode(click_count))
+        }
+        MouseRoute::Local => DownAction::Ignore,
+    }
+}
+
+/// Ctrl+V. Claude Code reads an image from the clipboard itself on this key.
+pub const IMAGE_PASTE_KEY: u8 = 0x16;
+
+/// Bytes Cmd+V sends. Text (also text alongside an image) goes through
+/// `encode_paste`; an image on its own sends Ctrl+V so the app fetches it;
+/// an empty clipboard sends nothing.
+pub fn paste_bytes(entries: &[ClipboardEntry], modes: &TermModes) -> Option<Vec<u8>> {
+    let text: String = entries
+        .iter()
+        .filter_map(|e| match e {
+            ClipboardEntry::String(s) => Some(s.text().as_str()),
+            ClipboardEntry::Image(_) => None,
+        })
+        .collect();
+    if !text.is_empty() {
+        return Some(encode_paste(&text, modes));
+    }
+    entries
+        .iter()
+        .any(|e| matches!(e, ClipboardEntry::Image(_)))
+        .then(|| vec![IMAGE_PASTE_KEY])
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shortcut {
+    Copy,
+    Paste,
+    Find,
+}
+
+/// The Cmd shortcut the terminal handles itself, if this is one.
+pub fn shortcut(ks: &Keystroke) -> Option<Shortcut> {
+    let m = &ks.modifiers;
+    if !m.platform || m.control || m.alt || m.shift || m.function {
+        return None;
+    }
+    match ks.key.as_str() {
+        "c" => Some(Shortcut::Copy),
+        "v" => Some(Shortcut::Paste),
+        "f" => Some(Shortcut::Find),
+        _ => None,
+    }
+}
+
+/// True when Option plus this key starts a dead-key composition. When a
+/// key is dead, gpui 0.2.2 re-translates Space with the same modifiers to get
+/// a printable form, so key_char is the accent followed by Option+Space
+/// (U+00A0 on a US layout): Option+E gives "\u{b4}\u{a0}", Option+I gives
+/// "^\u{a0}". Such keys go to the IME so the next key composes (`e` gives
+/// `\u{e9}`); other Option keys give one character and still act as Meta.
+pub fn starts_composition(ks: &Keystroke) -> bool {
+    let m = &ks.modifiers;
+    if !m.alt || m.control || m.platform || m.function {
+        return false;
+    }
+    let Some(text) = ks.key_char.as_deref() else {
+        return false;
+    };
+    let mut chars = text.chars();
+    matches!(
+        (chars.next(), chars.next(), chars.next()),
+        (Some(accent), Some(' ' | '\u{a0}'), None) if !accent.is_whitespace()
+    )
+}
+
+/// A key press while the find bar is open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FindKey {
+    Insert(String),
+    Backspace,
+    /// Enter: the next match up (older output).
+    Older,
+    /// Shift+Enter: the next match down (newer output).
+    Newer,
+    Close,
+}
+
+/// Maps a key press to a find bar action. None lets the key through to the
+/// terminal (Ctrl keys, arrows and so on).
+pub fn find_key(ks: &Keystroke) -> Option<FindKey> {
+    let m = &ks.modifiers;
+    if m.control || m.platform || m.function {
+        return None;
+    }
+    match ks.key.as_str() {
+        "escape" => return Some(FindKey::Close),
+        "enter" => {
+            return Some(if m.shift {
+                FindKey::Newer
+            } else {
+                FindKey::Older
+            })
+        }
+        "backspace" => return Some(FindKey::Backspace),
+        "space" => return Some(FindKey::Insert(" ".into())),
+        _ => {}
+    }
+    match ks.key_char.as_deref() {
+        Some(t) if !t.is_empty() && !t.chars().any(char::is_control) => {
+            Some(FindKey::Insert(t.to_string()))
+        }
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FindOutcome {
+    /// The query changed: search again and call `set_matches`.
+    Search,
+    /// The current match changed: scroll it into view.
+    Moved,
+    Closed,
+    Nothing,
+}
+
+/// State of the find bar. Matches are kept oldest first.
+#[derive(Debug, Default)]
+pub struct FindBar {
+    open: bool,
+    query: String,
+    matches: Rc<Vec<(AbsPos, AbsPos)>>,
+    current: Option<usize>,
+}
+
+impl FindBar {
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+
+    /// Opens the bar, keeping the last query (searched again if not empty).
+    pub fn open(&mut self) -> FindOutcome {
+        self.open = true;
+        if self.query.is_empty() {
+            FindOutcome::Nothing
+        } else {
+            FindOutcome::Search
+        }
+    }
+
+    /// Closes the bar and drops the highlights. The query is kept.
+    pub fn close(&mut self) {
+        self.open = false;
+        self.matches = Rc::default();
+        self.current = None;
+    }
+
+    /// Adds typed or pasted text to the query; line breaks become spaces.
+    pub fn insert(&mut self, text: &str) -> FindOutcome {
+        let before = self.query.len();
+        self.query.extend(
+            text.chars()
+                .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+                .filter(|c| !c.is_control()),
+        );
+        if self.query.len() == before {
+            FindOutcome::Nothing
+        } else {
+            FindOutcome::Search
+        }
+    }
+
+    pub fn key(&mut self, key: FindKey) -> FindOutcome {
+        match key {
+            FindKey::Insert(text) => self.insert(&text),
+            FindKey::Backspace => match self.query.pop() {
+                Some(_) => FindOutcome::Search,
+                None => FindOutcome::Nothing,
+            },
+            FindKey::Older => self.step(-1),
+            FindKey::Newer => self.step(1),
+            FindKey::Close => {
+                self.close();
+                FindOutcome::Closed
+            }
+        }
+    }
+
+    /// New results for the query, oldest first. The newest match (nearest
+    /// the live screen) becomes current.
+    pub fn set_matches(&mut self, matches: Vec<(AbsPos, AbsPos)>) {
+        self.current = matches.len().checked_sub(1);
+        self.matches = Rc::new(matches);
+    }
+
+    /// Moves to the next match in `dir`, wrapping at either end.
+    fn step(&mut self, dir: isize) -> FindOutcome {
+        let n = self.matches.len();
+        if n == 0 {
+            return FindOutcome::Nothing;
+        }
+        let i = match self.current {
+            None => n - 1,
+            Some(i) => (i as isize + dir).rem_euclid(n as isize) as usize,
+        };
+        self.current = Some(i);
+        FindOutcome::Moved
+    }
+
+    pub fn matches(&self) -> Rc<Vec<(AbsPos, AbsPos)>> {
+        self.matches.clone()
+    }
+
+    pub fn current(&self) -> Option<(AbsPos, AbsPos)> {
+        self.current.and_then(|i| self.matches.get(i).copied())
+    }
+
+    /// Text after the query: `3/7`, `No matches`, or nothing.
+    pub fn status(&self) -> String {
+        if self.query.is_empty() {
+            return String::new();
+        }
+        match self.current {
+            Some(i) if !self.matches.is_empty() => format!("{}/{}", i + 1, self.matches.len()),
+            _ => "No matches".into(),
+        }
+    }
+}
+
+/// Editor for Cmd+click on a path when the config does not name one.
+pub const DEFAULT_EDITOR: &str = "Visual Studio Code";
+
+#[derive(Deserialize, Default)]
+struct EditorConfig {
+    #[serde(default)]
+    editor: EditorSection,
+}
+
+#[derive(Deserialize, Default)]
+struct EditorSection {
+    name: Option<String>,
+}
+
+/// The editor app from config text: `[editor] name = "Zed"`. Missing,
+/// empty or unreadable values give `DEFAULT_EDITOR`.
+pub fn editor_from_toml(text: &str) -> String {
+    toml::from_str::<EditorConfig>(text)
+        .ok()
+        .and_then(|c| c.editor.name)
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| DEFAULT_EDITOR.to_string())
+}
+
+/// Reads the editor from `~/.config/overseer/config.toml`.
+pub fn load_editor() -> String {
+    Theme::config_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|t| editor_from_toml(&t))
+        .unwrap_or_else(|| DEFAULT_EDITOR.to_string())
+}
+
+/// A process to run for a Cmd+click, as argv (never through a shell), with
+/// a second one to try if the first cannot be started.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkCommand {
+    pub argv: Vec<OsString>,
+    pub fallback: Option<Vec<OsString>>,
+}
+
+fn argv<I: IntoIterator<Item = S>, S: Into<OsString>>(items: I) -> Vec<OsString> {
+    items.into_iter().map(Into::into).collect()
+}
+
+fn is_vscode(editor: &str) -> bool {
+    matches!(
+        editor.trim().to_ascii_lowercase().as_str(),
+        "visual studio code" | "code" | "vscode" | "vs code"
+    )
+}
+
+/// The local path of a `file://` URL, percent-decoded. None for anything
+/// that is not an absolute local path.
+fn file_url_path(url: &str) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    let scheme = url.get(..7)?;
+    if !scheme.eq_ignore_ascii_case("file://") {
+        return None;
+    }
+    let mut rest = &url[7..];
+    if let Some(r) = rest.strip_prefix("localhost") {
+        rest = r;
+    }
+    let rest = rest.split(['?', '#']).next().unwrap_or_default();
+    if !rest.starts_with('/') {
+        return None;
+    }
+    let raw = rest.as_bytes();
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] == b'%' && i + 2 < raw.len() {
+            let hex = std::str::from_utf8(&raw[i + 1..i + 3]).ok()?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(raw[i]);
+            i += 1;
+        }
+    }
+    if out.contains(&0) {
+        return None;
+    }
+    Some(PathBuf::from(OsString::from_vec(out)))
+}
+
+/// Resolves `~/` against `home` and relative paths against `base`.
+fn resolve_path(path: &Path, base: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    if let Ok(rest) = path.strip_prefix("~") {
+        return Some(home?.join(rest));
+    }
+    Some(if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    })
+}
+
+fn path_command(
+    path: &Path,
+    line: Option<u32>,
+    editor: &str,
+    exists: impl Fn(&Path) -> bool,
+) -> Option<LinkCommand> {
+    if !exists(path) {
+        return None;
+    }
+    let app = if is_vscode(editor) {
+        DEFAULT_EDITOR
+    } else {
+        editor
+    };
+    let open_in_editor = argv([
+        OsString::from("open"),
+        "-a".into(),
+        app.into(),
+        path.as_os_str().to_owned(),
+    ]);
+    match line {
+        Some(n) if is_vscode(editor) => {
+            let mut target = path.as_os_str().to_owned();
+            target.push(format!(":{n}"));
+            Some(LinkCommand {
+                argv: argv([OsString::from("code"), "-g".into(), target]),
+                fallback: Some(open_in_editor),
+            })
+        }
+        _ => Some(LinkCommand {
+            argv: open_in_editor,
+            fallback: None,
+        }),
+    }
+}
+
+/// The command a Cmd+click on `link` runs, or None to ignore it. Link text
+/// comes from untrusted program output, so only http and https URLs are
+/// handed to `open`; `file://` URLs and paths must name something that
+/// exists and open in `editor`. Relative paths resolve against `base` (the
+/// slot's working directory). With VS Code and a line number the path opens
+/// at that line through `code -g`, falling back to `open -a`.
+pub fn link_command(
+    link: &Link,
+    editor: &str,
+    base: &Path,
+    home: Option<&Path>,
+    exists: impl Fn(&Path) -> bool,
+) -> Option<LinkCommand> {
+    match link {
+        Link::Url(url) => {
+            if let Some(path) = file_url_path(url) {
+                return path_command(&path, None, editor, exists);
+            }
+            let lower = url.to_ascii_lowercase();
+            let web = lower.starts_with("http://") || lower.starts_with("https://");
+            if !web || url.chars().any(|c| c.is_control() || c.is_whitespace()) {
+                return None;
+            }
+            Some(LinkCommand {
+                argv: argv(["open", url.as_str()]),
+                fallback: None,
+            })
+        }
+        Link::Path(path, line) => {
+            let resolved = resolve_path(path, base, home)?;
+            path_command(&resolved, *line, editor, exists)
+        }
+    }
+}
+
+/// Length of `s` in UTF-16 code units, which is how the IME counts.
+fn utf16_len(s: &str) -> usize {
+    s.encode_utf16().count()
+}
+
+// ---------------------------------------------------------------------------
 // Pump (tokio side)
 // ---------------------------------------------------------------------------
 
@@ -535,6 +1161,8 @@ struct Shared {
     dirty: AtomicBool,
     /// A message shown over the grid (attach failure, lost connection).
     status: Mutex<Option<String>>,
+    /// The slot's working directory, for resolving relative link paths.
+    cwd: Mutex<Option<PathBuf>>,
 }
 
 impl Shared {
@@ -573,6 +1201,7 @@ async fn attach(slot: SlotId, client: &Client, shared: &Shared) -> Result<(), St
                 .into_iter()
                 .find(|s| s.id == slot)
                 .ok_or_else(|| format!("S{slot} does not exist."))?;
+            *shared.cwd.lock().unwrap() = info.cwd.clone();
             if info.state == SlotState::Empty {
                 return Err(format!(
                     "S{slot} is empty. Start it with: overseer ctl start {slot} --cwd <dir>"
@@ -721,14 +1350,26 @@ fn spawn_pump(
 // View (GPUI side)
 // ---------------------------------------------------------------------------
 
-/// Where the grid was last laid out, for mapping wheel positions to cells.
+/// Where the grid was last laid out and painted, for mapping pointer
+/// positions to cells.
 #[derive(Debug, Clone, Copy, Default)]
 struct Geometry {
     origin: (f32, f32),
+    size: (f32, f32),
     cols: usize,
     rows: usize,
+    /// Cursor cell in the last frame, where the IME window goes.
+    cursor: (usize, usize),
     /// Last size sent to the pump.
     requested: Option<(u16, u16)>,
+}
+
+/// A Cmd+hovered link: absolute line and columns `start..end`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HoverLink {
+    line: i64,
+    start: usize,
+    end: usize,
 }
 
 pub struct TerminalView {
@@ -742,20 +1383,80 @@ pub struct TerminalView {
     cmds: mpsc::UnboundedSender<Cmd>,
     metrics: Option<(CellMetrics, f32)>,
     geometry: Rc<StdCell<Geometry>>,
+    /// The snapshot painted last: what the pointer is over.
+    frame: Rc<RefCell<Option<Snapshot>>>,
     scroll: ScrollAccumulator,
     focus_reported: bool,
+    /// App that opens Cmd+clicked paths.
+    editor: String,
+    selection: Option<LocalSelection>,
+    /// The left button is down for a local selection.
+    selecting: bool,
+    /// A press was reported to the app; motion and release follow it.
+    reporting: Option<TermButton>,
+    last_report_cell: Option<(usize, usize)>,
+    find: FindBar,
+    hover: Option<HoverLink>,
+    last_mouse: Option<gpui::Point<Pixels>>,
+    /// IME composition in progress, such as a dead-key accent.
+    marked: Option<String>,
     _subscriptions: Vec<Subscription>,
     _notifier: Task<()>,
 }
 
 fn hsla(c: Rgb) -> Hsla {
+    rgba(c, 1.0)
+}
+
+fn rgba(c: Rgb, a: f32) -> Hsla {
     Rgba {
         r: c.0 as f32 / 255.0,
         g: c.1 as f32 / 255.0,
         b: c.2 as f32 / 255.0,
-        a: 1.0,
+        a,
     }
     .into()
+}
+
+fn term_button(b: MouseButton) -> Option<TermButton> {
+    match b {
+        MouseButton::Left => Some(TermButton::Left),
+        MouseButton::Right => Some(TermButton::Right),
+        MouseButton::Middle => Some(TermButton::Middle),
+        _ => None,
+    }
+}
+
+/// Starts `argv` with no shell and no inherited stdio, reaping it on a
+/// thread of its own.
+fn spawn_argv(argv: &[OsString]) -> std::io::Result<()> {
+    use std::process::{Command, Stdio};
+    let (program, args) = argv
+        .split_first()
+        .ok_or_else(|| std::io::Error::other("empty command"))?;
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+fn run_link_command(cmd: &LinkCommand) {
+    let Err(first) = spawn_argv(&cmd.argv) else {
+        return;
+    };
+    let result = match &cmd.fallback {
+        Some(fallback) => spawn_argv(fallback),
+        None => Err(first),
+    };
+    if let Err(e) = result {
+        eprintln!("overseer: cannot open link: {e}");
+    }
 }
 
 impl TerminalView {
@@ -777,6 +1478,7 @@ impl TerminalView {
                 bridge: Mutex::new(bridge),
                 dirty: AtomicBool::new(false),
                 status: Mutex::new(None),
+                cwd: Mutex::new(None),
             });
             let (cmds, cmd_rx) = mpsc::unbounded_channel();
             let (wake_tx, mut wake_rx) = mpsc::unbounded_channel::<()>();
@@ -822,8 +1524,18 @@ impl TerminalView {
                 cmds,
                 metrics: None,
                 geometry: Rc::default(),
+                frame: Rc::default(),
                 scroll: ScrollAccumulator::default(),
                 focus_reported: false,
+                editor: load_editor(),
+                selection: None,
+                selecting: false,
+                reporting: None,
+                last_report_cell: None,
+                find: FindBar::default(),
+                hover: None,
+                last_mouse: None,
+                marked: None,
                 _subscriptions: subscriptions,
                 _notifier: notifier,
             }
@@ -839,14 +1551,23 @@ impl TerminalView {
         let _ = poll_once(self.client.send_input(self.slot, bytes));
     }
 
+    fn modes(&self) -> TermModes {
+        self.shared.bridge.lock().unwrap().modes()
+    }
+
+    /// Sends `bytes` typed or pasted by the user, returning to live output.
+    fn send_user_input(&self, bytes: &[u8]) {
+        self.shared.bridge.lock().unwrap().scroll_to_bottom();
+        self.send(bytes);
+    }
+
     /// Sends a focus report when the effective focus (view focused and window
     /// active) changes.
     fn sync_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let focused = self.focus_handle.is_focused(window) && window.is_window_active();
         if focused != self.focus_reported {
             self.focus_reported = focused;
-            let modes = self.shared.bridge.lock().unwrap().modes();
-            if let Some(report) = focus_report(focused, &modes) {
+            if let Some(report) = focus_report(focused, &self.modes()) {
                 self.send(report);
             }
         }
@@ -854,20 +1575,135 @@ impl TerminalView {
     }
 
     fn on_key_down(&mut self, ev: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let bytes = {
-            let mut bridge = self.shared.bridge.lock().unwrap();
-            let bytes = keystroke_bytes(&ev.keystroke, &bridge.modes());
-            if !bytes.is_empty() {
-                bridge.scroll_to_bottom();
+        let ks = &ev.keystroke;
+        if let Some(sc) = shortcut(ks) {
+            let handled = match sc {
+                Shortcut::Copy => self.copy(cx),
+                Shortcut::Paste => {
+                    self.paste(cx);
+                    true
+                }
+                Shortcut::Find => {
+                    let outcome = self.find.open();
+                    self.apply_find(outcome);
+                    true
+                }
+            };
+            if handled {
+                cx.stop_propagation();
+                cx.notify();
             }
-            bytes
-        };
+            return;
+        }
+        // Left unhandled, the platform hands the key to the IME, which marks
+        // the accent and composes it with the next key.
+        if starts_composition(ks) {
+            return;
+        }
+        if self.find.is_open() {
+            if let Some(key) = find_key(ks) {
+                let outcome = self.find.key(key);
+                self.apply_find(outcome);
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+        }
+        let bytes = keystroke_bytes(ks, &self.modes());
         if bytes.is_empty() {
             return;
         }
-        self.send(&bytes);
+        self.send_user_input(&bytes);
         cx.stop_propagation();
         cx.notify();
+    }
+
+    /// Copies the selection. False when there is none, so Cmd+C propagates.
+    fn copy(&self, cx: &mut Context<Self>) -> bool {
+        let Some((start, end)) = self.selection.and_then(|s| s.bounds()) else {
+            return false;
+        };
+        let text = {
+            let bridge = self.shared.bridge.lock().unwrap();
+            let h = bridge.history_size();
+            bridge.selection_text(Selection {
+                start: start.to_grid(h),
+                end: end.to_grid(h),
+            })
+        };
+        if text.is_empty() {
+            return false;
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        true
+    }
+
+    fn paste(&mut self, cx: &mut Context<Self>) {
+        let item = cx.read_from_clipboard();
+        if self.find.is_open() {
+            if let Some(text) = item.as_ref().and_then(|i| i.text()) {
+                let outcome = self.find.insert(&text);
+                self.apply_find(outcome);
+            }
+            return;
+        }
+        let entries = item.as_ref().map(|i| i.entries()).unwrap_or_default();
+        if let Some(bytes) = paste_bytes(entries, &self.modes()) {
+            self.send_user_input(&bytes);
+        }
+    }
+
+    /// Text committed by the IME (or typed while composing).
+    fn commit_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        if text.is_empty() {
+            return;
+        }
+        if self.find.is_open() {
+            let outcome = self.find.insert(text);
+            self.apply_find(outcome);
+        } else {
+            self.send_user_input(text.as_bytes());
+        }
+        cx.notify();
+    }
+
+    fn apply_find(&mut self, outcome: FindOutcome) {
+        match outcome {
+            FindOutcome::Search => self.run_search(),
+            FindOutcome::Moved => self.reveal_current_match(),
+            FindOutcome::Closed | FindOutcome::Nothing => {}
+        }
+    }
+
+    fn run_search(&mut self) {
+        let found = {
+            let bridge = self.shared.bridge.lock().unwrap();
+            let h = bridge.history_size();
+            bridge
+                .search(self.find.query())
+                .into_iter()
+                .map(|m| (AbsPos::from_grid(m.start, h), AbsPos::from_grid(m.end, h)))
+                .collect()
+        };
+        self.find.set_matches(found);
+        self.reveal_current_match();
+    }
+
+    fn reveal_current_match(&mut self) {
+        let Some((start, _)) = self.find.current() else {
+            return;
+        };
+        let rows = self.geometry.get().rows;
+        let mut bridge = self.shared.bridge.lock().unwrap();
+        let delta = scroll_delta_to_show(
+            start.line,
+            bridge.display_offset(),
+            bridge.history_size(),
+            rows,
+        );
+        if delta != 0 {
+            bridge.scroll(delta);
+        }
     }
 
     fn on_scroll_wheel(&mut self, ev: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -880,9 +1716,7 @@ impl TerminalView {
         if lines == 0 {
             return;
         }
-        let g = self.geometry.get();
-        let (x, y): (f32, f32) = (ev.position.x.into(), ev.position.y.into());
-        let (row, col) = pixel_to_grid(x - g.origin.0, y - g.origin.1, m, g.cols, g.rows);
+        let (row, col) = self.cell_at(ev.position, true).unwrap_or((0, 0));
         let mods = &ev.modifiers;
         let mut bridge = self.shared.bridge.lock().unwrap();
         let action = route_wheel(
@@ -906,6 +1740,204 @@ impl TerminalView {
             WheelAction::Ignore => {}
         }
         cx.stop_propagation();
+    }
+
+    /// The viewport cell under a window position. Outside the grid this is
+    /// None, or the nearest cell with `clamp`.
+    fn cell_at(&self, pos: gpui::Point<Pixels>, clamp: bool) -> Option<(usize, usize)> {
+        let (m, _) = self.metrics?;
+        let g = self.geometry.get();
+        if g.cols == 0 || g.rows == 0 {
+            return None;
+        }
+        let x = f32::from(pos.x) - g.origin.0;
+        let y = f32::from(pos.y) - g.origin.1;
+        let inside = x >= 0.0 && y >= 0.0 && x < g.size.0 && y < g.size.1;
+        if !inside && !clamp {
+            return None;
+        }
+        Some(pixel_to_grid(x, y, m, g.cols, g.rows))
+    }
+
+    /// The selection unit at a viewport cell of the last frame.
+    fn unit_at(&self, mode: SelectionMode, row: usize, col: usize) -> Option<(AbsPos, AbsPos)> {
+        let frame = self.frame.borrow();
+        let snap = frame.as_ref()?;
+        if row >= snap.rows || snap.cols == 0 {
+            return None;
+        }
+        let chars: Vec<char> = snap.cells[row * snap.cols..(row + 1) * snap.cols]
+            .iter()
+            .map(|c| c.ch)
+            .collect();
+        let line = top_line(snap.display_offset, snap.history_size) + row as i64;
+        Some(unit_span(mode, &chars, line, col.min(snap.cols - 1)))
+    }
+
+    /// The link at a viewport cell of the last frame and what opening it
+    /// runs. None when there is no link or it would be ignored.
+    fn link_at(&self, row: usize, col: usize) -> Option<(HoverLink, LinkCommand)> {
+        let frame = self.frame.borrow();
+        let snap = frame.as_ref()?;
+        let span = find_link_span_at(snap, row, col)?;
+        let base = self
+            .shared
+            .cwd
+            .lock()
+            .unwrap()
+            .clone()
+            .or_else(|| std::env::current_dir().ok())?;
+        let home = std::env::var_os("HOME")
+            .filter(|h| !h.is_empty())
+            .map(PathBuf::from);
+        let cmd = link_command(&span.link, &self.editor, &base, home.as_deref(), |p| {
+            p.exists()
+        })?;
+        let hover = HoverLink {
+            line: top_line(snap.display_offset, snap.history_size) + row as i64,
+            start: span.start_col,
+            end: span.end_col,
+        };
+        Some((hover, cmd))
+    }
+
+    fn report(&self, event: MouseEvent, (row, col): (usize, usize), mods: &gpui::Modifiers) {
+        let input = MouseInput {
+            event,
+            row,
+            col,
+            shift: false,
+            ctrl: mods.control,
+            alt: mods.alt,
+        };
+        if let Some(bytes) = encode_mouse(&input, &self.modes()) {
+            self.send(&bytes);
+        }
+    }
+
+    fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus_handle);
+        let Some(button) = term_button(ev.button) else {
+            return;
+        };
+        let Some(cell) = self.cell_at(ev.position, false) else {
+            return;
+        };
+        let mods = ev.modifiers;
+        let link = if mods.platform {
+            self.link_at(cell.0, cell.1)
+        } else {
+            None
+        };
+        let action = mouse_down_action(
+            &self.modes(),
+            button,
+            mods.shift,
+            mods.platform,
+            link.is_some(),
+            ev.click_count,
+        );
+        match action {
+            DownAction::OpenLink => {
+                if let Some((_, cmd)) = link {
+                    run_link_command(&cmd);
+                }
+            }
+            DownAction::Report => {
+                self.selection = None;
+                self.reporting = Some(button);
+                self.last_report_cell = Some(cell);
+                self.report(MouseEvent::Press(button), cell, &mods);
+            }
+            DownAction::Select(mode) => {
+                self.selection = self
+                    .unit_at(mode, cell.0, cell.1)
+                    .map(|unit| LocalSelection::new(mode, unit));
+                self.selecting = self.selection.is_some();
+            }
+            DownAction::Ignore => {}
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    /// Every mouse move in the window, so drags keep tracking outside the
+    /// grid.
+    fn on_mouse_move(&mut self, ev: &MouseMoveEvent, cx: &mut Context<Self>) {
+        self.last_mouse = Some(ev.position);
+        if let Some(button) = self.reporting {
+            if let Some(cell) = self.cell_at(ev.position, true) {
+                if self.last_report_cell != Some(cell) {
+                    self.last_report_cell = Some(cell);
+                    self.report(MouseEvent::Drag(button), cell, &ev.modifiers);
+                }
+            }
+            return;
+        }
+        if self.selecting {
+            let Some(mut sel) = self.selection else {
+                return;
+            };
+            let unit = self
+                .cell_at(ev.position, true)
+                .and_then(|(row, col)| self.unit_at(sel.mode, row, col));
+            if let Some(unit) = unit {
+                sel.extend(unit);
+                if self.selection != Some(sel) {
+                    self.selection = Some(sel);
+                    cx.notify();
+                }
+            }
+            return;
+        }
+        if let Some(cell) = self.cell_at(ev.position, false) {
+            let hovering = ev.pressed_button.is_none() && !ev.modifiers.shift;
+            if hovering
+                && self.modes().mouse == MouseMode::Motion
+                && self.last_report_cell != Some(cell)
+            {
+                self.last_report_cell = Some(cell);
+                self.report(MouseEvent::Move, cell, &ev.modifiers);
+            }
+        }
+        self.refresh_hover(ev.modifiers.platform, cx);
+    }
+
+    /// Every mouse release in the window, so a drag ends wherever it does.
+    fn on_mouse_up(&mut self, ev: &MouseUpEvent, cx: &mut Context<Self>) {
+        let Some(button) = term_button(ev.button) else {
+            return;
+        };
+        if self.reporting == Some(button) {
+            self.reporting = None;
+            if let Some(cell) = self.cell_at(ev.position, true) {
+                self.report(MouseEvent::Release(button), cell, &ev.modifiers);
+            }
+            self.last_report_cell = None;
+        }
+        if button == TermButton::Left && self.selecting {
+            self.selecting = false;
+            if self.selection.and_then(|s| s.bounds()).is_none() {
+                self.selection = None;
+            }
+            cx.notify();
+        }
+    }
+
+    /// Underlines the link under the pointer while Cmd is held.
+    fn refresh_hover(&mut self, cmd: bool, cx: &mut Context<Self>) {
+        let hover = if cmd {
+            self.last_mouse
+                .and_then(|p| self.cell_at(p, false))
+                .and_then(|(row, col)| self.link_at(row, col))
+                .map(|(h, _)| h)
+        } else {
+            None
+        };
+        if hover != self.hover {
+            self.hover = hover;
+            cx.notify();
+        }
     }
 
     /// Cell size from the font: width is the advance of `M`. Tells the bridge
@@ -938,6 +1970,94 @@ impl TerminalView {
     }
 }
 
+/// IME support: dead keys and input methods mark text while composing; the
+/// committed text goes to the PTY (or the find bar). The terminal has no
+/// document of its own, so ranges only cover the marked text.
+impl EntityInputHandler for TerminalView {
+    fn text_for_range(
+        &mut self,
+        _: Range<usize>,
+        _: &mut Option<Range<usize>>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<String> {
+        None
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _: bool,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        let end = self.marked.as_deref().map(utf16_len).unwrap_or(0);
+        Some(UTF16Selection {
+            range: end..end,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
+        self.marked.as_deref().map(|t| 0..utf16_len(t))
+    }
+
+    fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        self.marked = None;
+        cx.notify();
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        _: Option<Range<usize>>,
+        text: &str,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.marked = None;
+        self.commit_text(text, cx);
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _: Option<Range<usize>>,
+        new_text: &str,
+        _: Option<Range<usize>>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.marked = (!new_text.is_empty()).then(|| new_text.to_string());
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _: Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        let (m, _) = self.metrics?;
+        let (row, col) = self.geometry.get().cursor;
+        Some(Bounds::new(
+            point(
+                element_bounds.origin.x + px(col as f32 * m.width),
+                element_bounds.origin.y + px(row as f32 * m.height),
+            ),
+            size(px(m.width), px(m.height)),
+        ))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _: gpui::Point<Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
+    }
+}
+
 impl Focusable for TerminalView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -954,13 +2074,29 @@ impl Drop for TerminalView {
     }
 }
 
+/// Highlights and decorations drawn over the grid.
+#[derive(Default)]
+struct Overlay {
+    selection: Option<(AbsPos, AbsPos)>,
+    matches: Rc<Vec<(AbsPos, AbsPos)>>,
+    current_match: Option<(AbsPos, AbsPos)>,
+    hover: Option<HoverLink>,
+    marked: Option<String>,
+}
+
+const SELECTION_TINT: (Rgb, f32) = (Rgb(0x4d, 0x73, 0xcc), 0.45);
+const MATCH_TINT: (Rgb, f32) = (Rgb(0xff, 0xd8, 0x33), 0.35);
+const CURRENT_MATCH_TINT: (Rgb, f32) = (Rgb(0xff, 0x8c, 0x1a), 0.65);
+
 /// Everything paint needs, captured per frame.
 struct PaintStyle {
     font: Font,
     font_size: Pixels,
     metrics: CellMetrics,
     background: Rgb,
+    foreground: Rgb,
     focused: bool,
+    overlay: Overlay,
 }
 
 impl PaintStyle {
@@ -1059,14 +2195,26 @@ fn paint_shape(
     }
 }
 
+/// Paints the grid and returns the snapshot it painted.
 fn paint_grid(
     bounds: Bounds<Pixels>,
     shared: &Shared,
     ps: &PaintStyle,
     window: &mut Window,
     cx: &mut App,
-) {
+) -> Snapshot {
     let snap = shared.bridge.lock().unwrap().snapshot();
+    paint_snapshot(&snap, bounds, ps, window, cx);
+    snap
+}
+
+fn paint_snapshot(
+    snap: &Snapshot,
+    bounds: Bounds<Pixels>,
+    ps: &PaintStyle,
+    window: &mut Window,
+    cx: &mut App,
+) {
     let m = ps.metrics;
     let (ox, oy): (f32, f32) = (bounds.origin.x.into(), bounds.origin.y.into());
     let at = |row: usize, col: usize| {
@@ -1076,6 +2224,29 @@ fn paint_grid(
         )
     };
 
+    let cells_quad = |row: usize, col: usize, len: usize, color: Hsla| {
+        fill(
+            Bounds::new(at(row, col), size(px(len as f32 * m.width), px(m.height))),
+            color,
+        )
+    };
+    let ov = &ps.overlay;
+    let top = top_line(snap.display_offset, snap.history_size);
+    let bottom = top + snap.rows as i64 - 1;
+    let visible = |&(s, e): &(AbsPos, AbsPos)| e.line >= top && s.line <= bottom;
+    let mut tints: Vec<((AbsPos, AbsPos), (Rgb, f32))> = ov
+        .matches
+        .iter()
+        .filter(|r| visible(r))
+        .map(|&r| (r, MATCH_TINT))
+        .collect();
+    tints.extend(
+        ov.current_match
+            .filter(visible)
+            .map(|r| (r, CURRENT_MATCH_TINT)),
+    );
+    tints.extend(ov.selection.filter(visible).map(|r| (r, SELECTION_TINT)));
+
     for row in 0..snap.rows {
         let cells = &snap.cells[row * snap.cols..(row + 1) * snap.cols];
         let RowLayout {
@@ -1084,13 +2255,13 @@ fn paint_grid(
             shapes,
         } = layout_row(cells, ps.background);
         for s in spans {
-            window.paint_quad(fill(
-                Bounds::new(
-                    at(row, s.col),
-                    size(px(s.len as f32 * m.width), px(m.height)),
-                ),
-                hsla(s.color),
-            ));
+            window.paint_quad(cells_quad(row, s.col, s.len, hsla(s.color)));
+        }
+        let line = top + row as i64;
+        for &((start, end), (color, alpha)) in &tints {
+            if let Some((c0, c1)) = span_cols_in_row(start, end, line, snap.cols) {
+                window.paint_quad(cells_quad(row, c0, c1 - c0 + 1, rgba(color, alpha)));
+            }
         }
         for b in batches {
             paint_text(
@@ -1108,6 +2279,47 @@ fn paint_grid(
         }
     }
 
+    if let Some(h) = ov.hover.filter(|h| (top..=bottom).contains(&h.line)) {
+        let row = (h.line - top) as usize;
+        let o = at(row, h.start);
+        window.paint_quad(fill(
+            Bounds::new(
+                point(o.x, o.y + px(m.height - 1.)),
+                size(px(h.end.saturating_sub(h.start) as f32 * m.width), px(1.)),
+            ),
+            hsla(ps.foreground),
+        ));
+    }
+
+    paint_cursor(snap, ps, &at, window, cx);
+
+    // Composition in progress, drawn over the cursor and underlined.
+    if let Some(text) = ov.marked.as_deref() {
+        let origin = at(snap.cursor.row, snap.cursor.col);
+        let cells = text.chars().count().max(1);
+        window.paint_quad(fill(
+            Bounds::new(origin, size(px(cells as f32 * m.width), px(m.height))),
+            hsla(ps.background),
+        ));
+        let style = TextStyle {
+            fg: ps.foreground,
+            bold: false,
+            italic: false,
+            underline: true,
+            strikethrough: false,
+        };
+        paint_text(text, &style, false, origin, ps, window, cx);
+    }
+}
+
+fn paint_cursor(
+    snap: &Snapshot,
+    ps: &PaintStyle,
+    at: &dyn Fn(usize, usize) -> gpui::Point<Pixels>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let m = ps.metrics;
     let cur = snap.cursor;
     if !cur.visible {
         return;
@@ -1165,17 +2377,36 @@ fn paint_grid(
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let metrics = self.update_metrics(window);
+        let find_open = self.find.is_open();
         let ps = PaintStyle {
             font: font(self.theme.font_family.clone()),
             font_size: px(self.theme.font_size),
             metrics,
             background: self.theme.background,
+            foreground: self.theme.palette.foreground,
             focused: self.focus_handle.is_focused(window),
+            overlay: Overlay {
+                selection: self.selection.and_then(|s| s.bounds()),
+                matches: if find_open {
+                    self.find.matches()
+                } else {
+                    Rc::default()
+                },
+                current_match: self.find.current().filter(|_| find_open),
+                hover: self.hover,
+                // While the find bar is open it shows the composition.
+                marked: self.marked.clone().filter(|_| !find_open),
+            },
         };
         let status = self.shared.status.lock().unwrap().clone();
         let shared = self.shared.clone();
         let cmds = self.cmds.clone();
         let geometry = self.geometry.clone();
+        let painted = self.geometry.clone();
+        let frame = self.frame.clone();
+        let focus = self.focus_handle.clone();
+        let entity = cx.entity();
+        let weak = cx.weak_entity();
 
         let grid = canvas(
             move |bounds, _, _| {
@@ -1183,6 +2414,7 @@ impl Render for TerminalView {
                 let (cols, rows) = grid_size(w, h, metrics);
                 let mut g = geometry.get();
                 g.origin = (bounds.origin.x.into(), bounds.origin.y.into());
+                g.size = (w, h);
                 g.cols = cols as usize;
                 g.rows = rows as usize;
                 if g.requested != Some((cols, rows)) {
@@ -1191,9 +2423,42 @@ impl Render for TerminalView {
                 }
                 geometry.set(g);
             },
-            move |bounds, (), window, cx| paint_grid(bounds, &shared, &ps, window, cx),
+            move |bounds, (), window, cx| {
+                window.handle_input(&focus, ElementInputHandler::new(bounds, entity), cx);
+                let snap = paint_grid(bounds, &shared, &ps, window, cx);
+                let mut g = painted.get();
+                g.cursor = (snap.cursor.row, snap.cursor.col);
+                painted.set(g);
+                *frame.borrow_mut() = Some(snap);
+                listen_for_drags(weak, window);
+            },
         )
         .size_full();
+
+        let find_bar = find_open.then(|| {
+            let focus = self.focus_handle.clone();
+            let marked = self.marked.as_deref().unwrap_or_default();
+            div()
+                .absolute()
+                .top_1()
+                .right_2()
+                .px_2()
+                .py_1()
+                .occlude()
+                .bg(hsla(Rgb(0x30, 0x30, 0x30)))
+                .text_color(hsla(Rgb(0xe5, 0xe5, 0xe5)))
+                .font_family(self.theme.font_family.clone())
+                .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                    window.focus(&focus);
+                    cx.stop_propagation();
+                })
+                .child(format!(
+                    "Find: {}{}_  {}",
+                    self.find.query(),
+                    marked,
+                    self.find.status()
+                ))
+        });
 
         div()
             .key_context("Terminal")
@@ -1201,13 +2466,18 @@ impl Render for TerminalView {
             .relative()
             .size_full()
             .bg(hsla(self.theme.background))
+            .when(self.hover.is_some(), |d| d.cursor_pointer())
+            .when(self.hover.is_none(), |d| d.cursor_text())
             .on_key_down(cx.listener(Self::on_key_down))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, window, _| window.focus(&this.focus_handle)),
-            )
+            .on_modifiers_changed(cx.listener(|this, ev: &ModifiersChangedEvent, _, cx| {
+                this.refresh_hover(ev.modifiers.platform, cx)
+            }))
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_mouse_down))
+            .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_mouse_down))
             .child(grid)
+            .children(find_bar)
             .children(status.map(|s| {
                 div()
                     .absolute()
@@ -1220,6 +2490,22 @@ impl Render for TerminalView {
                     .child(s)
             }))
     }
+}
+
+/// Window-wide move and release listeners for this frame. They run in the
+/// capture phase so a drag that leaves the grid still tracks and ends.
+fn listen_for_drags(view: WeakEntity<TerminalView>, window: &mut Window) {
+    let v = view.clone();
+    window.on_mouse_event(move |ev: &MouseMoveEvent, phase, _, cx| {
+        if phase == DispatchPhase::Capture {
+            let _ = v.update(cx, |this, cx| this.on_mouse_move(ev, cx));
+        }
+    });
+    window.on_mouse_event(move |ev: &MouseUpEvent, phase, _, cx| {
+        if phase == DispatchPhase::Capture {
+            let _ = view.update(cx, |this, cx| this.on_mouse_up(ev, cx));
+        }
+    });
 }
 
 #[cfg(test)]
@@ -1660,5 +2946,602 @@ mod tests {
     fn poll_once_completes_ready_futures() {
         assert_eq!(poll_once(async { 7 }), Poll::Ready(7));
         assert!(poll_once(std::future::pending::<()>()).is_pending());
+    }
+
+    // --- Selection, mouse, paste, find, links and composition ---
+
+    fn p(line: i64, col: usize) -> AbsPos {
+        AbsPos::new(line, col)
+    }
+
+    #[test]
+    fn click_count_picks_selection_mode() {
+        assert_eq!(selection_mode(0), SelectionMode::Simple);
+        assert_eq!(selection_mode(1), SelectionMode::Simple);
+        assert_eq!(selection_mode(2), SelectionMode::Word);
+        assert_eq!(selection_mode(3), SelectionMode::Line);
+        assert_eq!(selection_mode(5), SelectionMode::Line);
+    }
+
+    #[test]
+    fn word_span_stops_at_separators() {
+        let chars: Vec<char> = "ls (src/main.rs:12) x".chars().collect();
+        assert_eq!(word_span(&chars, 0), (0, 1));
+        assert_eq!(word_span(&chars, 8), (4, 17), "path:line is one word");
+        assert_eq!(word_span(&chars, 3), (3, 3), "a separator selects itself");
+        assert_eq!(word_span(&chars, 2), (2, 2), "so does a space");
+        assert_eq!(word_span(&chars, 99), (20, 20), "clamped to the row");
+        assert_eq!(word_span(&[], 3), (0, 0));
+    }
+
+    #[test]
+    fn unit_span_by_mode() {
+        let chars: Vec<char> = "foo bar".chars().collect();
+        assert_eq!(
+            unit_span(SelectionMode::Simple, &chars, 7, 5),
+            (p(7, 5), p(7, 5))
+        );
+        assert_eq!(
+            unit_span(SelectionMode::Word, &chars, 7, 5),
+            (p(7, 4), p(7, 6))
+        );
+        assert_eq!(
+            unit_span(SelectionMode::Line, &chars, 7, 5),
+            (p(7, 0), p(7, 6))
+        );
+    }
+
+    #[test]
+    fn plain_click_selects_nothing_until_dragged() {
+        let mut s = LocalSelection::new(SelectionMode::Simple, (p(3, 5), p(3, 5)));
+        assert_eq!(s.bounds(), None);
+        s.extend((p(4, 2), p(4, 2)));
+        assert_eq!(s.bounds(), Some((p(3, 5), p(4, 2))));
+        // Dragging back above the anchor flips the ends.
+        s.extend((p(1, 9), p(1, 9)));
+        assert_eq!(s.bounds(), Some((p(1, 9), p(3, 5))));
+        s.extend((p(3, 5), p(3, 5)));
+        assert_eq!(s.bounds(), None, "back on the anchor");
+    }
+
+    #[test]
+    fn word_and_line_selection_extend_by_unit() {
+        let mut w = LocalSelection::new(SelectionMode::Word, (p(2, 4), p(2, 6)));
+        assert_eq!(w.bounds(), Some((p(2, 4), p(2, 6))), "selected at once");
+        w.extend((p(2, 0), p(2, 2)));
+        assert_eq!(w.bounds(), Some((p(2, 0), p(2, 6))));
+        let mut l = LocalSelection::new(SelectionMode::Line, (p(5, 0), p(5, 79)));
+        l.extend((p(7, 0), p(7, 79)));
+        assert_eq!(l.bounds(), Some((p(5, 0), p(7, 79))));
+    }
+
+    #[test]
+    fn span_cols_cover_selection_rows() {
+        let (a, b) = (p(2, 5), p(4, 3));
+        assert_eq!(span_cols_in_row(a, b, 1, 80), None);
+        assert_eq!(span_cols_in_row(a, b, 2, 80), Some((5, 79)));
+        assert_eq!(span_cols_in_row(a, b, 3, 80), Some((0, 79)));
+        assert_eq!(span_cols_in_row(a, b, 4, 80), Some((0, 3)));
+        assert_eq!(span_cols_in_row(a, b, 5, 80), None);
+        assert_eq!(span_cols_in_row(p(0, 90), p(0, 95), 0, 80), None);
+        assert_eq!(span_cols_in_row(a, b, 2, 0), None);
+    }
+
+    #[test]
+    fn abs_positions_survive_scrolling() {
+        // 100 lines of history, scrolled back 10: row 0 shows line 90.
+        let a = AbsPos::from_viewport(0, 3, 10, 100);
+        assert_eq!(a, p(90, 3));
+        assert_eq!(a.to_grid(100), GridPos { line: -10, col: 3 });
+        // After one more line of output the same text is grid line -11.
+        assert_eq!(a.to_grid(101), GridPos { line: -11, col: 3 });
+        assert_eq!(AbsPos::from_grid(GridPos { line: -11, col: 3 }, 101), a);
+    }
+
+    #[test]
+    fn selection_text_through_abs_positions() {
+        let mut b = TermBridge::new(20, 3, DEFAULT_SCROLLBACK);
+        b.feed(b"one\r\ntwo words\r\nthree\r\nfour");
+        let snap = b.snapshot();
+        let h = snap.history_size;
+        assert_eq!(h, 1);
+        // Viewport row 0 is "two words"; a double click on "words".
+        let chars: Vec<char> = snap.cells[..snap.cols].iter().map(|c| c.ch).collect();
+        let line = top_line(snap.display_offset, h);
+        let sel = LocalSelection::new(
+            SelectionMode::Word,
+            unit_span(SelectionMode::Word, &chars, line, 6),
+        );
+        let (s, e) = sel.bounds().unwrap();
+        // More output scrolls the screen; the selection still names "words".
+        b.feed(b"\r\nfive\r\nsix");
+        let h = b.history_size();
+        let text = b.selection_text(Selection {
+            start: s.to_grid(h),
+            end: e.to_grid(h),
+        });
+        assert_eq!(text, "words");
+    }
+
+    #[test]
+    fn scroll_to_show_a_match() {
+        // History 100, 24 rows, at the bottom: lines 100..=123 visible.
+        assert_eq!(scroll_delta_to_show(110, 0, 100, 24), 0);
+        // Line 40 is above: scroll back so it is the top row (offset 60).
+        assert_eq!(scroll_delta_to_show(40, 0, 100, 24), 60);
+        // Scrolled back 60 (lines 40..=63); line 120 becomes the bottom row
+        // at offset 3.
+        assert_eq!(scroll_delta_to_show(120, 60, 100, 24), -57);
+        assert_eq!(scroll_delta_to_show(123, 60, 100, 24), -60);
+        // Line 70 at offset 60 becomes the bottom row.
+        assert_eq!(scroll_delta_to_show(70, 60, 100, 24), -7);
+        // Never past the top of history.
+        assert_eq!(scroll_delta_to_show(-5, 0, 100, 24), 100);
+    }
+
+    fn mouse_on() -> TermModes {
+        TermModes {
+            mouse: MouseMode::Click,
+            sgr_mouse: true,
+            ..TermModes::default()
+        }
+    }
+
+    #[test]
+    fn mouse_reports_only_in_mouse_mode_without_shift() {
+        assert_eq!(mouse_route(&mouse_on(), false), MouseRoute::Report);
+        assert_eq!(mouse_route(&mouse_on(), true), MouseRoute::Local);
+        assert_eq!(mouse_route(&TermModes::default(), false), MouseRoute::Local);
+        assert_eq!(mouse_route(&TermModes::default(), true), MouseRoute::Local);
+    }
+
+    #[test]
+    fn mouse_down_actions() {
+        let off = TermModes::default();
+        let on = mouse_on();
+        let (l, r) = (TermButton::Left, TermButton::Right);
+        let sel = DownAction::Select;
+        assert_eq!(
+            mouse_down_action(&off, l, false, false, false, 1),
+            sel(SelectionMode::Simple)
+        );
+        assert_eq!(
+            mouse_down_action(&off, l, false, false, false, 2),
+            sel(SelectionMode::Word)
+        );
+        assert_eq!(
+            mouse_down_action(&off, l, false, false, false, 3),
+            sel(SelectionMode::Line)
+        );
+        assert_eq!(
+            mouse_down_action(&off, r, false, false, false, 1),
+            DownAction::Ignore
+        );
+        assert_eq!(
+            mouse_down_action(&on, l, false, false, false, 2),
+            DownAction::Report
+        );
+        assert_eq!(
+            mouse_down_action(&on, r, false, false, false, 1),
+            DownAction::Report
+        );
+        assert_eq!(
+            mouse_down_action(&on, l, true, false, false, 1),
+            sel(SelectionMode::Simple),
+            "Shift-drag selects in mouse mode"
+        );
+        assert_eq!(
+            mouse_down_action(&on, l, true, false, false, 2),
+            sel(SelectionMode::Word)
+        );
+        // Cmd+click opens a link in either mode; without a link it is a click.
+        assert_eq!(
+            mouse_down_action(&on, l, false, true, true, 1),
+            DownAction::OpenLink
+        );
+        assert_eq!(
+            mouse_down_action(&off, l, false, true, true, 1),
+            DownAction::OpenLink
+        );
+        assert_eq!(
+            mouse_down_action(&off, l, false, true, false, 1),
+            sel(SelectionMode::Simple)
+        );
+        assert_eq!(
+            mouse_down_action(&off, r, false, true, true, 1),
+            DownAction::Ignore
+        );
+    }
+
+    /// Ruling R9: scrollback unless the alt screen and mouse mode are both
+    /// on; 1007 arrows on the alt screen without mouse mode; Shift is local.
+    #[test]
+    fn wheel_rule_matrix() {
+        let modes = |alt_screen, mouse, alternate_scroll| TermModes {
+            alt_screen,
+            mouse: if mouse {
+                MouseMode::Click
+            } else {
+                MouseMode::Off
+            },
+            sgr_mouse: true,
+            alternate_scroll,
+            ..TermModes::default()
+        };
+        let wheel = |m: TermModes, shift| route_wheel(1, &m, 0, 0, shift, false, false);
+        let back = WheelAction::Scrollback(1);
+        let report = WheelAction::Send(b"\x1b[<64;1;1M".to_vec());
+        let arrow = WheelAction::Send(b"\x1b[A".to_vec());
+        assert_eq!(wheel(modes(false, false, false), false), back);
+        assert_eq!(wheel(modes(false, true, true), false), back, "main screen");
+        assert_eq!(
+            wheel(modes(true, false, false), false),
+            back,
+            "no mouse mode"
+        );
+        assert_eq!(wheel(modes(true, false, true), false), arrow, "1007");
+        assert_eq!(wheel(modes(true, true, false), false), report);
+        assert_eq!(wheel(modes(true, true, true), false), report);
+        assert_eq!(wheel(modes(true, true, true), true), back, "Shift");
+        assert_eq!(wheel(modes(true, false, true), true), back, "Shift");
+    }
+
+    fn text(t: &str) -> ClipboardEntry {
+        ClipboardEntry::String(gpui::ClipboardString::new(t.into()))
+    }
+
+    fn image() -> ClipboardEntry {
+        ClipboardEntry::Image(gpui::Image::from_bytes(
+            gpui::ImageFormat::Png,
+            vec![0x89, b'P', b'N', b'G'],
+        ))
+    }
+
+    #[test]
+    fn paste_text_goes_through_encode_paste() {
+        let bracketed = TermModes {
+            bracketed_paste: true,
+            ..TermModes::default()
+        };
+        assert_eq!(
+            paste_bytes(&[text("a\nb\nc")], &bracketed),
+            Some(b"\x1b[200~a\rb\rc\x1b[201~".to_vec()),
+            "three lines arrive as one bracketed paste"
+        );
+        assert_eq!(
+            paste_bytes(&[text("a\nb")], &TermModes::default()),
+            Some(b"a\rb".to_vec())
+        );
+        assert_eq!(
+            paste_bytes(&[image(), text("hi")], &bracketed),
+            Some(b"\x1b[200~hi\x1b[201~".to_vec()),
+            "text beside an image is pasted as text"
+        );
+    }
+
+    #[test]
+    fn image_only_paste_sends_ctrl_v() {
+        assert_eq!(
+            paste_bytes(&[image()], &TermModes::default()),
+            Some(vec![0x16])
+        );
+        assert_eq!(
+            paste_bytes(&[text(""), image()], &TermModes::default()),
+            Some(vec![0x16])
+        );
+    }
+
+    #[test]
+    fn empty_clipboard_pastes_nothing() {
+        assert_eq!(paste_bytes(&[], &TermModes::default()), None);
+        assert_eq!(paste_bytes(&[text("")], &TermModes::default()), None);
+    }
+
+    #[test]
+    fn cmd_shortcuts() {
+        let cmd = |k: &str| ks(k, None, |m| m.platform = true);
+        assert_eq!(shortcut(&cmd("c")), Some(Shortcut::Copy));
+        assert_eq!(shortcut(&cmd("v")), Some(Shortcut::Paste));
+        assert_eq!(shortcut(&cmd("f")), Some(Shortcut::Find));
+        assert_eq!(shortcut(&cmd("q")), None);
+        assert_eq!(shortcut(&ks("c", Some("c"), |_| {})), None);
+        assert_eq!(shortcut(&ks("c", None, |m| m.control = true)), None);
+        assert_eq!(
+            shortcut(&ks("c", None, |m| {
+                m.platform = true;
+                m.shift = true
+            })),
+            None
+        );
+    }
+
+    #[test]
+    fn dead_keys_start_composition() {
+        // key_char values as gpui 0.2.2 reports them on a US layout.
+        let opt = |k: &str, ch: &str| ks(k, Some(ch), |m| m.alt = true);
+        assert!(
+            starts_composition(&opt("e", "\u{b4}\u{a0}")),
+            "Option+E acute"
+        );
+        assert!(
+            starts_composition(&opt("u", "\u{a8}\u{a0}")),
+            "Option+U umlaut"
+        );
+        assert!(
+            starts_composition(&opt("i", "^\u{a0}")),
+            "Option+I circumflex"
+        );
+        assert!(starts_composition(&opt("n", "~\u{a0}")), "Option+N tilde");
+        assert!(starts_composition(&opt("`", "`\u{a0}")), "Option+` grave");
+        assert!(
+            !starts_composition(&opt("b", "\u{222b}")),
+            "Option+B is Meta"
+        );
+        assert!(!starts_composition(&opt("space", "\u{a0}")), "Option+Space");
+        assert!(!starts_composition(&opt("e", "\u{b4}")), "no dead-key tail");
+        assert!(!starts_composition(&ks("e", Some("e"), |_| {})));
+        assert!(!starts_composition(&ks("e", Some("\u{b4}\u{a0}"), |m| {
+            m.alt = true;
+            m.platform = true
+        })));
+        // Option+B still sends Meta-b.
+        assert_eq!(bytes(opt("b", "\u{222b}")), b"\x1bb");
+    }
+
+    #[test]
+    fn find_keys() {
+        assert_eq!(find_key(&ks("escape", None, |_| {})), Some(FindKey::Close));
+        assert_eq!(
+            find_key(&ks("enter", Some("\n"), |_| {})),
+            Some(FindKey::Older)
+        );
+        assert_eq!(
+            find_key(&ks("enter", Some("\n"), |m| m.shift = true)),
+            Some(FindKey::Newer)
+        );
+        assert_eq!(
+            find_key(&ks("backspace", None, |_| {})),
+            Some(FindKey::Backspace)
+        );
+        assert_eq!(
+            find_key(&ks("e", Some("E"), |m| m.shift = true)),
+            Some(FindKey::Insert("E".into()))
+        );
+        assert_eq!(
+            find_key(&ks("space", Some(" "), |_| {})),
+            Some(FindKey::Insert(" ".into()))
+        );
+        assert_eq!(find_key(&ks("c", None, |m| m.control = true)), None);
+        assert_eq!(find_key(&ks("up", None, |_| {})), None);
+        assert_eq!(find_key(&ks("tab", Some("\t"), |_| {})), None);
+    }
+
+    fn three_matches() -> Vec<(AbsPos, AbsPos)> {
+        vec![(p(1, 0), p(1, 4)), (p(5, 2), p(5, 6)), (p(9, 0), p(9, 4))]
+    }
+
+    #[test]
+    fn find_bar_query_and_search() {
+        let mut f = FindBar::default();
+        assert!(!f.is_open());
+        assert_eq!(f.open(), FindOutcome::Nothing, "nothing to search yet");
+        assert!(f.is_open());
+        assert_eq!(f.status(), "");
+        assert_eq!(f.key(FindKey::Insert("err".into())), FindOutcome::Search);
+        assert_eq!(f.key(FindKey::Insert("or".into())), FindOutcome::Search);
+        assert_eq!(f.query(), "error");
+        f.set_matches(Vec::new());
+        assert_eq!(f.status(), "No matches");
+        assert_eq!(f.key(FindKey::Older), FindOutcome::Nothing);
+        assert_eq!(f.key(FindKey::Backspace), FindOutcome::Search);
+        assert_eq!(f.query(), "erro");
+        assert_eq!(f.insert("a\nb"), FindOutcome::Search, "pasted text");
+        assert_eq!(f.query(), "erroa b");
+        assert_eq!(f.insert("\u{7}"), FindOutcome::Nothing);
+    }
+
+    #[test]
+    fn find_bar_cycles_and_wraps() {
+        let mut f = FindBar::default();
+        f.open();
+        f.insert("x");
+        f.set_matches(three_matches());
+        // The newest match (nearest the live screen) is current first.
+        assert_eq!(f.current(), Some((p(9, 0), p(9, 4))));
+        assert_eq!(f.status(), "3/3");
+        assert_eq!(f.key(FindKey::Older), FindOutcome::Moved);
+        assert_eq!(f.current(), Some((p(5, 2), p(5, 6))));
+        f.key(FindKey::Older);
+        assert_eq!(f.status(), "1/3");
+        f.key(FindKey::Older);
+        assert_eq!(f.status(), "3/3", "Enter wraps from the oldest");
+        f.key(FindKey::Newer);
+        assert_eq!(f.status(), "1/3", "Shift+Enter wraps from the newest");
+        assert_eq!(f.matches().len(), 3);
+    }
+
+    #[test]
+    fn find_bar_escape_closes_and_reopen_searches_again() {
+        let mut f = FindBar::default();
+        f.open();
+        f.insert("error");
+        f.set_matches(three_matches());
+        assert_eq!(f.key(FindKey::Close), FindOutcome::Closed);
+        assert!(!f.is_open());
+        assert!(f.matches().is_empty(), "highlights dropped");
+        assert_eq!(f.current(), None);
+        assert_eq!(f.query(), "error", "query kept");
+        assert_eq!(f.open(), FindOutcome::Search);
+    }
+
+    #[test]
+    fn editor_config() {
+        assert_eq!(editor_from_toml(""), "Visual Studio Code");
+        assert_eq!(editor_from_toml("[editor]\nname = \"Zed\"\n"), "Zed");
+        assert_eq!(
+            editor_from_toml("[terminal]\nfont_size = 14\n[editor]\nname = \" \"\n"),
+            "Visual Studio Code"
+        );
+        assert_eq!(editor_from_toml("not toml ["), "Visual Studio Code");
+    }
+
+    fn os(v: &[&str]) -> Vec<OsString> {
+        v.iter().map(OsString::from).collect()
+    }
+
+    fn cmd_for(link: Link, editor: &str, existing: &[&str]) -> Option<LinkCommand> {
+        link_command(
+            &link,
+            editor,
+            Path::new("/work/repo"),
+            Some(Path::new("/Users/me")),
+            |p| existing.iter().any(|e| Path::new(e) == p),
+        )
+    }
+
+    #[test]
+    fn web_urls_open_with_open() {
+        let c = cmd_for(Link::Url("https://example.com/a?b=1".into()), "Zed", &[]);
+        assert_eq!(
+            c,
+            Some(LinkCommand {
+                argv: os(&["open", "https://example.com/a?b=1"]),
+                fallback: None,
+            })
+        );
+        let c = cmd_for(Link::Url("HTTP://example.com".into()), "Zed", &[]).unwrap();
+        assert_eq!(c.argv, os(&["open", "HTTP://example.com"]));
+    }
+
+    #[test]
+    fn other_urls_are_ignored() {
+        for url in [
+            "javascript:alert(1)",
+            "ftp://host/x",
+            "ssh://host",
+            "x-man-page://ls",
+        ] {
+            assert_eq!(cmd_for(Link::Url(url.into()), "Zed", &[]), None, "{url}");
+        }
+        assert_eq!(
+            cmd_for(Link::Url("https://a.com/\u{7}".into()), "Zed", &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn file_urls_open_existing_files_in_the_editor() {
+        let c = cmd_for(
+            Link::Url("file:///tmp/my%20notes.txt".into()),
+            "Zed",
+            &["/tmp/my notes.txt"],
+        );
+        assert_eq!(
+            c.unwrap().argv,
+            os(&["open", "-a", "Zed", "/tmp/my notes.txt"])
+        );
+        assert_eq!(
+            cmd_for(Link::Url("file:///tmp/missing".into()), "Zed", &[]),
+            None
+        );
+        assert_eq!(
+            cmd_for(Link::Url("file://otherhost/x".into()), "Zed", &["/x"]),
+            None
+        );
+    }
+
+    #[test]
+    fn plain_path_opens_in_editor() {
+        let c = cmd_for(
+            Link::Path("/etc/hosts".into(), None),
+            "Visual Studio Code",
+            &["/etc/hosts"],
+        );
+        assert_eq!(
+            c,
+            Some(LinkCommand {
+                argv: os(&["open", "-a", "Visual Studio Code", "/etc/hosts"]),
+                fallback: None,
+            })
+        );
+    }
+
+    #[test]
+    fn path_with_line_uses_code_g_for_vscode() {
+        let c = cmd_for(
+            Link::Path("crates/overseer/src/main.rs".into(), Some(1)),
+            "Visual Studio Code",
+            &["/work/repo/crates/overseer/src/main.rs"],
+        );
+        assert_eq!(
+            c,
+            Some(LinkCommand {
+                argv: os(&["code", "-g", "/work/repo/crates/overseer/src/main.rs:1"]),
+                fallback: Some(os(&[
+                    "open",
+                    "-a",
+                    "Visual Studio Code",
+                    "/work/repo/crates/overseer/src/main.rs"
+                ])),
+            })
+        );
+        // `code` as the configured name is VS Code too.
+        let c = cmd_for(Link::Path("/a.rs".into(), Some(7)), "code", &["/a.rs"]).unwrap();
+        assert_eq!(c.argv, os(&["code", "-g", "/a.rs:7"]));
+        assert_eq!(
+            c.fallback,
+            Some(os(&["open", "-a", "Visual Studio Code", "/a.rs"]))
+        );
+    }
+
+    #[test]
+    fn path_with_line_in_other_editor_opens_the_file() {
+        let c = cmd_for(Link::Path("/a.rs".into(), Some(7)), "Zed", &["/a.rs"]);
+        assert_eq!(
+            c,
+            Some(LinkCommand {
+                argv: os(&["open", "-a", "Zed", "/a.rs"]),
+                fallback: None,
+            })
+        );
+    }
+
+    #[test]
+    fn paths_resolve_and_must_exist() {
+        let c = cmd_for(
+            Link::Path("~/notes.md".into(), None),
+            "Zed",
+            &["/Users/me/notes.md"],
+        );
+        assert_eq!(
+            c.unwrap().argv,
+            os(&["open", "-a", "Zed", "/Users/me/notes.md"])
+        );
+        let c = cmd_for(
+            Link::Path("./src/lib.rs".into(), None),
+            "Zed",
+            &["/work/repo/./src/lib.rs"],
+        );
+        assert!(c.is_some(), "relative to the slot's cwd");
+        assert_eq!(
+            cmd_for(Link::Path("and/or".into(), None), "Zed", &[]),
+            None,
+            "not on disk"
+        );
+        let none_home = link_command(
+            &Link::Path("~/x".into(), None),
+            "Zed",
+            Path::new("/"),
+            None,
+            |_| true,
+        );
+        assert_eq!(none_home, None);
+    }
+
+    #[test]
+    fn utf16_lengths() {
+        assert_eq!(utf16_len("\u{b4}"), 1);
+        assert_eq!(utf16_len("e\u{301}"), 2);
+        assert_eq!(utf16_len("\u{1f600}"), 2);
     }
 }

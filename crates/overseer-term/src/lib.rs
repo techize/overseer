@@ -14,6 +14,6 @@ pub use bridge::{
     DEFAULT_SCROLLBACK,
 };
 pub use keys::{encode_key, Key, KeyInput};
-pub use links::{find_link_at, Link};
+pub use links::{find_link_at, find_link_span_at, Link, LinkSpan};
 pub use mouse::{encode_mouse, MouseButton, MouseEvent, MouseInput, MouseMode, TermModes};
 pub use paste::encode_paste;
