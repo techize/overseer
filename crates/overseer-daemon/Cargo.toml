@@ -5,3 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+overseer-proto = { path = "../overseer-proto" }
+portable-pty.workspace = true
+tokio = { workspace = true, features = ["sync", "rt", "time", "macros"] }
+bytes.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
