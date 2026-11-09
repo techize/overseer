@@ -140,9 +140,12 @@ pub struct Snapshot {
     pub cursor: Cursor,
     /// Lines scrolled back from the bottom; 0 means following live output.
     pub display_offset: usize,
-    /// Lines of scrollback above the live screen. `line + history_size` is a
-    /// position that stays put while new output scrolls the screen.
+    /// Lines of scrollback above the live screen.
     pub history_size: usize,
+    /// `line + abs_line_base` is a position that stays on its text while new
+    /// output scrolls the screen, including once scrollback is full and old
+    /// lines are evicted (see `TermBridge::abs_line_base`).
+    pub abs_line_base: usize,
 }
 
 impl Snapshot {
@@ -244,6 +247,25 @@ pub struct TermBridge {
     color_requests: Arc<Mutex<Vec<(usize, ColorFmt)>>>,
     window_size: Arc<Mutex<WindowSize>>,
     palette: Palette,
+    scrollback: usize,
+    /// Lines that have dropped off the top of a full scrollback, in total.
+    lines_evicted: usize,
+    /// A push count in progress on the primary grid (see `begin_count`).
+    count: Option<PushCount>,
+}
+
+/// How lines pushed into history are counted across one parse. alacritty
+/// does not report evictions, but `Grid::scroll_up` adds the lines it pushes
+/// to a non-zero display offset (capped at the scrollback limit). So the
+/// offset is parked at 1 for the parse and read back afterwards, then put
+/// back where it was. The grid is never painted in between.
+#[derive(Debug, Clone, Copy)]
+struct PushCount {
+    offset_before: usize,
+    history_before: usize,
+    /// False when history was empty, so the offset could not be parked and
+    /// the growth of history is the count.
+    parked: bool,
 }
 
 impl TermBridge {
@@ -268,6 +290,9 @@ impl TermBridge {
             color_requests,
             window_size,
             palette: Palette::default(),
+            scrollback: scrollback_lines,
+            lines_evicted: 0,
+            count: None,
         }
     }
 
@@ -278,8 +303,97 @@ impl TermBridge {
     /// Feed raw PTY bytes. Chunks may be any size and may split escape
     /// sequences or UTF-8 sequences anywhere.
     pub fn feed(&mut self, bytes: &[u8]) {
-        self.processor.advance(&mut self.term, bytes);
+        // Parse in pieces of bounded line count so one parse cannot push
+        // more lines than the parked offset can count.
+        let max_lfs = (self.scrollback / 2).max(1);
+        let mut rest = bytes;
+        while !rest.is_empty() {
+            let mut lfs = 0;
+            let end = rest
+                .iter()
+                .position(|&b| {
+                    lfs += usize::from(b == b'\n');
+                    lfs > max_lfs
+                })
+                .unwrap_or(rest.len());
+            let (piece, tail) = rest.split_at(end);
+            self.begin_count();
+            self.processor.advance(&mut self.term, piece);
+            self.end_count();
+            rest = tail;
+        }
         self.answer_color_requests();
+    }
+
+    fn alt_screen(&self) -> bool {
+        self.term.mode().contains(TermMode::ALT_SCREEN)
+    }
+
+    fn begin_count(&mut self) {
+        // A count left open while the alt screen was up is still running:
+        // the inactive primary grid kept its parked offset.
+        if self.count.is_some() || self.alt_screen() {
+            return;
+        }
+        let grid = self.term.grid();
+        let (history, offset) = (grid.history_size(), grid.display_offset());
+        let parked = history >= 1 && self.scrollback >= 2;
+        if parked {
+            self.term
+                .grid_mut()
+                .scroll_display(Scroll::Delta(1 - offset as i32));
+        }
+        self.count = Some(PushCount {
+            offset_before: offset,
+            history_before: history,
+            parked,
+        });
+    }
+
+    fn end_count(&mut self) {
+        if self.alt_screen() {
+            return;
+        }
+        let Some(c) = self.count.take() else {
+            return;
+        };
+        let grid = self.term.grid();
+        let (history, offset) = (grid.history_size(), grid.display_offset());
+        let pushed = if !c.parked {
+            history.saturating_sub(c.history_before)
+        } else if offset >= self.scrollback {
+            // Saturated: at least a whole scrollback went by. Count every old
+            // line as gone so no stored position lands on new text.
+            c.history_before + grid.screen_lines() + offset
+        } else {
+            offset.saturating_sub(1)
+        };
+        // Lines pushed beyond what history grew by fell off the top. A
+        // cleared history (CSI 3 J) also counts as evicted.
+        let grew = history as i64 - c.history_before as i64;
+        self.lines_evicted += (pushed as i64 - grew).max(0) as usize;
+        // Keep a scrolled-back viewport on the same text, as alacritty does.
+        let target = if c.offset_before == 0 {
+            0
+        } else {
+            (c.offset_before + pushed).min(history)
+        };
+        self.term
+            .grid_mut()
+            .scroll_display(Scroll::Delta(target as i32 - offset as i32));
+    }
+
+    /// Lines that have dropped off the top of a full scrollback since start.
+    pub fn lines_evicted(&self) -> usize {
+        self.lines_evicted
+    }
+
+    /// `GridPos::line + abs_line_base()` numbers every line ever scrolled
+    /// into history, so it stays on its text as output arrives, even after
+    /// scrollback fills and starts evicting. Positions below
+    /// `lines_evicted()` refer to text that is gone.
+    pub fn abs_line_base(&self) -> usize {
+        self.lines_evicted + self.term.grid().history_size()
     }
 
     /// When a synchronized update (DEC 2026) times out, or None when none is
@@ -296,7 +410,9 @@ impl TermBridge {
     /// `tick` with an explicit clock, for tests and schedulers.
     pub fn tick_at(&mut self, now: Instant) {
         if self.sync_deadline().is_some_and(|d| d <= now) {
+            self.begin_count();
             self.processor.stop_sync(&mut self.term);
+            self.end_count();
             self.answer_color_requests();
         }
     }
@@ -416,6 +532,7 @@ impl TermBridge {
             },
             display_offset: offset,
             history_size: grid.history_size(),
+            abs_line_base: self.abs_line_base(),
         }
     }
 
@@ -645,6 +762,139 @@ mod tests {
         assert_eq!(b.snapshot().display_offset, 5);
         b.scroll_to_bottom();
         assert_eq!(b.display_offset(), 0);
+    }
+
+    /// Text at absolute line `abs` (columns `a..=b`), or "" once evicted.
+    fn text_at(b: &TermBridge, abs: usize, a: usize, e: usize) -> String {
+        let line = abs as i64 - b.abs_line_base() as i64;
+        b.selection_text(Selection {
+            start: GridPos {
+                line: line as i32,
+                col: a,
+            },
+            end: GridPos {
+                line: line as i32,
+                col: e,
+            },
+        })
+    }
+
+    fn feed_lines(b: &mut TermBridge, range: std::ops::Range<usize>) {
+        for i in range {
+            b.feed(format!("w{i:03}\r\n").as_bytes());
+        }
+    }
+
+    #[test]
+    fn abs_lines_stay_on_their_text_after_scrollback_fills() {
+        let mut b = TermBridge::new(20, 5, 10);
+        feed_lines(&mut b, 0..12);
+        assert_eq!(b.history_size(), 8);
+        assert_eq!(b.lines_evicted(), 0);
+        // "w005" is on grid line 5 - 8 = -3.
+        let abs = (-3 + b.abs_line_base() as i64) as usize;
+        assert_eq!(text_at(&b, abs, 0, 3), "w005");
+
+        // Fill scrollback; history stops growing and lines are evicted.
+        feed_lines(&mut b, 12..15);
+        assert_eq!(b.history_size(), 10);
+        assert_eq!(b.lines_evicted(), 1);
+        assert_eq!(text_at(&b, abs, 0, 3), "w005");
+
+        // One big chunk of several lines at once.
+        let chunk: String = (15..18).map(|i| format!("w{i:03}\r\n")).collect();
+        b.feed(chunk.as_bytes());
+        assert_eq!(b.lines_evicted(), 4);
+        assert_eq!(text_at(&b, abs, 0, 3), "w005");
+
+        // Once w005 itself is evicted its position yields nothing, never
+        // another line's text.
+        feed_lines(&mut b, 18..30);
+        assert!(abs < b.lines_evicted());
+        assert_eq!(text_at(&b, abs, 0, 3), "");
+    }
+
+    #[test]
+    fn a_chunk_longer_than_scrollback_still_counts() {
+        let mut b = TermBridge::new(20, 5, 10);
+        feed_lines(&mut b, 0..3);
+        let base0 = b.abs_line_base();
+        let chunk: String = (3..103).map(|i| format!("w{i:03}\r\n")).collect();
+        b.feed(chunk.as_bytes());
+        // The cursor starts on row 3 of 5, so the first newline moves it to
+        // the last row and the other 99 each push a line: base moves by 99.
+        assert_eq!(b.abs_line_base(), base0 + 99);
+        let m = b.search("w099");
+        assert_eq!(m.len(), 1);
+        let abs = (m[0].start.line as i64 + b.abs_line_base() as i64) as usize;
+        feed_lines(&mut b, 103..106);
+        assert_eq!(text_at(&b, abs, 0, 3), "w099");
+    }
+
+    #[test]
+    fn scrolled_back_view_and_matches_stay_put_when_full() {
+        let mut b = TermBridge::new(20, 5, 10);
+        feed_lines(&mut b, 0..40);
+        b.scroll(4);
+        let top = |b: &TermBridge| -> String {
+            (0..4)
+                .map(|c| b.snapshot().cell(0, c).map(|x| x.ch).unwrap_or(' '))
+                .collect()
+        };
+        let shown = top(&b);
+        let m = b.search(&shown);
+        assert_eq!(m.len(), 1);
+        let abs = (m[0].start.line as i64 + b.abs_line_base() as i64) as usize;
+        let offset = b.display_offset();
+
+        feed_lines(&mut b, 40..43);
+        assert_eq!(top(&b), shown, "viewport stays on its text");
+        assert_eq!(b.display_offset(), offset + 3);
+        assert_eq!(text_at(&b, abs, 0, 3), shown);
+
+        // When the shown text is evicted the view pins to the oldest line.
+        feed_lines(&mut b, 43..60);
+        assert_eq!(b.display_offset(), b.history_size());
+        assert_eq!(text_at(&b, abs, 0, 3), "");
+    }
+
+    #[test]
+    fn live_view_stays_live_while_counting() {
+        let mut b = TermBridge::new(20, 5, 10);
+        feed_lines(&mut b, 0..30);
+        assert_eq!(b.display_offset(), 0);
+        assert_eq!(b.snapshot().display_offset, 0);
+    }
+
+    #[test]
+    fn alt_screen_output_does_not_disturb_the_count() {
+        let mut b = TermBridge::new(20, 5, 10);
+        feed_lines(&mut b, 0..20);
+        let m = b.search("w012");
+        let abs = (m[0].start.line as i64 + b.abs_line_base() as i64) as usize;
+        // Enter the alt screen, scroll it a lot, then come back in pieces.
+        b.feed(b"w020\r\n\x1b[?1049h");
+        for _ in 0..30 {
+            b.feed(b"alt\r\n");
+        }
+        b.feed(b"\x1b[?1049l");
+        assert_eq!(b.display_offset(), 0, "primary view is live again");
+        assert_eq!(text_at(&b, abs, 0, 3), "w012");
+        feed_lines(&mut b, 21..23);
+        assert_eq!(text_at(&b, abs, 0, 3), "w012");
+    }
+
+    #[test]
+    fn clearing_history_evicts_it() {
+        let mut b = TermBridge::new(20, 5, 10);
+        feed_lines(&mut b, 0..8);
+        let m = b.search("w001");
+        let abs = (m[0].start.line as i64 + b.abs_line_base() as i64) as usize;
+        let base = b.abs_line_base();
+        b.feed(b"\x1b[3J");
+        assert_eq!(b.history_size(), 0);
+        assert_eq!(b.abs_line_base(), base, "screen lines keep their numbers");
+        assert_eq!(text_at(&b, abs, 0, 3), "");
     }
 
     #[test]

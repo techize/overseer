@@ -539,8 +539,9 @@ fn poll_once<F: Future>(fut: F) -> Poll<F::Output> {
 // Pure logic: selection, mouse routing, paste, find, links, composition
 // ---------------------------------------------------------------------------
 
-/// A grid position that stays put while output scrolls: `line` counts from
-/// the top of scrollback (`GridPos::line + history_size`).
+/// A grid position that stays on its text while output scrolls: `line` is
+/// `GridPos::line + base`, where `base` is the bridge's `abs_line_base()`
+/// (lines evicted from a full scrollback plus the current history size).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AbsPos {
     pub line: i64,
@@ -553,16 +554,16 @@ impl AbsPos {
     }
 
     /// The position of viewport cell (`row`, `col`).
-    pub fn from_viewport(row: usize, col: usize, display_offset: usize, history: usize) -> AbsPos {
-        AbsPos::new(top_line(display_offset, history) + row as i64, col)
+    pub fn from_viewport(row: usize, col: usize, display_offset: usize, base: usize) -> AbsPos {
+        AbsPos::new(top_line(display_offset, base) + row as i64, col)
     }
 
-    pub fn from_grid(p: GridPos, history: usize) -> AbsPos {
-        AbsPos::new(p.line as i64 + history as i64, p.col)
+    pub fn from_grid(p: GridPos, base: usize) -> AbsPos {
+        AbsPos::new(p.line as i64 + base as i64, p.col)
     }
 
-    pub fn to_grid(self, history: usize) -> GridPos {
-        let line = (self.line - history as i64).clamp(i32::MIN as i64, i32::MAX as i64);
+    pub fn to_grid(self, base: usize) -> GridPos {
+        let line = (self.line - base as i64).clamp(i32::MIN as i64, i32::MAX as i64);
         GridPos {
             line: line as i32,
             col: self.col,
@@ -571,8 +572,8 @@ impl AbsPos {
 }
 
 /// The absolute line shown on viewport row 0.
-pub fn top_line(display_offset: usize, history: usize) -> i64 {
-    history as i64 - display_offset as i64
+pub fn top_line(display_offset: usize, base: usize) -> i64 {
+    base as i64 - display_offset as i64
 }
 
 /// Columns of `line` covered by the inclusive range `start..=end`, if any.
@@ -591,9 +592,16 @@ pub fn span_cols_in_row(
 }
 
 /// How many lines to scroll (positive is toward older output) so that
-/// absolute `line` is on screen. Zero when it already is.
-pub fn scroll_delta_to_show(line: i64, display_offset: usize, history: usize, rows: usize) -> i32 {
-    let top = top_line(display_offset, history);
+/// absolute `line` is on screen. Zero when it already is. `base` is the
+/// bridge's `abs_line_base()` and `history` its `history_size()`.
+pub fn scroll_delta_to_show(
+    line: i64,
+    display_offset: usize,
+    base: usize,
+    history: usize,
+    rows: usize,
+) -> i32 {
+    let top = top_line(display_offset, base);
     let bottom = top + rows.max(1) as i64 - 1;
     if (top..=bottom).contains(&line) {
         return 0;
@@ -603,7 +611,7 @@ pub fn scroll_delta_to_show(line: i64, display_offset: usize, history: usize, ro
     } else {
         line - (rows.max(1) as i64 - 1)
     };
-    let new_offset = (history as i64 - new_top).clamp(0, history as i64);
+    let new_offset = (base as i64 - new_top).clamp(0, history as i64);
     (new_offset - display_offset as i64).clamp(i32::MIN as i64, i32::MAX as i64) as i32
 }
 
@@ -937,6 +945,24 @@ impl FindBar {
         self.matches = Rc::new(matches);
     }
 
+    /// Drops matches that ended above absolute line `first` (evicted from
+    /// scrollback). The current match keeps its place, or moves to the oldest
+    /// remaining one when it was dropped. True when anything was dropped.
+    pub fn forget_before(&mut self, first: i64) -> bool {
+        let gone = self.matches.iter().take_while(|m| m.1.line < first).count();
+        if gone == 0 {
+            return false;
+        }
+        let kept = self.matches[gone..].to_vec();
+        self.current = match self.current {
+            _ if kept.is_empty() => None,
+            Some(i) if i >= gone => Some(i - gone),
+            _ => Some(0),
+        };
+        self.matches = Rc::new(kept);
+        true
+    }
+
     /// Moves to the next match in `dir`, wrapping at either end.
     fn step(&mut self, dir: isize) -> FindOutcome {
         let n = self.matches.len();
@@ -1076,7 +1102,9 @@ fn path_command(
     editor: &str,
     exists: impl Fn(&Path) -> bool,
 ) -> Option<LinkCommand> {
-    if !exists(path) {
+    // Only absolute paths reach argv, whatever the base or HOME was: a
+    // relative one could start with '-' and be read as an option.
+    if !path.is_absolute() || !exists(path) {
         return None;
     }
     let app = if is_vscode(editor) {
@@ -1619,16 +1647,22 @@ impl TerminalView {
     }
 
     /// Copies the selection. False when there is none, so Cmd+C propagates.
-    fn copy(&self, cx: &mut Context<Self>) -> bool {
+    fn copy(&mut self, cx: &mut Context<Self>) -> bool {
         let Some((start, end)) = self.selection.and_then(|s| s.bounds()) else {
             return false;
         };
         let text = {
             let bridge = self.shared.bridge.lock().unwrap();
-            let h = bridge.history_size();
+            if end.line < bridge.lines_evicted() as i64 {
+                // The selected text has left scrollback entirely.
+                drop(bridge);
+                self.selection = None;
+                return false;
+            }
+            let base = bridge.abs_line_base();
             bridge.selection_text(Selection {
-                start: start.to_grid(h),
-                end: end.to_grid(h),
+                start: start.to_grid(base),
+                end: end.to_grid(base),
             })
         };
         if text.is_empty() {
@@ -1668,6 +1702,8 @@ impl TerminalView {
     }
 
     fn apply_find(&mut self, outcome: FindOutcome) {
+        let evicted = self.shared.bridge.lock().unwrap().lines_evicted();
+        self.find.forget_before(evicted as i64);
         match outcome {
             FindOutcome::Search => self.run_search(),
             FindOutcome::Moved => self.reveal_current_match(),
@@ -1678,11 +1714,16 @@ impl TerminalView {
     fn run_search(&mut self) {
         let found = {
             let bridge = self.shared.bridge.lock().unwrap();
-            let h = bridge.history_size();
+            let base = bridge.abs_line_base();
             bridge
                 .search(self.find.query())
                 .into_iter()
-                .map(|m| (AbsPos::from_grid(m.start, h), AbsPos::from_grid(m.end, h)))
+                .map(|m| {
+                    (
+                        AbsPos::from_grid(m.start, base),
+                        AbsPos::from_grid(m.end, base),
+                    )
+                })
                 .collect()
         };
         self.find.set_matches(found);
@@ -1698,6 +1739,7 @@ impl TerminalView {
         let delta = scroll_delta_to_show(
             start.line,
             bridge.display_offset(),
+            bridge.abs_line_base(),
             bridge.history_size(),
             rows,
         );
@@ -1770,7 +1812,7 @@ impl TerminalView {
             .iter()
             .map(|c| c.ch)
             .collect();
-        let line = top_line(snap.display_offset, snap.history_size) + row as i64;
+        let line = top_line(snap.display_offset, snap.abs_line_base) + row as i64;
         Some(unit_span(mode, &chars, line, col.min(snap.cols - 1)))
     }
 
@@ -1794,7 +1836,7 @@ impl TerminalView {
             p.exists()
         })?;
         let hover = HoverLink {
-            line: top_line(snap.display_offset, snap.history_size) + row as i64,
+            line: top_line(snap.display_offset, snap.abs_line_base) + row as i64,
             start: span.start_col,
             end: span.end_col,
         };
@@ -2231,7 +2273,7 @@ fn paint_snapshot(
         )
     };
     let ov = &ps.overlay;
-    let top = top_line(snap.display_offset, snap.history_size);
+    let top = top_line(snap.display_offset, snap.abs_line_base);
     let bottom = top + snap.rows as i64 - 1;
     let visible = |&(s, e): &(AbsPos, AbsPos)| e.line >= top && s.line <= bottom;
     let mut tints: Vec<((AbsPos, AbsPos), (Rgb, f32))> = ov
@@ -3043,7 +3085,7 @@ mod tests {
         let mut b = TermBridge::new(20, 3, DEFAULT_SCROLLBACK);
         b.feed(b"one\r\ntwo words\r\nthree\r\nfour");
         let snap = b.snapshot();
-        let h = snap.history_size;
+        let h = snap.abs_line_base;
         assert_eq!(h, 1);
         // Viewport row 0 is "two words"; a double click on "words".
         let chars: Vec<char> = snap.cells[..snap.cols].iter().map(|c| c.ch).collect();
@@ -3055,7 +3097,7 @@ mod tests {
         let (s, e) = sel.bounds().unwrap();
         // More output scrolls the screen; the selection still names "words".
         b.feed(b"\r\nfive\r\nsix");
-        let h = b.history_size();
+        let h = b.abs_line_base();
         let text = b.selection_text(Selection {
             start: s.to_grid(h),
             end: e.to_grid(h),
@@ -3063,20 +3105,151 @@ mod tests {
         assert_eq!(text, "words");
     }
 
+    /// Word-selects viewport cell (`row`, `col`) the way a double click
+    /// does, from a fresh snapshot.
+    fn word_at(b: &TermBridge, row: usize, col: usize) -> (AbsPos, AbsPos) {
+        let snap = b.snapshot();
+        let chars: Vec<char> = snap.cells[row * snap.cols..(row + 1) * snap.cols]
+            .iter()
+            .map(|c| c.ch)
+            .collect();
+        let line = top_line(snap.display_offset, snap.abs_line_base) + row as i64;
+        LocalSelection::new(
+            SelectionMode::Word,
+            unit_span(SelectionMode::Word, &chars, line, col),
+        )
+        .bounds()
+        .unwrap()
+    }
+
+    fn text_of(b: &TermBridge, (s, e): (AbsPos, AbsPos)) -> String {
+        let base = b.abs_line_base();
+        b.selection_text(Selection {
+            start: s.to_grid(base),
+            end: e.to_grid(base),
+        })
+    }
+
+    #[test]
+    fn selection_survives_a_full_scrollback() {
+        let mut b = TermBridge::new(20, 4, 8);
+        for i in 0..30 {
+            b.feed(format!("row {i} item{i}\r\n").as_bytes());
+        }
+        assert!(b.lines_evicted() > 0, "scrollback is full");
+        // Row 0 of the live view reads "row 27 item27".
+        let sel = word_at(&b, 0, 8);
+        assert_eq!(text_of(&b, sel), "item27");
+        for i in 30..35 {
+            b.feed(format!("row {i} item{i}\r\n").as_bytes());
+        }
+        assert_eq!(text_of(&b, sel), "item27");
+        // Scrolled back, the view and the selection both stay on their text.
+        b.scroll(3);
+        let sel2 = word_at(&b, 1, 8);
+        let shown = text_of(&b, sel2);
+        b.feed(b"more\r\nmore\r\n");
+        assert_eq!(text_of(&b, sel2), shown);
+        assert_eq!(word_at(&b, 1, 8), sel2, "viewport row 1 is the same line");
+        // Evicted entirely: nothing, never other text.
+        for i in 0..20 {
+            b.feed(format!("tail {i}\r\n").as_bytes());
+        }
+        assert!(sel.1.line < b.lines_evicted() as i64);
+        assert_eq!(text_of(&b, sel), "");
+    }
+
+    #[test]
+    fn search_matches_stay_on_their_text_after_output() {
+        let mut b = TermBridge::new(20, 4, 8);
+        for i in 0..20 {
+            b.feed(format!("n{i} needle{i}\r\n").as_bytes());
+        }
+        b.scroll(2);
+        let base = b.abs_line_base();
+        let found: Vec<(AbsPos, AbsPos)> = b
+            .search("needle1")
+            .into_iter()
+            .map(|m| {
+                (
+                    AbsPos::from_grid(m.start, base),
+                    AbsPos::from_grid(m.end, base),
+                )
+            })
+            .collect();
+        let before: Vec<String> = found.iter().map(|&r| text_of(&b, r)).collect();
+        assert!(before.iter().all(|t| t.starts_with("needle1")));
+        b.feed(b"x\r\ny\r\n");
+        // Held matches keep their text; the oldest was evicted and is empty.
+        let evicted = b.lines_evicted() as i64;
+        for (&r, t) in found.iter().zip(&before) {
+            let want = if r.1.line < evicted { "" } else { t.as_str() };
+            assert_eq!(text_of(&b, r), want);
+        }
+        assert!(found.iter().filter(|r| r.1.line >= evicted).count() >= 8);
+
+        let mut bar = FindBar::default();
+        bar.open();
+        bar.insert("needle1");
+        bar.set_matches(found.clone());
+        for _ in 0..12 {
+            b.feed(b"z\r\n");
+        }
+        bar.forget_before(b.lines_evicted() as i64);
+        for (s, e) in bar.matches().iter() {
+            assert!(e.line >= b.lines_evicted() as i64);
+            assert!(text_of(&b, (*s, *e)).starts_with("needle1"));
+        }
+    }
+
+    #[test]
+    fn forget_before_drops_evicted_matches() {
+        let mut bar = FindBar::default();
+        bar.set_matches(vec![
+            (p(1, 0), p(1, 2)),
+            (p(5, 0), p(5, 2)),
+            (p(9, 0), p(9, 2)),
+        ]);
+        assert_eq!(bar.current(), Some((p(9, 0), p(9, 2))));
+        assert!(!bar.forget_before(1));
+        assert!(bar.forget_before(2));
+        assert_eq!(bar.matches().len(), 2);
+        assert_eq!(
+            bar.current(),
+            Some((p(9, 0), p(9, 2))),
+            "current keeps its match"
+        );
+        bar.key(FindKey::Older);
+        assert_eq!(bar.current(), Some((p(5, 0), p(5, 2))));
+        assert!(bar.forget_before(6));
+        assert_eq!(
+            bar.current(),
+            Some((p(9, 0), p(9, 2))),
+            "falls to the oldest left"
+        );
+        assert!(bar.forget_before(100));
+        assert_eq!(bar.current(), None);
+        assert!(bar.matches().is_empty());
+    }
+
     #[test]
     fn scroll_to_show_a_match() {
         // History 100, 24 rows, at the bottom: lines 100..=123 visible.
-        assert_eq!(scroll_delta_to_show(110, 0, 100, 24), 0);
+        assert_eq!(scroll_delta_to_show(110, 0, 100, 100, 24), 0);
         // Line 40 is above: scroll back so it is the top row (offset 60).
-        assert_eq!(scroll_delta_to_show(40, 0, 100, 24), 60);
+        assert_eq!(scroll_delta_to_show(40, 0, 100, 100, 24), 60);
         // Scrolled back 60 (lines 40..=63); line 120 becomes the bottom row
         // at offset 3.
-        assert_eq!(scroll_delta_to_show(120, 60, 100, 24), -57);
-        assert_eq!(scroll_delta_to_show(123, 60, 100, 24), -60);
+        assert_eq!(scroll_delta_to_show(120, 60, 100, 100, 24), -57);
+        assert_eq!(scroll_delta_to_show(123, 60, 100, 100, 24), -60);
         // Line 70 at offset 60 becomes the bottom row.
-        assert_eq!(scroll_delta_to_show(70, 60, 100, 24), -7);
+        assert_eq!(scroll_delta_to_show(70, 60, 100, 100, 24), -7);
         // Never past the top of history.
-        assert_eq!(scroll_delta_to_show(-5, 0, 100, 24), 100);
+        assert_eq!(scroll_delta_to_show(-5, 0, 100, 100, 24), 100);
+        // 50 lines evicted: base 150, history 100. Line 90 is grid line -60.
+        assert_eq!(scroll_delta_to_show(90, 0, 150, 100, 24), 60);
+        // An evicted line clamps to the oldest line still held.
+        assert_eq!(scroll_delta_to_show(10, 0, 150, 100, 24), 100);
     }
 
     fn mouse_on() -> TermModes {
@@ -3536,6 +3709,27 @@ mod tests {
             |_| true,
         );
         assert_eq!(none_home, None);
+    }
+
+    #[test]
+    fn relative_resolved_paths_are_rejected() {
+        let rel = |link: Link, base: &str, home: Option<&str>| {
+            link_command(&link, "Zed", Path::new(base), home.map(Path::new), |_| true)
+        };
+        // A relative slot cwd never yields a command, even if it "exists".
+        assert_eq!(rel(Link::Path("main.rs".into(), None), "-x", None), None);
+        assert_eq!(
+            rel(Link::Path("src/a.rs".into(), Some(3)), "-x", None),
+            None
+        );
+        assert_eq!(rel(Link::Path("./a".into(), None), "rel/dir", None), None);
+        // Nor does a relative HOME.
+        assert_eq!(
+            rel(Link::Path("~/a".into(), None), "/", Some("-home")),
+            None
+        );
+        // An absolute base still works.
+        assert!(rel(Link::Path("main.rs".into(), None), "/w", None).is_some());
     }
 
     #[test]
