@@ -104,6 +104,13 @@ pub struct TextStyle {
     pub strikethrough: bool,
 }
 
+impl TextStyle {
+    /// Draws a line across every cell it covers, spaces included.
+    pub fn decorated(&self) -> bool {
+        self.underline || self.strikethrough
+    }
+}
+
 /// A run of cells shaped and painted together, starting at `col`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextBatch {
@@ -267,9 +274,10 @@ pub fn layout_row(cells: &[Cell], default_bg: Rgb) -> RowLayout {
                 color: fg,
             });
         } else if c.hidden || plain_space {
-            // Invisible: may join a neighbouring batch to save shaping calls.
+            // Invisible: may join a neighbouring batch to save shaping calls,
+            // but never a decorated one, or its line would run under this cell.
             if let Some(b) = out.batches.last_mut() {
-                if b.monospace && b.col + b.cells == col && width == 1 {
+                if b.monospace && !b.style.decorated() && b.col + b.cells == col && width == 1 {
                     b.text.push(' ');
                     b.cells += 1;
                 }
@@ -306,8 +314,10 @@ pub fn layout_row(cells: &[Cell], default_bg: Rgb) -> RowLayout {
         }
         col += width;
     }
+    // Trailing spaces in an undecorated batch draw nothing; in a decorated
+    // one they carry the underline or strikethrough, so they stay.
     for b in &mut out.batches {
-        while b.monospace && b.text.ends_with(' ') && b.cells > 1 {
+        while b.monospace && !b.style.decorated() && b.text.ends_with(' ') && b.cells > 1 {
             b.text.pop();
             b.cells -= 1;
         }
@@ -1344,6 +1354,62 @@ mod tests {
         assert_eq!(b[0].text, "e\u{301}");
         assert!(!b[0].monospace);
         assert_eq!(b[1].text, "x");
+    }
+
+    /// Words decorated, the gap between them not: the gap must stay bare.
+    fn gap_layout(decorate: fn(&mut Cell), hide_gap: bool) -> Vec<TextBatch> {
+        let mut cells = row("foo bar");
+        for (i, c) in cells.iter_mut().enumerate() {
+            if i == 3 {
+                if hide_gap {
+                    c.ch = 'x';
+                    c.hidden = true;
+                }
+            } else {
+                decorate(c);
+            }
+        }
+        layout_row(&cells, BG).batches
+    }
+
+    fn assert_gap_bare(b: &[TextBatch]) {
+        let texts: Vec<_> = b
+            .iter()
+            .map(|b| (b.text.as_str(), b.col, b.cells))
+            .collect();
+        assert_eq!(texts, vec![("foo", 0, 3), ("bar", 4, 3)]);
+    }
+
+    #[test]
+    fn underline_does_not_bleed_across_plain_space() {
+        let b = gap_layout(|c| c.underline = true, false);
+        assert_gap_bare(&b);
+        assert!(b.iter().all(|b| b.style.underline));
+    }
+
+    #[test]
+    fn strikethrough_does_not_bleed_across_plain_space() {
+        let b = gap_layout(|c| c.strikethrough = true, false);
+        assert_gap_bare(&b);
+        assert!(b.iter().all(|b| b.style.strikethrough));
+    }
+
+    #[test]
+    fn decoration_does_not_bleed_across_hidden_cell() {
+        assert_gap_bare(&gap_layout(|c| c.underline = true, true));
+        assert_gap_bare(&gap_layout(|c| c.strikethrough = true, true));
+    }
+
+    #[test]
+    fn underlined_trailing_spaces_keep_decoration() {
+        let mut cells = row("ab  ");
+        for c in &mut cells {
+            c.underline = true;
+        }
+        let b = layout_row(&cells, BG).batches;
+        assert_eq!(b.len(), 1);
+        assert_eq!((b[0].text.as_str(), b[0].col, b[0].cells), ("ab  ", 0, 4));
+        assert!(b[0].style.underline);
     }
 
     #[test]
