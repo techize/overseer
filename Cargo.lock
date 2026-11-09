@@ -3391,6 +3391,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "gpui",
+ "libc",
  "overseer-daemon",
  "overseer-proto",
  "overseer-term",

@@ -11,6 +11,12 @@
 //! write, so dropping their futures cannot leave half a frame on the stream.
 //! The queue is unbounded because it is fed at human or request rate.
 //!
+//! Ordering marks: `request_marked` also puts the reply into the subscriber
+//! stream, as `Frame::Response`, at the point it arrived on the wire. A
+//! subscriber can then tell frames the daemon sent before the reply (such as
+//! output from an earlier attach) from frames sent after it (the snapshot of
+//! a new attach). Plain `request` replies never enter the stream.
+//!
 //! The inbox channel is bounded (`INBOX_CAP` frames). The reader never blocks on it,
 //! because it also has to route responses. A consumer that falls that far
 //! behind is cut off instead: the reader stops, `inbox_overflowed` turns true
@@ -37,8 +43,15 @@ const INBOX_CAP: usize = 4096;
 /// Frames buffered between the forwarder task and the subscriber.
 const SUBSCRIBER_QUEUE: usize = 256;
 
+/// A request waiting for its reply.
+struct Waiter {
+    reply: oneshot::Sender<Response>,
+    /// Also put the reply into the subscriber stream (see `request_marked`).
+    mark: bool,
+}
+
 /// `None` once the connection is gone, so late requests fail fast.
-type Pending = StdMutex<Option<HashMap<u32, oneshot::Sender<Response>>>>;
+type Pending = StdMutex<Option<HashMap<u32, Waiter>>>;
 
 /// Removes a request's pending entry if its future is dropped while waiting.
 struct PendingGuard {
@@ -62,6 +75,20 @@ pub struct Client {
     pending: Arc<Pending>,
     inbox: StdMutex<Option<mpsc::Receiver<Frame>>>,
     overflowed: Arc<AtomicBool>,
+}
+
+/// Queues `frame` for the subscriber. False when the subscriber has fallen
+/// `INBOX_CAP` frames behind, which ends the connection.
+fn forward(tx: &mpsc::Sender<Frame>, frame: Frame, overflowed: &AtomicBool) -> bool {
+    match tx.try_send(frame) {
+        Ok(()) => true,
+        // No subscriber left; keep serving responses.
+        Err(mpsc::error::TrySendError::Closed(_)) => true,
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            overflowed.store(true, Ordering::SeqCst);
+            false
+        }
+    }
 }
 
 impl Client {
@@ -98,19 +125,21 @@ impl Client {
                             .unwrap()
                             .as_mut()
                             .and_then(|m| m.remove(&seq));
-                        if let Some(w) = waiter {
-                            let _ = w.send(resp);
-                        }
-                    }
-                    Frame::Event(_) | Frame::Output { .. } => {
-                        match tx.try_send(frame) {
-                            Ok(()) => {}
-                            // No subscriber left; keep serving responses.
-                            Err(mpsc::error::TrySendError::Closed(_)) => {}
-                            Err(mpsc::error::TrySendError::Full(_)) => {
-                                reader_overflowed.store(true, Ordering::SeqCst);
+                        let Some(w) = waiter else { continue };
+                        if w.mark {
+                            let mark = Frame::Response {
+                                seq,
+                                resp: resp.clone(),
+                            };
+                            if !forward(&tx, mark, &reader_overflowed) {
                                 break;
                             }
+                        }
+                        let _ = w.reply.send(resp);
+                    }
+                    Frame::Event(_) | Frame::Output { .. } => {
+                        if !forward(&tx, frame, &reader_overflowed) {
+                            break;
                         }
                     }
                     // Servers do not send these.
@@ -162,6 +191,28 @@ impl Client {
     /// Sends a request and waits for its response. Cancel-safe: dropping the
     /// future forgets the reply but leaves the stream intact.
     pub async fn request(&self, req: Request) -> anyhow::Result<Response> {
+        self.send_request(req, false, |_| {}).await
+    }
+
+    /// Like `request`, and the reply is also put into the subscriber stream
+    /// as `Frame::Response { seq, .. }`, ordered with the events and output
+    /// around it. `on_seq` gets the request's sequence number before the
+    /// request is sent, so the subscriber can be told which mark to expect
+    /// before it can possibly arrive.
+    pub async fn request_marked(
+        &self,
+        req: Request,
+        on_seq: impl FnOnce(u32),
+    ) -> anyhow::Result<Response> {
+        self.send_request(req, true, on_seq).await
+    }
+
+    async fn send_request(
+        &self,
+        req: Request,
+        mark: bool,
+        on_seq: impl FnOnce(u32),
+    ) -> anyhow::Result<Response> {
         let (tx, rx) = oneshot::channel();
         let seq = {
             let mut next = self.next_seq.lock().unwrap();
@@ -169,10 +220,11 @@ impl Client {
             let seq = *next;
             match self.pending.lock().unwrap().as_mut() {
                 Some(m) => {
-                    m.insert(seq, tx);
+                    m.insert(seq, Waiter { reply: tx, mark });
                 }
                 None => bail!("connection to the daemon is closed"),
             }
+            on_seq(seq);
             if self.outbox.send(Frame::Request { seq, req }).is_err() {
                 if let Some(m) = self.pending.lock().unwrap().as_mut() {
                     m.remove(&seq);
@@ -189,7 +241,8 @@ impl Client {
             .map_err(|_| anyhow!("connection to the daemon closed before it replied"))
     }
 
-    /// Takes the stream of events and output frames. Frames that arrived
+    /// Takes the stream of events, output frames and the replies of
+    /// `request_marked` calls. Frames that arrived
     /// before the call are delivered first, in order. Only the first call
     /// gets frames; later calls return a closed receiver.
     pub fn subscribe(&self) -> mpsc::Receiver<Frame> {

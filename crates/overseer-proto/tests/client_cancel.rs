@@ -110,5 +110,58 @@ async fn inbox_overflow_ends_connection() {
     {
         n += 1;
     }
-    assert!(n >= 1 && n <= 2, "got {n} frames");
+    assert!((1..=2).contains(&n), "got {n} frames");
+}
+
+#[tokio::test]
+async fn marked_reply_is_ordered_in_the_stream() {
+    let path = sock("marked");
+    let listener = UnixListener::bind(&path).unwrap();
+    // Each request gets: output "before", its reply, output "after".
+    tokio::spawn(async move {
+        let (mut s, _) = listener.accept().await.unwrap();
+        while let Ok(Some(frame)) = read_frame(&mut s).await {
+            let Frame::Request { seq, .. } = frame else {
+                continue;
+            };
+            let out = |data: &'static [u8]| Frame::Output {
+                id: 1,
+                data: bytes::Bytes::from_static(data),
+            };
+            write_frame(&mut s, &out(b"before")).await.unwrap();
+            let resp = Response::Ok;
+            write_frame(&mut s, &Frame::Response { seq, resp })
+                .await
+                .unwrap();
+            write_frame(&mut s, &out(b"after")).await.unwrap();
+        }
+    });
+    let client = Client::connect(&path).await.unwrap();
+    let mut rx = client.subscribe();
+    let mut seen_seq = None;
+    let r = client
+        .request_marked(Request::Attach { id: 1 }, |s| seen_seq = Some(s))
+        .await
+        .unwrap();
+    assert_eq!(r, Response::Ok);
+    // A plain request puts no reply into the stream.
+    client.request(Request::ListSlots).await.unwrap();
+
+    let mut got = Vec::new();
+    for _ in 0..5 {
+        let f = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        got.push(match f {
+            Frame::Output { data, .. } => String::from_utf8(data.to_vec()).unwrap(),
+            Frame::Response { seq, resp } => {
+                assert_eq!(Some(seq), seen_seq);
+                assert_eq!(resp, Response::Ok);
+                "reply".into()
+            }
+            other => panic!("unexpected {other:?}"),
+        });
+    }
+    assert_eq!(got, ["before", "reply", "after", "before", "after"]);
 }

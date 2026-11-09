@@ -24,7 +24,7 @@ async fn burst(tag: &str, command: Option<Vec<String>>, input: &[u8], end: &str)
     }));
     let client = Arc::new(Client::connect_or_start(&socket, || Ok(())).await.unwrap());
     let hub = FrameHub::start(&client, tokio::runtime::Handle::current());
-    let (_, mut out) = hub.route(1);
+    let (gen, mut out) = hub.route(1);
 
     let start = Request::StartSlot {
         id: 1,
@@ -34,8 +34,7 @@ async fn burst(tag: &str, command: Option<Vec<String>>, input: &[u8], end: &str)
     };
     assert_eq!(client.request(start).await.unwrap(), Response::Ok);
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let attach = Request::Attach { id: 1 };
-    assert_eq!(client.request(attach).await.unwrap(), Response::Ok);
+    assert_eq!(hub.attach(&client, 1, gen).await.unwrap(), Response::Ok);
     if !input.is_empty() {
         client.send_input(1, input).await.unwrap();
     }

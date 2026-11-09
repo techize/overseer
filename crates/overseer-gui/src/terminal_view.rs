@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use gpui::{
     canvas, div, fill, font, outline, point, prelude::*, px, size, App, BorderStyle, Bounds,
-    ClipboardEntry, ClipboardItem, Context, DispatchPhase, ElementInputHandler, Entity,
+    ClipboardEntry, ClipboardItem, ContentMask, Context, DispatchPhase, ElementInputHandler, Entity,
     EntityInputHandler, FocusHandle, Focusable, Font, FontStyle, FontWeight, Hsla, KeyDownEvent,
     Keystroke, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     Pixels, Rgba, ScrollWheelEvent, StrikethroughStyle, Subscription, Task, TextRun, TouchPhase,
@@ -1167,7 +1167,13 @@ fn feed(shared: &Shared, data: &[u8]) {
 
 /// Sizes the bridge to the slot's PTY (so the replay renders as it was
 /// drawn), then attaches. Returns a message for the user on failure.
-async fn attach(slot: SlotId, client: &Client, shared: &Shared) -> Result<(), String> {
+async fn attach(
+    slot: SlotId,
+    client: &Client,
+    hub: &FrameHub,
+    route_gen: u64,
+    shared: &Shared,
+) -> Result<(), String> {
     let lost = |e: anyhow::Error| format!("Lost the daemon: {e:#}");
     match client.request(Request::ListSlots).await.map_err(lost)? {
         Response::Slots(slots) => {
@@ -1192,8 +1198,8 @@ async fn attach(slot: SlotId, client: &Client, shared: &Shared) -> Result<(), St
         Response::Error { message } => return Err(message),
         other => return Err(format!("Unexpected reply: {other:?}")),
     }
-    match client
-        .request(Request::Attach { id: slot })
+    match hub
+        .attach(client, slot, route_gen)
         .await
         .map_err(lost)?
     {
@@ -1216,15 +1222,27 @@ fn apply_resize(slot: SlotId, client: &Client, shared: &Shared, cols: u16, rows:
     }));
 }
 
+/// One attach: the hub route this view reads and its number.
+struct RouteHandle {
+    hub: FrameHub,
+    gen: u64,
+    output: mpsc::UnboundedReceiver<Bytes>,
+}
+
 async fn pump(
     slot: SlotId,
     client: Arc<Client>,
     shared: Arc<Shared>,
-    mut output: mpsc::UnboundedReceiver<Bytes>,
+    route: RouteHandle,
     mut cmds: mpsc::UnboundedReceiver<Cmd>,
     wake: mpsc::UnboundedSender<()>,
 ) {
-    if let Err(msg) = attach(slot, &client, &shared).await {
+    let RouteHandle {
+        hub,
+        gen,
+        mut output,
+    } = route;
+    if let Err(msg) = attach(slot, &client, &hub, gen, &shared).await {
         *shared.status.lock().unwrap() = Some(msg);
         shared.wake(&wake);
         return;
@@ -1294,7 +1312,7 @@ fn spawn_pump(
     slot: SlotId,
     client: Arc<Client>,
     shared: Arc<Shared>,
-    output: mpsc::UnboundedReceiver<Bytes>,
+    route: RouteHandle,
     cmds: mpsc::UnboundedReceiver<Cmd>,
     wake: mpsc::UnboundedSender<()>,
 ) {
@@ -1307,7 +1325,7 @@ fn spawn_pump(
                 .enable_time()
                 .build()
             {
-                Ok(rt) => rt.block_on(pump(slot, client, shared, output, cmds, wake)),
+                Ok(rt) => rt.block_on(pump(slot, client, shared, route, cmds, wake)),
                 Err(e) => {
                     *shared.status.lock().unwrap() = Some(format!("Cannot start terminal: {e}"));
                     shared.wake(&wake);
@@ -1464,14 +1482,12 @@ impl TerminalView {
             });
             let (cmds, cmd_rx) = mpsc::unbounded_channel();
             let (wake_tx, mut wake_rx) = mpsc::unbounded_channel::<()>();
-            spawn_pump(
-                slot,
-                client.clone(),
-                shared.clone(),
+            let route = RouteHandle {
+                hub: hub.clone(),
+                gen: route_gen,
                 output,
-                cmd_rx,
-                wake_tx,
-            );
+            };
+            spawn_pump(slot, client.clone(), shared.clone(), route, cmd_rx, wake_tx);
             let notifier = cx.spawn(async move |this, cx| {
                 while wake_rx.recv().await.is_some() {
                     let alive = this.update(cx, |this: &mut TerminalView, cx| {
@@ -2243,7 +2259,11 @@ fn paint_grid(
     cx: &mut App,
 ) -> Snapshot {
     let snap = shared.bridge.lock().unwrap().snapshot();
-    paint_snapshot(&snap, bounds, ps, window, cx);
+    // N12: the grid can be a little larger than the bounds (a resize not yet
+    // applied, or a partial cell at the edge), so clip to the view.
+    window.with_content_mask(Some(ContentMask { bounds }), |window| {
+        paint_snapshot(&snap, bounds, ps, window, cx)
+    });
     snap
 }
 

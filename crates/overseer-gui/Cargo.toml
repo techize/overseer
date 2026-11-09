@@ -13,6 +13,7 @@ bytes.workspace = true
 serde.workspace = true
 toml = "0.8"
 anyhow.workspace = true
+libc = "0.2"
 
 [dev-dependencies]
 overseer-daemon = { path = "../overseer-daemon" }
