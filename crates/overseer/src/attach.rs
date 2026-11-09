@@ -15,7 +15,7 @@ use crate::ctl;
 const DETACH_KEY: u8 = 0x1d;
 /// Ctrl-] as a terminal using the kitty keyboard protocol reports it.
 const DETACH_KITTY: &[u8] = b"\x1b[93;5u";
-/// How long to wait for the daemon to acknowledge Detach before leaving.
+/// How long to wait for the daemon to acknowledge Detach or Resize.
 const DETACH_GRACE: Duration = Duration::from_secs(1);
 
 /// Returns the bytes before the detach key and whether it was seen. The key
@@ -52,34 +52,6 @@ impl Drop for TerminalGuard {
             b"\x1b[<u\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1l\x1b>\x1b[?1049l\x1b[0m\x1b[?25h\n",
         );
         let _ = out.flush();
-    }
-}
-
-/// Everything that writes to the daemon goes through here, in order, from one
-/// task. The main loop only queues commands, so no write future is ever
-/// dropped half-way by a `select!` (N7).
-enum Cmd {
-    Input(Vec<u8>),
-    Resize(u16, u16),
-    Detach,
-}
-
-async fn writer_task(client: std::sync::Arc<Client>, id: SlotId, mut rx: mpsc::Receiver<Cmd>) {
-    while let Some(cmd) = rx.recv().await {
-        let ok = match cmd {
-            Cmd::Input(data) => client.send_input(id, &data).await.is_ok(),
-            Cmd::Resize(cols, rows) => client
-                .request(Request::Resize { id, cols, rows })
-                .await
-                .is_ok(),
-            Cmd::Detach => {
-                let _ = client.request(Request::Detach { id }).await;
-                return;
-            }
-        };
-        if !ok {
-            return;
-        }
     }
 }
 
@@ -163,12 +135,10 @@ pub async fn run(id: SlotId) -> anyhow::Result<()> {
 
     let ending = {
         let _guard = TerminalGuard::enter()?;
-        let (cmd_tx, cmd_rx) = mpsc::channel(256);
-        let writer = tokio::spawn(writer_task(client.clone(), id, cmd_rx));
-        let ending = pump(id, &mut frames, &cmd_tx, &client).await;
+        let ending = pump(id, &mut frames, &client).await;
         if matches!(ending, Ending::Detached) {
-            let _ = cmd_tx.send(Cmd::Detach).await;
-            let _ = tokio::time::timeout(DETACH_GRACE, writer).await;
+            let _ =
+                tokio::time::timeout(DETACH_GRACE, client.request(Request::Detach { id })).await;
         }
         ending
     };
@@ -186,12 +156,7 @@ pub async fn run(id: SlotId) -> anyhow::Result<()> {
     }
 }
 
-async fn pump(
-    id: SlotId,
-    frames: &mut mpsc::Receiver<Frame>,
-    cmds: &mpsc::Sender<Cmd>,
-    client: &Client,
-) -> Ending {
+async fn pump(id: SlotId, frames: &mut mpsc::Receiver<Frame>, client: &Client) -> Ending {
     let mut stdin = spawn_stdin_reader();
     let mut winch = match signal(SignalKind::window_change()) {
         Ok(s) => s,
@@ -222,7 +187,9 @@ async fn pump(
             bytes = stdin.recv() => match bytes {
                 Some(bytes) => {
                     let (before, detach) = split_detach(&bytes);
-                    if !before.is_empty() && cmds.send(Cmd::Input(before)).await.is_err() {
+                    // Queues the frame without awaiting the socket, so the select
+                    // can never cancel a half-written frame (N7).
+                    if !before.is_empty() && client.send_input(id, &before).await.is_err() {
                         return Ending::Lost(anyhow!("connection to the daemon was lost"));
                     }
                     if detach {
@@ -233,7 +200,8 @@ async fn pump(
             },
             _ = winch.recv() => {
                 if let Ok((cols, rows)) = terminal::size() {
-                    let _ = cmds.send(Cmd::Resize(cols, rows)).await;
+                    let resize = client.request(Request::Resize { id, cols, rows });
+                    let _ = tokio::time::timeout(DETACH_GRACE, resize).await;
                 }
             }
         }

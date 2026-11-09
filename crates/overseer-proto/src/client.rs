@@ -5,7 +5,13 @@
 //! everything else (events, output) in arrival order through one channel, so
 //! the server's frame order is preserved end to end.
 //!
-//! That channel is bounded (`INBOX_CAP` frames). The reader never blocks on it,
+//! Writes are cancel-safe (N7): a dedicated writer task owns the write half and
+//! drains an unbounded queue of frames. `request` and `send_input` only enqueue
+//! (synchronously, so enqueue order is wire order) and never await a socket
+//! write, so dropping their futures cannot leave half a frame on the stream.
+//! The queue is unbounded because it is fed at human or request rate.
+//!
+//! The inbox channel is bounded (`INBOX_CAP` frames). The reader never blocks on it,
 //! because it also has to route responses. A consumer that falls that far
 //! behind is cut off instead: the reader stops, `inbox_overflowed` turns true
 //! and every request fails as if the daemon had hung up.
@@ -19,9 +25,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail};
 use bytes::Bytes;
-use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::UnixStream;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot};
 
 use crate::{read_frame, write_frame, Frame, Request, Response, SlotId};
 
@@ -35,13 +40,25 @@ const SUBSCRIBER_QUEUE: usize = 256;
 /// `None` once the connection is gone, so late requests fail fast.
 type Pending = StdMutex<Option<HashMap<u32, oneshot::Sender<Response>>>>;
 
-struct Writer {
-    half: OwnedWriteHalf,
-    next_seq: u32,
+/// Removes a request's pending entry if its future is dropped while waiting.
+struct PendingGuard {
+    pending: Arc<Pending>,
+    seq: u32,
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        if let Some(m) = self.pending.lock().unwrap().as_mut() {
+            m.remove(&self.seq);
+        }
+    }
 }
 
 pub struct Client {
-    writer: Mutex<Writer>,
+    /// Guards the sequence counter; held while enqueuing so seq order equals
+    /// wire order.
+    next_seq: StdMutex<u32>,
+    outbox: mpsc::UnboundedSender<Frame>,
     pending: Arc<Pending>,
     inbox: StdMutex<Option<mpsc::Receiver<Frame>>>,
     overflowed: Arc<AtomicBool>,
@@ -49,12 +66,29 @@ pub struct Client {
 
 impl Client {
     pub async fn connect(path: impl AsRef<Path>) -> io::Result<Client> {
-        let (mut rd, half) = UnixStream::connect(path.as_ref()).await?.into_split();
+        Client::connect_with_inbox_cap(path, INBOX_CAP).await
+    }
+
+    /// `connect` with a custom inbox cap, so tests can force an overflow.
+    #[doc(hidden)]
+    pub async fn connect_with_inbox_cap(path: impl AsRef<Path>, cap: usize) -> io::Result<Client> {
+        let (mut rd, mut half) = UnixStream::connect(path.as_ref()).await?.into_split();
         let pending: Arc<Pending> = Arc::new(StdMutex::new(Some(HashMap::new())));
-        let (tx, rx) = mpsc::channel(INBOX_CAP);
+        let (tx, rx) = mpsc::channel(cap);
         let overflowed = Arc::new(AtomicBool::new(false));
         let reader_pending = pending.clone();
         let reader_overflowed = overflowed.clone();
+        let (outbox, mut queue) = mpsc::unbounded_channel::<Frame>();
+        let writer_pending = pending.clone();
+        tokio::spawn(async move {
+            while let Some(frame) = queue.recv().await {
+                if write_frame(&mut half, &frame).await.is_err() {
+                    break;
+                }
+            }
+            // Dropping `queue` makes later enqueues fail; fail waiting requests.
+            *writer_pending.lock().unwrap() = None;
+        });
         tokio::spawn(async move {
             while let Ok(Some(frame)) = read_frame(&mut rd).await {
                 match frame {
@@ -87,7 +121,8 @@ impl Client {
             *reader_pending.lock().unwrap() = None;
         });
         Ok(Client {
-            writer: Mutex::new(Writer { half, next_seq: 0 }),
+            next_seq: StdMutex::new(0),
+            outbox,
             pending,
             inbox: StdMutex::new(Some(rx)),
             overflowed,
@@ -124,28 +159,32 @@ impl Client {
         }
     }
 
-    /// Sends a request and waits for its response.
+    /// Sends a request and waits for its response. Cancel-safe: dropping the
+    /// future forgets the reply but leaves the stream intact.
     pub async fn request(&self, req: Request) -> anyhow::Result<Response> {
         let (tx, rx) = oneshot::channel();
-        {
-            // Registering and writing under one lock keeps send order equal
-            // to seq order.
-            let mut w = self.writer.lock().await;
-            w.next_seq = w.next_seq.wrapping_add(1);
-            let seq = w.next_seq;
+        let seq = {
+            let mut next = self.next_seq.lock().unwrap();
+            *next = next.wrapping_add(1);
+            let seq = *next;
             match self.pending.lock().unwrap().as_mut() {
                 Some(m) => {
                     m.insert(seq, tx);
                 }
                 None => bail!("connection to the daemon is closed"),
             }
-            if let Err(e) = write_frame(&mut w.half, &Frame::Request { seq, req }).await {
+            if self.outbox.send(Frame::Request { seq, req }).is_err() {
                 if let Some(m) = self.pending.lock().unwrap().as_mut() {
                     m.remove(&seq);
                 }
-                return Err(anyhow!(e).context("write to daemon"));
+                bail!("connection to the daemon is closed");
             }
-        }
+            seq
+        };
+        let _guard = PendingGuard {
+            pending: self.pending.clone(),
+            seq,
+        };
         rx.await
             .map_err(|_| anyhow!("connection to the daemon closed before it replied"))
     }
@@ -173,16 +212,20 @@ impl Client {
         self.overflowed.load(Ordering::SeqCst)
     }
 
-    /// Fire-and-forget keystrokes for a slot.
+    /// Fire-and-forget keystrokes for a slot. Only queues the frame; an
+    /// error means the connection is already gone.
     pub async fn send_input(&self, id: SlotId, data: &[u8]) -> io::Result<()> {
-        let mut w = self.writer.lock().await;
-        write_frame(
-            &mut w.half,
-            &Frame::Input {
+        let _order = self.next_seq.lock().unwrap();
+        self.outbox
+            .send(Frame::Input {
                 id,
                 data: Bytes::copy_from_slice(data),
-            },
-        )
-        .await
+            })
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "connection to the daemon is closed",
+                )
+            })
     }
 }
