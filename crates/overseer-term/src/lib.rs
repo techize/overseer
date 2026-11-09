@@ -10,8 +10,8 @@ pub mod mouse;
 pub mod paste;
 
 pub use bridge::{
-    Cell, Cursor, CursorShape, GridPos, Match, Palette, Rgb, Selection, Snapshot, TermBridge,
-    DEFAULT_SCROLLBACK,
+    Cell, CellSide, Cursor, CursorShape, GridPos, Match, Palette, Rgb, Selection, SelectionKind,
+    Snapshot, TermBridge, DEFAULT_SCROLLBACK,
 };
 pub use keys::{encode_key, Key, KeyInput};
 pub use links::{find_link_at, find_link_span_at, Link, LinkSpan};

@@ -16,8 +16,10 @@
 //! otherwise (or with Shift) make a local selection by cell, word or line.
 //! Cmd+C copies it, Cmd+V pastes (an image-only clipboard sends Ctrl+V so
 //! Claude Code reads the image itself), Cmd+F opens a find bar, Cmd+click
-//! opens links and the IME composes dead keys and accents. Selections and
-//! matches are kept in `AbsPos`, which output scrolling does not move.
+//! opens links and the IME composes dead keys and accents. The selection
+//! lives in the terminal, which moves, clamps or drops it as output scrolls,
+//! clears and resizes. Find matches and the hovered link are not kept
+//! across output: they are searched or looked up again on the content shown.
 //!
 //! The pure helpers (cell styling, row layout, pixel to grid, scroll
 //! accumulation, key, wheel and mouse routing, paste, find bar state and
@@ -44,9 +46,9 @@ use gpui::{
 };
 use overseer_proto::{Client, Request, Response, SlotId, SlotState};
 use overseer_term::{
-    encode_key, encode_mouse, encode_paste, find_link_span_at, Cell, CursorShape, GridPos, Key,
-    KeyInput, Link, MouseButton as TermButton, MouseEvent, MouseInput, MouseMode, Rgb, Selection,
-    Snapshot, TermBridge, TermModes, DEFAULT_SCROLLBACK,
+    encode_key, encode_mouse, encode_paste, find_link_span_at, Cell, CellSide, CursorShape,
+    GridPos, Key, KeyInput, Link, LinkSpan, MouseButton as TermButton, MouseEvent, MouseInput,
+    MouseMode, Rgb, SelectionKind, Snapshot, TermBridge, TermModes, DEFAULT_SCROLLBACK,
 };
 use serde::Deserialize;
 use tokio::sync::mpsc;
@@ -539,48 +541,23 @@ fn poll_once<F: Future>(fut: F) -> Poll<F::Output> {
 // Pure logic: selection, mouse routing, paste, find, links, composition
 // ---------------------------------------------------------------------------
 
-/// A grid position that stays on its text while output scrolls: `line` is
-/// `GridPos::line + base`, where `base` is the bridge's `abs_line_base()`
-/// (lines evicted from a full scrollback plus the current history size).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct AbsPos {
-    pub line: i64,
-    pub col: usize,
+/// Grid line (0 is the top of the live screen, negative in scrollback) of
+/// viewport `row`.
+pub fn grid_line(row: usize, display_offset: usize) -> i32 {
+    row as i32 - display_offset as i32
 }
 
-impl AbsPos {
-    pub fn new(line: i64, col: usize) -> AbsPos {
-        AbsPos { line, col }
-    }
-
-    /// The position of viewport cell (`row`, `col`).
-    pub fn from_viewport(row: usize, col: usize, display_offset: usize, base: usize) -> AbsPos {
-        AbsPos::new(top_line(display_offset, base) + row as i64, col)
-    }
-
-    pub fn from_grid(p: GridPos, base: usize) -> AbsPos {
-        AbsPos::new(p.line as i64 + base as i64, p.col)
-    }
-
-    pub fn to_grid(self, base: usize) -> GridPos {
-        let line = (self.line - base as i64).clamp(i32::MIN as i64, i32::MAX as i64);
-        GridPos {
-            line: line as i32,
-            col: self.col,
-        }
-    }
+/// Viewport row showing grid `line`, if it is on screen.
+pub fn viewport_row(line: i32, display_offset: usize, rows: usize) -> Option<usize> {
+    let row = line as i64 + display_offset as i64;
+    (0..rows as i64).contains(&row).then_some(row as usize)
 }
 
-/// The absolute line shown on viewport row 0.
-pub fn top_line(display_offset: usize, base: usize) -> i64 {
-    base as i64 - display_offset as i64
-}
-
-/// Columns of `line` covered by the inclusive range `start..=end`, if any.
+/// Columns of grid `line` covered by the inclusive range `start..=end`.
 pub fn span_cols_in_row(
-    start: AbsPos,
-    end: AbsPos,
-    line: i64,
+    start: GridPos,
+    end: GridPos,
+    line: i32,
     cols: usize,
 ) -> Option<(usize, usize)> {
     if cols == 0 || line < start.line || line > end.line {
@@ -591,28 +568,27 @@ pub fn span_cols_in_row(
     (s <= e).then_some((s, e))
 }
 
-/// How many lines to scroll (positive is toward older output) so that
-/// absolute `line` is on screen. Zero when it already is. `base` is the
-/// bridge's `abs_line_base()` and `history` its `history_size()`.
-pub fn scroll_delta_to_show(
-    line: i64,
-    display_offset: usize,
-    base: usize,
-    history: usize,
-    rows: usize,
-) -> i32 {
-    let top = top_line(display_offset, base);
-    let bottom = top + rows.max(1) as i64 - 1;
-    if (top..=bottom).contains(&line) {
+/// How many lines to scroll (positive is toward older output) so that grid
+/// `line` is on screen. Zero when it already is.
+pub fn scroll_delta_to_show(line: i32, display_offset: usize, history: usize, rows: usize) -> i32 {
+    let rows = rows.max(1) as i64;
+    let line = line as i64;
+    let top = -(display_offset as i64);
+    if (top..top + rows).contains(&line) {
         return 0;
     }
-    let new_top = if line < top {
-        line
-    } else {
-        line - (rows.max(1) as i64 - 1)
-    };
-    let new_offset = (base as i64 - new_top).clamp(0, history as i64);
+    let new_top = if line < top { line } else { line - (rows - 1) };
+    let new_offset = (-new_top).clamp(0, history as i64);
     (new_offset - display_offset as i64).clamp(i32::MIN as i64, i32::MAX as i64) as i32
+}
+
+/// Which half of its cell an x offset (from the grid origin) falls in.
+pub fn cell_side(x: f32, m: CellMetrics) -> CellSide {
+    if m.width <= 0.0 || (x / m.width).fract() < 0.5 {
+        CellSide::Left
+    } else {
+        CellSide::Right
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -623,6 +599,16 @@ pub enum SelectionMode {
     Line,
 }
 
+impl From<SelectionMode> for SelectionKind {
+    fn from(m: SelectionMode) -> SelectionKind {
+        match m {
+            SelectionMode::Simple => SelectionKind::Simple,
+            SelectionMode::Word => SelectionKind::Word,
+            SelectionMode::Line => SelectionKind::Line,
+        }
+    }
+}
+
 /// Selection unit for the platform's click count: one click selects cell by
 /// cell, a double click by word, a triple (or more) click by line.
 pub fn selection_mode(click_count: usize) -> SelectionMode {
@@ -630,81 +616,6 @@ pub fn selection_mode(click_count: usize) -> SelectionMode {
         0 | 1 => SelectionMode::Simple,
         2 => SelectionMode::Word,
         _ => SelectionMode::Line,
-    }
-}
-
-fn is_word_char(c: char) -> bool {
-    !(c.is_whitespace() || c == '\0' || "\"'`()[]{}<>|,;\u{2502}".contains(c))
-}
-
-/// Inclusive columns of the word at `col`. A separator selects just itself.
-pub fn word_span(chars: &[char], col: usize) -> (usize, usize) {
-    if chars.is_empty() {
-        return (0, 0);
-    }
-    let col = col.min(chars.len() - 1);
-    if !is_word_char(chars[col]) {
-        return (col, col);
-    }
-    let mut start = col;
-    while start > 0 && is_word_char(chars[start - 1]) {
-        start -= 1;
-    }
-    let mut end = col;
-    while end + 1 < chars.len() && is_word_char(chars[end + 1]) {
-        end += 1;
-    }
-    (start, end)
-}
-
-/// The cells one selection unit covers at (`line`, `col`), given the row's
-/// characters.
-pub fn unit_span(mode: SelectionMode, chars: &[char], line: i64, col: usize) -> (AbsPos, AbsPos) {
-    match mode {
-        SelectionMode::Simple => (AbsPos::new(line, col), AbsPos::new(line, col)),
-        SelectionMode::Word => {
-            let (s, e) = word_span(chars, col);
-            (AbsPos::new(line, s), AbsPos::new(line, e))
-        }
-        SelectionMode::Line => (
-            AbsPos::new(line, 0),
-            AbsPos::new(line, chars.len().saturating_sub(1)),
-        ),
-    }
-}
-
-/// A selection made locally with the mouse (not reported to the app).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LocalSelection {
-    pub mode: SelectionMode,
-    anchor: (AbsPos, AbsPos),
-    head: (AbsPos, AbsPos),
-}
-
-impl LocalSelection {
-    /// Starts at the unit under the press.
-    pub fn new(mode: SelectionMode, unit: (AbsPos, AbsPos)) -> LocalSelection {
-        LocalSelection {
-            mode,
-            anchor: unit,
-            head: unit,
-        }
-    }
-
-    /// Moves the dragged end to the unit under the pointer.
-    pub fn extend(&mut self, unit: (AbsPos, AbsPos)) {
-        self.head = unit;
-    }
-
-    /// Inclusive bounds. None for a plain click that has not been dragged.
-    pub fn bounds(&self) -> Option<(AbsPos, AbsPos)> {
-        if self.mode == SelectionMode::Simple && self.anchor == self.head {
-            return None;
-        }
-        Some((
-            self.anchor.0.min(self.head.0),
-            self.anchor.1.max(self.head.1),
-        ))
     }
 }
 
@@ -872,13 +783,21 @@ pub enum FindOutcome {
     Nothing,
 }
 
-/// State of the find bar. Matches are kept oldest first.
+/// A search match as an inclusive range of grid positions.
+pub type FindMatch = (GridPos, GridPos);
+
+/// State of the find bar. Matches are grid positions from the latest search,
+/// oldest first; they are not kept across output but searched again (see
+/// `refresh`), and none are kept while the bar is closed.
 #[derive(Debug, Default)]
 pub struct FindBar {
     open: bool,
     query: String,
-    matches: Rc<Vec<(AbsPos, AbsPos)>>,
+    matches: Rc<Vec<FindMatch>>,
     current: Option<usize>,
+    /// Display offset when `matches` were found, to place the current match
+    /// on screen when they are refreshed.
+    offset: usize,
 }
 
 impl FindBar {
@@ -938,29 +857,33 @@ impl FindBar {
         }
     }
 
-    /// New results for the query, oldest first. The newest match (nearest
-    /// the live screen) becomes current.
-    pub fn set_matches(&mut self, matches: Vec<(AbsPos, AbsPos)>) {
+    /// New results for the query, oldest first, found at `display_offset`.
+    /// The newest match (nearest the live screen) becomes current.
+    pub fn set_matches(&mut self, matches: Vec<FindMatch>, display_offset: usize) {
         self.current = matches.len().checked_sub(1);
         self.matches = Rc::new(matches);
+        self.offset = display_offset;
     }
 
-    /// Drops matches that ended above absolute line `first` (evicted from
-    /// scrollback). The current match keeps its place, or moves to the oldest
-    /// remaining one when it was dropped. True when anything was dropped.
-    pub fn forget_before(&mut self, first: i64) -> bool {
-        let gone = self.matches.iter().take_while(|m| m.1.line < first).count();
-        if gone == 0 {
-            return false;
-        }
-        let kept = self.matches[gone..].to_vec();
-        self.current = match self.current {
-            _ if kept.is_empty() => None,
-            Some(i) if i >= gone => Some(i - gone),
-            _ => Some(0),
+    /// Results of searching again after output or a resize. The current
+    /// match becomes the one nearest, on screen, to where the old current
+    /// match was shown (the first on a tie); with no old current match, the
+    /// newest.
+    pub fn refresh(&mut self, matches: Vec<FindMatch>, display_offset: usize) {
+        let Some((prev, _)) = self.current() else {
+            return self.set_matches(matches, display_offset);
         };
-        self.matches = Rc::new(kept);
-        true
+        let row = prev.line as i64 + self.offset as i64;
+        self.current = matches
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, (s, _))| {
+                let r = s.line as i64 + display_offset as i64;
+                ((r - row).abs(), s.col.abs_diff(prev.col))
+            })
+            .map(|(i, _)| i);
+        self.matches = Rc::new(matches);
+        self.offset = display_offset;
     }
 
     /// Moves to the next match in `dir`, wrapping at either end.
@@ -977,11 +900,11 @@ impl FindBar {
         FindOutcome::Moved
     }
 
-    pub fn matches(&self) -> Rc<Vec<(AbsPos, AbsPos)>> {
+    pub fn matches(&self) -> Rc<Vec<FindMatch>> {
         self.matches.clone()
     }
 
-    pub fn current(&self) -> Option<(AbsPos, AbsPos)> {
+    pub fn current(&self) -> Option<FindMatch> {
         self.current.and_then(|i| self.matches.get(i).copied())
     }
 
@@ -1392,12 +1315,14 @@ struct Geometry {
     requested: Option<(u16, u16)>,
 }
 
-/// A Cmd+hovered link: absolute line and columns `start..end`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A Cmd+hovered link: the viewport cell under the pointer and the link
+/// found there. Paint looks the link up again in the snapshot it draws and
+/// underlines it only if the same link is still there.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct HoverLink {
-    line: i64,
-    start: usize,
-    end: usize,
+    row: usize,
+    col: usize,
+    link: Link,
 }
 
 pub struct TerminalView {
@@ -1417,9 +1342,11 @@ pub struct TerminalView {
     focus_reported: bool,
     /// App that opens Cmd+clicked paths.
     editor: String,
-    selection: Option<LocalSelection>,
-    /// The left button is down for a local selection.
+    /// The left button is down for a local selection. The selection itself
+    /// lives in the terminal (see `TermBridge::start_selection`).
     selecting: bool,
+    /// Content version the find bar's matches were searched at.
+    searched: u64,
     /// A press was reported to the app; motion and release follow it.
     reporting: Option<TermButton>,
     last_report_cell: Option<(usize, usize)>,
@@ -1556,8 +1483,8 @@ impl TerminalView {
                 scroll: ScrollAccumulator::default(),
                 focus_reported: false,
                 editor: load_editor(),
-                selection: None,
                 selecting: false,
+                searched: 0,
                 reporting: None,
                 last_report_cell: None,
                 find: FindBar::default(),
@@ -1648,26 +1575,10 @@ impl TerminalView {
 
     /// Copies the selection. False when there is none, so Cmd+C propagates.
     fn copy(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some((start, end)) = self.selection.and_then(|s| s.bounds()) else {
+        let text = self.shared.bridge.lock().unwrap().selection_text();
+        let Some(text) = text else {
             return false;
         };
-        let text = {
-            let bridge = self.shared.bridge.lock().unwrap();
-            if end.line < bridge.lines_evicted() as i64 {
-                // The selected text has left scrollback entirely.
-                drop(bridge);
-                self.selection = None;
-                return false;
-            }
-            let base = bridge.abs_line_base();
-            bridge.selection_text(Selection {
-                start: start.to_grid(base),
-                end: end.to_grid(base),
-            })
-        };
-        if text.is_empty() {
-            return false;
-        }
         cx.write_to_clipboard(ClipboardItem::new_string(text));
         true
     }
@@ -1702,8 +1613,6 @@ impl TerminalView {
     }
 
     fn apply_find(&mut self, outcome: FindOutcome) {
-        let evicted = self.shared.bridge.lock().unwrap().lines_evicted();
-        self.find.forget_before(evicted as i64);
         match outcome {
             FindOutcome::Search => self.run_search(),
             FindOutcome::Moved => self.reveal_current_match(),
@@ -1711,23 +1620,38 @@ impl TerminalView {
         }
     }
 
+    /// Matches for the query now, with the display offset and content
+    /// version they belong to.
+    fn search_now(&self) -> (Vec<FindMatch>, usize, u64) {
+        let bridge = self.shared.bridge.lock().unwrap();
+        let found = bridge
+            .search(self.find.query())
+            .into_iter()
+            .map(|m| (m.start, m.end))
+            .collect();
+        (found, bridge.display_offset(), bridge.content_version())
+    }
+
     fn run_search(&mut self) {
-        let found = {
-            let bridge = self.shared.bridge.lock().unwrap();
-            let base = bridge.abs_line_base();
-            bridge
-                .search(self.find.query())
-                .into_iter()
-                .map(|m| {
-                    (
-                        AbsPos::from_grid(m.start, base),
-                        AbsPos::from_grid(m.end, base),
-                    )
-                })
-                .collect()
-        };
-        self.find.set_matches(found);
+        let (found, offset, version) = self.search_now();
+        self.find.set_matches(found, offset);
+        self.searched = version;
         self.reveal_current_match();
+    }
+
+    /// Searches again when output or a resize changed the content since the
+    /// last search, keeping the current match near where it was on screen.
+    fn refresh_search(&mut self) {
+        if !self.find.is_open() || self.find.query().is_empty() {
+            return;
+        }
+        let version = self.shared.bridge.lock().unwrap().content_version();
+        if version == self.searched {
+            return;
+        }
+        let (found, offset, version) = self.search_now();
+        self.find.refresh(found, offset);
+        self.searched = version;
     }
 
     fn reveal_current_match(&mut self) {
@@ -1739,7 +1663,6 @@ impl TerminalView {
         let delta = scroll_delta_to_show(
             start.line,
             bridge.display_offset(),
-            bridge.abs_line_base(),
             bridge.history_size(),
             rows,
         );
@@ -1801,19 +1724,27 @@ impl TerminalView {
         Some(pixel_to_grid(x, y, m, g.cols, g.rows))
     }
 
-    /// The selection unit at a viewport cell of the last frame.
-    fn unit_at(&self, mode: SelectionMode, row: usize, col: usize) -> Option<(AbsPos, AbsPos)> {
-        let frame = self.frame.borrow();
-        let snap = frame.as_ref()?;
-        if row >= snap.rows || snap.cols == 0 {
-            return None;
-        }
-        let chars: Vec<char> = snap.cells[row * snap.cols..(row + 1) * snap.cols]
-            .iter()
-            .map(|c| c.ch)
-            .collect();
-        let line = top_line(snap.display_offset, snap.abs_line_base) + row as i64;
-        Some(unit_span(mode, &chars, line, col.min(snap.cols - 1)))
+    /// The grid position and cell half under a window position, clamped to
+    /// the grid, for selecting.
+    fn select_point(&self, pos: gpui::Point<Pixels>) -> Option<(GridPos, CellSide)> {
+        let (row, col) = self.cell_at(pos, true)?;
+        let (m, _) = self.metrics?;
+        let x = f32::from(pos.x) - self.geometry.get().origin.0;
+        let side = if x < 0.0 {
+            CellSide::Left
+        } else if x >= self.geometry.get().size.0 {
+            CellSide::Right
+        } else {
+            cell_side(x, m)
+        };
+        let offset = self.shared.bridge.lock().unwrap().display_offset();
+        Some((
+            GridPos {
+                line: grid_line(row, offset),
+                col,
+            },
+            side,
+        ))
     }
 
     /// The link at a viewport cell of the last frame and what opening it
@@ -1836,9 +1767,9 @@ impl TerminalView {
             p.exists()
         })?;
         let hover = HoverLink {
-            line: top_line(snap.display_offset, snap.abs_line_base) + row as i64,
-            start: span.start_col,
-            end: span.end_col,
+            row,
+            col,
+            link: span.link,
         };
         Some((hover, cmd))
     }
@@ -1886,16 +1817,20 @@ impl TerminalView {
                 }
             }
             DownAction::Report => {
-                self.selection = None;
+                self.shared.bridge.lock().unwrap().clear_selection();
                 self.reporting = Some(button);
                 self.last_report_cell = Some(cell);
                 self.report(MouseEvent::Press(button), cell, &mods);
             }
             DownAction::Select(mode) => {
-                self.selection = self
-                    .unit_at(mode, cell.0, cell.1)
-                    .map(|unit| LocalSelection::new(mode, unit));
-                self.selecting = self.selection.is_some();
+                if let Some((pos, side)) = self.select_point(ev.position) {
+                    self.shared
+                        .bridge
+                        .lock()
+                        .unwrap()
+                        .start_selection(mode.into(), pos, side);
+                    self.selecting = true;
+                }
             }
             DownAction::Ignore => {}
         }
@@ -1917,18 +1852,13 @@ impl TerminalView {
             return;
         }
         if self.selecting {
-            let Some(mut sel) = self.selection else {
-                return;
-            };
-            let unit = self
-                .cell_at(ev.position, true)
-                .and_then(|(row, col)| self.unit_at(sel.mode, row, col));
-            if let Some(unit) = unit {
-                sel.extend(unit);
-                if self.selection != Some(sel) {
-                    self.selection = Some(sel);
-                    cx.notify();
-                }
+            if let Some((pos, side)) = self.select_point(ev.position) {
+                self.shared
+                    .bridge
+                    .lock()
+                    .unwrap()
+                    .update_selection(pos, side);
+                cx.notify();
             }
             return;
         }
@@ -1959,8 +1889,10 @@ impl TerminalView {
         }
         if button == TermButton::Left && self.selecting {
             self.selecting = false;
-            if self.selection.and_then(|s| s.bounds()).is_none() {
-                self.selection = None;
+            // A plain click that was not dragged leaves an empty selection.
+            let mut bridge = self.shared.bridge.lock().unwrap();
+            if bridge.selection_range().is_none() {
+                bridge.clear_selection();
             }
             cx.notify();
         }
@@ -2119,9 +2051,12 @@ impl Drop for TerminalView {
 /// Highlights and decorations drawn over the grid.
 #[derive(Default)]
 struct Overlay {
-    selection: Option<(AbsPos, AbsPos)>,
-    matches: Rc<Vec<(AbsPos, AbsPos)>>,
-    current_match: Option<(AbsPos, AbsPos)>,
+    matches: Rc<Vec<FindMatch>>,
+    current_match: Option<FindMatch>,
+    /// Content version the matches belong to. Matches are not drawn over a
+    /// snapshot of other content (output landed after the search); the next
+    /// render searches again.
+    matches_version: u64,
     hover: Option<HoverLink>,
     marked: Option<String>,
 }
@@ -2273,21 +2208,29 @@ fn paint_snapshot(
         )
     };
     let ov = &ps.overlay;
-    let top = top_line(snap.display_offset, snap.abs_line_base);
-    let bottom = top + snap.rows as i64 - 1;
-    let visible = |&(s, e): &(AbsPos, AbsPos)| e.line >= top && s.line <= bottom;
-    let mut tints: Vec<((AbsPos, AbsPos), (Rgb, f32))> = ov
-        .matches
-        .iter()
-        .filter(|r| visible(r))
-        .map(|&r| (r, MATCH_TINT))
-        .collect();
+    let top = grid_line(0, snap.display_offset);
+    let bottom = grid_line(snap.rows.max(1) - 1, snap.display_offset);
+    let visible = |&(s, e): &FindMatch| e.line >= top && s.line <= bottom;
+    let mut tints: Vec<(FindMatch, (Rgb, f32))> = Vec::new();
+    if ov.matches_version == snap.content_version {
+        tints.extend(
+            ov.matches
+                .iter()
+                .filter(|r| visible(r))
+                .map(|&r| (r, MATCH_TINT)),
+        );
+        tints.extend(
+            ov.current_match
+                .filter(visible)
+                .map(|r| (r, CURRENT_MATCH_TINT)),
+        );
+    }
     tints.extend(
-        ov.current_match
+        snap.selection
+            .map(|sel| (sel.start, sel.end))
             .filter(visible)
-            .map(|r| (r, CURRENT_MATCH_TINT)),
+            .map(|r| (r, SELECTION_TINT)),
     );
-    tints.extend(ov.selection.filter(visible).map(|r| (r, SELECTION_TINT)));
 
     for row in 0..snap.rows {
         let cells = &snap.cells[row * snap.cols..(row + 1) * snap.cols];
@@ -2299,7 +2242,7 @@ fn paint_snapshot(
         for s in spans {
             window.paint_quad(cells_quad(row, s.col, s.len, hsla(s.color)));
         }
-        let line = top + row as i64;
+        let line = grid_line(row, snap.display_offset);
         for &((start, end), (color, alpha)) in &tints {
             if let Some((c0, c1)) = span_cols_in_row(start, end, line, snap.cols) {
                 window.paint_quad(cells_quad(row, c0, c1 - c0 + 1, rgba(color, alpha)));
@@ -2321,13 +2264,14 @@ fn paint_snapshot(
         }
     }
 
-    if let Some(h) = ov.hover.filter(|h| (top..=bottom).contains(&h.line)) {
-        let row = (h.line - top) as usize;
-        let o = at(row, h.start);
+    let hovered = ov.hover.as_ref().and_then(|h| hover_span(snap, h));
+    if let Some((row, span)) = hovered {
+        let o = at(row, span.start_col);
+        let cells = span.end_col.saturating_sub(span.start_col);
         window.paint_quad(fill(
             Bounds::new(
                 point(o.x, o.y + px(m.height - 1.)),
-                size(px(h.end.saturating_sub(h.start) as f32 * m.width), px(1.)),
+                size(px(cells as f32 * m.width), px(1.)),
             ),
             hsla(ps.foreground),
         ));
@@ -2352,6 +2296,14 @@ fn paint_snapshot(
         };
         paint_text(text, &style, false, origin, ps, window, cx);
     }
+}
+
+/// The span to underline for a Cmd+hovered link in `snap`: the link at the
+/// hovered cell, if it is still the one that was hovered.
+fn hover_span(snap: &Snapshot, h: &HoverLink) -> Option<(usize, LinkSpan)> {
+    find_link_span_at(snap, h.row, h.col)
+        .filter(|span| span.link == h.link)
+        .map(|span| (h.row, span))
 }
 
 fn paint_cursor(
@@ -2419,6 +2371,7 @@ fn paint_cursor(
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let metrics = self.update_metrics(window);
+        self.refresh_search();
         let find_open = self.find.is_open();
         let ps = PaintStyle {
             font: font(self.theme.font_family.clone()),
@@ -2428,14 +2381,14 @@ impl Render for TerminalView {
             foreground: self.theme.palette.foreground,
             focused: self.focus_handle.is_focused(window),
             overlay: Overlay {
-                selection: self.selection.and_then(|s| s.bounds()),
+                matches_version: self.searched,
                 matches: if find_open {
                     self.find.matches()
                 } else {
                     Rc::default()
                 },
                 current_match: self.find.current().filter(|_| find_open),
-                hover: self.hover,
+                hover: self.hover.clone(),
                 // While the find bar is open it shows the composition.
                 marked: self.marked.clone().filter(|_| !find_open),
             },
@@ -2992,8 +2945,8 @@ mod tests {
 
     // --- Selection, mouse, paste, find, links and composition ---
 
-    fn p(line: i64, col: usize) -> AbsPos {
-        AbsPos::new(line, col)
+    fn p(line: i32, col: usize) -> GridPos {
+        GridPos { line, col }
     }
 
     #[test]
@@ -3003,253 +2956,216 @@ mod tests {
         assert_eq!(selection_mode(2), SelectionMode::Word);
         assert_eq!(selection_mode(3), SelectionMode::Line);
         assert_eq!(selection_mode(5), SelectionMode::Line);
-    }
-
-    #[test]
-    fn word_span_stops_at_separators() {
-        let chars: Vec<char> = "ls (src/main.rs:12) x".chars().collect();
-        assert_eq!(word_span(&chars, 0), (0, 1));
-        assert_eq!(word_span(&chars, 8), (4, 17), "path:line is one word");
-        assert_eq!(word_span(&chars, 3), (3, 3), "a separator selects itself");
-        assert_eq!(word_span(&chars, 2), (2, 2), "so does a space");
-        assert_eq!(word_span(&chars, 99), (20, 20), "clamped to the row");
-        assert_eq!(word_span(&[], 3), (0, 0));
-    }
-
-    #[test]
-    fn unit_span_by_mode() {
-        let chars: Vec<char> = "foo bar".chars().collect();
         assert_eq!(
-            unit_span(SelectionMode::Simple, &chars, 7, 5),
-            (p(7, 5), p(7, 5))
+            SelectionKind::from(SelectionMode::Simple),
+            SelectionKind::Simple
         );
         assert_eq!(
-            unit_span(SelectionMode::Word, &chars, 7, 5),
-            (p(7, 4), p(7, 6))
+            SelectionKind::from(SelectionMode::Word),
+            SelectionKind::Word
         );
         assert_eq!(
-            unit_span(SelectionMode::Line, &chars, 7, 5),
-            (p(7, 0), p(7, 6))
+            SelectionKind::from(SelectionMode::Line),
+            SelectionKind::Line
         );
-    }
-
-    #[test]
-    fn plain_click_selects_nothing_until_dragged() {
-        let mut s = LocalSelection::new(SelectionMode::Simple, (p(3, 5), p(3, 5)));
-        assert_eq!(s.bounds(), None);
-        s.extend((p(4, 2), p(4, 2)));
-        assert_eq!(s.bounds(), Some((p(3, 5), p(4, 2))));
-        // Dragging back above the anchor flips the ends.
-        s.extend((p(1, 9), p(1, 9)));
-        assert_eq!(s.bounds(), Some((p(1, 9), p(3, 5))));
-        s.extend((p(3, 5), p(3, 5)));
-        assert_eq!(s.bounds(), None, "back on the anchor");
-    }
-
-    #[test]
-    fn word_and_line_selection_extend_by_unit() {
-        let mut w = LocalSelection::new(SelectionMode::Word, (p(2, 4), p(2, 6)));
-        assert_eq!(w.bounds(), Some((p(2, 4), p(2, 6))), "selected at once");
-        w.extend((p(2, 0), p(2, 2)));
-        assert_eq!(w.bounds(), Some((p(2, 0), p(2, 6))));
-        let mut l = LocalSelection::new(SelectionMode::Line, (p(5, 0), p(5, 79)));
-        l.extend((p(7, 0), p(7, 79)));
-        assert_eq!(l.bounds(), Some((p(5, 0), p(7, 79))));
     }
 
     #[test]
     fn span_cols_cover_selection_rows() {
-        let (a, b) = (p(2, 5), p(4, 3));
+        let (a, b) = (p(-2, 5), p(0, 3));
+        assert_eq!(span_cols_in_row(a, b, -3, 80), None);
+        assert_eq!(span_cols_in_row(a, b, -2, 80), Some((5, 79)));
+        assert_eq!(span_cols_in_row(a, b, -1, 80), Some((0, 79)));
+        assert_eq!(span_cols_in_row(a, b, 0, 80), Some((0, 3)));
         assert_eq!(span_cols_in_row(a, b, 1, 80), None);
-        assert_eq!(span_cols_in_row(a, b, 2, 80), Some((5, 79)));
-        assert_eq!(span_cols_in_row(a, b, 3, 80), Some((0, 79)));
-        assert_eq!(span_cols_in_row(a, b, 4, 80), Some((0, 3)));
-        assert_eq!(span_cols_in_row(a, b, 5, 80), None);
         assert_eq!(span_cols_in_row(p(0, 90), p(0, 95), 0, 80), None);
-        assert_eq!(span_cols_in_row(a, b, 2, 0), None);
+        assert_eq!(span_cols_in_row(a, b, 0, 0), None);
     }
 
     #[test]
-    fn abs_positions_survive_scrolling() {
-        // 100 lines of history, scrolled back 10: row 0 shows line 90.
-        let a = AbsPos::from_viewport(0, 3, 10, 100);
-        assert_eq!(a, p(90, 3));
-        assert_eq!(a.to_grid(100), GridPos { line: -10, col: 3 });
-        // After one more line of output the same text is grid line -11.
-        assert_eq!(a.to_grid(101), GridPos { line: -11, col: 3 });
-        assert_eq!(AbsPos::from_grid(GridPos { line: -11, col: 3 }, 101), a);
+    fn viewport_rows_and_grid_lines() {
+        assert_eq!(grid_line(0, 0), 0);
+        assert_eq!(grid_line(0, 10), -10);
+        assert_eq!(grid_line(3, 10), -7);
+        assert_eq!(viewport_row(-7, 10, 24), Some(3));
+        assert_eq!(viewport_row(-11, 10, 24), None);
+        assert_eq!(viewport_row(14, 10, 24), None);
+        assert_eq!(viewport_row(13, 10, 24), Some(23));
     }
 
     #[test]
-    fn selection_text_through_abs_positions() {
-        let mut b = TermBridge::new(20, 3, DEFAULT_SCROLLBACK);
-        b.feed(b"one\r\ntwo words\r\nthree\r\nfour");
-        let snap = b.snapshot();
-        let h = snap.abs_line_base;
-        assert_eq!(h, 1);
-        // Viewport row 0 is "two words"; a double click on "words".
-        let chars: Vec<char> = snap.cells[..snap.cols].iter().map(|c| c.ch).collect();
-        let line = top_line(snap.display_offset, h);
-        let sel = LocalSelection::new(
-            SelectionMode::Word,
-            unit_span(SelectionMode::Word, &chars, line, 6),
-        );
-        let (s, e) = sel.bounds().unwrap();
-        // More output scrolls the screen; the selection still names "words".
-        b.feed(b"\r\nfive\r\nsix");
-        let h = b.abs_line_base();
-        let text = b.selection_text(Selection {
-            start: s.to_grid(h),
-            end: e.to_grid(h),
-        });
-        assert_eq!(text, "words");
+    fn cell_halves_pick_the_side() {
+        assert_eq!(cell_side(0.0, M), CellSide::Left);
+        assert_eq!(cell_side(M.width * 0.49, M), CellSide::Left);
+        assert_eq!(cell_side(M.width * 0.51, M), CellSide::Right);
+        assert_eq!(cell_side(M.width * 3.2, M), CellSide::Left);
+        assert_eq!(cell_side(M.width * 3.8, M), CellSide::Right);
     }
 
-    /// Word-selects viewport cell (`row`, `col`) the way a double click
-    /// does, from a fresh snapshot.
-    fn word_at(b: &TermBridge, row: usize, col: usize) -> (AbsPos, AbsPos) {
-        let snap = b.snapshot();
-        let chars: Vec<char> = snap.cells[row * snap.cols..(row + 1) * snap.cols]
-            .iter()
-            .map(|c| c.ch)
-            .collect();
-        let line = top_line(snap.display_offset, snap.abs_line_base) + row as i64;
-        LocalSelection::new(
-            SelectionMode::Word,
-            unit_span(SelectionMode::Word, &chars, line, col),
-        )
-        .bounds()
-        .unwrap()
-    }
-
-    fn text_of(b: &TermBridge, (s, e): (AbsPos, AbsPos)) -> String {
-        let base = b.abs_line_base();
-        b.selection_text(Selection {
-            start: s.to_grid(base),
-            end: e.to_grid(base),
-        })
+    /// Selects with the mouse the way the view does: a press at viewport
+    /// cell (`row`, `col`) in `mode`.
+    fn press(b: &mut TermBridge, mode: SelectionMode, row: usize, col: usize) {
+        let pos = p(grid_line(row, b.display_offset()), col);
+        b.start_selection(mode.into(), pos, CellSide::Left);
     }
 
     #[test]
-    fn selection_survives_a_full_scrollback() {
-        let mut b = TermBridge::new(20, 4, 8);
-        for i in 0..30 {
+    fn selection_survives_output_past_the_cap() {
+        for sb in [1, 6] {
+            let mut b = TermBridge::new(20, 4, sb);
+            for i in 0..30 {
+                b.feed(format!("row {i} item{i}\r\n").as_bytes());
+            }
+            // Row 0 of the live view reads "row 27 item27".
+            press(&mut b, SelectionMode::Word, 0, 8);
+            assert_eq!(b.selection_text().as_deref(), Some("item27"));
+            b.feed(b"row 30 item30\r\n");
+            assert_eq!(b.selection_text().as_deref(), Some("item27"), "sb {sb}");
+            // The tint follows the text: it moved up into scrollback.
+            let snap = b.snapshot();
+            let sel = snap.selection.unwrap();
+            assert_eq!(sel.start.line, -1);
+            // Pushed out of scrollback: nothing, never other text.
+            for i in 0..(sb + 6) {
+                b.feed(format!("tail {i} more\r\n").as_bytes());
+                let t = b.selection_text();
+                assert!(t.is_none() || t.as_deref() == Some("item27"), "{t:?}");
+            }
+            assert_eq!(b.selection_text(), None);
+        }
+    }
+
+    #[test]
+    fn scrolled_back_selection_stays_on_its_text() {
+        let mut b = TermBridge::new(20, 4, 10);
+        for i in 0..12 {
             b.feed(format!("row {i} item{i}\r\n").as_bytes());
         }
-        assert!(b.lines_evicted() > 0, "scrollback is full");
-        // Row 0 of the live view reads "row 27 item27".
-        let sel = word_at(&b, 0, 8);
-        assert_eq!(text_of(&b, sel), "item27");
-        for i in 30..35 {
-            b.feed(format!("row {i} item{i}\r\n").as_bytes());
-        }
-        assert_eq!(text_of(&b, sel), "item27");
-        // Scrolled back, the view and the selection both stay on their text.
         b.scroll(3);
-        let sel2 = word_at(&b, 1, 8);
-        let shown = text_of(&b, sel2);
-        b.feed(b"more\r\nmore\r\n");
-        assert_eq!(text_of(&b, sel2), shown);
-        assert_eq!(word_at(&b, 1, 8), sel2, "viewport row 1 is the same line");
-        // Evicted entirely: nothing, never other text.
-        for i in 0..20 {
-            b.feed(format!("tail {i}\r\n").as_bytes());
-        }
-        assert!(sel.1.line < b.lines_evicted() as i64);
-        assert_eq!(text_of(&b, sel), "");
+        press(&mut b, SelectionMode::Line, 1, 0);
+        let orig = b.selection_text().unwrap();
+        b.feed(b"x\r\ny\r\n");
+        assert_eq!(b.selection_text().as_deref(), Some(orig.as_str()));
+        // Screen clear and scrollback clear in one piece.
+        b.feed(b"\x1b[H\x1b[2J\x1b[3J");
+        let t = b.selection_text();
+        assert!(t.is_none() || t.as_deref() == Some(orig.as_str()), "{t:?}");
+    }
+
+    /// The text of every match, read back from the terminal.
+    fn match_texts(b: &TermBridge, bar: &FindBar) -> Vec<String> {
+        bar.matches()
+            .iter()
+            .map(|&(start, end)| b.text_in(overseer_term::Selection { start, end }))
+            .collect()
+    }
+
+    fn search(b: &TermBridge, q: &str) -> Vec<FindMatch> {
+        b.search(q).into_iter().map(|m| (m.start, m.end)).collect()
     }
 
     #[test]
-    fn search_matches_stay_on_their_text_after_output() {
-        let mut b = TermBridge::new(20, 4, 8);
-        for i in 0..20 {
-            b.feed(format!("n{i} needle{i}\r\n").as_bytes());
+    fn find_highlights_follow_output_past_the_cap() {
+        for (sb, scrolled) in [(1, 0), (6, 0), (6, 2)] {
+            let mut b = TermBridge::new(20, 4, sb);
+            for i in 0..20 {
+                b.feed(format!("n{i} needle{}\r\n", i % 3).as_bytes());
+            }
+            b.scroll(scrolled);
+            let mut bar = FindBar::default();
+            bar.open();
+            bar.insert("needle1");
+            bar.set_matches(search(&b, "needle1"), b.display_offset());
+            assert!(!bar.matches().is_empty());
+            for round in 0..10 {
+                b.feed(format!("o{round} needle{}\r\n", round % 2).as_bytes());
+                // What render does after each batch of output.
+                bar.refresh(search(&b, bar.query()), b.display_offset());
+                for t in match_texts(&b, &bar) {
+                    assert_eq!(t, "needle1", "sb {sb} scrolled {scrolled} round {round}");
+                }
+                assert_eq!(bar.current().is_some(), !bar.matches().is_empty());
+            }
         }
-        b.scroll(2);
-        let base = b.abs_line_base();
-        let found: Vec<(AbsPos, AbsPos)> = b
-            .search("needle1")
-            .into_iter()
-            .map(|m| {
-                (
-                    AbsPos::from_grid(m.start, base),
-                    AbsPos::from_grid(m.end, base),
-                )
-            })
-            .collect();
-        let before: Vec<String> = found.iter().map(|&r| text_of(&b, r)).collect();
-        assert!(before.iter().all(|t| t.starts_with("needle1")));
-        b.feed(b"x\r\ny\r\n");
-        // Held matches keep their text; the oldest was evicted and is empty.
-        let evicted = b.lines_evicted() as i64;
-        for (&r, t) in found.iter().zip(&before) {
-            let want = if r.1.line < evicted { "" } else { t.as_str() };
-            assert_eq!(text_of(&b, r), want);
-        }
-        assert!(found.iter().filter(|r| r.1.line >= evicted).count() >= 8);
+    }
 
+    #[test]
+    fn refresh_keeps_the_current_match_where_it_was_on_screen() {
         let mut bar = FindBar::default();
         bar.open();
-        bar.insert("needle1");
-        bar.set_matches(found.clone());
-        for _ in 0..12 {
-            b.feed(b"z\r\n");
-        }
-        bar.forget_before(b.lines_evicted() as i64);
-        for (s, e) in bar.matches().iter() {
-            assert!(e.line >= b.lines_evicted() as i64);
-            assert!(text_of(&b, (*s, *e)).starts_with("needle1"));
-        }
+        bar.insert("x");
+        // Found at offset 0: matches on grid lines -5, -2 and 1.
+        bar.set_matches(
+            vec![
+                (p(-5, 0), p(-5, 0)),
+                (p(-2, 3), p(-2, 3)),
+                (p(1, 0), p(1, 0)),
+            ],
+            0,
+        );
+        bar.key(FindKey::Older);
+        assert_eq!(bar.current(), Some((p(-2, 3), p(-2, 3))));
+        // The old current was on viewport row -2 (offset 0). At offset 4 the
+        // new matches sit on viewport rows -5, -2 and 1.
+        bar.refresh(
+            vec![
+                (p(-9, 0), p(-9, 0)),
+                (p(-6, 3), p(-6, 3)),
+                (p(-3, 0), p(-3, 0)),
+            ],
+            4,
+        );
+        assert_eq!(bar.current(), Some((p(-6, 3), p(-6, 3))));
+        // A tie picks the first: rows -4 and 0 around row -2.
+        bar.refresh(vec![(p(-8, 3), p(-8, 3)), (p(-4, 3), p(-4, 3))], 4);
+        assert_eq!(bar.current(), Some((p(-8, 3), p(-8, 3))));
+        // No matches left, then new ones with no current: the newest.
+        bar.refresh(vec![], 0);
+        assert_eq!(bar.current(), None);
+        assert_eq!(bar.status(), "No matches");
+        bar.refresh(vec![(p(0, 0), p(0, 0)), (p(2, 0), p(2, 0))], 0);
+        assert_eq!(bar.current(), Some((p(2, 0), p(2, 0))));
+        // Closing keeps no match state.
+        bar.close();
+        assert!(bar.matches().is_empty());
+        assert_eq!(bar.current(), None);
     }
 
     #[test]
-    fn forget_before_drops_evicted_matches() {
-        let mut bar = FindBar::default();
-        bar.set_matches(vec![
-            (p(1, 0), p(1, 2)),
-            (p(5, 0), p(5, 2)),
-            (p(9, 0), p(9, 2)),
-        ]);
-        assert_eq!(bar.current(), Some((p(9, 0), p(9, 2))));
-        assert!(!bar.forget_before(1));
-        assert!(bar.forget_before(2));
-        assert_eq!(bar.matches().len(), 2);
-        assert_eq!(
-            bar.current(),
-            Some((p(9, 0), p(9, 2))),
-            "current keeps its match"
-        );
-        bar.key(FindKey::Older);
-        assert_eq!(bar.current(), Some((p(5, 0), p(5, 2))));
-        assert!(bar.forget_before(6));
-        assert_eq!(
-            bar.current(),
-            Some((p(9, 0), p(9, 2))),
-            "falls to the oldest left"
-        );
-        assert!(bar.forget_before(100));
-        assert_eq!(bar.current(), None);
-        assert!(bar.matches().is_empty());
+    fn hover_underline_is_recomputed_from_the_painted_snapshot() {
+        let mut b = TermBridge::new(40, 3, 10);
+        b.feed(b"see https://example.com/a here\r\n");
+        let snap = b.snapshot();
+        let span = find_link_span_at(&snap, 0, 8).unwrap();
+        let hover = HoverLink {
+            row: 0,
+            col: 8,
+            link: span.link.clone(),
+        };
+        assert_eq!(hover_span(&snap, &hover), Some((0, span)));
+        // Output moves the link up a row: the old cell no longer shows it.
+        b.feed(b"\r\n\r\nplain text on this row now\r\n");
+        assert_eq!(hover_span(&b.snapshot(), &hover), None);
+        // A different link at the same cell is not underlined either.
+        let mut c = TermBridge::new(40, 3, 10);
+        c.feed(b"see https://other.example/b here\r\n");
+        assert_eq!(hover_span(&c.snapshot(), &hover), None);
     }
 
     #[test]
     fn scroll_to_show_a_match() {
-        // History 100, 24 rows, at the bottom: lines 100..=123 visible.
-        assert_eq!(scroll_delta_to_show(110, 0, 100, 100, 24), 0);
-        // Line 40 is above: scroll back so it is the top row (offset 60).
-        assert_eq!(scroll_delta_to_show(40, 0, 100, 100, 24), 60);
-        // Scrolled back 60 (lines 40..=63); line 120 becomes the bottom row
+        // History 100, 24 rows, at the bottom: grid lines 0..=23 visible.
+        assert_eq!(scroll_delta_to_show(10, 0, 100, 24), 0);
+        // Line -60 is above: scroll back so it is the top row (offset 60).
+        assert_eq!(scroll_delta_to_show(-60, 0, 100, 24), 60);
+        // Scrolled back 60 (lines -60..=-37); line 20 becomes the bottom row
         // at offset 3.
-        assert_eq!(scroll_delta_to_show(120, 60, 100, 100, 24), -57);
-        assert_eq!(scroll_delta_to_show(123, 60, 100, 100, 24), -60);
-        // Line 70 at offset 60 becomes the bottom row.
-        assert_eq!(scroll_delta_to_show(70, 60, 100, 100, 24), -7);
+        assert_eq!(scroll_delta_to_show(20, 60, 100, 24), -57);
+        assert_eq!(scroll_delta_to_show(23, 60, 100, 24), -60);
+        // Line -30 at offset 60 becomes the bottom row.
+        assert_eq!(scroll_delta_to_show(-30, 60, 100, 24), -7);
         // Never past the top of history.
-        assert_eq!(scroll_delta_to_show(-5, 0, 100, 100, 24), 100);
-        // 50 lines evicted: base 150, history 100. Line 90 is grid line -60.
-        assert_eq!(scroll_delta_to_show(90, 0, 150, 100, 24), 60);
-        // An evicted line clamps to the oldest line still held.
-        assert_eq!(scroll_delta_to_show(10, 0, 150, 100, 24), 100);
+        assert_eq!(scroll_delta_to_show(-105, 0, 100, 24), 100);
     }
 
     fn mouse_on() -> TermModes {
@@ -3489,7 +3405,7 @@ mod tests {
         assert_eq!(find_key(&ks("tab", Some("\t"), |_| {})), None);
     }
 
-    fn three_matches() -> Vec<(AbsPos, AbsPos)> {
+    fn three_matches() -> Vec<FindMatch> {
         vec![(p(1, 0), p(1, 4)), (p(5, 2), p(5, 6)), (p(9, 0), p(9, 4))]
     }
 
@@ -3503,7 +3419,7 @@ mod tests {
         assert_eq!(f.key(FindKey::Insert("err".into())), FindOutcome::Search);
         assert_eq!(f.key(FindKey::Insert("or".into())), FindOutcome::Search);
         assert_eq!(f.query(), "error");
-        f.set_matches(Vec::new());
+        f.set_matches(Vec::new(), 0);
         assert_eq!(f.status(), "No matches");
         assert_eq!(f.key(FindKey::Older), FindOutcome::Nothing);
         assert_eq!(f.key(FindKey::Backspace), FindOutcome::Search);
@@ -3518,7 +3434,7 @@ mod tests {
         let mut f = FindBar::default();
         f.open();
         f.insert("x");
-        f.set_matches(three_matches());
+        f.set_matches(three_matches(), 0);
         // The newest match (nearest the live screen) is current first.
         assert_eq!(f.current(), Some((p(9, 0), p(9, 4))));
         assert_eq!(f.status(), "3/3");
@@ -3538,7 +3454,7 @@ mod tests {
         let mut f = FindBar::default();
         f.open();
         f.insert("error");
-        f.set_matches(three_matches());
+        f.set_matches(three_matches(), 0);
         assert_eq!(f.key(FindKey::Close), FindOutcome::Closed);
         assert!(!f.is_open());
         assert!(f.matches().is_empty(), "highlights dropped");

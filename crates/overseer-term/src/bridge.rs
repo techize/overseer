@@ -6,7 +6,8 @@ use std::time::Instant;
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::Direction;
-use alacritty_terminal::index::{Column, Line, Point};
+use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::selection::{Selection as TermSelection, SelectionType};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::search::{RegexIter, RegexSearch};
 use alacritty_terminal::term::test::TermSize;
@@ -142,10 +143,11 @@ pub struct Snapshot {
     pub display_offset: usize,
     /// Lines of scrollback above the live screen.
     pub history_size: usize,
-    /// `line + abs_line_base` is a position that stays on its text while new
-    /// output scrolls the screen, including once scrollback is full and old
-    /// lines are evicted (see `TermBridge::abs_line_base`).
-    pub abs_line_base: usize,
+    /// The terminal-owned selection as an inclusive range of grid positions
+    /// (viewport row = `line + display_offset`), or None.
+    pub selection: Option<Selection>,
+    /// `TermBridge::content_version` when this was taken.
+    pub content_version: u64,
 }
 
 impl Snapshot {
@@ -170,7 +172,44 @@ impl GridPos {
     fn point(self) -> Point {
         Point::new(Line(self.line), Column(self.col))
     }
+
+    fn from_point(p: Point) -> GridPos {
+        GridPos {
+            line: p.line.0,
+            col: p.column.0,
+        }
+    }
 }
+
+/// How a mouse selection grows: by cell, by word, or by whole line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionKind {
+    Simple,
+    Word,
+    Line,
+}
+
+/// Which half of a cell the pointer is over. A simple selection covers a
+/// cell only once the pointer has crossed into it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellSide {
+    Left,
+    Right,
+}
+
+impl From<CellSide> for Side {
+    fn from(s: CellSide) -> Side {
+        match s {
+            CellSide::Left => Side::Left,
+            CellSide::Right => Side::Right,
+        }
+    }
+}
+
+/// Characters that end a word for double-click selection. Unlike
+/// alacritty's default, ':' is part of a word (so `path:line` and URLs select
+/// whole) and ';' is not.
+pub const WORD_SEPARATORS: &str = ",│`|\"' ()[]{}<>\t;";
 
 /// An inclusive search match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -247,25 +286,7 @@ pub struct TermBridge {
     color_requests: Arc<Mutex<Vec<(usize, ColorFmt)>>>,
     window_size: Arc<Mutex<WindowSize>>,
     palette: Palette,
-    scrollback: usize,
-    /// Lines that have dropped off the top of a full scrollback, in total.
-    lines_evicted: usize,
-    /// A push count in progress on the primary grid (see `begin_count`).
-    count: Option<PushCount>,
-}
-
-/// How lines pushed into history are counted across one parse. alacritty
-/// does not report evictions, but `Grid::scroll_up` adds the lines it pushes
-/// to a non-zero display offset (capped at the scrollback limit). So the
-/// offset is parked at 1 for the parse and read back afterwards, then put
-/// back where it was. The grid is never painted in between.
-#[derive(Debug, Clone, Copy)]
-struct PushCount {
-    offset_before: usize,
-    history_before: usize,
-    /// False when history was empty, so the offset could not be parked and
-    /// the growth of history is the count.
-    parked: bool,
+    version: u64,
 }
 
 impl TermBridge {
@@ -280,6 +301,7 @@ impl TermBridge {
         }
         let config = Config {
             scrolling_history: scrollback_lines,
+            semantic_escape_chars: WORD_SEPARATORS.to_owned(),
             ..Config::default()
         };
         let term = Term::new(config, &TermSize::new(cols.max(1), rows.max(1)), listener);
@@ -290,9 +312,7 @@ impl TermBridge {
             color_requests,
             window_size,
             palette: Palette::default(),
-            scrollback: scrollback_lines,
-            lines_evicted: 0,
-            count: None,
+            version: 0,
         }
     }
 
@@ -303,97 +323,9 @@ impl TermBridge {
     /// Feed raw PTY bytes. Chunks may be any size and may split escape
     /// sequences or UTF-8 sequences anywhere.
     pub fn feed(&mut self, bytes: &[u8]) {
-        // Parse in pieces of bounded line count so one parse cannot push
-        // more lines than the parked offset can count.
-        let max_lfs = (self.scrollback / 2).max(1);
-        let mut rest = bytes;
-        while !rest.is_empty() {
-            let mut lfs = 0;
-            let end = rest
-                .iter()
-                .position(|&b| {
-                    lfs += usize::from(b == b'\n');
-                    lfs > max_lfs
-                })
-                .unwrap_or(rest.len());
-            let (piece, tail) = rest.split_at(end);
-            self.begin_count();
-            self.processor.advance(&mut self.term, piece);
-            self.end_count();
-            rest = tail;
-        }
+        self.version += 1;
+        self.processor.advance(&mut self.term, bytes);
         self.answer_color_requests();
-    }
-
-    fn alt_screen(&self) -> bool {
-        self.term.mode().contains(TermMode::ALT_SCREEN)
-    }
-
-    fn begin_count(&mut self) {
-        // A count left open while the alt screen was up is still running:
-        // the inactive primary grid kept its parked offset.
-        if self.count.is_some() || self.alt_screen() {
-            return;
-        }
-        let grid = self.term.grid();
-        let (history, offset) = (grid.history_size(), grid.display_offset());
-        let parked = history >= 1 && self.scrollback >= 2;
-        if parked {
-            self.term
-                .grid_mut()
-                .scroll_display(Scroll::Delta(1 - offset as i32));
-        }
-        self.count = Some(PushCount {
-            offset_before: offset,
-            history_before: history,
-            parked,
-        });
-    }
-
-    fn end_count(&mut self) {
-        if self.alt_screen() {
-            return;
-        }
-        let Some(c) = self.count.take() else {
-            return;
-        };
-        let grid = self.term.grid();
-        let (history, offset) = (grid.history_size(), grid.display_offset());
-        let pushed = if !c.parked {
-            history.saturating_sub(c.history_before)
-        } else if offset >= self.scrollback {
-            // Saturated: at least a whole scrollback went by. Count every old
-            // line as gone so no stored position lands on new text.
-            c.history_before + grid.screen_lines() + offset
-        } else {
-            offset.saturating_sub(1)
-        };
-        // Lines pushed beyond what history grew by fell off the top. A
-        // cleared history (CSI 3 J) also counts as evicted.
-        let grew = history as i64 - c.history_before as i64;
-        self.lines_evicted += (pushed as i64 - grew).max(0) as usize;
-        // Keep a scrolled-back viewport on the same text, as alacritty does.
-        let target = if c.offset_before == 0 {
-            0
-        } else {
-            (c.offset_before + pushed).min(history)
-        };
-        self.term
-            .grid_mut()
-            .scroll_display(Scroll::Delta(target as i32 - offset as i32));
-    }
-
-    /// Lines that have dropped off the top of a full scrollback since start.
-    pub fn lines_evicted(&self) -> usize {
-        self.lines_evicted
-    }
-
-    /// `GridPos::line + abs_line_base()` numbers every line ever scrolled
-    /// into history, so it stays on its text as output arrives, even after
-    /// scrollback fills and starts evicting. Positions below
-    /// `lines_evicted()` refer to text that is gone.
-    pub fn abs_line_base(&self) -> usize {
-        self.lines_evicted + self.term.grid().history_size()
     }
 
     /// When a synchronized update (DEC 2026) times out, or None when none is
@@ -410,9 +342,8 @@ impl TermBridge {
     /// `tick` with an explicit clock, for tests and schedulers.
     pub fn tick_at(&mut self, now: Instant) {
         if self.sync_deadline().is_some_and(|d| d <= now) {
-            self.begin_count();
+            self.version += 1;
             self.processor.stop_sync(&mut self.term);
-            self.end_count();
             self.answer_color_requests();
         }
     }
@@ -441,6 +372,7 @@ impl TermBridge {
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
+        self.version += 1;
         self.term.resize(TermSize::new(cols.max(1), rows.max(1)));
         if let Ok(mut w) = self.window_size.lock() {
             w.num_cols = cols.min(u16::MAX as usize) as u16;
@@ -532,7 +464,8 @@ impl TermBridge {
             },
             display_offset: offset,
             history_size: grid.history_size(),
-            abs_line_base: self.abs_line_base(),
+            selection: self.selection_range(),
+            content_version: self.version,
         }
     }
 
@@ -586,7 +519,64 @@ impl TermBridge {
             .collect()
     }
 
-    pub fn selection_text(&self, sel: Selection) -> String {
+    /// Bumped whenever content may have moved: output, a flushed
+    /// synchronized update, or a resize. Scrolling the view does not bump it.
+    pub fn content_version(&self) -> u64 {
+        self.version
+    }
+
+    /// Starts a selection at `pos`, replacing any other. The terminal owns
+    /// it from here: alacritty moves it with scrolling output, and clamps,
+    /// drops or clears it on eviction, screen clears, alt-screen switches,
+    /// reset and resize.
+    pub fn start_selection(&mut self, kind: SelectionKind, pos: GridPos, side: CellSide) {
+        let ty = match kind {
+            SelectionKind::Simple => SelectionType::Simple,
+            SelectionKind::Word => SelectionType::Semantic,
+            SelectionKind::Line => SelectionType::Lines,
+        };
+        let point = self.clamp_point(pos);
+        self.term.selection = Some(TermSelection::new(ty, point, side.into()));
+    }
+
+    /// Moves the selection's moving end to `pos`.
+    pub fn update_selection(&mut self, pos: GridPos, side: CellSide) {
+        let point = self.clamp_point(pos);
+        if let Some(sel) = self.term.selection.as_mut() {
+            sel.update(point, side.into());
+        }
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.term.selection = None;
+    }
+
+    /// The selection as an inclusive range, or None when there is none or
+    /// it is empty (a plain click that was not dragged).
+    pub fn selection_range(&self) -> Option<Selection> {
+        let r = self.term.selection.as_ref()?.to_range(&self.term)?;
+        Some(Selection {
+            start: GridPos::from_point(r.start),
+            end: GridPos::from_point(r.end),
+        })
+    }
+
+    /// The selected text, or None when nothing is selected.
+    pub fn selection_text(&self) -> Option<String> {
+        self.term.selection_to_string().filter(|t| !t.is_empty())
+    }
+
+    fn clamp_point(&self, pos: GridPos) -> Point {
+        let top = self.term.topmost_line().0;
+        let bottom = self.term.bottommost_line().0;
+        Point::new(
+            Line(pos.line.clamp(top, bottom)),
+            Column(pos.col.min(self.term.last_column().0)),
+        )
+    }
+
+    /// Text between two grid positions, inclusive, clamped to the grid.
+    pub fn text_in(&self, sel: Selection) -> String {
         let (a, b) = if (sel.start.line, sel.start.col) <= (sel.end.line, sel.end.col) {
             (sel.start, sel.end)
         } else {
@@ -739,7 +729,7 @@ mod tests {
         assert_eq!(m.len(), 1);
         assert!(m[0].start.line < 0, "match is in scrollback");
         assert_eq!(
-            b.selection_text(Selection {
+            b.text_in(Selection {
                 start: m[0].start,
                 end: m[0].end
             }),
@@ -764,137 +754,186 @@ mod tests {
         assert_eq!(b.display_offset(), 0);
     }
 
-    /// Text at absolute line `abs` (columns `a..=b`), or "" once evicted.
-    fn text_at(b: &TermBridge, abs: usize, a: usize, e: usize) -> String {
-        let line = abs as i64 - b.abs_line_base() as i64;
-        b.selection_text(Selection {
-            start: GridPos {
-                line: line as i32,
-                col: a,
-            },
-            end: GridPos {
-                line: line as i32,
-                col: e,
-            },
-        })
+    /// A bridge 20x4 with `sb` lines of scrollback showing
+    /// "r{i} word{i}" for i in 0..n, cursor on an empty last line.
+    fn lines(sb: usize, n: usize) -> TermBridge {
+        let mut b = TermBridge::new(20, 4, sb);
+        for i in 0..n {
+            b.feed(format!("r{i} word{i}\r\n").as_bytes());
+        }
+        b
     }
 
-    fn feed_lines(b: &mut TermBridge, range: std::ops::Range<usize>) {
-        for i in range {
-            b.feed(format!("w{i:03}\r\n").as_bytes());
+    /// Double-click the word at grid (`line`, `col`) and return its text.
+    fn pick_word(b: &mut TermBridge, line: i32, col: usize) -> String {
+        b.start_selection(SelectionKind::Word, GridPos { line, col }, CellSide::Left);
+        b.selection_text().expect("a word is selected")
+    }
+
+    /// The selection still copies `orig`, or nothing: never other text.
+    fn same_or_nothing(b: &TermBridge, orig: &str, case: &str) {
+        let t = b.selection_text();
+        assert!(
+            t.is_none() || t.as_deref() == Some(orig),
+            "{case}: copied {t:?}, selected {orig:?}"
+        );
+    }
+
+    #[test]
+    fn word_selection_uses_our_separators() {
+        let mut b = TermBridge::new(40, 3, 10);
+        b.feed(b"see src/main.rs:12; (x) a,b");
+        assert_eq!(pick_word(&mut b, 0, 6), "src/main.rs:12");
+        assert_eq!(pick_word(&mut b, 0, 21), "x");
+        b.start_selection(
+            SelectionKind::Line,
+            GridPos { line: 0, col: 3 },
+            CellSide::Left,
+        );
+        assert_eq!(
+            b.selection_text().as_deref(),
+            Some("see src/main.rs:12; (x) a,b\n"),
+        );
+    }
+
+    #[test]
+    fn simple_selection_needs_a_drag() {
+        let mut b = TermBridge::new(20, 3, 10);
+        b.feed(b"hello world");
+        let at = |col| GridPos { line: 0, col };
+        b.start_selection(SelectionKind::Simple, at(0), CellSide::Left);
+        assert_eq!(b.selection_text(), None, "a plain click selects nothing");
+        assert_eq!(b.snapshot().selection, None);
+        b.update_selection(at(4), CellSide::Right);
+        assert_eq!(b.selection_text().as_deref(), Some("hello"));
+        // Dragging back past the anchor still includes the anchor cell.
+        b.start_selection(SelectionKind::Simple, at(10), CellSide::Right);
+        b.update_selection(at(6), CellSide::Left);
+        assert_eq!(b.selection_text().as_deref(), Some("world"));
+        assert_eq!(
+            b.snapshot().selection,
+            Some(Selection {
+                start: at(6),
+                end: at(10)
+            })
+        );
+        b.clear_selection();
+        assert_eq!(b.selection_text(), None);
+    }
+
+    #[test]
+    fn selection_follows_output_past_the_cap() {
+        for sb in [1, 5] {
+            let mut b = lines(sb, 10);
+            // Screen rows 0..=2 hold r7..r9; select "word8" on row 1.
+            let orig = pick_word(&mut b, 1, 5);
+            assert_eq!(orig, "word8");
+            b.feed(b"x\r\n");
+            assert_eq!(b.selection_text().as_deref(), Some("word8"), "sb {sb}");
+            let sel = b.snapshot().selection.unwrap();
+            assert_eq!(sel.start.line, 0, "the range moved up with its text");
+            // Push it all the way out of scrollback: nothing, never other text.
+            for i in 0..(sb + 6) {
+                b.feed(format!("y{i} more{i}\r\n").as_bytes());
+                same_or_nothing(&b, &orig, &format!("sb {sb} push {i}"));
+            }
+            assert_eq!(b.selection_text(), None, "sb {sb}: evicted");
+            assert_eq!(b.snapshot().selection, None);
         }
     }
 
     #[test]
-    fn abs_lines_stay_on_their_text_after_scrollback_fills() {
-        let mut b = TermBridge::new(20, 5, 10);
-        feed_lines(&mut b, 0..12);
-        assert_eq!(b.history_size(), 8);
-        assert_eq!(b.lines_evicted(), 0);
-        // "w005" is on grid line 5 - 8 = -3.
-        let abs = (-3 + b.abs_line_base() as i64) as usize;
-        assert_eq!(text_at(&b, abs, 0, 3), "w005");
-
-        // Fill scrollback; history stops growing and lines are evicted.
-        feed_lines(&mut b, 12..15);
-        assert_eq!(b.history_size(), 10);
-        assert_eq!(b.lines_evicted(), 1);
-        assert_eq!(text_at(&b, abs, 0, 3), "w005");
-
-        // One big chunk of several lines at once.
-        let chunk: String = (15..18).map(|i| format!("w{i:03}\r\n")).collect();
-        b.feed(chunk.as_bytes());
-        assert_eq!(b.lines_evicted(), 4);
-        assert_eq!(text_at(&b, abs, 0, 3), "w005");
-
-        // Once w005 itself is evicted its position yields nothing, never
-        // another line's text.
-        feed_lines(&mut b, 18..30);
-        assert!(abs < b.lines_evicted());
-        assert_eq!(text_at(&b, abs, 0, 3), "");
-    }
-
-    #[test]
-    fn a_chunk_longer_than_scrollback_still_counts() {
-        let mut b = TermBridge::new(20, 5, 10);
-        feed_lines(&mut b, 0..3);
-        let base0 = b.abs_line_base();
-        let chunk: String = (3..103).map(|i| format!("w{i:03}\r\n")).collect();
-        b.feed(chunk.as_bytes());
-        // The cursor starts on row 3 of 5, so the first newline moves it to
-        // the last row and the other 99 each push a line: base moves by 99.
-        assert_eq!(b.abs_line_base(), base0 + 99);
-        let m = b.search("w099");
-        assert_eq!(m.len(), 1);
-        let abs = (m[0].start.line as i64 + b.abs_line_base() as i64) as usize;
-        feed_lines(&mut b, 103..106);
-        assert_eq!(text_at(&b, abs, 0, 3), "w099");
-    }
-
-    #[test]
-    fn scrolled_back_view_and_matches_stay_put_when_full() {
-        let mut b = TermBridge::new(20, 5, 10);
-        feed_lines(&mut b, 0..40);
-        b.scroll(4);
-        let top = |b: &TermBridge| -> String {
-            (0..4)
-                .map(|c| b.snapshot().cell(0, c).map(|x| x.ch).unwrap_or(' '))
-                .collect()
-        };
-        let shown = top(&b);
-        let m = b.search(&shown);
-        assert_eq!(m.len(), 1);
-        let abs = (m[0].start.line as i64 + b.abs_line_base() as i64) as usize;
-        let offset = b.display_offset();
-
-        feed_lines(&mut b, 40..43);
-        assert_eq!(top(&b), shown, "viewport stays on its text");
-        assert_eq!(b.display_offset(), offset + 3);
-        assert_eq!(text_at(&b, abs, 0, 3), shown);
-
-        // When the shown text is evicted the view pins to the oldest line.
-        feed_lines(&mut b, 43..60);
-        assert_eq!(b.display_offset(), b.history_size());
-        assert_eq!(text_at(&b, abs, 0, 3), "");
-    }
-
-    #[test]
-    fn live_view_stays_live_while_counting() {
-        let mut b = TermBridge::new(20, 5, 10);
-        feed_lines(&mut b, 0..30);
-        assert_eq!(b.display_offset(), 0);
-        assert_eq!(b.snapshot().display_offset, 0);
-    }
-
-    #[test]
-    fn alt_screen_output_does_not_disturb_the_count() {
-        let mut b = TermBridge::new(20, 5, 10);
-        feed_lines(&mut b, 0..20);
-        let m = b.search("w012");
-        let abs = (m[0].start.line as i64 + b.abs_line_base() as i64) as usize;
-        // Enter the alt screen, scroll it a lot, then come back in pieces.
-        b.feed(b"w020\r\n\x1b[?1049h");
-        for _ in 0..30 {
-            b.feed(b"alt\r\n");
+    fn screen_clears_and_reset_never_copy_other_text() {
+        let cases: &[&[u8]] = &[
+            b"\x1b[H\x1b[2J\x1b[3J",
+            b"\x1b[H\x1b[2J\x1b[3Jr8 word8 r8 word8\r\nnew\r\n",
+            b"\x1b[3Jafter\r\nmore\r\n",
+            b"\x1b[3J\x1b[H\x1b[2Jr0 word0\r\nr1 word1\r\nr2 word2\r\n",
+            b"\x1bc",
+            b"\x1bcr0 word0\r\nr1 word1\r\nr2 word2\r\nr3 word3\r\n",
+        ];
+        for sb in [1, 5] {
+            for (n, case) in cases.iter().enumerate() {
+                // Select on screen and, separately, in scrollback.
+                for line in [1, -1] {
+                    let mut b = lines(sb, 10);
+                    let orig = pick_word(&mut b, line, 5);
+                    b.feed(case);
+                    same_or_nothing(&b, &orig, &format!("sb {sb} case {n} line {line}"));
+                }
+            }
         }
-        b.feed(b"\x1b[?1049l");
-        assert_eq!(b.display_offset(), 0, "primary view is live again");
-        assert_eq!(text_at(&b, abs, 0, 3), "w012");
-        feed_lines(&mut b, 21..23);
-        assert_eq!(text_at(&b, abs, 0, 3), "w012");
     }
 
     #[test]
-    fn clearing_history_evicts_it() {
-        let mut b = TermBridge::new(20, 5, 10);
-        feed_lines(&mut b, 0..8);
-        let m = b.search("w001");
-        let abs = (m[0].start.line as i64 + b.abs_line_base() as i64) as usize;
-        let base = b.abs_line_base();
-        b.feed(b"\x1b[3J");
-        assert_eq!(b.history_size(), 0);
-        assert_eq!(b.abs_line_base(), base, "screen lines keep their numbers");
-        assert_eq!(text_at(&b, abs, 0, 3), "");
+    fn pushes_without_history_never_copy_other_text() {
+        // History is empty, so every push goes into (and past) a tiny
+        // scrollback in one piece, by every way a line can be pushed.
+        let long = "z".repeat(20 * 6);
+        let cases: Vec<Vec<u8>> = vec![
+            format!("\x1b[4;1H{long}").into_bytes(),
+            b"\x1b[4;1H\x0b\x0b\x0b\x0c\x0c\x0c\x0b".to_vec(),
+            b"\x1b[4;1H\x1bD\x1bD\x1bD\x1bD\x1bD\x1bD".to_vec(),
+            b"\x1b[4;1H\x1bE\x1bE\x1bE\x1bE\x1bE\x1bE".to_vec(),
+            b"\x1b[6S".to_vec(),
+            b"\x1b[1S".to_vec(),
+        ];
+        for sb in [1, 5] {
+            for (n, case) in cases.iter().enumerate() {
+                let mut b = TermBridge::new(20, 4, sb);
+                b.feed(b"r0 word0\r\nr1 word1\r\nr2 word2");
+                assert_eq!(b.history_size(), 0);
+                let orig = pick_word(&mut b, 1, 5);
+                assert_eq!(orig, "word1");
+                b.feed(case);
+                same_or_nothing(&b, &orig, &format!("sb {sb} case {n}"));
+            }
+        }
+    }
+
+    #[test]
+    fn resize_keeps_or_drops_the_selection() {
+        for sb in [1, 5] {
+            for (cols, rows) in [(20, 2), (20, 1), (20, 8), (10, 4), (30, 3)] {
+                for line in [0, 1, -1] {
+                    let mut b = lines(sb, 12);
+                    let orig = pick_word(&mut b, line, 5);
+                    b.resize(cols, rows);
+                    same_or_nothing(&b, &orig, &format!("sb {sb} {cols}x{rows} line {line}"));
+                    b.feed(b"after\r\n");
+                    same_or_nothing(&b, &orig, &format!("sb {sb} {cols}x{rows} then output"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn alt_screen_and_resize_never_copy_other_text() {
+        for sb in [1, 5] {
+            let mut b = lines(sb, 12);
+            let orig = pick_word(&mut b, 1, 5);
+            b.feed(b"\x1b[?1049h");
+            same_or_nothing(&b, &orig, "enter alt");
+            b.resize(20, 8);
+            b.feed(b"alt\r\nalt\r\n");
+            same_or_nothing(&b, &orig, "alt output");
+            b.feed(b"\x1b[?1049l");
+            b.resize(20, 3);
+            same_or_nothing(&b, &orig, "back and shrunk");
+        }
+    }
+
+    #[test]
+    fn content_version_moves_with_content_not_scrolling() {
+        let mut b = lines(10, 10);
+        let v = b.content_version();
+        b.scroll(2);
+        assert_eq!(b.content_version(), v);
+        b.feed(b"x");
+        assert!(b.content_version() > v);
+        let v = b.content_version();
+        b.resize(30, 5);
+        assert!(b.content_version() > v);
     }
 
     #[test]
