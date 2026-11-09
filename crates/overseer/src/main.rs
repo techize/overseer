@@ -1,4 +1,5 @@
 mod agent;
+mod attach;
 mod ctl;
 
 use clap::{Parser, Subcommand};
@@ -26,6 +27,8 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ctl::CtlCmd,
     },
+    /// Mirror one slot in this terminal. Ctrl-] detaches.
+    Attach { n: overseer_proto::SlotId },
     /// Install the LaunchAgent that keeps the daemon running.
     InstallAgent,
     /// Remove the LaunchAgent.
@@ -54,6 +57,7 @@ fn main() {
                 default_command: default_command(),
             }))
         }),
+        Cmd::Attach { n } => runtime().and_then(|rt| rt.block_on(attach::run(n))),
         Cmd::Ctl { cmd } => runtime().and_then(|rt| rt.block_on(ctl::run(cmd))),
     };
     if let Err(e) = result {

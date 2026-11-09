@@ -8,9 +8,10 @@ license.workspace = true
 overseer-gui = { path = "../overseer-gui" }
 overseer-proto = { path = "../overseer-proto" }
 overseer-daemon = { path = "../overseer-daemon" }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync"] }
 clap.workspace = true
 anyhow.workspace = true
+crossterm.workspace = true
 libc = "0.2"
 
 [dev-dependencies]

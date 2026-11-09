@@ -87,3 +87,23 @@ fn ctl_unreachable_message() {
     assert!(t.elapsed() < Duration::from_secs(4), "{:?}", t.elapsed());
     std::fs::set_permissions(&env.home, std::fs::Permissions::from_mode(0o700)).unwrap();
 }
+
+#[test]
+fn attach_empty_slot_message() {
+    let env = Env::new();
+    let mut c = Command::cargo_bin("overseer").unwrap();
+    let out = c
+        .env("OVERSEER_HOME", &env.home)
+        .env("OVERSEER_DEFAULT_COMMAND", SCRIPT)
+        .args(["attach", "3"])
+        .timeout(Duration::from_secs(10))
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("S3 is empty. Start it with: overseer ctl start 3 --cwd <dir>"),
+        "{stderr}"
+    );
+}

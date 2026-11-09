@@ -4,11 +4,17 @@
 //! read half. It routes `Response` frames to the waiting request and forwards
 //! everything else (events, output) in arrival order through one channel, so
 //! the server's frame order is preserved end to end.
+//!
+//! That channel is bounded (`INBOX_CAP` frames). The reader never blocks on it,
+//! because it also has to route responses. A consumer that falls that far
+//! behind is cut off instead: the reader stops, `inbox_overflowed` turns true
+//! and every request fails as if the daemon had hung up.
 
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail};
@@ -21,7 +27,9 @@ use crate::{read_frame, write_frame, Frame, Request, Response, SlotId};
 
 const RETRY_EVERY: Duration = Duration::from_millis(100);
 const RETRY_FOR: Duration = Duration::from_secs(3);
-/// Frames buffered for the subscriber before the reader is back-pressured.
+/// Frames the reader may queue for the subscriber before it disconnects.
+const INBOX_CAP: usize = 4096;
+/// Frames buffered between the forwarder task and the subscriber.
 const SUBSCRIBER_QUEUE: usize = 256;
 
 /// `None` once the connection is gone, so late requests fail fast.
@@ -34,17 +42,19 @@ struct Writer {
 
 pub struct Client {
     writer: Mutex<Writer>,
-    pending: std::sync::Arc<Pending>,
-    inbox: StdMutex<Option<mpsc::UnboundedReceiver<Frame>>>,
+    pending: Arc<Pending>,
+    inbox: StdMutex<Option<mpsc::Receiver<Frame>>>,
+    overflowed: Arc<AtomicBool>,
 }
 
 impl Client {
     pub async fn connect(path: impl AsRef<Path>) -> io::Result<Client> {
         let (mut rd, half) = UnixStream::connect(path.as_ref()).await?.into_split();
-        let pending: std::sync::Arc<Pending> =
-            std::sync::Arc::new(StdMutex::new(Some(HashMap::new())));
-        let (tx, rx) = mpsc::unbounded_channel();
+        let pending: Arc<Pending> = Arc::new(StdMutex::new(Some(HashMap::new())));
+        let (tx, rx) = mpsc::channel(INBOX_CAP);
+        let overflowed = Arc::new(AtomicBool::new(false));
         let reader_pending = pending.clone();
+        let reader_overflowed = overflowed.clone();
         tokio::spawn(async move {
             while let Ok(Some(frame)) = read_frame(&mut rd).await {
                 match frame {
@@ -59,8 +69,14 @@ impl Client {
                         }
                     }
                     Frame::Event(_) | Frame::Output { .. } => {
-                        if tx.send(frame).is_err() {
-                            // No subscriber handle left; keep serving responses.
+                        match tx.try_send(frame) {
+                            Ok(()) => {}
+                            // No subscriber left; keep serving responses.
+                            Err(mpsc::error::TrySendError::Closed(_)) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                reader_overflowed.store(true, Ordering::SeqCst);
+                                break;
+                            }
                         }
                     }
                     // Servers do not send these.
@@ -74,6 +90,7 @@ impl Client {
             writer: Mutex::new(Writer { half, next_seq: 0 }),
             pending,
             inbox: StdMutex::new(Some(rx)),
+            overflowed,
         })
     }
 
@@ -148,6 +165,12 @@ impl Client {
             });
         }
         rx
+    }
+
+    /// True when the connection was dropped because the subscriber stopped
+    /// draining frames (see the module docs).
+    pub fn inbox_overflowed(&self) -> bool {
+        self.overflowed.load(Ordering::SeqCst)
     }
 
     /// Fire-and-forget keystrokes for a slot.
