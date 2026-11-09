@@ -26,11 +26,20 @@ make install
 4. installs and starts the LaunchAgent `uk.co.techize.overseer`
    (`~/Library/LaunchAgents/uk.co.techize.overseer.plist`), which runs the daemon.
 
-Running it again is safe: it replaces the app and reloads the agent.
+Running it again replaces the app and reloads the agent, which restarts the
+daemon: every running session ends (see Upgrade below). Nothing else is lost.
 
-The agent records the `PATH` of the shell you ran `make install` from, so the
-daemon finds `claude` (for example in `/opt/homebrew/bin`). If you move `claude`
-somewhere new, run `make install` again.
+Sessions start with your login shell's environment: when the daemon starts it
+runs `$SHELL -l -i -c` once to read it, so variables from your shell rc files
+(`PATH`, `LANG`, proxies, `AWS_*`, `ANTHROPIC_*` and so on) reach Claude.
+Variables that belong to a running Claude Code session (`CLAUDECODE`,
+`CLAUDE_CODE_SESSION_*` and the like) are removed, and each session gets
+`OVERSEER_SLOT=S<n>`. If the shell fails or takes more than 5 s, sessions get
+the daemon's own environment instead and `daemon.log` says so. The agent also
+records the `PATH` of the shell you ran `make install` from, which the daemon
+itself uses (for example to find `claude` in `/opt/homebrew/bin`). If you
+change your shell setup, restart the daemon (`overseer ctl shutdown`, then open
+the app) to pick it up; if you move `claude`, run `make install` again.
 
 Open Overseer from `~/Applications` in Finder or with
 `open ~/Applications/Overseer.app`. Put `~/.local/bin` on your `PATH` to use the
