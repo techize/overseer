@@ -58,9 +58,17 @@ fn assert_consecutive(buf: &[u8]) -> usize {
     checked
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn reattach_delivers_only_the_new_snapshot_and_live_output() {
-    let dir = std::path::PathBuf::from(format!("/tmp/ovgr-{}", std::process::id()));
+struct Setup {
+    dir: std::path::PathBuf,
+    task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    client: Arc<Client>,
+    hub: FrameHub,
+}
+
+/// A daemon in a temp dir with slot 1 printing endless numbered lines, so
+/// any replayed or stale chunk shows as a jump.
+async fn setup(name: &str) -> Setup {
+    let dir = std::path::PathBuf::from(format!("/tmp/ovgr-{}-{name}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let socket = dir.join("s.sock");
     let task = tokio::spawn(run(DaemonConfig {
@@ -69,8 +77,6 @@ async fn reattach_delivers_only_the_new_snapshot_and_live_output() {
     }));
     let client = Arc::new(Client::connect_or_start(&socket, || Ok(())).await.unwrap());
     let hub = FrameHub::start(&client, tokio::runtime::Handle::current());
-
-    // Endless numbered lines, so any replayed or stale chunk shows as a jump.
     let start = Request::StartSlot {
         id: 1,
         label: "t".into(),
@@ -78,22 +84,67 @@ async fn reattach_delivers_only_the_new_snapshot_and_live_output() {
         command: Some(vec!["/usr/bin/seq".into(), "1".into(), "1000000000".into()]),
     };
     assert_eq!(client.request(start).await.unwrap(), Response::Ok);
+    Setup {
+        dir,
+        task,
+        client,
+        hub,
+    }
+}
+
+async fn teardown(s: Setup) {
+    let _ = s.client.request(Request::Shutdown).await;
+    let _ = timeout(Duration::from_secs(2), s.task).await;
+    let _ = std::fs::remove_dir_all(&s.dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reattach_delivers_only_the_new_snapshot_and_live_output() {
+    let s = setup("seq").await;
+    let (client, hub) = (&s.client, &s.hub);
 
     // First view attaches and sees live output.
     let (gen_a, mut out_a) = hub.route(1);
-    attach(&hub, &client, gen_a).await;
+    attach(hub, client, gen_a).await;
     collect(&mut out_a, 64 * 1024).await;
 
     // Recreate the view several times while output is streaming at full speed.
     for round in 0..5 {
         let (gen_b, mut out_b) = hub.route(1);
-        attach(&hub, &client, gen_b).await;
+        attach(hub, client, gen_b).await;
         let buf = collect(&mut out_b, 512 * 1024).await;
         let checked = assert_consecutive(&buf);
         assert!(checked > 1000, "round {round}: only {checked} lines");
     }
 
-    let _ = client.request(Request::Shutdown).await;
-    let _ = timeout(Duration::from_secs(2), task).await;
-    let _ = std::fs::remove_dir_all(&dir);
+    teardown(s).await;
+}
+
+/// A superseded view whose Attach is still pending (its pump was in an
+/// earlier round trip when the newer view replaced it) must not send it:
+/// the daemon would restart the stream and replay a second snapshot into
+/// the newer, already live route.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn superseded_attach_is_never_sent() {
+    let s = setup("late").await;
+    let (client, hub) = (&s.client, &s.hub);
+
+    let (gen_old, _out_old) = hub.route(1);
+    let (gen_new, mut out_new) = hub.route(1);
+    attach(hub, client, gen_new).await;
+    let mut buf = collect(&mut out_new, 64 * 1024).await;
+
+    // The old view's Attach arrives late, after the newer one went live.
+    let late = hub.attach(client, 1, gen_old).await;
+
+    // The newer route keeps one unbroken stream: no second snapshot.
+    buf.extend(collect(&mut out_new, 512 * 1024).await);
+    assert!(assert_consecutive(&buf) > 1000);
+    let err = late.unwrap_err();
+    assert!(err.is::<overseer_proto::client::Cancelled>(), "{err:#}");
+
+    // Same after the old view is dropped (unroute, then a late Attach).
+    assert!(!hub.unroute(1, gen_old));
+    assert!(hub.attach(client, 1, gen_old).await.is_err());
+    teardown(s).await;
 }

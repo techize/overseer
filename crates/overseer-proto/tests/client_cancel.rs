@@ -140,7 +140,10 @@ async fn marked_reply_is_ordered_in_the_stream() {
     let mut rx = client.subscribe();
     let mut seen_seq = None;
     let r = client
-        .request_marked(Request::Attach { id: 1 }, |s| seen_seq = Some(s))
+        .request_marked(Request::Attach { id: 1 }, |s| {
+            seen_seq = Some(s);
+            true
+        })
         .await
         .unwrap();
     assert_eq!(r, Response::Ok);
@@ -164,4 +167,39 @@ async fn marked_reply_is_ordered_in_the_stream() {
         });
     }
     assert_eq!(got, ["before", "reply", "after", "before", "after"]);
+}
+
+#[tokio::test]
+async fn declined_marked_request_is_never_sent() {
+    let path = sock("declined");
+    let listener = UnixListener::bind(&path).unwrap();
+    let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let (mut s, _) = listener.accept().await.unwrap();
+        while let Ok(Some(frame)) = read_frame(&mut s).await {
+            let Frame::Request { seq, req } = frame else {
+                continue;
+            };
+            let _ = seen_tx.send(req);
+            let resp = Response::Ok;
+            write_frame(&mut s, &Frame::Response { seq, resp })
+                .await
+                .unwrap();
+        }
+    });
+    let client = Client::connect(&path).await.unwrap();
+    let mut rx = client.subscribe();
+    let err = client
+        .request_marked(Request::Attach { id: 1 }, |_| false)
+        .await
+        .unwrap_err();
+    assert!(err.is::<overseer_proto::client::Cancelled>(), "{err:#}");
+    // The next request is the first thing the server sees.
+    client.request(Request::ListSlots).await.unwrap();
+    assert_eq!(seen_rx.recv().await, Some(Request::ListSlots));
+    assert!(seen_rx.try_recv().is_err());
+    // And no mark for the declined request reached the stream.
+    assert!(timeout(Duration::from_millis(100), rx.recv())
+        .await
+        .is_err());
 }

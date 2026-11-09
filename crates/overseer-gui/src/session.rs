@@ -54,7 +54,11 @@ pub fn panel_model(
     } else {
         info.label.trim().to_string()
     };
-    let cwd = info.cwd.as_deref().map(|p| tilde(p, home)).unwrap_or_else(dash);
+    let cwd = info
+        .cwd
+        .as_deref()
+        .map(|p| tilde(p, home))
+        .unwrap_or_else(dash);
     let (pid, state, started) = match &info.state {
         SlotState::Empty => (dash(), "Empty".to_string(), dash()),
         SlotState::Running { pid, since } => (
@@ -174,8 +178,7 @@ fn button(id: &'static str, text: &'static str, enabled: bool) -> gpui::Stateful
             colors::MUTED
         }))
         .when(enabled, |b| {
-            b.cursor_pointer()
-                .hover(|s| s.bg(rgb(colors::CARD_HOVER)))
+            b.cursor_pointer().hover(|s| s.bg(rgb(colors::CARD_HOVER)))
         })
         .child(text)
 }
@@ -237,9 +240,9 @@ impl OverseerApp {
                     .text_color(rgb(if on { colors::ORANGE } else { colors::TEXT }))
                     .cursor_pointer()
                     .child(tab_label(info))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.go_session(id, window, cx)
-                    }))
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| this.go_session(id, window, cx)),
+                    )
             })
             .collect();
         let focus = self.session_focus.clone();
@@ -295,23 +298,18 @@ impl OverseerApp {
             })
             .child(
                 panel_box("Session")
-                    .child(
-                        div()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(m.title),
-                    )
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child(m.title))
                     .children(rows)
                     .child(div().flex().gap_2().pt_1().child(stop).child(restart)),
             )
             .child(placeholder("Owns", "phase 3"))
             .child(placeholder("Holds", "phase 3"))
             .child(placeholder("Progress", "phase 4"))
-            .children(self.status.clone().map(|s| {
-                div()
-                    .text_sm()
-                    .text_color(rgb(colors::ORANGE))
-                    .child(s)
-            }))
+            .children(
+                self.status
+                    .clone()
+                    .map(|s| div().text_sm().text_color(rgb(colors::ORANGE)).child(s)),
+            )
     }
 
     pub(crate) fn render_session(
@@ -348,9 +346,9 @@ impl OverseerApp {
                         .text_color(rgb(colors::TEXT_DIM))
                         .child(SharedString::from(format!("{} is empty", slot_name(id)))),
                 )
-                .child(button("start-empty", "+ start", true).on_click(cx.listener(
-                    move |this, _, window, cx| this.open_dialog(id, window, cx),
-                ))),
+                .child(button("start-empty", "+ start", true).on_click(
+                    cx.listener(move |this, _, window, cx| this.open_dialog(id, window, cx)),
+                )),
         };
         let tabs = self.render_tabs(id, cx);
         let panel = self.render_panel(id, now, cx);
@@ -469,7 +467,10 @@ mod tests {
         assert!(keep_view(inc, &RUN));
         let ex = SlotState::Exited { code: None, at: 9 };
         assert!(keep_view(inc, &ex));
-        let again = SlotState::Running { pid: 78, since: 200 };
+        let again = SlotState::Running {
+            pid: 78,
+            since: 200,
+        };
         assert!(!keep_view(inc, &again));
         assert!(!keep_view(inc, &SlotState::Empty));
         // A view made while exited is dropped when the slot runs again.
@@ -502,7 +503,11 @@ mod tests {
 
     #[test]
     fn restart_exited_starts_at_once_and_empty_cannot() {
-        let (first, plan) = restart_begin(&info(SlotState::Exited { code: Some(0), at: 1 })).unwrap();
+        let (first, plan) = restart_begin(&info(SlotState::Exited {
+            code: Some(0),
+            at: 1,
+        }))
+        .unwrap();
         assert!(matches!(first, Request::StartSlot { id: 2, .. }));
         assert!(plan.is_none());
         assert!(restart_begin(&info(SlotState::Empty)).is_none());

@@ -53,6 +53,18 @@ struct Waiter {
 /// `None` once the connection is gone, so late requests fail fast.
 type Pending = StdMutex<Option<HashMap<u32, Waiter>>>;
 
+/// A `request_marked` call whose `on_seq` declined to send the request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cancelled;
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("request cancelled before it was sent")
+    }
+}
+
+impl std::error::Error for Cancelled {}
+
 /// Removes a request's pending entry if its future is dropped while waiting.
 struct PendingGuard {
     pending: Arc<Pending>,
@@ -191,18 +203,21 @@ impl Client {
     /// Sends a request and waits for its response. Cancel-safe: dropping the
     /// future forgets the reply but leaves the stream intact.
     pub async fn request(&self, req: Request) -> anyhow::Result<Response> {
-        self.send_request(req, false, |_| {}).await
+        self.send_request(req, false, |_| true).await
     }
 
     /// Like `request`, and the reply is also put into the subscriber stream
     /// as `Frame::Response { seq, .. }`, ordered with the events and output
     /// around it. `on_seq` gets the request's sequence number before the
     /// request is sent, so the subscriber can be told which mark to expect
-    /// before it can possibly arrive.
+    /// before it can possibly arrive. If `on_seq` returns false the request
+    /// is not sent and the call fails with `Cancelled`. `on_seq` runs under
+    /// the lock that orders requests, so a request it lets through goes out
+    /// before any request numbered after it.
     pub async fn request_marked(
         &self,
         req: Request,
-        on_seq: impl FnOnce(u32),
+        on_seq: impl FnOnce(u32) -> bool,
     ) -> anyhow::Result<Response> {
         self.send_request(req, true, on_seq).await
     }
@@ -211,7 +226,7 @@ impl Client {
         &self,
         req: Request,
         mark: bool,
-        on_seq: impl FnOnce(u32),
+        on_seq: impl FnOnce(u32) -> bool,
     ) -> anyhow::Result<Response> {
         let (tx, rx) = oneshot::channel();
         let seq = {
@@ -224,11 +239,17 @@ impl Client {
                 }
                 None => bail!("connection to the daemon is closed"),
             }
-            on_seq(seq);
-            if self.outbox.send(Frame::Request { seq, req }).is_err() {
+            let forget = || {
                 if let Some(m) = self.pending.lock().unwrap().as_mut() {
                     m.remove(&seq);
                 }
+            };
+            if !on_seq(seq) {
+                forget();
+                return Err(Cancelled.into());
+            }
+            if self.outbox.send(Frame::Request { seq, req }).is_err() {
+                forget();
                 bail!("connection to the daemon is closed");
             }
             seq

@@ -107,6 +107,72 @@ impl Outbox {
     }
 }
 
+/// One connection's output streams, one per slot.
+///
+/// `abort` does not wait, so a stream task that is mid-poll could still queue
+/// a chunk after the reply to a re-attach or detach, and the client would
+/// take it as new output. Each stream therefore carries the epoch it was
+/// started in and only sends while that epoch is current, checking and
+/// queueing under one lock. `cut` bumps the epoch before the reply is
+/// queued, so nothing from an earlier stream can follow that reply.
+struct Streams {
+    epochs: Arc<Mutex<[u64; crate::manager::SLOT_COUNT]>>,
+    tasks: [Option<JoinHandle<()>>; crate::manager::SLOT_COUNT],
+}
+
+/// A stream's right to send `Output` for one slot.
+#[derive(Clone)]
+struct StreamGate {
+    epochs: Arc<Mutex<[u64; crate::manager::SLOT_COUNT]>>,
+    id: SlotId,
+    epoch: u64,
+}
+
+impl StreamGate {
+    /// Queues `data` unless a later `cut` ended this stream. Returns false
+    /// when the stream should stop.
+    fn send(&self, outbox: &Outbox, data: Bytes) -> bool {
+        let epochs = self.epochs.lock().unwrap();
+        if epochs[self.id as usize] != self.epoch {
+            return false;
+        }
+        outbox.send(Frame::Output { id: self.id, data })
+    }
+}
+
+impl Streams {
+    fn new() -> Streams {
+        Streams {
+            epochs: Arc::new(Mutex::new([0; crate::manager::SLOT_COUNT])),
+            tasks: Default::default(),
+        }
+    }
+
+    /// Ends `id`'s stream: from now on its task can queue nothing. Returns
+    /// the gate for a stream started after this point.
+    fn cut(&mut self, id: SlotId) -> StreamGate {
+        let epoch = {
+            let mut epochs = self.epochs.lock().unwrap();
+            epochs[id as usize] += 1;
+            epochs[id as usize]
+        };
+        if let Some(old) = self.tasks[id as usize].take() {
+            old.abort();
+        }
+        StreamGate {
+            epochs: self.epochs.clone(),
+            id,
+            epoch,
+        }
+    }
+
+    fn abort_all(&mut self) {
+        for h in self.tasks.iter_mut().filter_map(Option::take) {
+            h.abort();
+        }
+    }
+}
+
 async fn handle_conn(stream: UnixStream, manager: Manager, shutdown: Arc<Notify>) {
     let (mut rd, mut wr) = stream.into_split();
     let (out_tx, mut out_rx) = mpsc::channel::<Frame>(OUTBOUND_QUEUE);
@@ -150,12 +216,12 @@ async fn handle_conn(stream: UnixStream, manager: Manager, shutdown: Arc<Notify>
     });
 
     let mut events = manager.lock().unwrap().subscribe_events();
-    let mut attached: [Option<JoinHandle<()>>; crate::manager::SLOT_COUNT] = Default::default();
+    let mut streams = Streams::new();
 
     loop {
         tokio::select! {
             frame = in_rx.recv() => match frame {
-                Some(f) => handle_frame(f, &manager, &outbox, &shutdown, &mut attached),
+                Some(f) => handle_frame(f, &manager, &outbox, &shutdown, &mut streams),
                 None => break, // client hung up
             },
             ev = events.recv() => match ev {
@@ -171,9 +237,7 @@ async fn handle_conn(stream: UnixStream, manager: Manager, shutdown: Arc<Notify>
         }
     }
 
-    for h in attached.iter().flatten() {
-        h.abort();
-    }
+    streams.abort_all();
     reader.abort();
     writer.abort();
 }
@@ -183,17 +247,19 @@ fn handle_frame(
     manager: &Manager,
     outbox: &Outbox,
     shutdown: &Notify,
-    attached: &mut [Option<JoinHandle<()>>],
+    streams: &mut Streams,
 ) {
     match frame {
         Frame::Request { seq, req } => {
             let is_shutdown = matches!(req, Request::Shutdown);
             let mut pending_attach = None;
-            let resp = handle_request(req, manager, attached, &mut pending_attach);
+            let resp = handle_request(req, manager, streams, &mut pending_attach);
+            // A re-attach ends the earlier stream before its Ok is queued.
+            let gate = pending_attach.as_ref().map(|(id, _)| streams.cut(*id));
             outbox.send(Frame::Response { seq, resp });
             // Ok first, then the snapshot, then live output.
-            if let Some((id, att)) = pending_attach {
-                start_stream(id, att, outbox, attached);
+            if let (Some((_, att)), Some(gate)) = (pending_attach, gate) {
+                start_stream(gate, att, outbox, streams);
             }
             if is_shutdown {
                 shutdown.notify_one();
@@ -224,7 +290,7 @@ fn handle_frame(
 fn handle_request(
     req: Request,
     manager: &Manager,
-    attached: &mut [Option<JoinHandle<()>>],
+    streams: &mut Streams,
     pending_attach: &mut Option<(SlotId, Attachment)>,
 ) -> Response {
     let err = |message: String| Response::Error { message };
@@ -258,9 +324,8 @@ fn handle_request(
             if !valid_id(id) {
                 return err(format!("invalid slot id {id}"));
             }
-            if let Some(h) = attached[id as usize].take() {
-                h.abort();
-            }
+            // Ends the stream before the Ok is queued.
+            streams.cut(id);
             Response::Ok
         }
         Request::Resize { id, cols, rows } => match manager.lock().unwrap().slot(id) {
@@ -307,25 +372,15 @@ fn coalesce(first: Bytes, live: &mut broadcast::Receiver<Bytes>, id: SlotId) -> 
 
 /// Sends the snapshot as one `Output` frame, then forwards live output until
 /// the stream ends, the connection dies or the client detaches.
-fn start_stream(
-    id: SlotId,
-    att: Attachment,
-    outbox: &Outbox,
-    attached: &mut [Option<JoinHandle<()>>],
-) {
-    // Re-attaching replaces any earlier stream for this slot.
-    if let Some(old) = attached[id as usize].take() {
-        old.abort();
-    }
-    if !outbox.send(Frame::Output {
-        id,
-        data: Bytes::from(att.snapshot),
-    }) {
+/// `gate` comes from the `cut` that ended any earlier stream for the slot.
+fn start_stream(gate: StreamGate, att: Attachment, outbox: &Outbox, streams: &mut Streams) {
+    let id = gate.id;
+    if !gate.send(outbox, Bytes::from(att.snapshot)) {
         return;
     }
     let Some(mut live) = att.live else { return };
     let outbox = outbox.clone();
-    attached[id as usize] = Some(tokio::spawn(async move {
+    streams.tasks[id as usize] = Some(tokio::spawn(async move {
         loop {
             let first = match live.recv().await {
                 Ok(data) => data,
@@ -338,7 +393,7 @@ fn start_stream(
                 Err(broadcast::error::RecvError::Closed) => break,
             };
             let (data, closed) = coalesce(first, &mut live, id);
-            if !data.is_empty() && !outbox.send(Frame::Output { id, data }) {
+            if !data.is_empty() && !gate.send(&outbox, data) {
                 break;
             }
             if closed {
@@ -346,4 +401,45 @@ fn start_stream(
             }
         }
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn outbox() -> (Outbox, mpsc::Receiver<Frame>) {
+        let (tx, rx) = mpsc::channel(16);
+        let (dead, _) = watch::channel(false);
+        let dead = Arc::new(dead);
+        (Outbox { tx, dead }, rx)
+    }
+
+    fn output(rx: &mut mpsc::Receiver<Frame>) -> Vec<Bytes> {
+        let mut got = Vec::new();
+        while let Ok(f) = rx.try_recv() {
+            match f {
+                Frame::Output { data, .. } => got.push(data),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        got
+    }
+
+    #[test]
+    fn a_cut_stream_queues_nothing_more() {
+        let (outbox, mut rx) = outbox();
+        let mut streams = Streams::new();
+        let old = streams.cut(1);
+        assert!(old.send(&outbox, Bytes::from_static(b"old")));
+        // A re-attach (or detach) cuts the stream; the old task may still
+        // be running, but whatever it sends now is dropped and it stops.
+        let new = streams.cut(1);
+        assert!(!old.send(&outbox, Bytes::from_static(b"stale")));
+        assert!(new.send(&outbox, Bytes::from_static(b"new")));
+        // Other slots are untouched.
+        let other = streams.cut(2);
+        assert!(new.send(&outbox, Bytes::from_static(b"still")));
+        assert!(other.send(&outbox, Bytes::from_static(b"two")));
+        assert_eq!(output(&mut rx), ["old", "new", "still", "two"]);
+    }
 }

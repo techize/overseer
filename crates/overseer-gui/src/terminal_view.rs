@@ -41,11 +41,11 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use gpui::{
     canvas, div, fill, font, outline, point, prelude::*, px, size, App, BorderStyle, Bounds,
-    ClipboardEntry, ClipboardItem, ContentMask, Context, DispatchPhase, ElementInputHandler, Entity,
-    EntityInputHandler, FocusHandle, Focusable, Font, FontStyle, FontWeight, Hsla, KeyDownEvent,
-    Keystroke, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Pixels, Rgba, ScrollWheelEvent, StrikethroughStyle, Subscription, Task, TextRun, TouchPhase,
-    UTF16Selection, UnderlineStyle, WeakEntity, Window,
+    ClipboardEntry, ClipboardItem, ContentMask, Context, DispatchPhase, ElementInputHandler,
+    Entity, EntityInputHandler, FocusHandle, Focusable, Font, FontStyle, FontWeight, Hsla,
+    KeyDownEvent, Keystroke, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Rgba, ScrollWheelEvent, StrikethroughStyle, Subscription, Task, TextRun,
+    TouchPhase, UTF16Selection, UnderlineStyle, WeakEntity, Window,
 };
 use overseer_proto::{Client, Request, Response, SlotId, SlotState};
 use overseer_term::{
@@ -1198,11 +1198,7 @@ async fn attach(
         Response::Error { message } => return Err(message),
         other => return Err(format!("Unexpected reply: {other:?}")),
     }
-    match hub
-        .attach(client, slot, route_gen)
-        .await
-        .map_err(lost)?
-    {
+    match hub.attach(client, slot, route_gen).await.map_err(lost)? {
         Response::Ok => Ok(()),
         Response::Error { message } => Err(message),
         other => Err(format!("Unexpected reply: {other:?}")),

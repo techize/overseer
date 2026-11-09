@@ -87,7 +87,11 @@ impl TextField {
 
     /// The text with a bar at the cursor, for display.
     pub fn with_cursor(&self) -> String {
-        format!("{}|{}", &self.text[..self.cursor], &self.text[self.cursor..])
+        format!(
+            "{}|{}",
+            &self.text[..self.cursor],
+            &self.text[self.cursor..]
+        )
     }
 }
 
@@ -363,8 +367,16 @@ fn button(id: &'static str, text: &'static str, primary: bool) -> gpui::Stateful
         .rounded(px(5.))
         .border_1()
         .border_color(rgb(colors::BUTTON_BORDER))
-        .bg(rgb(if primary { colors::ACCENT_BG } else { colors::BUTTON }))
-        .text_color(rgb(if primary { colors::ACCENT } else { colors::TEXT }))
+        .bg(rgb(if primary {
+            colors::ACCENT_BG
+        } else {
+            colors::BUTTON
+        }))
+        .text_color(rgb(if primary {
+            colors::ACCENT
+        } else {
+            colors::TEXT
+        }))
         .cursor_pointer()
         .hover(|s| s.bg(rgb(colors::CARD_HOVER)))
         .child(text)
@@ -458,12 +470,17 @@ impl Render for StartDialog {
                             .text_color(rgb(colors::MUTED))
                             .child("Tab next field · Enter start · Esc cancel"),
                     )
-                    .child(button("cancel", "Cancel", false).on_click(
-                        cx.listener(|_, _, _, cx| cx.emit(DialogEvent::Cancelled)),
-                    ))
                     .child(
-                        button("submit", if self.busy { "Starting…" } else { "Start" }, true)
-                            .on_click(cx.listener(|this, _, _, cx| this.submit(cx))),
+                        button("cancel", "Cancel", false)
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DialogEvent::Cancelled))),
+                    )
+                    .child(
+                        button(
+                            "submit",
+                            if self.busy { "Starting…" } else { "Start" },
+                            true,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.submit(cx))),
                     ),
             );
         div()
@@ -527,10 +544,16 @@ mod tests {
         assert_eq!(edit_key(&mut f, &key("escape", None)), DialogKey::Cancel);
         assert_eq!(edit_key(&mut f, &key("enter", None)), DialogKey::Submit);
         assert_eq!(edit_key(&mut f, &key("tab", None)), DialogKey::NextField);
-        assert_eq!(edit_key(&mut f, &key("shift-tab", None)), DialogKey::PrevField);
+        assert_eq!(
+            edit_key(&mut f, &key("shift-tab", None)),
+            DialogKey::PrevField
+        );
         assert_eq!(edit_key(&mut f, &key("cmd-v", None)), DialogKey::Paste);
         assert_eq!(edit_key(&mut f, &key("cmd-1", None)), DialogKey::Ignored);
-        assert_eq!(edit_key(&mut f, &key("ctrl-a", Some("a"))), DialogKey::Ignored);
+        assert_eq!(
+            edit_key(&mut f, &key("ctrl-a", Some("a"))),
+            DialogKey::Ignored
+        );
         assert_eq!(f.text, "");
     }
 

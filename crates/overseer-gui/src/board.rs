@@ -369,7 +369,11 @@ mod tests {
             pid: 4321,
             since: 1000,
         };
-        let m = card_model(&info(1, "health report", st), 1000 + 485, Some(Path::new(HOME)));
+        let m = card_model(
+            &info(1, "health report", st),
+            1000 + 485,
+            Some(Path::new(HOME)),
+        );
         assert_eq!(m.title, "S1 · health report");
         assert_eq!(m.badge, "● Running 8m 05s");
         assert_eq!(m.tone, Tone::Running);

@@ -160,6 +160,13 @@ impl FrameHub {
 
     /// Attaches `slot` for route `gen`. Once the daemon answers `Ok`, the
     /// route gets the snapshot and then live output, and nothing older.
+    ///
+    /// If a newer `route` call (or `unroute`) has superseded `gen`, the
+    /// Attach is never sent and this fails with `Cancelled`: a late Attach
+    /// would make the daemon restart the stream and replay its snapshot into
+    /// the newer, already live route. The check runs under the client's
+    /// request ordering lock, so an Attach that passes it is on the wire
+    /// before the newer route's Attach.
     pub async fn attach(
         &self,
         client: &Client,
@@ -169,10 +176,12 @@ impl FrameHub {
         let routes = self.routes.clone();
         client
             .request_marked(Request::Attach { id: slot }, move |seq| {
-                if let Some(r) = routes.lock().unwrap().by_slot.get_mut(&slot) {
-                    if r.gen == gen {
+                match routes.lock().unwrap().by_slot.get_mut(&slot) {
+                    Some(r) if r.gen == gen => {
                         r.state = RouteState::Attaching(seq);
+                        true
                     }
+                    _ => false,
                 }
             })
             .await
@@ -248,7 +257,13 @@ mod tests {
     }
 
     fn set_state(hub: &FrameHub, slot: SlotId, state: RouteState) {
-        hub.routes.lock().unwrap().by_slot.get_mut(&slot).unwrap().state = state;
+        hub.routes
+            .lock()
+            .unwrap()
+            .by_slot
+            .get_mut(&slot)
+            .unwrap()
+            .state = state;
     }
 
     #[test]
@@ -288,7 +303,10 @@ mod tests {
             seq: 6,
             resp: Response::Ok,
         };
-        assert!(r.dispatch(other).is_some(), "unclaimed reply goes to the app");
+        assert!(
+            r.dispatch(other).is_some(),
+            "unclaimed reply goes to the app"
+        );
         r.dispatch(out(1, b"still stale"));
         let own = Frame::Response {
             seq: 7,
@@ -323,15 +341,17 @@ mod tests {
     #[test]
     fn events_go_to_the_app() {
         let (_rt, hub) = hub();
-        let ev = Frame::Event(overseer_proto::Event::SlotChanged(overseer_proto::SlotInfo {
-            id: 1,
-            label: String::new(),
-            cwd: None,
-            command: None,
-            state: overseer_proto::SlotState::Empty,
-            cols: 80,
-            rows: 24,
-        }));
+        let ev = Frame::Event(overseer_proto::Event::SlotChanged(
+            overseer_proto::SlotInfo {
+                id: 1,
+                label: String::new(),
+                cwd: None,
+                command: None,
+                state: overseer_proto::SlotState::Empty,
+                cols: 80,
+                rows: 24,
+            },
+        ));
         assert_eq!(hub.routes.lock().unwrap().dispatch(ev.clone()), Some(ev));
     }
 }

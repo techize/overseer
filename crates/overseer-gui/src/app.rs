@@ -21,14 +21,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gpui::{
     actions, div, prelude::*, rgb, App, Context, Entity, FocusHandle, Focusable, KeyBinding,
-    Subscription,
-    Task, Window,
+    Subscription, Task, Window,
 };
 use overseer_proto::{Client, Event, Frame, Request, Response, SlotId, SlotInfo, SlotState};
 
 use crate::board::Dir;
-use crate::session::{incarnation, keep_view, restart_begin, restart_on_change, Incarnation};
 use crate::session::RestartPlan;
+use crate::session::{incarnation, keep_view, restart_begin, restart_on_change, Incarnation};
 use crate::start_dialog::{DialogEvent, StartDialog};
 use crate::{FrameHub, TerminalView, Theme};
 
@@ -120,6 +119,32 @@ pub fn needs_tick(screen: Screen, slots: &[SlotInfo]) -> bool {
     }
 }
 
+/// Whether the 1 s elapsed-time ticker runs. The ticker stops itself when
+/// nothing running is visible, so every change to the screen or the slots
+/// must go through `on_change` to start it again.
+#[derive(Debug, Default)]
+pub struct Ticker {
+    running: bool,
+}
+
+impl Ticker {
+    /// After the screen or the slots changed: true when a ticker task must be
+    /// spawned now.
+    pub fn on_change(&mut self, screen: Screen, slots: &[SlotInfo]) -> bool {
+        if self.running || !needs_tick(screen, slots) {
+            return false;
+        }
+        self.running = true;
+        true
+    }
+
+    /// On each tick: true to keep ticking. False stops the ticker.
+    pub fn on_tick(&mut self, screen: Screen, slots: &[SlotInfo]) -> bool {
+        self.running = needs_tick(screen, slots);
+        self.running
+    }
+}
+
 /// The slot `Cmd+N` starts: the selected card on the board, the shown slot in
 /// a session. None when that slot is already running.
 pub fn start_target(screen: Screen, selected: SlotId, slots: &[SlotInfo]) -> Option<SlotId> {
@@ -189,17 +214,24 @@ pub struct OverseerApp {
     root_focus: FocusHandle,
     pub(crate) board_focus: FocusHandle,
     pub(crate) session_focus: FocusHandle,
-    ticking: bool,
+    ticker: Ticker,
     _ticker: Option<Task<()>>,
     _events: Task<()>,
 }
 
 impl OverseerApp {
-    pub fn new(client: Arc<Client>, theme: Theme, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        client: Arc<Client>,
+        theme: Theme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let hub = cx.global::<FrameHub>().clone();
         let mut frames = hub.take_events();
         let events = cx.spawn_in(window, async move |this, cx| {
-            let Some(frames) = frames.as_mut() else { return };
+            let Some(frames) = frames.as_mut() else {
+                return;
+            };
             while let Some(frame) = frames.recv().await {
                 let alive = this.update_in(cx, |this, window, cx| this.on_frame(frame, window, cx));
                 if alive.is_err() {
@@ -215,7 +247,7 @@ impl OverseerApp {
         // it is applied in order with the events around it.
         let lister = client.clone();
         cx.spawn(async move |this, cx| {
-            if let Err(e) = lister.request_marked(Request::ListSlots, |_| {}).await {
+            if let Err(e) = lister.request_marked(Request::ListSlots, |_| true).await {
                 let _ = this.update(cx, |this, cx| {
                     this.status = Some(format!("Lost the daemon: {e:#}"));
                     cx.notify();
@@ -240,7 +272,7 @@ impl OverseerApp {
             root_focus: cx.focus_handle(),
             board_focus,
             session_focus: cx.focus_handle(),
-            ticking: false,
+            ticker: Ticker::default(),
             _ticker: None,
             _events: events,
         }
@@ -316,21 +348,18 @@ impl OverseerApp {
     }
 
     fn ensure_ticker(&mut self, cx: &mut Context<Self>) {
-        if self.ticking || !needs_tick(self.screen, &self.slots) {
+        if !self.ticker.on_change(self.screen, &self.slots) {
             return;
         }
-        self.ticking = true;
         self._ticker = Some(cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(Duration::from_secs(1)).await;
             let more = this
                 .update(cx, |this, cx| {
-                    if needs_tick(this.screen, &this.slots) {
+                    let more = this.ticker.on_tick(this.screen, &this.slots);
+                    if more {
                         cx.notify();
-                        true
-                    } else {
-                        this.ticking = false;
-                        false
                     }
+                    more
                 })
                 .unwrap_or(false);
             if !more {
@@ -391,18 +420,25 @@ impl OverseerApp {
         cx.notify();
     }
 
+    /// The only place the screen changes, so the ticker always restarts when
+    /// a running slot becomes visible again.
+    fn set_screen(&mut self, screen: Screen, cx: &mut Context<Self>) {
+        self.screen = screen;
+        self.ensure_ticker(cx);
+    }
+
     pub(crate) fn go_board(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Screen::Session(id) = self.screen {
             self.selected = id;
         }
-        self.screen = Screen::Board;
+        self.set_screen(Screen::Board, cx);
         self.focus_when_ready = None;
         window.focus(&self.board_focus);
         cx.notify();
     }
 
     pub(crate) fn go_session(&mut self, id: SlotId, window: &mut Window, cx: &mut Context<Self>) {
-        self.screen = Screen::Session(id);
+        self.set_screen(Screen::Session(id), cx);
         self.selected = id;
         match self.ensure_terminal(id, window, cx) {
             Some(view) => {
@@ -415,7 +451,6 @@ impl OverseerApp {
                 window.focus(&self.session_focus)
             }
         }
-        self.ensure_ticker(cx);
         cx.notify();
     }
 
@@ -512,7 +547,10 @@ mod tests {
     /// focused element's own key handling.
     fn routed(key: &str, contexts: &[&str]) -> Option<&'static str> {
         let keymap = Keymap::new(key_bindings());
-        let stack: Vec<KeyContext> = contexts.iter().map(|c| KeyContext::parse(c).unwrap()).collect();
+        let stack: Vec<KeyContext> = contexts
+            .iter()
+            .map(|c| KeyContext::parse(c).unwrap())
+            .collect();
         let ks = Keystroke::parse(key).unwrap();
         let (bindings, _) = keymap.bindings_for_input(&[ks], &stack);
         bindings.first().map(|b| b.action().name())
@@ -578,6 +616,22 @@ mod tests {
         assert!(needs_tick(Screen::Session(3), &slots_with(&[3])));
         assert!(!needs_tick(Screen::Session(2), &slots_with(&[3])));
         assert!(!needs_tick(Screen::Session(9), &slots_with(&[3])));
+    }
+
+    #[test]
+    fn ticker_restarts_when_returning_to_the_board() {
+        let s = slots_with(&[1]);
+        let mut t = Ticker::default();
+        assert!(t.on_change(Screen::Board, &s), "starts on the board");
+        assert!(!t.on_change(Screen::Board, &s), "only one ticker");
+        // An empty session hides every running slot, so the ticker ends.
+        assert!(!t.on_tick(Screen::Session(2), &s));
+        // Back on the board the running card is visible again.
+        assert!(t.on_change(Screen::Board, &s));
+        assert!(t.on_tick(Screen::Board, &s));
+        // Nothing running anywhere: no ticker.
+        let mut idle = Ticker::default();
+        assert!(!idle.on_change(Screen::Board, &slots_with(&[])));
     }
 
     #[test]
