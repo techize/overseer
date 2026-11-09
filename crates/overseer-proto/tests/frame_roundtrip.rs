@@ -113,3 +113,38 @@ fn overseer_home_override() {
     assert_eq!(paths::state_dir(), PathBuf::from("/tmp/x"));
     std::env::remove_var("OVERSEER_HOME");
 }
+
+#[tokio::test]
+async fn truncated_frame_is_unexpected_eof() {
+    // Header promises 10 bytes, only 3 follow.
+    let mut buf = 10u32.to_be_bytes().to_vec();
+    buf.extend_from_slice(&[3, 1, 2]);
+    let mut rd = &buf[..];
+    let err = read_frame(&mut rd).await.unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+
+    // A partial length header is also truncation, not a clean EOF.
+    let mut rd: &[u8] = &[0, 0];
+    let err = read_frame(&mut rd).await.unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+}
+
+#[tokio::test]
+async fn length_just_over_max_rejected() {
+    let len = (overseer_proto::MAX_FRAME + 1) as u32;
+    let mut buf = len.to_be_bytes().to_vec();
+    buf.push(3);
+    let mut rd = &buf[..];
+    let err = read_frame(&mut rd).await.unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[tokio::test]
+async fn unknown_kind_rejected() {
+    let mut buf = 2u32.to_be_bytes().to_vec();
+    buf.extend_from_slice(&[99, 0]);
+    let mut rd = &buf[..];
+    let err = read_frame(&mut rd).await.unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(err.to_string().contains("unknown frame kind"), "{err}");
+}

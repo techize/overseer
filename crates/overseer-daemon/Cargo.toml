@@ -7,7 +7,10 @@ license.workspace = true
 [dependencies]
 overseer-proto = { path = "../overseer-proto" }
 portable-pty.workspace = true
-tokio = { workspace = true, features = ["sync", "rt", "time", "macros"] }
+tokio = { workspace = true, features = ["sync", "rt", "time", "macros", "net", "io-util"] }
 bytes.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
