@@ -13,6 +13,8 @@ clap.workspace = true
 anyhow.workspace = true
 crossterm.workspace = true
 libc = "0.2"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "env-filter", "std"] }
+tracing.workspace = true
 
 [dev-dependencies]
 assert_cmd = "2"

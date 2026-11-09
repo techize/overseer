@@ -4,7 +4,7 @@ mod ctl;
 
 use clap::{Parser, Subcommand};
 use overseer_daemon::DaemonConfig;
-use overseer_proto::paths::socket_path;
+use overseer_proto::paths::{log_dir, socket_path};
 
 #[derive(Parser)]
 #[command(name = "overseer", about = "Host Claude Code sessions in one window")]
@@ -54,12 +54,27 @@ fn main() {
     let result = match command {
         Cmd::InstallAgent => agent::install(),
         Cmd::UninstallAgent => agent::uninstall(),
-        Cmd::Daemon { foreground: _ } => runtime().and_then(|rt| {
-            rt.block_on(overseer_daemon::run(DaemonConfig {
-                socket: socket_path(),
-                default_command: default_command(),
-            }))
-        }),
+        Cmd::Daemon { foreground: _ } => {
+            init_logging("daemon.log");
+            let socket = socket_path();
+            tracing::info!(
+                "daemon {} starting (pid {}) on {}",
+                env!("CARGO_PKG_VERSION"),
+                std::process::id(),
+                socket.display()
+            );
+            let result = runtime().and_then(|rt| {
+                rt.block_on(overseer_daemon::run(DaemonConfig {
+                    socket,
+                    default_command: default_command(),
+                }))
+            });
+            match &result {
+                Ok(()) => tracing::info!("daemon stopped"),
+                Err(e) => tracing::error!("daemon failed: {e:#}"),
+            }
+            result
+        }
         Cmd::Attach { n } => runtime().and_then(|rt| rt.block_on(attach::run(n))),
         Cmd::Ctl { cmd } => runtime().and_then(|rt| rt.block_on(ctl::run(cmd))),
     };
@@ -69,8 +84,33 @@ fn main() {
     }
 }
 
+/// Sends tracing output to `name` in the log dir, filtered by `RUST_LOG`
+/// (default `info`). Falls back to stderr if the file cannot be opened.
+fn init_logging(name: &str) {
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let dir = log_dir();
+    let file = std::fs::create_dir_all(&dir).and_then(|()| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join(name))
+    });
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(false);
+    let _ = match file {
+        Ok(f) => builder.with_writer(std::sync::Mutex::new(f)).try_init(),
+        Err(e) => {
+            eprintln!("overseer: cannot open log in {}: {e}", dir.display());
+            builder.with_writer(std::io::stderr).try_init()
+        }
+    };
+}
+
 /// Connects (starting the daemon if needed) and opens the window.
 fn gui() -> anyhow::Result<()> {
+    init_logging("gui.log");
     let rt = runtime()?;
     let client = rt.block_on(ctl::connect())?;
     overseer_gui::run_gui(std::sync::Arc::new(client), rt.handle().clone());

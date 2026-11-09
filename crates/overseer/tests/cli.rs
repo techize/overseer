@@ -107,3 +107,36 @@ fn attach_empty_slot_message() {
         "{stderr}"
     );
 }
+
+#[test]
+fn daemon_logs_and_exits_zero_on_shutdown() {
+    let env = Env::new();
+    let mut daemon = StdCommand::new(assert_cmd::cargo::cargo_bin("overseer"))
+        .env("OVERSEER_HOME", &env.home)
+        .env("OVERSEER_DEFAULT_COMMAND", SCRIPT)
+        .args(["daemon", "--foreground"])
+        .spawn()
+        .unwrap();
+    // Wait for the socket so ctl does not autostart a second daemon.
+    let up = Instant::now() + Duration::from_secs(5);
+    while !env.home.join("overseer.sock").exists() {
+        assert!(Instant::now() < up, "daemon did not bind");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    env.ctl(&["start", "1", "--cwd", "/tmp"]).assert().success();
+    env.ctl(&["shutdown"]).assert().success();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(s) = daemon.try_wait().unwrap() {
+            break s;
+        }
+        assert!(Instant::now() < deadline, "daemon did not exit");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    // launchd keeps a cleanly exited daemon down, so this must be 0.
+    assert_eq!(status.code(), Some(0));
+    let log = std::fs::read_to_string(env.home.join("logs/daemon.log")).unwrap();
+    assert!(log.contains("starting"), "{log}");
+    assert!(log.contains("S1 started"), "{log}");
+    assert!(log.contains("daemon stopped"), "{log}");
+}

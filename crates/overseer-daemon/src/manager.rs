@@ -83,9 +83,20 @@ impl SlotManager {
         }
         let command = command.unwrap_or_else(|| self.default_command.clone());
         let (tx, monitor_rx) = broadcast::channel(OUTPUT_CHANNEL_CAP);
-        let slot = Slot::spawn(id, label, cwd, &command, DEFAULT_COLS, DEFAULT_ROWS, tx)
-            .map_err(|e| format!("{e:#}"))?;
+        let slot =
+            Slot::spawn(id, label, cwd, &command, DEFAULT_COLS, DEFAULT_ROWS, tx).map_err(|e| {
+                tracing::warn!("{} failed to start {:?}: {e:#}", slot_name(id), command);
+                format!("{e:#}")
+            })?;
         let slot = Arc::new(slot);
+        if let SlotState::Running { pid, .. } = slot.info().state {
+            tracing::info!(
+                "{} started {:?} in {} (pid {pid})",
+                slot_name(id),
+                command,
+                cwd.display()
+            );
+        }
         // N4: tear down whatever occupied the slot before (an exited child;
         // kill is a no-op then, but keeps the invariant in one place).
         if let Some(old) = slots[id as usize].replace(Entry { slot: slot.clone() }) {
@@ -201,6 +212,9 @@ async fn monitor_exit(
     // identity and send under the same lock `start` uses to replace and
     // announce.
     let info = slot.info();
+    if let SlotState::Exited { code, .. } = &info.state {
+        tracing::info!("{} exited (code {code:?})", slot_name(info.id));
+    }
     let slots = slots.lock().unwrap();
     let current = slots[info.id as usize]
         .as_ref()

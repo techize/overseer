@@ -34,8 +34,17 @@ pub enum CtlCmd {
     Shutdown,
 }
 
-/// Spawns `current_exe() daemon` in its own session, logging to `daemon.log`.
+/// Starts the daemon. With the LaunchAgent installed (and the default state
+/// dir) this kickstarts the agent, so the daemon runs under launchd with the
+/// agent's PATH. Otherwise it spawns `current_exe() daemon` in its own
+/// session, logging to `daemon.log`.
 pub fn spawn_daemon() -> io::Result<()> {
+    let plist_exists = crate::agent::plist_path().is_ok_and(|p| p.exists());
+    if crate::agent::use_launchd(std::env::var_os("OVERSEER_HOME"), plist_exists)
+        && crate::agent::kickstart()
+    {
+        return Ok(());
+    }
     let exe = std::env::current_exe()?;
     let dir = log_dir();
     // If the log cannot be opened the daemon still starts, just silently.
