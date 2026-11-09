@@ -38,6 +38,8 @@ pub struct Slot {
     writer: Mutex<Box<dyn Write + Send>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     ring: Arc<Mutex<RingBuffer>>,
+    /// Weak so the channel still closes when the reader thread ends.
+    out: broadcast::WeakSender<Bytes>,
     exit_rx: watch::Receiver<ExitValue>,
     exited_at: Arc<Mutex<Option<i64>>>,
 }
@@ -83,6 +85,7 @@ impl Slot {
         let writer = pair.master.take_writer().context("take pty writer")?;
 
         let ring = Arc::new(Mutex::new(RingBuffer::new(RING_CAP)));
+        let out_weak = out.downgrade();
         let reader_ring = ring.clone();
         std::thread::Builder::new()
             .name(format!("pty-read-{}", slot_name(id)))
@@ -92,8 +95,11 @@ impl Slot {
                     match reader.read(&mut buf) {
                         Ok(0) => break,
                         Ok(n) => {
-                            // Ring first, so snapshot-then-subscribe never misses bytes.
-                            reader_ring.lock().unwrap().push(&buf[..n]);
+                            // Push and broadcast under one lock so `attach` sees
+                            // each chunk either in its snapshot or on its
+                            // receiver, never both and never neither.
+                            let mut ring = reader_ring.lock().unwrap();
+                            ring.push(&buf[..n]);
                             let _ = out.send(Bytes::copy_from_slice(&buf[..n]));
                         }
                         Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -141,6 +147,7 @@ impl Slot {
             writer: Mutex::new(writer),
             killer: Mutex::new(killer),
             ring,
+            out: out_weak,
             exit_rx,
             exited_at,
         })
@@ -174,13 +181,23 @@ impl Slot {
         }
     }
 
-    /// Current ring contents.
-    ///
-    /// Output is pushed to the ring BEFORE it is broadcast, so a client that
-    /// takes a snapshot and then subscribes never misses bytes. It may see a
-    /// one-off duplicate of bytes that landed between the two calls.
+    /// Current ring contents. For attaching a client use [`Slot::attach`],
+    /// which pairs the snapshot with a gap-free live receiver.
     pub fn snapshot(&self) -> Vec<u8> {
         self.ring.lock().unwrap().contents()
+    }
+
+    /// Atomically take the ring contents and subscribe to live output.
+    ///
+    /// The reader thread pushes to the ring and broadcasts under the ring
+    /// lock, and this takes the same lock, so the snapshot plus the receiver's
+    /// bytes form the exact output stream: no gap and no duplicate. (If the
+    /// ring has wrapped, the snapshot starts at the oldest retained byte.)
+    /// The receiver is `None` once the output stream has ended.
+    pub fn attach(&self) -> (Vec<u8>, Option<broadcast::Receiver<Bytes>>) {
+        let ring = self.ring.lock().unwrap();
+        let rx = self.out.upgrade().map(|tx| tx.subscribe());
+        (ring.contents(), rx)
     }
 
     pub fn info(&self) -> SlotInfo {

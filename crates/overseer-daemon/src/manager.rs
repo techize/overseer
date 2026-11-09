@@ -29,8 +29,6 @@ fn invalid_id(id: SlotId) -> String {
 
 struct Entry {
     slot: Arc<Slot>,
-    /// Weak so that the output channel closes when the reader thread ends.
-    out: broadcast::WeakSender<Bytes>,
 }
 
 pub struct SlotManager {
@@ -42,7 +40,7 @@ pub struct SlotManager {
 /// What a client needs to attach to a slot.
 pub struct Attachment {
     pub slot: Arc<Slot>,
-    /// Live output, subscribed BEFORE the snapshot was taken. `None` when the
+    /// Live output, gap-free and duplicate-free after `snapshot`. `None` when the
     /// slot's output stream has already ended (the snapshot is all there is).
     pub live: Option<broadcast::Receiver<Bytes>>,
     pub snapshot: Vec<u8>,
@@ -78,16 +76,12 @@ impl SlotManager {
         }
         let command = command.unwrap_or_else(|| self.default_command.clone());
         let (tx, monitor_rx) = broadcast::channel(OUTPUT_CHANNEL_CAP);
-        let out = tx.downgrade();
         let slot = Slot::spawn(id, label, cwd, &command, DEFAULT_COLS, DEFAULT_ROWS, tx)
             .map_err(|e| format!("{e:#}"))?;
         let slot = Arc::new(slot);
         // N4: tear down whatever occupied the slot before (an exited child;
         // kill is a no-op then, but keeps the invariant in one place).
-        if let Some(old) = self.slots[id as usize].replace(Entry {
-            slot: slot.clone(),
-            out,
-        }) {
+        if let Some(old) = self.slots[id as usize].replace(Entry { slot: slot.clone() }) {
             old.slot.kill();
         }
         let _ = self.events.send(Event::SlotChanged(slot.info()));
@@ -140,11 +134,7 @@ impl SlotManager {
         let entry = self.slots[id as usize]
             .as_ref()
             .ok_or_else(|| format!("{} is empty", slot_name(id)))?;
-        // Subscribe first, then snapshot. The reader pushes to the ring before
-        // it broadcasts, so every byte is in the snapshot, the live stream, or
-        // both (a rare duplicate). The reverse order could lose bytes.
-        let live = entry.out.upgrade().map(|tx| tx.subscribe());
-        let snapshot = entry.slot.snapshot();
+        let (snapshot, live) = entry.slot.attach();
         Ok(Attachment {
             slot: entry.slot.clone(),
             live,

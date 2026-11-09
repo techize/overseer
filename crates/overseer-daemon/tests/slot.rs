@@ -103,3 +103,55 @@ async fn ring_caps_flood() {
     assert!(tail.contains("FLOOD-END"), "tail {tail:?}");
     drain.abort();
 }
+
+#[tokio::test]
+async fn attach_mid_stream_has_no_gap_or_duplicate() {
+    let (tx, _keep) = broadcast::channel(65536);
+    drop(_keep);
+    // ~3.4 MB of numbered lines, under the 4 MiB ring so nothing wraps.
+    let slot = Slot::spawn(
+        5,
+        "seq".into(),
+        Path::new("/tmp"),
+        &[
+            "/usr/bin/awk".into(),
+            "BEGIN { for (i = 0; i < 500000; i++) print i }".into(),
+        ],
+        80,
+        24,
+        tx,
+    )
+    .unwrap();
+    // Attach as soon as some output exists, i.e. mid-stream.
+    let (snap, rx) = loop {
+        let (snap, rx) = slot.attach();
+        if !snap.is_empty() {
+            break (snap, rx);
+        }
+        tokio::task::yield_now().await;
+    };
+    let mut rx = rx.expect("stream still open");
+    let mut all = snap;
+    timeout(Duration::from_secs(20), async {
+        loop {
+            match rx.recv().await {
+                Ok(b) => all.extend_from_slice(&b),
+                Err(broadcast::error::RecvError::Lagged(n)) => panic!("lagged {n}"),
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let text = String::from_utf8(all).unwrap();
+    let mut expect = 0u32;
+    for line in text.lines() {
+        assert_eq!(
+            line.trim().parse::<u32>().unwrap(),
+            expect,
+            "seam at {expect}"
+        );
+        expect += 1;
+    }
+    assert_eq!(expect, 500000);
+}
