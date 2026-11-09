@@ -394,3 +394,28 @@ async fn shutdown_kills_and_removes_socket() {
     assert!(res.0.unwrap().is_ok());
     assert!(!res.1.socket.exists());
 }
+
+/// A program writing one short line per syscall (as `seq` does on a TTY)
+/// produces a flood of tiny PTY reads. An attached client that keeps up must
+/// not be dropped as slow, which needs queued chunks merged into few frames.
+#[tokio::test]
+async fn line_at_a_time_burst_does_not_drop_live_client() {
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    let start = Request::StartSlot {
+        id: 2,
+        label: "burst".into(),
+        cwd: PathBuf::from("/tmp"),
+        command: Some(vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "sleep 0.5; seq 1 200000; echo BURST-END".into(),
+        ]),
+    };
+    assert_eq!(c.request(start).await, Response::Ok);
+    assert_eq!(c.request(Request::Attach { id: 2 }).await, Response::Ok);
+    let out = timeout(WAIT * 4, c.output_until(2, "BURST-END"))
+        .await
+        .expect("burst did not arrive");
+    assert!(out.contains("199999"));
+}

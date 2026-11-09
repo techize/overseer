@@ -275,6 +275,36 @@ fn handle_request(
     }
 }
 
+/// Largest Output frame built by merging queued chunks.
+const COALESCE_MAX: usize = 64 * 1024;
+
+/// Appends the chunks already waiting in `live` to `first`, up to
+/// `COALESCE_MAX` bytes, so a program that writes one line per syscall (each
+/// a tiny PTY read) costs one frame per wakeup instead of one per line. The
+/// outbound queue counts frames, so without this a client that keeps up is
+/// still cut off as slow during a burst. Returns the bytes and whether the
+/// stream has closed.
+fn coalesce(first: Bytes, live: &mut broadcast::Receiver<Bytes>, id: SlotId) -> (Bytes, bool) {
+    let mut buf: Option<Vec<u8>> = None;
+    let mut closed = false;
+    while buf.as_ref().map_or(first.len(), Vec::len) < COALESCE_MAX {
+        match live.try_recv() {
+            Ok(more) => buf
+                .get_or_insert_with(|| first.to_vec())
+                .extend_from_slice(&more),
+            Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                tracing::warn!("{} output lagged by {n} chunks", slot_name(id));
+            }
+            Err(broadcast::error::TryRecvError::Empty) => break,
+            Err(broadcast::error::TryRecvError::Closed) => {
+                closed = true;
+                break;
+            }
+        }
+    }
+    (buf.map_or(first, Bytes::from), closed)
+}
+
 /// Sends the snapshot as one `Output` frame, then forwards live output until
 /// the stream ends, the connection dies or the client detaches.
 fn start_stream(
@@ -297,18 +327,22 @@ fn start_stream(
     let outbox = outbox.clone();
     attached[id as usize] = Some(tokio::spawn(async move {
         loop {
-            match live.recv().await {
-                Ok(data) => {
-                    if !outbox.send(Frame::Output { id, data }) {
-                        break;
-                    }
-                }
+            let first = match live.recv().await {
+                Ok(data) => data,
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     tracing::warn!("{} output lagged by {n} chunks", slot_name(id));
+                    continue;
                 }
                 // Output ended (child exited and the PTY drained). Everything
                 // buffered before the close has already been delivered.
                 Err(broadcast::error::RecvError::Closed) => break,
+            };
+            let (data, closed) = coalesce(first, &mut live, id);
+            if !data.is_empty() && !outbox.send(Frame::Output { id, data }) {
+                break;
+            }
+            if closed {
+                break;
             }
         }
     }));
