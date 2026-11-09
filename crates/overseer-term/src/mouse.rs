@@ -19,6 +19,10 @@ pub struct TermModes {
     pub mouse: MouseMode,
     pub sgr_mouse: bool,
     pub alt_screen: bool,
+    /// Focus in and out reports (DEC 1004).
+    pub focus_reporting: bool,
+    /// Wheel becomes arrow keys on the alternate screen (DEC 1007).
+    pub alternate_scroll: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -45,7 +45,10 @@ fn default_command() -> Vec<String> {
 fn main() {
     let cli = Cli::parse();
     let Some(command) = cli.command else {
-        overseer_gui::run_gui_spike();
+        if let Err(e) = gui() {
+            eprintln!("overseer: {e:#}");
+            std::process::exit(1);
+        }
         return;
     };
     let result = match command {
@@ -64,6 +67,14 @@ fn main() {
         eprintln!("overseer: {e:#}");
         std::process::exit(1);
     }
+}
+
+/// Connects (starting the daemon if needed) and opens the window.
+fn gui() -> anyhow::Result<()> {
+    let rt = runtime()?;
+    let client = rt.block_on(ctl::connect())?;
+    overseer_gui::run_gui(std::sync::Arc::new(client), rt.handle().clone());
+    Ok(())
 }
 
 fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {

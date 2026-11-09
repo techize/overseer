@@ -334,6 +334,11 @@ impl TermBridge {
         self.term.scroll_display(Scroll::Delta(delta_lines));
     }
 
+    /// Return the viewport to live output.
+    pub fn scroll_to_bottom(&mut self) {
+        self.term.scroll_display(Scroll::Bottom);
+    }
+
     fn resolve(&self, color: Color) -> Rgb {
         match color {
             Color::Spec(rgb) => rgb.into(),
@@ -417,6 +422,8 @@ impl TermBridge {
             mouse,
             sgr_mouse: m.contains(TermMode::SGR_MOUSE),
             alt_screen: m.contains(TermMode::ALT_SCREEN),
+            focus_reporting: m.contains(TermMode::FOCUS_IN_OUT),
+            alternate_scroll: m.contains(TermMode::ALTERNATE_SCROLL),
         }
     }
 
@@ -540,6 +547,27 @@ mod tests {
     }
 
     #[test]
+    fn focus_reporting_mode() {
+        let mut b = TermBridge::new(80, 24, DEFAULT_SCROLLBACK);
+        assert!(!b.modes().focus_reporting);
+        b.feed(b"\x1b[?1004h");
+        assert!(b.modes().focus_reporting);
+        b.feed(b"\x1b[?1004l");
+        assert!(!b.modes().focus_reporting);
+    }
+
+    #[test]
+    fn alternate_scroll_mode() {
+        let mut b = TermBridge::new(80, 24, DEFAULT_SCROLLBACK);
+        // On by default, as in alacritty and iTerm2.
+        assert!(b.modes().alternate_scroll);
+        b.feed(b"\x1b[?1007l");
+        assert!(!b.modes().alternate_scroll);
+        b.feed(b"\x1b[?1007h");
+        assert!(b.modes().alternate_scroll);
+    }
+
+    #[test]
     fn bracketed_paste_mode() {
         let mut b = TermBridge::new(80, 24, DEFAULT_SCROLLBACK);
         assert!(!b.modes().bracketed_paste);
@@ -607,6 +635,9 @@ mod tests {
         b.scroll(3);
         assert_eq!(b.snapshot().display_offset, 3);
         b.scroll(-10);
+        assert_eq!(b.snapshot().display_offset, 0);
+        b.scroll(7);
+        b.scroll_to_bottom();
         assert_eq!(b.snapshot().display_offset, 0);
     }
 

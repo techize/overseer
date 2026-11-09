@@ -3388,7 +3388,15 @@ dependencies = [
 name = "overseer-gui"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "bytes",
  "gpui",
+ "overseer-daemon",
+ "overseer-proto",
+ "overseer-term",
+ "serde",
+ "tokio",
+ "toml 0.8.23",
 ]
 
 [[package]]
