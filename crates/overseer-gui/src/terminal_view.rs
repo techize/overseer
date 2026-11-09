@@ -1165,6 +1165,21 @@ fn feed(shared: &Shared, data: &[u8]) {
     }
 }
 
+/// Feeds the attach snapshot and throws away the replies it produced. The
+/// snapshot is old output: answering the queries in it (device attributes,
+/// cursor reports, colour queries) would type stale answers into the live
+/// session. The daemon already strips the queries it knows; this catches the
+/// rest. Only queries in live output are answered.
+fn feed_snapshot(shared: &Shared, data: &[u8]) {
+    feed(shared, data);
+    drop(shared.bridge.lock().unwrap().take_pty_writes());
+}
+
+/// Status text when the connection to the daemon has gone. Phase 1 has no
+/// reconnect, so it says how to get one.
+pub const LOST_DAEMON: &str =
+    "Lost the connection to the daemon. Quit and reopen Overseer to reconnect.";
+
 /// Sizes the bridge to the slot's PTY (so the replay renders as it was
 /// drawn), then attaches. Returns a message for the user on failure.
 async fn attach(
@@ -1174,7 +1189,7 @@ async fn attach(
     route_gen: u64,
     shared: &Shared,
 ) -> Result<(), String> {
-    let lost = |e: anyhow::Error| format!("Lost the daemon: {e:#}");
+    let lost = |e: anyhow::Error| format!("{LOST_DAEMON} ({e:#})");
     match client.request(Request::ListSlots).await.map_err(lost)? {
         Response::Slots(slots) => {
             let info = slots
@@ -1270,10 +1285,20 @@ async fn pump(
                         "The view fell too far behind the daemon, so the connection was dropped."
                             .into()
                     } else {
-                        "Lost the connection to the daemon.".into()
+                        LOST_DAEMON.into()
                     });
                     shared.wake(&wake);
                     return;
+                }
+                Some(data) if !replayed => {
+                    // The snapshot, alone: live output queued behind it is
+                    // fed (and its queries answered) on the next turn.
+                    feed_snapshot(&shared, &data);
+                    replayed = true;
+                    if let Some((cols, rows)) = pending.take() {
+                        apply_resize(slot, &client, &shared, cols, rows);
+                    }
+                    shared.wake(&wake);
                 }
                 Some(data) => {
                     feed(&shared, &data);
@@ -1284,12 +1309,6 @@ async fn pump(
                         budget = budget.saturating_sub(more.len());
                     }
                     shared.flush_writes(&client, slot);
-                    if !replayed {
-                        replayed = true;
-                        if let Some((cols, rows)) = pending.take() {
-                            apply_resize(slot, &client, &shared, cols, rows);
-                        }
-                    }
                     shared.wake(&wake);
                 }
             },
@@ -1350,6 +1369,25 @@ struct Geometry {
     cursor: (usize, usize),
     /// Last size sent to the pump.
     requested: Option<(u16, u16)>,
+}
+
+impl Geometry {
+    /// The size to send for a layout of `cols` x `rows`: Some when it is not
+    /// the size sent last.
+    fn take_resize(&mut self, cols: u16, rows: u16) -> Option<(u16, u16)> {
+        (self.requested != Some((cols, rows))).then(|| {
+            self.requested = Some((cols, rows));
+            (cols, rows)
+        })
+    }
+
+    /// I3: forgets the size sent last, so the next layout sends it again.
+    /// Another client (`overseer attach` in a smaller pane) may have resized
+    /// the PTY since. Called when the view gains focus, so the client the
+    /// user turns to wins, and two clients never resize each other in a loop.
+    fn forget_requested(&mut self) {
+        self.requested = None;
+    }
 }
 
 /// A Cmd+hovered link: the viewport cell under the pointer and the link
@@ -1563,6 +1601,11 @@ impl TerminalView {
         let focused = self.focus_handle.is_focused(window) && window.is_window_active();
         if focused != self.focus_reported {
             self.focus_reported = focused;
+            if focused {
+                let mut g = self.geometry.get();
+                g.forget_requested();
+                self.geometry.set(g);
+            }
             if let Some(report) = focus_report(focused, &self.modes()) {
                 self.send(report);
             }
@@ -2490,8 +2533,7 @@ impl Render for TerminalView {
                 g.size = (w, h);
                 g.cols = cols as usize;
                 g.rows = rows as usize;
-                if g.requested != Some((cols, rows)) {
-                    g.requested = Some((cols, rows));
+                if let Some((cols, rows)) = g.take_resize(cols, rows) {
                     let _ = cmds.send(Cmd::Resize { cols, rows });
                 }
                 geometry.set(g);
@@ -2614,6 +2656,39 @@ mod tests {
         width: 8.0,
         height: 16.0,
     };
+
+    fn shared() -> Shared {
+        Shared {
+            bridge: Mutex::new(TermBridge::new(80, 24, 100)),
+            dirty: AtomicBool::new(false),
+            status: Mutex::new(None),
+            cwd: Mutex::new(None),
+        }
+    }
+
+    #[test]
+    fn snapshot_replay_answers_no_queries_but_live_output_does() {
+        let s = shared();
+        // DA1, DSR, OSC 11 colour query and CSI 14 t, as Claude Code sends
+        // them at startup, sitting in the replayed history.
+        let queries = b"\x1b[c\x1b[6n\x1b]11;?\x07\x1b[14t";
+        feed_snapshot(&s, queries);
+        assert!(s.bridge.lock().unwrap().take_pty_writes().is_empty());
+        feed(&s, b"\x1b[c");
+        assert!(!s.bridge.lock().unwrap().take_pty_writes().is_empty());
+    }
+
+    #[test]
+    fn focus_gain_resends_the_size() {
+        let mut g = Geometry::default();
+        assert_eq!(g.take_resize(100, 30), Some((100, 30)));
+        // Same layout, nothing to send, even if another client has resized
+        // the PTY meanwhile.
+        assert_eq!(g.take_resize(100, 30), None);
+        g.forget_requested();
+        assert_eq!(g.take_resize(100, 30), Some((100, 30)));
+        assert_eq!(g.take_resize(100, 30), None);
+    }
 
     #[test]
     fn grid_size_floors_and_clamps() {

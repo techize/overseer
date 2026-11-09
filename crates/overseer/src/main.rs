@@ -119,11 +119,23 @@ fn init_logging(name: &str) {
     };
 }
 
-/// Connects (starting the daemon if needed) and opens the window.
+/// Connects (starting the daemon if needed) and opens the window. If the
+/// daemon cannot be reached, shows the error in a window (a Finder launch
+/// has no terminal for stderr) and exits 1 once it is dismissed.
 fn gui() -> anyhow::Result<()> {
     init_logging("gui.log");
     let rt = runtime()?;
-    let client = rt.block_on(ctl::connect())?;
+    let client = match rt.block_on(ctl::connect()) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("cannot reach the daemon: {e:#}");
+            eprintln!("overseer: {e:#}");
+            overseer_gui::run_startup_error(
+                format!("{e:#}"),
+                overseer_gui::startup_error::advice(&log_dir()),
+            );
+        }
+    };
     overseer_gui::run_gui(std::sync::Arc::new(client), rt.handle().clone());
     Ok(())
 }

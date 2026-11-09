@@ -4,6 +4,7 @@ pub mod app;
 pub mod board;
 pub mod session;
 pub mod start_dialog;
+pub mod startup_error;
 pub mod terminal_view;
 pub mod theme;
 
@@ -19,6 +20,7 @@ use overseer_proto::{Client, Frame, Request, Response, SlotId};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 
+pub use startup_error::run_startup_error;
 pub use terminal_view::TerminalView;
 pub use theme::Theme;
 

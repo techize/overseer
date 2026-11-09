@@ -239,7 +239,7 @@ impl OverseerApp {
                 }
             }
             let _ = this.update(cx, |this, cx| {
-                this.status = Some("Lost the connection to the daemon.".into());
+                this.status = Some(crate::terminal_view::LOST_DAEMON.into());
                 cx.notify();
             });
         });
@@ -249,7 +249,7 @@ impl OverseerApp {
         cx.spawn(async move |this, cx| {
             if let Err(e) = lister.request_marked(Request::ListSlots, |_| true).await {
                 let _ = this.update(cx, |this, cx| {
-                    this.status = Some(format!("Lost the daemon: {e:#}"));
+                    this.status = Some(format!("{} ({e:#})", crate::terminal_view::LOST_DAEMON));
                     cx.notify();
                 });
             }
@@ -380,7 +380,7 @@ impl OverseerApp {
             let _ = this.update(cx, |this, cx| {
                 let err = match result {
                     Ok(Response::Error { message }) => Some(message),
-                    Err(e) => Some(format!("Lost the daemon: {e:#}")),
+                    Err(e) => Some(format!("{} ({e:#})", crate::terminal_view::LOST_DAEMON)),
                     Ok(_) => None,
                 };
                 if let Some(e) = err {

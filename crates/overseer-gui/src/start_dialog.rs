@@ -349,7 +349,9 @@ impl StartDialog {
                     Ok(Response::Ok) => cx.emit(DialogEvent::Started(slot)),
                     Ok(Response::Error { message }) => this.error = Some(message),
                     Ok(other) => this.error = Some(format!("Unexpected reply: {other:?}")),
-                    Err(e) => this.error = Some(format!("Lost the daemon: {e:#}")),
+                    Err(e) => {
+                        this.error = Some(format!("{} ({e:#})", crate::terminal_view::LOST_DAEMON))
+                    }
                 }
                 cx.notify();
             });
