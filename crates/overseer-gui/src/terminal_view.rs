@@ -18,8 +18,10 @@
 //! Claude Code reads the image itself), Cmd+F opens a find bar, Cmd+click
 //! opens links and the IME composes dead keys and accents. The selection
 //! lives in the terminal, which moves, clamps or drops it as output scrolls,
-//! clears and resizes. Find matches and the hovered link are not kept
-//! across output: they are searched or looked up again on the content shown.
+//! clears and resizes, and is dropped if it would ever read other text than
+//! it was made on. Find matches and the hovered link are not kept across
+//! output: matches are searched again at most every 200 ms while output
+//! streams, and the link is looked up again on the content shown.
 //!
 //! The pure helpers (cell styling, row layout, pixel to grid, scroll
 //! accumulation, key, wheel and mouse routing, paste, find bar state and
@@ -34,6 +36,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll, Waker};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use gpui::{
@@ -548,9 +551,29 @@ pub fn grid_line(row: usize, display_offset: usize) -> i32 {
 }
 
 /// Viewport row showing grid `line`, if it is on screen.
-pub fn viewport_row(line: i32, display_offset: usize, rows: usize) -> Option<usize> {
+#[cfg(test)]
+fn viewport_row(line: i32, display_offset: usize, rows: usize) -> Option<usize> {
     let row = line as i64 + display_offset as i64;
     (0..rows as i64).contains(&row).then_some(row as usize)
+}
+
+/// Shortest gap between live searches while output streams. Each search
+/// walks the whole scrollback under the terminal lock.
+pub const SEARCH_REFRESH_INTERVAL: Duration = Duration::from_millis(200);
+
+/// How long to wait before searching again, or None when the matches are
+/// current. `dirty` is whether content changed since the last search, made
+/// at `last` (None if never). Searches are at least
+/// `SEARCH_REFRESH_INTERVAL` apart; the one that follows the last change
+/// is the trailing refresh once output settles.
+pub fn search_refresh_delay(dirty: bool, last: Option<Instant>, now: Instant) -> Option<Duration> {
+    if !dirty {
+        return None;
+    }
+    let since = last.map_or(SEARCH_REFRESH_INTERVAL, |t| {
+        now.saturating_duration_since(t)
+    });
+    Some(SEARCH_REFRESH_INTERVAL.saturating_sub(since))
 }
 
 /// Columns of grid `line` covered by the inclusive range `start..=end`.
@@ -1347,6 +1370,10 @@ pub struct TerminalView {
     selecting: bool,
     /// Content version the find bar's matches were searched at.
     searched: u64,
+    /// When the find bar last searched, for throttling live refreshes.
+    last_search: Option<Instant>,
+    /// Pending throttled refresh of the find bar's matches.
+    search_timer: Option<Task<()>>,
     /// A press was reported to the app; motion and release follow it.
     reporting: Option<TermButton>,
     last_report_cell: Option<(usize, usize)>,
@@ -1485,6 +1512,8 @@ impl TerminalView {
                 editor: load_editor(),
                 selecting: false,
                 searched: 0,
+                last_search: None,
+                search_timer: None,
                 reporting: None,
                 last_report_cell: None,
                 find: FindBar::default(),
@@ -1636,13 +1665,18 @@ impl TerminalView {
         let (found, offset, version) = self.search_now();
         self.find.set_matches(found, offset);
         self.searched = version;
+        self.last_search = Some(Instant::now());
         self.reveal_current_match();
+    }
+
+    fn live_search(&self) -> bool {
+        self.find.is_open() && !self.find.query().is_empty()
     }
 
     /// Searches again when output or a resize changed the content since the
     /// last search, keeping the current match near where it was on screen.
     fn refresh_search(&mut self) {
-        if !self.find.is_open() || self.find.query().is_empty() {
+        if !self.live_search() {
             return;
         }
         let version = self.shared.bridge.lock().unwrap().content_version();
@@ -1652,6 +1686,34 @@ impl TerminalView {
         let (found, offset, version) = self.search_now();
         self.find.refresh(found, offset);
         self.searched = version;
+        self.last_search = Some(Instant::now());
+    }
+
+    /// Arms a timer for the next live search when content changed since the
+    /// last one. Rendering never searches itself; the timer fires at most
+    /// once per `SEARCH_REFRESH_INTERVAL`, and re-renders, which arms the
+    /// next one while output keeps changing. Until then the paint skips
+    /// match tints from an older content version.
+    fn schedule_search_refresh(&mut self, cx: &mut Context<Self>) {
+        if !self.live_search() {
+            self.search_timer = None;
+            return;
+        }
+        if self.search_timer.is_some() {
+            return;
+        }
+        let dirty = self.shared.bridge.lock().unwrap().content_version() != self.searched;
+        let Some(delay) = search_refresh_delay(dirty, self.last_search, Instant::now()) else {
+            return;
+        };
+        self.search_timer = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            let _ = this.update(cx, |this: &mut TerminalView, cx| {
+                this.search_timer = None;
+                this.refresh_search();
+                cx.notify();
+            });
+        }));
     }
 
     fn reveal_current_match(&mut self) {
@@ -2371,7 +2433,7 @@ fn paint_cursor(
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let metrics = self.update_metrics(window);
-        self.refresh_search();
+        self.schedule_search_refresh(cx);
         let find_open = self.find.is_open();
         let ps = PaintStyle {
             font: font(self.theme.font_family.clone()),
@@ -3150,6 +3212,79 @@ mod tests {
         let mut c = TermBridge::new(40, 3, 10);
         c.feed(b"see https://other.example/b here\r\n");
         assert_eq!(hover_span(&c.snapshot(), &hover), None);
+    }
+
+    #[test]
+    fn live_search_is_throttled_with_a_trailing_refresh() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        // Nothing changed: no search, however long it has been.
+        assert_eq!(search_refresh_delay(false, None, t0), None);
+        assert_eq!(search_refresh_delay(false, Some(t0), t0 + ms(5000)), None);
+        // First change, or a change after a quiet spell: search now.
+        assert_eq!(search_refresh_delay(true, None, t0), Some(ms(0)));
+        assert_eq!(
+            search_refresh_delay(true, Some(t0), t0 + ms(200)),
+            Some(ms(0))
+        );
+        assert_eq!(
+            search_refresh_delay(true, Some(t0), t0 + ms(900)),
+            Some(ms(0))
+        );
+        // Changes soon after a search wait out the interval, so a stream
+        // is searched at most every 200 ms and the last change still is.
+        assert_eq!(search_refresh_delay(true, Some(t0), t0), Some(ms(200)));
+        assert_eq!(
+            search_refresh_delay(true, Some(t0), t0 + ms(50)),
+            Some(ms(150))
+        );
+        assert_eq!(
+            search_refresh_delay(true, Some(t0), t0 + ms(199)),
+            Some(ms(1))
+        );
+        // A clock that reads earlier than the last search waits the interval.
+        assert_eq!(
+            search_refresh_delay(true, Some(t0 + ms(10)), t0),
+            Some(ms(200))
+        );
+    }
+
+    #[test]
+    fn a_stream_is_searched_at_most_every_interval() {
+        // Content changes every 16 ms for 1 s, then stops. Simulate the
+        // timer: one pending at a time, fired at its deadline.
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let (mut version, mut searched) = (0u64, 0u64);
+        let mut last: Option<Instant> = None;
+        let mut timer: Option<Instant> = None;
+        let mut searches = Vec::new();
+        for tick in 0..=1500u64 {
+            let now = t0 + ms(tick);
+            if tick <= 1000 && tick % 16 == 0 {
+                version += 1;
+            }
+            if timer.is_some_and(|at| at <= now) {
+                timer = None;
+                if version != searched {
+                    searched = version;
+                    last = Some(now);
+                    searches.push(tick);
+                }
+            }
+            if timer.is_none() {
+                if let Some(d) = search_refresh_delay(version != searched, last, now) {
+                    timer = Some(now + d);
+                }
+            }
+        }
+        assert_eq!(searched, version, "the last change was searched");
+        assert!(
+            searches.windows(2).all(|w| w[1] - w[0] >= 200),
+            "{searches:?}"
+        );
+        assert!(searches.len() <= 7, "{searches:?}");
+        assert!(*searches.last().unwrap() <= 1200, "{searches:?}");
     }
 
     #[test]

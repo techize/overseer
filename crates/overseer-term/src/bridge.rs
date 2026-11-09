@@ -287,6 +287,12 @@ pub struct TermBridge {
     window_size: Arc<Mutex<WindowSize>>,
     palette: Palette,
     version: u64,
+    /// The selection's text as recorded when it was made or extended. After
+    /// every content change the live selection must still read exactly this,
+    /// or it is dropped: alacritty can move a selection onto other text (for
+    /// example on reverse scrolls at the top of the screen), and copying must
+    /// give the original text or nothing.
+    selected: Option<String>,
 }
 
 impl TermBridge {
@@ -313,6 +319,7 @@ impl TermBridge {
             window_size,
             palette: Palette::default(),
             version: 0,
+            selected: None,
         }
     }
 
@@ -326,6 +333,7 @@ impl TermBridge {
         self.version += 1;
         self.processor.advance(&mut self.term, bytes);
         self.answer_color_requests();
+        self.check_selection();
     }
 
     /// When a synchronized update (DEC 2026) times out, or None when none is
@@ -345,6 +353,7 @@ impl TermBridge {
             self.version += 1;
             self.processor.stop_sync(&mut self.term);
             self.answer_color_requests();
+            self.check_selection();
         }
     }
 
@@ -374,6 +383,7 @@ impl TermBridge {
     pub fn resize(&mut self, cols: usize, rows: usize) {
         self.version += 1;
         self.term.resize(TermSize::new(cols.max(1), rows.max(1)));
+        self.check_selection();
         if let Ok(mut w) = self.window_size.lock() {
             w.num_cols = cols.min(u16::MAX as usize) as u16;
             w.num_lines = rows.min(u16::MAX as usize) as u16;
@@ -528,7 +538,8 @@ impl TermBridge {
     /// Starts a selection at `pos`, replacing any other. The terminal owns
     /// it from here: alacritty moves it with scrolling output, and clamps,
     /// drops or clears it on eviction, screen clears, alt-screen switches,
-    /// reset and resize.
+    /// reset and resize. Its text is recorded, and after any content change
+    /// the selection is dropped unless it still reads that text.
     pub fn start_selection(&mut self, kind: SelectionKind, pos: GridPos, side: CellSide) {
         let ty = match kind {
             SelectionKind::Simple => SelectionType::Simple,
@@ -537,6 +548,7 @@ impl TermBridge {
         };
         let point = self.clamp_point(pos);
         self.term.selection = Some(TermSelection::new(ty, point, side.into()));
+        self.record_selection();
     }
 
     /// Moves the selection's moving end to `pos`.
@@ -545,10 +557,26 @@ impl TermBridge {
         if let Some(sel) = self.term.selection.as_mut() {
             sel.update(point, side.into());
         }
+        self.record_selection();
     }
 
     pub fn clear_selection(&mut self) {
         self.term.selection = None;
+        self.selected = None;
+    }
+
+    fn record_selection(&mut self) {
+        self.selected = self.term.selection_to_string();
+    }
+
+    /// Drops the selection when the content under it is no longer the text
+    /// it was made on. Runs once per fed batch, flush or resize.
+    fn check_selection(&mut self) {
+        if self.term.selection.is_none() {
+            self.selected = None;
+        } else if self.term.selection_to_string() != self.selected {
+            self.clear_selection();
+        }
     }
 
     /// The selection as an inclusive range, or None when there is none or
@@ -561,9 +589,14 @@ impl TermBridge {
         })
     }
 
-    /// The selected text, or None when nothing is selected.
+    /// The selected text, or None when nothing is selected. It is always
+    /// the text the selection was made on.
     pub fn selection_text(&self) -> Option<String> {
-        self.term.selection_to_string().filter(|t| !t.is_empty())
+        let text = self.term.selection_to_string();
+        if text != self.selected {
+            return None;
+        }
+        text.filter(|t| !t.is_empty())
     }
 
     fn clamp_point(&self, pos: GridPos) -> Point {
@@ -920,6 +953,86 @@ mod tests {
             b.feed(b"\x1b[?1049l");
             b.resize(20, 3);
             same_or_nothing(&b, &orig, "back and shrunk");
+        }
+    }
+
+    /// Selects at grid `line` with `kind` (a drag over "word{i}" for
+    /// Simple) and returns the recorded text.
+    fn select(b: &mut TermBridge, kind: SelectionKind, line: i32) -> String {
+        let at = |col| GridPos { line, col };
+        b.start_selection(kind, at(3), CellSide::Left);
+        if kind == SelectionKind::Simple {
+            b.update_selection(at(7), CellSide::Right);
+        }
+        b.selection_text().expect("something is selected")
+    }
+
+    #[test]
+    fn reverse_scrolls_never_copy_other_text() {
+        let cases: &[(&str, &[u8])] = &[
+            ("RI at top", b"\x1b[H\x1bM"),
+            ("RI twice at top", b"\x1b[H\x1bM\x1bM"),
+            ("SD 1", b"\x1b[1T"),
+            ("SD 3", b"\x1b[3T"),
+            ("IL 1 at row 0", b"\x1b[H\x1b[1L"),
+            ("IL 2 at row 0", b"\x1b[H\x1b[2L"),
+            ("SD 1 in a margin", b"\x1b[2;4r\x1b[1T\x1b[r"),
+            ("DL 1 at row 0", b"\x1b[H\x1b[1M"),
+            ("overwrite in place", b"\x1b[2;1Hr8 XXXXX"),
+            ("overwrite the start", b"\x1b[1;1HXXXXX"),
+        ];
+        for sb in [5, 100] {
+            for (name, bytes) in cases {
+                for line in [-2, -1, 1] {
+                    for kind in [SelectionKind::Simple, SelectionKind::Line] {
+                        let mut b = lines(sb, 10);
+                        let orig = select(&mut b, kind, line);
+                        b.feed(bytes);
+                        let case = format!("sb {sb} {name} line {line} {kind:?}");
+                        same_or_nothing(&b, &orig, &case);
+                        // A dropped selection loses its tint too.
+                        assert_eq!(
+                            b.selection_text().is_some(),
+                            b.snapshot().selection.is_some(),
+                            "{case}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reverse_scroll_drops_a_moved_selection() {
+        // The probe's cases: alacritty moves these onto other text.
+        for sb in [5, 100] {
+            let mut b = lines(sb, 10);
+            assert_eq!(select(&mut b, SelectionKind::Simple, -2), "word5");
+            b.feed(b"\x1b[1T");
+            assert_eq!(b.selection_text(), None, "sb {sb}");
+            assert_eq!(b.snapshot().selection, None, "sb {sb}");
+        }
+    }
+
+    #[test]
+    fn untouched_selection_survives_ordinary_output() {
+        for kind in [
+            SelectionKind::Simple,
+            SelectionKind::Word,
+            SelectionKind::Line,
+        ] {
+            let mut b = lines(100, 10);
+            let orig = select(&mut b, kind, 1);
+            for i in 10..20 {
+                b.feed(format!("r{i} more\r\n").as_bytes());
+            }
+            b.feed(b"partial line");
+            assert_eq!(
+                b.selection_text().as_deref(),
+                Some(orig.as_str()),
+                "{kind:?}"
+            );
+            assert!(b.snapshot().selection.is_some(), "{kind:?}");
         }
     }
 
