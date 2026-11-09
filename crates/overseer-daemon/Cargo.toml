@@ -11,6 +11,8 @@ tokio = { workspace = true, features = ["sync", "rt", "time", "macros", "net", "
 bytes.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+libc = "0.2"
 
 [dev-dependencies]
+overseer-term = { path = "../overseer-term" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }

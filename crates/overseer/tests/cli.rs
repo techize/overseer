@@ -140,3 +140,150 @@ fn daemon_logs_and_exits_zero_on_shutdown() {
     assert!(log.contains("S1 started"), "{log}");
     assert!(log.contains("daemon stopped"), "{log}");
 }
+
+/// Spawns `overseer daemon --foreground` for `env` with extra variables and
+/// waits for its socket.
+fn spawn_daemon(env: &Env, vars: &[(&str, &str)]) -> std::process::Child {
+    let mut cmd = StdCommand::new(assert_cmd::cargo::cargo_bin("overseer"));
+    cmd.env("OVERSEER_HOME", &env.home)
+        .env("OVERSEER_DEFAULT_COMMAND", SCRIPT)
+        .args(["daemon", "--foreground"]);
+    for (k, v) in vars {
+        cmd.env(k, v);
+    }
+    let child = cmd.spawn().unwrap();
+    let up = Instant::now() + Duration::from_secs(5);
+    while !env.home.join("overseer.sock").exists() {
+        assert!(Instant::now() < up, "daemon did not bind");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    child
+}
+
+fn wait_exit(child: &mut std::process::Child, within: Duration) -> std::process::ExitStatus {
+    let deadline = Instant::now() + within;
+    loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            return s;
+        }
+        assert!(Instant::now() < deadline, "process did not exit");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn second_daemon_exits_zero_and_leaves_the_first_running() {
+    let env = Env::new();
+    let mut first = spawn_daemon(&env, &[]);
+    let mut second = StdCommand::new(assert_cmd::cargo::cargo_bin("overseer"))
+        .env("OVERSEER_HOME", &env.home)
+        .args(["daemon", "--foreground"])
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // launchd's KeepAlive {SuccessfulExit=false} respawns non-zero exits.
+    let status = wait_exit(&mut second, Duration::from_secs(5));
+    assert_eq!(status.code(), Some(0));
+    let mut err = String::new();
+    std::io::Read::read_to_string(&mut second.stderr.take().unwrap(), &mut err).unwrap();
+    assert!(err.contains("already running"), "{err}");
+    assert_eq!(stdout_of(&mut env.ctl(&["status"])).lines().count(), 7);
+    assert!(first.try_wait().unwrap().is_none(), "first daemon died");
+    env.ctl(&["shutdown"]).assert().success();
+    wait_exit(&mut first, Duration::from_secs(5));
+}
+
+#[test]
+fn ctl_start_rejects_a_missing_cwd() {
+    let env = Env::new();
+    let missing = env.home.join("no-such-dir");
+    let out = env
+        .ctl(&["start", "1", "--cwd", missing.to_str().unwrap()])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("does not exist or is not a directory"),
+        "{stderr}"
+    );
+    let status = stdout_of(&mut env.ctl(&["status"]));
+    assert!(status.contains("S1  empty"), "{status}");
+}
+
+#[test]
+fn sessions_get_the_login_shell_env_without_parent_session_vars() {
+    let env = Env::new();
+    // A home of our own, so the login shell reads this .profile and not
+    // the real one.
+    let home = env.home.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join(".profile"),
+        "export FROM_PROFILE=yes\nexport CLAUDE_CODE_OAUTH_TOKEN=from-rc\n",
+    )
+    .unwrap();
+    let mut daemon = spawn_daemon(
+        &env,
+        &[
+            ("HOME", home.to_str().unwrap()),
+            ("SHELL", "/bin/sh"),
+            // As if started from inside a Claude Code session.
+            ("CLAUDECODE", "1"),
+            ("CLAUDE_CODE_ENTRYPOINT", "cli"),
+            ("CLAUDE_CODE_SESSION_ID", "parent-session"),
+            ("CLAUDE_CODE_SSE_PORT", "4242"),
+            ("CLAUDE_CODE_OAUTH_TOKEN", "parent-token"),
+            // User configuration that must survive.
+            ("CLAUDE_CODE_USE_BEDROCK", "1"),
+            ("ANTHROPIC_MODEL", "some-model"),
+        ],
+    );
+    let out = env.home.join("slot-env.txt");
+    let script = format!("env > {}.tmp && mv {0}.tmp {0}; sleep 5", out.display());
+    env.ctl(&[
+        "start", "1", "--cwd", "/tmp", "--", "/bin/sh", "-c", &script,
+    ])
+    .assert()
+    .success();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !out.exists() {
+        assert!(Instant::now() < deadline, "slot did not write its env");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let text = std::fs::read_to_string(&out).unwrap();
+    let vars: std::collections::HashMap<&str, &str> =
+        text.lines().filter_map(|l| l.split_once('=')).collect();
+    assert_eq!(
+        vars.get("FROM_PROFILE"),
+        Some(&"yes"),
+        "login shell env not used"
+    );
+    assert_eq!(vars.get("OVERSEER_SLOT"), Some(&"S1"));
+    assert_eq!(vars.get("CLAUDE_CODE_USE_BEDROCK"), Some(&"1"));
+    assert_eq!(vars.get("ANTHROPIC_MODEL"), Some(&"some-model"));
+    // The parent's token is gone; the one the user's rc sets is kept.
+    assert_eq!(vars.get("CLAUDE_CODE_OAUTH_TOKEN"), Some(&"from-rc"));
+    for gone in [
+        "CLAUDECODE",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CLAUDE_CODE_SESSION_ID",
+        "CLAUDE_CODE_SSE_PORT",
+    ] {
+        assert!(!vars.contains_key(gone), "{gone} leaked into the slot");
+    }
+    assert!(
+        vars.contains_key("LANG") || vars.contains_key("LC_ALL"),
+        "no locale"
+    );
+    env.ctl(&["shutdown"]).assert().success();
+    wait_exit(&mut daemon, Duration::from_secs(5));
+    let log = std::fs::read_to_string(env.home.join("logs/daemon.log")).unwrap();
+    assert!(log.contains("login shell:"), "{log}");
+    // Counts only, never values.
+    assert!(
+        !log.contains("from-rc") && !log.contains("parent-token"),
+        "{log}"
+    );
+}

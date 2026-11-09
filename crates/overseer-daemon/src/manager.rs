@@ -8,6 +8,7 @@ use bytes::Bytes;
 use overseer_proto::{slot_name, Event, SlotId, SlotInfo, SlotState};
 use tokio::sync::broadcast;
 
+use crate::env::BaseEnv;
 use crate::slot::Slot;
 
 pub const SLOT_COUNT: usize = 7;
@@ -39,6 +40,8 @@ pub struct SlotManager {
     slots: Slots,
     default_command: Vec<String>,
     events: broadcast::Sender<Event>,
+    /// Environment every slot starts from.
+    env: BaseEnv,
 }
 
 /// What a client needs to attach to a slot.
@@ -56,7 +59,14 @@ impl SlotManager {
             slots: Default::default(),
             default_command,
             events,
+            env: BaseEnv::ready(crate::env::own_env()),
         }
+    }
+
+    /// Uses `env` as the base environment for slots started from now on.
+    pub fn with_env(mut self, env: BaseEnv) -> Self {
+        self.env = env;
+        self
     }
 
     pub fn subscribe_events(&self) -> broadcast::Receiver<Event> {
@@ -73,6 +83,15 @@ impl SlotManager {
         if !valid_id(id) {
             return Err(invalid_id(id));
         }
+        // I4: portable-pty quietly falls back to $HOME for a cwd that is not
+        // a directory, which would run the session somewhere else than every
+        // client shows. The daemon is the source of truth, so it checks.
+        if !cwd.is_dir() {
+            return Err(format!(
+                "working directory {} does not exist or is not a directory",
+                cwd.display()
+            ));
+        }
         // Held through replace and event send so a monitor's identity check
         // cannot interleave with them.
         let mut slots = self.slots.lock().unwrap();
@@ -83,11 +102,21 @@ impl SlotManager {
         }
         let command = command.unwrap_or_else(|| self.default_command.clone());
         let (tx, monitor_rx) = broadcast::channel(OUTPUT_CHANNEL_CAP);
-        let slot =
-            Slot::spawn(id, label, cwd, &command, DEFAULT_COLS, DEFAULT_ROWS, tx).map_err(|e| {
-                tracing::warn!("{} failed to start {:?}: {e:#}", slot_name(id), command);
-                format!("{e:#}")
-            })?;
+        let env = self.env.get();
+        let slot = Slot::spawn_in(
+            id,
+            label,
+            cwd,
+            &command,
+            DEFAULT_COLS,
+            DEFAULT_ROWS,
+            tx,
+            &env,
+        )
+        .map_err(|e| {
+            tracing::warn!("{} failed to start {:?}: {e:#}", slot_name(id), command);
+            format!("{e:#}")
+        })?;
         let slot = Arc::new(slot);
         if let SlotState::Running { pid, .. } = slot.info().state {
             tracing::info!(
@@ -270,5 +299,25 @@ mod tests {
         assert!(matches!(seen[0], SlotState::Running { .. }), "{seen:?}");
         assert!(matches!(mgr.list()[1].state, SlotState::Running { .. }));
         mgr.shutdown_all();
+    }
+
+    #[tokio::test]
+    async fn start_rejects_a_missing_cwd() {
+        let (events, mut ev_rx) = broadcast::channel(16);
+        let mut mgr = SlotManager::new(vec!["/bin/sleep".into(), "30".into()], events);
+        let missing = Path::new("/tmp/overseer-no-such-dir-for-test");
+        let err = mgr.start(2, "x".into(), missing, None).unwrap_err();
+        assert!(
+            err.contains("does not exist or is not a directory"),
+            "{err}"
+        );
+        assert!(err.contains("overseer-no-such-dir-for-test"), "{err}");
+        // A file is not a directory either.
+        let err = mgr
+            .start(2, "x".into(), Path::new("/bin/sh"), None)
+            .unwrap_err();
+        assert!(err.contains("not a directory"), "{err}");
+        assert_eq!(mgr.list()[2].state, SlotState::Empty);
+        assert!(ev_rx.try_recv().is_err(), "no event for a refused start");
     }
 }

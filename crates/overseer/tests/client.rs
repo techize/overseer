@@ -14,6 +14,7 @@ async fn attach_snapshot_precedes_live_output() {
     let task = tokio::spawn(run(DaemonConfig {
         socket: socket.clone(),
         default_command: vec![SCRIPT.to_string()],
+        env: overseer_daemon::EnvSource::Inherit,
     }));
     let client = Client::connect_or_start(&socket, || Ok(())).await.unwrap();
     let mut rx = client.subscribe();

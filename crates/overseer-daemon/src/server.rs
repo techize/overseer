@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{bail, Context};
+use anyhow::Context;
 use bytes::Bytes;
 use overseer_proto::{read_frame, slot_name, write_frame, Event, Frame, Request, Response, SlotId};
 use tokio::io::AsyncWriteExt;
@@ -13,6 +13,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc, watch, Notify};
 use tokio::task::{JoinHandle, JoinSet};
 
+use crate::env::{BaseEnv, EnvSource};
 use crate::manager::{valid_id, Attachment, SlotManager};
 
 /// Frames queued per connection before it is considered too slow.
@@ -26,14 +27,30 @@ pub struct DaemonConfig {
     pub socket: PathBuf,
     /// Command used when `StartSlot` does not name one. Normally `["claude"]`.
     pub default_command: Vec<String>,
+    /// Where sessions get their base environment.
+    pub env: EnvSource,
 }
+
+/// `run` found another daemon serving the socket. Not a failure: the daemon
+/// that was asked for is running, so the process should exit 0 (launchd's
+/// KeepAlive would otherwise respawn it every 10 s).
+#[derive(Debug)]
+pub struct AlreadyRunning;
+
+impl std::fmt::Display for AlreadyRunning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("daemon already running")
+    }
+}
+
+impl std::error::Error for AlreadyRunning {}
 
 type Manager = Arc<Mutex<SlotManager>>;
 
 async fn bind(path: &PathBuf) -> anyhow::Result<UnixListener> {
     if path.exists() {
         match UnixStream::connect(path).await {
-            Ok(_) => bail!("daemon already running"),
+            Ok(_) => return Err(AlreadyRunning.into()),
             Err(e) => {
                 tracing::info!("removing stale socket {}: {e}", path.display());
                 std::fs::remove_file(path).context("remove stale socket")?;
@@ -55,8 +72,13 @@ async fn bind(path: &PathBuf) -> anyhow::Result<UnixListener> {
 
 pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
     let listener = bind(&cfg.socket).await?;
+    // Resolved in the background so clients can connect at once; a
+    // StartSlot waits for it.
+    let env = BaseEnv::start(&cfg.env);
     let (events, _) = broadcast::channel::<Event>(EVENT_CHANNEL_CAP);
-    let manager: Manager = Arc::new(Mutex::new(SlotManager::new(cfg.default_command, events)));
+    let manager: Manager = Arc::new(Mutex::new(
+        SlotManager::new(cfg.default_command, events).with_env(env.clone()),
+    ));
     let shutdown = Arc::new(Notify::new());
     let mut conns = JoinSet::new();
 
@@ -64,7 +86,7 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
         tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
-                    conns.spawn(handle_conn(stream, manager.clone(), shutdown.clone()));
+                    conns.spawn(handle_conn(stream, manager.clone(), shutdown.clone(), env.clone()));
                 }
                 Err(e) => tracing::warn!("accept failed: {e}"),
             },
@@ -173,7 +195,12 @@ impl Streams {
     }
 }
 
-async fn handle_conn(stream: UnixStream, manager: Manager, shutdown: Arc<Notify>) {
+async fn handle_conn(
+    stream: UnixStream,
+    manager: Manager,
+    shutdown: Arc<Notify>,
+    mut env: BaseEnv,
+) {
     let (mut rd, mut wr) = stream.into_split();
     let (out_tx, mut out_rx) = mpsc::channel::<Frame>(OUTBOUND_QUEUE);
     let (dead_tx, mut dead_rx) = watch::channel(false);
@@ -221,7 +248,14 @@ async fn handle_conn(stream: UnixStream, manager: Manager, shutdown: Arc<Notify>
     loop {
         tokio::select! {
             frame = in_rx.recv() => match frame {
-                Some(f) => handle_frame(f, &manager, &outbox, &shutdown, &mut streams),
+                Some(f) => {
+                    // The first starts after launch wait for the login
+                    // shell's environment (bounded by its timeout).
+                    if matches!(&f, Frame::Request { req: Request::StartSlot { .. }, .. }) {
+                        env.wait().await;
+                    }
+                    handle_frame(f, &manager, &outbox, &shutdown, &mut streams)
+                }
                 None => break, // client hung up
             },
             ev = events.recv() => match ev {

@@ -67,10 +67,21 @@ fn main() {
                 rt.block_on(overseer_daemon::run(DaemonConfig {
                     socket,
                     default_command: default_command(),
+                    env: overseer_daemon::EnvSource::LoginShell,
                 }))
             });
             match &result {
                 Ok(()) => tracing::info!("daemon stopped"),
+                // M4: the daemon that was asked for is running, so this is a
+                // success; a non-zero exit would make launchd respawn it.
+                Err(e)
+                    if e.downcast_ref::<overseer_daemon::AlreadyRunning>()
+                        .is_some() =>
+                {
+                    tracing::info!("another daemon is already running; exiting");
+                    eprintln!("overseer: another daemon is already running");
+                    return;
+                }
                 Err(e) => tracing::error!("daemon failed: {e:#}"),
             }
             result

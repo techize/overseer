@@ -1,5 +1,6 @@
 //! A single PTY-backed slot: child process, output ring and output broadcast.
 
+use std::ffi::OsString;
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -45,6 +46,8 @@ pub struct Slot {
 }
 
 impl Slot {
+    /// Spawns with the daemon's own environment (scrubbed, see
+    /// [`crate::env`]). The daemon proper uses [`Slot::spawn_in`].
     pub fn spawn(
         id: SlotId,
         label: String,
@@ -53,6 +56,23 @@ impl Slot {
         cols: u16,
         rows: u16,
         out: broadcast::Sender<Bytes>,
+    ) -> anyhow::Result<Slot> {
+        let env = crate::env::own_env();
+        Slot::spawn_in(id, label, cwd, command, cols, rows, out, &env)
+    }
+
+    /// Spawns `command` with exactly `env` (already scrubbed) plus
+    /// `OVERSEER_SLOT`, `TERM` and `COLORTERM`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_in(
+        id: SlotId,
+        label: String,
+        cwd: &Path,
+        command: &[String],
+        cols: u16,
+        rows: u16,
+        out: broadcast::Sender<Bytes>,
+        env: &[(OsString, OsString)],
     ) -> anyhow::Result<Slot> {
         let (program, args) = command
             .split_first()
@@ -69,6 +89,10 @@ impl Slot {
         let mut cmd = CommandBuilder::new(program);
         cmd.args(args);
         cmd.cwd(cwd);
+        cmd.env_clear();
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
         cmd.env("OVERSEER_SLOT", slot_name(id));
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
@@ -187,17 +211,26 @@ impl Slot {
         self.ring.lock().unwrap().contents()
     }
 
-    /// Atomically take the ring contents and subscribe to live output.
+    /// Atomically take the ring snapshot and subscribe to live output.
     ///
     /// The reader thread pushes to the ring and broadcasts under the ring
     /// lock, and this takes the same lock, so the snapshot plus the receiver's
     /// bytes form the exact output stream: no gap and no duplicate. (If the
-    /// ring has wrapped, the snapshot starts at the oldest retained byte.)
+    /// ring has wrapped, the snapshot starts at the oldest retained byte,
+    /// preceded by a preamble restoring the terminal modes set by the bytes
+    /// it dropped; that preamble is computed under the same lock.)
+    ///
+    /// Terminal queries are removed from the snapshot (outside the lock), so
+    /// a replaying terminal does not answer questions asked long ago. Live
+    /// queries reach the receiver untouched.
     /// The receiver is `None` once the output stream has ended.
     pub fn attach(&self) -> (Vec<u8>, Option<broadcast::Receiver<Bytes>>) {
-        let ring = self.ring.lock().unwrap();
-        let rx = self.out.upgrade().map(|tx| tx.subscribe());
-        (ring.contents(), rx)
+        let (snapshot, rx) = {
+            let ring = self.ring.lock().unwrap();
+            let rx = self.out.upgrade().map(|tx| tx.subscribe());
+            (ring.snapshot(), rx)
+        };
+        (crate::vt::strip_queries(&snapshot), rx)
     }
 
     pub fn info(&self) -> SlotInfo {

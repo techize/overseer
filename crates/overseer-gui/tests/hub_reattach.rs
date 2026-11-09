@@ -74,6 +74,7 @@ async fn setup(name: &str) -> Setup {
     let task = tokio::spawn(run(DaemonConfig {
         socket: socket.clone(),
         default_command: vec![SCRIPT.to_string()],
+        env: overseer_daemon::EnvSource::Inherit,
     }));
     let client = Arc::new(Client::connect_or_start(&socket, || Ok(())).await.unwrap());
     let hub = FrameHub::start(&client, tokio::runtime::Handle::current());

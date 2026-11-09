@@ -40,6 +40,7 @@ async fn start_daemon_at(socket: PathBuf) -> Daemon {
     let cfg = DaemonConfig {
         socket: socket.clone(),
         default_command: vec![SCRIPT.to_string()],
+        env: overseer_daemon::EnvSource::Inherit,
     };
     let task = tokio::spawn(run(cfg));
     for _ in 0..100 {
@@ -308,10 +309,15 @@ async fn second_daemon_refused() {
     let err = run(DaemonConfig {
         socket: d.socket.clone(),
         default_command: vec![SCRIPT.to_string()],
+        env: overseer_daemon::EnvSource::Inherit,
     })
     .await
     .unwrap_err();
     assert!(err.to_string().contains("daemon already running"), "{err}");
+    // M4: typed, so main can exit 0 and launchd does not respawn it.
+    assert!(err
+        .downcast_ref::<overseer_daemon::AlreadyRunning>()
+        .is_some());
 }
 
 #[tokio::test]
