@@ -1,8 +1,9 @@
 //! Bridge between PTY output bytes and an `alacritty_terminal` model.
 
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
-use alacritty_terminal::event::{Event, EventListener};
+use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::Direction;
 use alacritty_terminal::index::{Column, Line, Point};
@@ -101,8 +102,11 @@ pub struct Cell {
     pub fg: Rgb,
     pub bg: Rgb,
     pub bold: bool,
+    pub dim: bool,
     pub italic: bool,
     pub underline: bool,
+    pub strikethrough: bool,
+    pub hidden: bool,
     pub inverse: bool,
     /// True for the leading cell of a double-width character. The following
     /// cell is its spacer.
@@ -176,17 +180,56 @@ pub struct Selection {
     pub end: GridPos,
 }
 
-#[derive(Clone, Default)]
+type ColorFmt = Arc<dyn Fn(VteRgb) -> String + Sync + Send + 'static>;
+
+#[derive(Clone)]
 struct Listener {
     writes: Arc<Mutex<Vec<u8>>>,
+    /// Colour queries waiting to be resolved against the effective palette.
+    color_requests: Arc<Mutex<Vec<(usize, ColorFmt)>>>,
+    window_size: Arc<Mutex<WindowSize>>,
+}
+
+impl Default for Listener {
+    fn default() -> Self {
+        Listener {
+            writes: Arc::default(),
+            color_requests: Arc::default(),
+            window_size: Arc::new(Mutex::new(WindowSize {
+                num_lines: 0,
+                num_cols: 0,
+                cell_width: 0,
+                cell_height: 0,
+            })),
+        }
+    }
 }
 
 impl EventListener for Listener {
     fn send_event(&self, event: Event) {
-        if let Event::PtyWrite(text) = event {
-            if let Ok(mut w) = self.writes.lock() {
-                w.extend_from_slice(text.as_bytes());
+        match event {
+            Event::PtyWrite(text) => {
+                if let Ok(mut w) = self.writes.lock() {
+                    w.extend_from_slice(text.as_bytes());
+                }
             }
+            Event::ColorRequest(idx, fmt) => {
+                if let Ok(mut r) = self.color_requests.lock() {
+                    r.push((idx, fmt));
+                }
+            }
+            Event::TextAreaSizeRequest(fmt) => {
+                let size = self.window_size.lock().map(|s| *s).unwrap_or(WindowSize {
+                    num_lines: 0,
+                    num_cols: 0,
+                    cell_width: 0,
+                    cell_height: 0,
+                });
+                if let Ok(mut w) = self.writes.lock() {
+                    w.extend_from_slice(fmt(size).as_bytes());
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -195,6 +238,8 @@ pub struct TermBridge {
     term: Term<Listener>,
     processor: Processor,
     writes: Arc<Mutex<Vec<u8>>>,
+    color_requests: Arc<Mutex<Vec<(usize, ColorFmt)>>>,
+    window_size: Arc<Mutex<WindowSize>>,
     palette: Palette,
 }
 
@@ -202,6 +247,12 @@ impl TermBridge {
     pub fn new(cols: usize, rows: usize, scrollback_lines: usize) -> Self {
         let listener = Listener::default();
         let writes = listener.writes.clone();
+        let color_requests = listener.color_requests.clone();
+        let window_size = listener.window_size.clone();
+        if let Ok(mut w) = window_size.lock() {
+            w.num_cols = cols.min(u16::MAX as usize) as u16;
+            w.num_lines = rows.min(u16::MAX as usize) as u16;
+        }
         let config = Config {
             scrolling_history: scrollback_lines,
             ..Config::default()
@@ -211,6 +262,8 @@ impl TermBridge {
             term,
             processor: Processor::new(),
             writes,
+            color_requests,
+            window_size,
             palette: Palette::default(),
         }
     }
@@ -223,10 +276,57 @@ impl TermBridge {
     /// sequences or UTF-8 sequences anywhere.
     pub fn feed(&mut self, bytes: &[u8]) {
         self.processor.advance(&mut self.term, bytes);
+        self.answer_color_requests();
+    }
+
+    /// When a synchronized update (DEC 2026) times out, or None when none is
+    /// pending. Call `tick` at or after this instant.
+    pub fn sync_deadline(&self) -> Option<Instant> {
+        self.processor.sync_timeout().sync_timeout()
+    }
+
+    /// Flush a synchronized update whose timeout has elapsed.
+    pub fn tick(&mut self) {
+        self.tick_at(Instant::now());
+    }
+
+    /// `tick` with an explicit clock, for tests and schedulers.
+    pub fn tick_at(&mut self, now: Instant) {
+        if self.sync_deadline().is_some_and(|d| d <= now) {
+            self.processor.stop_sync(&mut self.term);
+            self.answer_color_requests();
+        }
+    }
+
+    /// Pixel size of one cell, reported to programs that query the text area
+    /// size (CSI 14 t / 16 t).
+    pub fn set_cell_size(&mut self, width_px: u16, height_px: u16) {
+        if let Ok(mut w) = self.window_size.lock() {
+            w.cell_width = width_px;
+            w.cell_height = height_px;
+        }
+    }
+
+    fn answer_color_requests(&mut self) {
+        let pending = match self.color_requests.lock() {
+            Ok(mut r) if !r.is_empty() => std::mem::take(&mut *r),
+            _ => return,
+        };
+        for (idx, fmt) in pending {
+            let Rgb(r, g, b) = self.resolve_index(idx.min(268));
+            let reply = fmt(VteRgb { r, g, b });
+            if let Ok(mut w) = self.writes.lock() {
+                w.extend_from_slice(reply.as_bytes());
+            }
+        }
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
         self.term.resize(TermSize::new(cols.max(1), rows.max(1)));
+        if let Ok(mut w) = self.window_size.lock() {
+            w.num_cols = cols.min(u16::MAX as usize) as u16;
+            w.num_lines = rows.min(u16::MAX as usize) as u16;
+        }
     }
 
     /// Scroll the viewport. Positive moves toward older history.
@@ -267,8 +367,11 @@ impl TermBridge {
                     fg: self.resolve(c.fg),
                     bg: self.resolve(c.bg),
                     bold: f.contains(Flags::BOLD),
+                    dim: f.contains(Flags::DIM),
                     italic: f.contains(Flags::ITALIC),
                     underline: f.intersects(Flags::ALL_UNDERLINES),
+                    strikethrough: f.contains(Flags::STRIKEOUT),
+                    hidden: f.contains(Flags::HIDDEN),
                     inverse: f.contains(Flags::INVERSE),
                     wide: f.contains(Flags::WIDE_CHAR),
                 });
@@ -536,6 +639,65 @@ mod tests {
         let (sa, sc) = (a.snapshot(), c.snapshot());
         assert_eq!(sa.cells, sc.cells);
         assert_eq!(row_text(&sa, sa.cursor.row), "red done \u{1f600}");
+    }
+
+    #[test]
+    fn sync_update_held_until_timeout() {
+        let mut b = TermBridge::new(20, 5, 100);
+        assert!(b.sync_deadline().is_none());
+        b.feed(b"\x1b[?2026hhello");
+        assert_eq!(
+            b.snapshot().cell(0, 0).unwrap().ch,
+            ' ',
+            "buffered during sync"
+        );
+        let deadline = b.sync_deadline().expect("deadline set");
+        b.tick_at(deadline - std::time::Duration::from_millis(1));
+        assert_eq!(b.snapshot().cell(0, 0).unwrap().ch, ' ');
+        b.tick_at(deadline);
+        assert_eq!(row_text(&b.snapshot(), 0), "hello");
+        assert!(b.sync_deadline().is_none());
+    }
+
+    #[test]
+    fn sync_update_flushes_on_esu() {
+        let mut b = TermBridge::new(20, 5, 100);
+        b.feed(b"\x1b[?2026hhi\x1b[?2026l");
+        assert_eq!(row_text(&b.snapshot(), 0), "hi");
+    }
+
+    #[test]
+    fn dim_strikethrough_hidden_attributes() {
+        let mut b = TermBridge::new(20, 5, 100);
+        b.feed(b"\x1b[2mA\x1b[0m\x1b[9mB\x1b[0m\x1b[8mC\x1b[0mD");
+        let s = b.snapshot();
+        assert!(s.cell(0, 0).unwrap().dim);
+        assert!(s.cell(0, 1).unwrap().strikethrough);
+        assert!(s.cell(0, 2).unwrap().hidden);
+        let d = s.cell(0, 3).unwrap();
+        assert!(!d.dim && !d.strikethrough && !d.hidden);
+    }
+
+    #[test]
+    fn osc_background_query_gets_reply() {
+        let mut b = TermBridge::new(20, 5, 100);
+        b.feed(b"\x1b]11;?\x07");
+        let w = String::from_utf8(b.take_pty_writes()).unwrap();
+        assert!(w.contains("rgb:"), "reply was {w:?}");
+        // Program override wins over the palette.
+        b.feed(b"\x1b]11;rgb:10/20/30\x07\x1b]11;?\x07");
+        let w = String::from_utf8(b.take_pty_writes()).unwrap();
+        assert!(w.contains("rgb:1010/2020/3030"), "reply was {w:?}");
+    }
+
+    #[test]
+    fn text_area_size_query_gets_reply() {
+        let mut b = TermBridge::new(80, 24, 100);
+        b.set_cell_size(9, 18);
+        b.feed(b"\x1b[14t");
+        assert_eq!(b.take_pty_writes(), b"\x1b[4;432;720t");
+        b.feed(b"\x1b[18t");
+        assert_eq!(b.take_pty_writes(), b"\x1b[8;24;80t");
     }
 
     #[test]
