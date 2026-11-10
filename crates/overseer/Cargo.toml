@@ -1,0 +1,21 @@
+[package]
+name = "overseer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+overseer-gui = { path = "../overseer-gui" }
+overseer-proto = { path = "../overseer-proto" }
+overseer-daemon = { path = "../overseer-daemon" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync"] }
+clap.workspace = true
+anyhow.workspace = true
+crossterm.workspace = true
+libc = "0.2"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "env-filter", "std"] }
+tracing.workspace = true
+
+[dev-dependencies]
+assert_cmd = "2"
+portable-pty.workspace = true

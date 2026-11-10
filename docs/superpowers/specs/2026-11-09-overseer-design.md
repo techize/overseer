@@ -119,7 +119,7 @@ States: **working**, **needs you**, **idle**, **blocked by lock**, **resumable**
 | Session waits on Jonathan | `Notification` hook (permission prompt or idle-input wait) | **needs you**, with a macOS notification. Clicking it opens that session. |
 | Turn ends | `Stop` hook | **idle** |
 | Write blocked | `PreToolUse` deny | **blocked by lock**, until the wait resolves |
-| "Now doing" line | `PostToolUse` (last tool and short args), overridden by the latest `report_progress` text | — |
+| "Now doing" line | `PostToolUse` (last tool and short args), overridden by the latest `report_progress` text | Card's "now doing" line |
 | Session registered | `SessionStart` hook | Records or confirms the session ID |
 
 If hooks fail, a light fallback reads the terminal screen for a visible permission prompt so that **needs you** is never missed. This fallback is the builder's call.

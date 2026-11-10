@@ -1,0 +1,18 @@
+[package]
+name = "overseer-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+overseer-proto = { path = "../overseer-proto" }
+portable-pty.workspace = true
+tokio = { workspace = true, features = ["sync", "rt", "time", "macros", "net", "io-util"] }
+bytes.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+libc = "0.2"
+
+[dev-dependencies]
+overseer-term = { path = "../overseer-term" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }

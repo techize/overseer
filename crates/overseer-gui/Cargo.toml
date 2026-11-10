@@ -1,0 +1,20 @@
+[package]
+name = "overseer-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gpui.workspace = true
+overseer-proto = { path = "../overseer-proto" }
+overseer-term = { path = "../overseer-term" }
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+bytes.workspace = true
+serde.workspace = true
+toml = "0.8"
+anyhow.workspace = true
+libc = "0.2"
+
+[dev-dependencies]
+overseer-daemon = { path = "../overseer-daemon" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
