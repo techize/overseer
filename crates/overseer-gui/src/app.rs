@@ -470,7 +470,12 @@ impl OverseerApp {
     pub(crate) fn open_dialog(&mut self, id: SlotId, window: &mut Window, cx: &mut Context<Self>) {
         self.status = None;
         let client = self.client.clone();
-        let dialog = cx.new(|cx| StartDialog::new(id, client, cx));
+        // A stopped slot reopens with its last settings, to change them.
+        let last = self
+            .slots
+            .get(id as usize)
+            .filter(|i| matches!(i.state, SlotState::Exited { .. }));
+        let dialog = cx.new(|cx| StartDialog::new(id, client, last, cx));
         let sub = cx.subscribe_in(&dialog, window, |this, _, ev: &DialogEvent, window, cx| {
             this.dialog = None;
             match ev {

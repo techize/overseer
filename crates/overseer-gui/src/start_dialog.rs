@@ -11,13 +11,13 @@ use gpui::{
     div, prelude::*, px, rgb, rgba, Context, EventEmitter, FocusHandle, Focusable, FontWeight,
     KeyDownEvent, Keystroke, MouseButton, PathPromptOptions, SharedString, Window,
 };
-use overseer_proto::{slot_name, Client, Request, Response, SlotId};
+use overseer_proto::{slot_name, Client, Request, Response, SlotId, SlotInfo};
 
 use crate::app::colors;
 use crate::board::tilde;
 
 /// Starting cwd.
-pub const DEFAULT_CWD: &str = "~/Repos";
+pub const DEFAULT_CWD: &str = "~/Repos/2ndBrain";
 /// Starting command. Left as is, the request names no command, so the daemon
 /// runs its default (`claude`, or `OVERSEER_DEFAULT_COMMAND`).
 pub const DEFAULT_COMMAND: &str = "claude";
@@ -183,6 +183,63 @@ pub fn expand_tilde(s: &str, home: Option<&Path>) -> PathBuf {
     }
 }
 
+/// Label, folder and command the dialog starts with: those of `last` when
+/// it ran before, else an empty label and the defaults.
+pub fn initial_fields(last: Option<&SlotInfo>, home: Option<&Path>) -> [String; 3] {
+    match last.and_then(|i| Some((i, i.cwd.as_deref()?))) {
+        Some((info, cwd)) => [
+            info.label.clone(),
+            tilde(cwd, home),
+            info.command
+                .as_ref()
+                .map_or_else(|| DEFAULT_COMMAND.to_string(), |c| c.join(" ")),
+        ],
+        None => [String::new(), DEFAULT_CWD.into(), DEFAULT_COMMAND.into()],
+    }
+}
+
+/// Where the folder picker opens: the folder typed in the field, or the
+/// nearest folder above it that exists, falling back to `home`.
+pub fn picker_start(
+    field: &str,
+    home: Option<&Path>,
+    is_dir: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    let field = field.trim();
+    let typed = expand_tilde(field, home);
+    if !field.is_empty() && typed.is_absolute() {
+        if let Some(dir) = typed.ancestors().find(|p| is_dir(p)) {
+            return Some(dir.to_path_buf());
+        }
+    }
+    home.map(Path::to_path_buf)
+}
+
+/// Makes the next macOS open panel start in `dir`. `NSOpenPanel` opens in
+/// the folder stored under this defaults key, and gpui's path prompt has no
+/// option for it.
+// objc 0.2's `msg_send!` expands a cfg this crate does not declare.
+#[allow(unexpected_cfgs)]
+fn set_open_panel_start(dir: &Path) {
+    use objc::runtime::Object;
+    use objc::{class, msg_send, sel, sel_impl};
+    use std::ffi::CString;
+    let (Some(path), Ok(key)) = (
+        dir.to_str().and_then(|p| CString::new(p).ok()),
+        CString::new("NSNavLastRootDirectory"),
+    ) else {
+        return;
+    };
+    // SAFETY: plain Foundation calls on the main thread with valid,
+    // NUL-terminated strings; the NSString results are autoreleased.
+    unsafe {
+        let defaults: *mut Object = msg_send![class!(NSUserDefaults), standardUserDefaults];
+        let value: *mut Object = msg_send![class!(NSString), stringWithUTF8String: path.as_ptr()];
+        let key: *mut Object = msg_send![class!(NSString), stringWithUTF8String: key.as_ptr()];
+        let _: () = msg_send![defaults, setObject: value forKey: key];
+    }
+}
+
 /// Validates the form and builds its `StartSlot`. `is_dir` checks the cwd.
 pub fn build_request(
     slot: SlotId,
@@ -256,15 +313,24 @@ impl Focusable for StartDialog {
 }
 
 impl StartDialog {
-    pub fn new(slot: SlotId, client: Arc<Client>, cx: &mut Context<Self>) -> Self {
+    /// The dialog for `slot`, filled in from `last` (the slot's previous
+    /// run) when there is one, else with the defaults.
+    pub fn new(
+        slot: SlotId,
+        client: Arc<Client>,
+        last: Option<&SlotInfo>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let [label, cwd, command] = initial_fields(last, home.as_deref());
         StartDialog {
             slot,
             client,
-            home: std::env::var_os("HOME").map(PathBuf::from),
+            home,
             fields: [
-                TextField::new(""),
-                TextField::new(DEFAULT_CWD),
-                TextField::new(DEFAULT_COMMAND),
+                TextField::new(&label),
+                TextField::new(&cwd),
+                TextField::new(&command),
             ],
             active: 0,
             error: None,
@@ -297,6 +363,10 @@ impl StartDialog {
     }
 
     fn choose_folder(&mut self, cx: &mut Context<Self>) {
+        let home = self.home.as_deref();
+        if let Some(dir) = picker_start(&self.fields[1].text, home, Path::is_dir) {
+            set_open_panel_start(&dir);
+        }
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -510,6 +580,61 @@ impl Render for StartDialog {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_stopped_slot_reopens_with_its_last_settings() {
+        let home = Some(Path::new("/Users/me"));
+        let mut last = SlotInfo {
+            id: 4,
+            label: "eks".into(),
+            cwd: Some("/Users/me/Repos/eks".into()),
+            command: Some(vec!["claude".into(), "--resume".into()]),
+            state: overseer_proto::SlotState::Exited {
+                code: Some(0),
+                at: 1,
+            },
+            cols: 80,
+            rows: 24,
+        };
+        assert_eq!(
+            initial_fields(Some(&last), home),
+            [
+                "eks".to_string(),
+                "~/Repos/eks".into(),
+                "claude --resume".into()
+            ]
+        );
+        last.command = None;
+        assert_eq!(initial_fields(Some(&last), home)[2], DEFAULT_COMMAND);
+        last.cwd = None;
+        assert_eq!(
+            initial_fields(Some(&last), home),
+            [String::new(), DEFAULT_CWD.into(), DEFAULT_COMMAND.into()]
+        );
+        assert_eq!(initial_fields(None, home)[1], "~/Repos/2ndBrain");
+    }
+
+    #[test]
+    fn picker_starts_in_the_typed_folder_or_the_nearest_one_above() {
+        let home = Path::new("/Users/me");
+        let dirs = ["/", "/Users", "/Users/me", "/Users/me/code"];
+        let is_dir = |p: &Path| dirs.iter().any(|d| Path::new(d) == p);
+        let start = |f| picker_start(f, Some(home), is_dir);
+        assert_eq!(start("~/code"), Some(PathBuf::from("/Users/me/code")));
+        assert_eq!(
+            start("/Users/me/code"),
+            Some(PathBuf::from("/Users/me/code"))
+        );
+        assert_eq!(
+            start("~/code/new/deeper"),
+            Some(PathBuf::from("/Users/me/code"))
+        );
+        assert_eq!(start("  ~  "), Some(PathBuf::from("/Users/me")));
+        // Empty or relative: home.
+        assert_eq!(start(""), Some(PathBuf::from("/Users/me")));
+        assert_eq!(start("code"), Some(PathBuf::from("/Users/me")));
+        assert_eq!(picker_start("", None, is_dir), None);
+    }
+
     fn key(k: &str, ch: Option<&str>) -> Keystroke {
         let mut ks = Keystroke::parse(k).unwrap();
         ks.key_char = ch.map(String::from);
@@ -587,8 +712,8 @@ mod tests {
             r,
             Request::StartSlot {
                 id: 5,
-                label: "Repos".into(),
-                cwd: "/Users/me/Repos".into(),
+                label: "2ndBrain".into(),
+                cwd: "/Users/me/Repos/2ndBrain".into(),
                 command: None,
             }
         );
