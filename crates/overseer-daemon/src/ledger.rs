@@ -26,9 +26,10 @@ pub struct SessionRow {
 /// A synchronous SQLite-backed ledger. It is `Send + Sync` so it can sit in
 /// an `Arc` and be shared across tasks.
 ///
-/// Callers must do the writes on a blocking thread
-/// (`tokio::task::spawn_blocking`), never on the async runtime: every call
-/// takes a mutex and does disk I/O.
+/// Every call takes a mutex and does disk I/O. The daemon calls it directly
+/// on the async runtime, under the slot manager's mutex: each write is a
+/// single-row statement, and the start path already forks a process
+/// synchronously, so a `spawn_blocking` hop would buy nothing.
 pub struct Ledger {
     conn: Mutex<Connection>,
 }
