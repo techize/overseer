@@ -41,20 +41,26 @@ struct Entry {
     /// Claude's current session id, empty for commands that are not claude.
     /// Kept so a hook only touches the ledger when the id really changed.
     session_id: String,
+    /// The command as the client gave it, before Overseer's flags. This is
+    /// what clients see and send back on a restart: reporting the flagged
+    /// argv would make every restart add a second set of flags.
+    command: Vec<String>,
 }
 
 impl Entry {
-    fn new(slot: Arc<Slot>, session_id: String) -> Self {
+    fn new(slot: Arc<Slot>, session_id: String, command: Vec<String>) -> Self {
         Entry {
             slot,
             activity: None,
             session_id,
+            command,
         }
     }
 
     fn info(&self) -> SlotInfo {
         SlotInfo {
             activity: self.activity.clone(),
+            command: Some(self.command.clone()),
             ..self.slot.info()
         }
     }
@@ -303,7 +309,9 @@ impl SlotManager {
         }
         // N4: tear down whatever occupied the slot before (an exited child;
         // kill is a no-op then, but keeps the invariant in one place).
-        if let Some(old) = slots[id as usize].replace(Entry::new(slot.clone(), entry_session_id)) {
+        let entry = Entry::new(slot.clone(), entry_session_id, command.clone());
+        let started = entry.info();
+        if let Some(old) = slots[id as usize].replace(entry) {
             old.slot.kill();
         }
         // Ledger writes are single-row SQLite statements done synchronously
@@ -329,7 +337,7 @@ impl SlotManager {
                 tracing::warn!("{} ledger start not recorded: {e:#}", slot_name(id));
             }
         }
-        let _ = self.events.send(Event::SlotChanged(slot.info()));
+        let _ = self.events.send(Event::SlotChanged(started));
         drop(slots);
         tokio::spawn(monitor_exit(
             slot,
@@ -507,12 +515,15 @@ async fn monitor_exit(
         tracing::info!("{} exited (code {code:?})", slot_name(info.id));
     }
     let mut slots = slots.lock().unwrap();
+    // The entry's info, not the slot's: it carries the base command.
     let current = slots[info.id as usize]
         .as_mut()
         .filter(|e| Arc::ptr_eq(&e.slot, &slot))
-        .map(|e| e.activity = None)
-        .is_some();
-    if current {
+        .map(|e| {
+            e.activity = None;
+            e.info()
+        });
+    if let Some(info) = current {
         // A daemon shutdown kills the children too, but those sessions must
         // stay live in the ledger so they can be resumed. Synchronous for the
         // same reason as the start write.
@@ -555,7 +566,7 @@ mod tests {
             )
             .unwrap(),
         );
-        mgr.slots.lock().unwrap()[1] = Some(Entry::new(old.clone(), String::new()));
+        mgr.slots.lock().unwrap()[1] = Some(Entry::new(old.clone(), String::new(), Vec::new()));
         old.wait_exit().await;
         tokio::spawn(monitor_exit(
             old.clone(),

@@ -973,3 +973,86 @@ async fn s0_started_fresh_gets_the_kickoff_last() {
     assert!(role.contains("bd ready --json"), "{role}");
     assert!(!role.contains("You are S0 of an Overseer team"), "{role}");
 }
+
+/// How many argv elements of a stub log line equal `arg`.
+fn count_arg(line: &str, arg: &str) -> usize {
+    line.split_once('|')
+        .unwrap()
+        .1
+        .split(' ')
+        .filter(|a| *a == arg)
+        .count()
+}
+
+/// Starts `id` with `command`, stops it, then starts it again with the
+/// command `list` reports, as the GUI's Restart and Start dialog do. Returns
+/// the second argv line and the slot info after the second start.
+async fn restart_with_listed_command(
+    c: &mut Client,
+    log: &std::path::Path,
+    id: u8,
+    command: Vec<String>,
+    cwd: &std::path::Path,
+) -> (String, SlotInfo) {
+    let start = |command| Request::StartSlot {
+        id,
+        label: "again".into(),
+        cwd: cwd.to_path_buf(),
+        command: Some(command),
+        prompt: None,
+    };
+    assert_eq!(c.request(start(command.clone())).await, Response::Ok);
+    wait_for_log(log, 1).await;
+    assert_eq!(c.list().await[id as usize].command, Some(command.clone()));
+    assert_eq!(c.request(Request::StopSlot { id }).await, Response::Ok);
+    c.exited_event(id).await;
+    let listed = c.list().await[id as usize]
+        .command
+        .clone()
+        .expect("exited slot keeps its command");
+    assert_eq!(listed, command, "exited slot reports the base command");
+    assert_eq!(c.request(start(listed)).await, Response::Ok);
+    let lines = wait_for_log(log, 2).await;
+    let info = c.list().await.remove(id as usize);
+    (lines[1].clone(), info)
+}
+
+#[tokio::test]
+async fn restart_with_listed_command_does_not_double_the_flags() {
+    let dir = std::env::temp_dir().join(format!("ovs-again-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (bin, log) = stub_claude(&dir);
+    let base = vec![bin.to_string_lossy().into_owned()];
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    let (line, info) = restart_with_listed_command(&mut c, &log, 2, base.clone(), &dir).await;
+    for flag in ["--session-id", "--name", "--settings"] {
+        assert_eq!(count_arg(&line, flag), 1, "{flag} in {line}");
+    }
+    assert_eq!(info.command, Some(base.clone()));
+    let ledger = overseer_daemon::ledger::Ledger::open(&d.state_dir.join("overseer.db")).unwrap();
+    let live = ledger.live_at_shutdown().unwrap();
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].command, base, "ledger keeps the base command");
+}
+
+#[tokio::test]
+async fn s0_restart_with_listed_command_gets_one_kickoff() {
+    let dir = std::env::temp_dir().join(format!("ovs-again0-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (bin, log) = stub_claude(&dir);
+    let base = vec![bin.to_string_lossy().into_owned()];
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    let (line, info) = restart_with_listed_command(&mut c, &log, 0, base.clone(), &dir).await;
+    let kickoff = overseer_daemon::launch::kickoff_prompt(&d.state_dir).unwrap();
+    assert!(line.ends_with(&format!(" -- {kickoff}")), "{line}");
+    assert_eq!(count_arg(&line, "--"), 1, "{line}");
+    assert_eq!(line.matches(kickoff.as_str()).count(), 1, "{line}");
+    for flag in ["--session-id", "--name", "--settings"] {
+        assert_eq!(count_arg(&line, flag), 1, "{flag} in {line}");
+    }
+    assert_eq!(info.command, Some(base.clone()));
+    let ledger = overseer_daemon::ledger::Ledger::open(&d.state_dir.join("overseer.db")).unwrap();
+    assert_eq!(ledger.live_at_shutdown().unwrap()[0].command, base);
+}
