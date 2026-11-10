@@ -34,7 +34,8 @@ dir removed afterwards.
 | F1 | Claude slots get the Overseer flags | Stub script named `claude` that logs argv. `overseer ctl start 2 --cwd <dir> --label flags -- /path/to/claude --dangerously-skip-permissions`, then `cat <state>/slots/S2/settings.json` | argv has `--session-id <uuid>`, `--name "S2 flags"`, `--settings <state>/slots/S2/settings.json`, `--append-system-prompt-file <state>/slots/S2/role.md`, after the user's own arguments; settings.json has the five hooks | Verified 2026-11-10: `[--dangerously-skip-permissions] [--session-id] [00085e4a-...] [--name] [S2 flags] [--settings] [.../slots/S2/settings.json] [--append-system-prompt-file] [.../slots/S2/role.md]`. Ledger row `2\|00085e4a-...\|` has the same id. `settings.json` (cat, rerun on a second run) has `hooks` keys SessionStart, UserPromptSubmit, Notification, Stop and PostToolUse (the last with `"matcher": "*"`), each `{"type": "command", "command": "'<overseer binary>' hook <Event>", "timeout": 2}`; the binary path is quoted. The slot dir holds `role.md` and `settings.json`; `<state>/roles/` holds coordinator.md, kickoff.md and worker.md |
 | F2 | The flags are on the real claude process | Start a slot with the default command, `ps -o args= -p <pid>` | The same flags appear on the real `claude` | awaiting Jonathan |
 | F3 | `--prompt` that starts with a dash | `overseer ctl start 3 --cwd <dir> --label dash --prompt "--help me" -- /path/to/claude` | Accepted by clap; `--` comes right before the prompt, which is the last argv element and a single argument | Verified 2026-11-10: argv ended `[--] [--help me]`, one element. Unit tests `dash_prompt_follows_double_dash` and `prompt_may_start_with_a_dash` cover the rest |
-| F4 | Non-claude slot is unaffected | `ctl start 1 -- sh -c '...'` (E1's slot). `ctl status`, then look in the state dir | No `--settings` or any other Overseer flag; no `slots/S1` dir; card stays `Running` with no activity line | Verified 2026-11-10 for the daemon side: command ran as given, `ctl status` showed `S1  running ... scrub`, then `exited code 0`, and `slots/` had only S2 and S3. The card colour is awaiting Jonathan (A1, row 8) |
+| F4 | Non-claude slot is unaffected | `ctl start 1 -- sh -c '...'` (E1's slot). `ctl status`, then look in the state dir | No `--settings` or any other Overseer flag; no `slots/S1` dir; card stays `Running` with no activity line | Verified 2026-11-10 for the daemon side: command ran as given, `ctl status` showed `S1  running ... scrub`, then `exited code 0`, and `slots/` had only S2 and S3. The card colour is awaiting Jonathan (A2) |
+| F5 | `--settings` merges with Jonathan's own settings and hooks | In a real claude slot started from the installed app, run `/hooks`. Then send a short message and let the turn finish. Then check `/model` and `/permissions` (or try a command Jonathan's own settings pre-approve) | `/hooks` lists both Jonathan's global hooks (from `~/.claude/settings.json`) and Overseer's five (SessionStart, UserPromptSubmit, Notification, Stop, PostToolUse, each calling `'<overseer binary>' hook <Event>`). At the end of the turn one of Jonathan's own hooks fired (its usual output or side effect) and the card went to Idle. Jonathan's model and permission rules still apply. Note: a managed (enterprise) setting `allowManagedHooksOnly` would turn off every non-managed hook, Overseer's included, and the cards would never leave Running | awaiting Jonathan |
 
 ## Hooks and latency
 
@@ -48,7 +49,7 @@ dir removed afterwards.
 
 | # | Item | Steps | Passes when | Result |
 |---|------|-------|-------------|--------|
-| A1 | Working, needs-you and idle cards | Start a claude slot labelled `notify test` in S3. Send "run ls in this folder": watch the card. Then a Bash command that is not pre-approved, for example "run `touch /tmp/overseer-perm-test` with Bash" (in a default permission mode Claude asks first). Then let the turn finish | Working: green `● Working <time>`, green edge, tool on the line under the cwd, session panel rows Activity and Doing. Needs you: orange `● Needs you <time>`, orange edge, reason in orange, header `1 running, 1 need you` in orange, panel rows Activity and Reason. Idle: grey `● Idle <time>`, no detail line, header `1 running` | awaiting Jonathan |
+| A1 | Working, needs-you and idle cards | Start a claude slot labelled `notify test` in S3. Send "run ls in this folder": watch the card. Then a Bash command that is not pre-approved, for example "run `touch /tmp/overseer-perm-test` with Bash" (in a default permission mode Claude asks first). Then let the turn finish | Working: green `● Working <time>`, green edge, tool on the line under the cwd, session panel rows Activity and Doing. Needs you: orange `● Needs you <time>`, orange edge, reason in orange, header `1 running, 1 need you` in orange, panel rows Activity and Reason. Idle: grey `● Idle <time>`, no detail line, header `1 running`. Check Idle within a minute of the turn ending (L6), and end the turn normally, not with Esc (L5) | awaiting Jonathan |
 | A2 | Non-claude card unchanged | Start `htop` (or any non-claude command) in another slot | Green `● Running <time>`, no detail line, no notification | awaiting Jonathan |
 | A3 | GUI restart keeps state, no repeat notification | Leave S3 on a permission prompt, Cmd+Q the GUI, reopen it | Card shows Needs you; no new notification (first-sync rule) | awaiting Jonathan |
 
@@ -57,7 +58,7 @@ dir removed afterwards.
 | # | Item | Steps | Passes when | Result |
 |---|------|-------|-------------|--------|
 | N1 | Authorization in the ad hoc signed bundle | First launch of `~/Applications/Overseer.app` from Finder after `make install`. Then System Settings, Notifications, Overseer | macOS asks to allow notifications; Alerts are allowed afterwards. Record whether the prompt appeared for an ad hoc signed bundle. If it does not, the board still works but there are no banners | awaiting Jonathan |
-| N2 | A notification fires once on needs-you | As A1, make S3 ask for permission | Exactly one banner, title `S3 needs you`, body `notify test: <reason>`, with sound; none when the turn ends and none when only the reason changes | awaiting Jonathan |
+| N2 | A notification fires once on needs-you | As A1, make S3 ask for permission | Exactly one banner, title `S3 needs you`, body `notify test: <reason>`, with sound; none when the turn ends and none when only the reason changes. The idle Notification about 60 s after a finished turn is a separate needs-you with its own banner (L6), so judge "none when the turn ends" within that minute | awaiting Jonathan |
 | N3 | Click opens the session while the app is running | With another app frontmost and Overseer open on the board, cause a permission request and click the banner | Overseer comes forward on the S3 session view | awaiting Jonathan |
 | N4 | Click from a cold launch (known gap) | Quit Overseer, click an old notification in Notification Center | The app launches. It may open on the board, not S3, because the delegate is installed inside the launch callback | awaiting Jonathan. Known limitation L2 |
 | N5 | Denied notifications | Turn notifications off for Overseer, repeat N2 | No banner; card and header still show Needs you; the GUI log may show `notification for S3 not delivered` | awaiting Jonathan |
@@ -120,6 +121,15 @@ dir removed afterwards.
 - **L4: the GUI start dialog has no prompt field,** so a GUI start or restart of
   S0 always gets the kickoff; `ctl start --prompt` is the only way to give a
   first prompt.
+- **L5: an interrupted turn stays Working for about a minute.** Claude Code
+  does not fire `Stop` when Jonathan interrupts a turn with Esc, so the card
+  stays `Working` until Claude's idle `Notification` arrives about 60 s later.
+  That turns it `Needs you` and posts a banner, although nothing is waiting on
+  a permission.
+- **L6: every finished turn becomes Needs you after about a minute.** Claude
+  Code sends its idle `Notification` ("waiting for your input") about 60 s
+  after any turn ends, so an `Idle` card turns `Needs you` and posts a banner
+  if nobody has typed in the meantime.
 
 ## Sign-off
 
