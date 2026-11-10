@@ -324,7 +324,9 @@ async fn paused_client_gets_the_whole_stream() {
         while let Ok(Some(f)) = read_frame(&mut rd).await {
             if let Frame::Output { id: 4, data } = f {
                 text.extend_from_slice(&data);
-                if text.ends_with(b"\n400000\r\n") {
+                let tail = &text[text.len().saturating_sub(16)..];
+                let tail: Vec<u8> = tail.iter().copied().filter(|&b| b != b'\r').collect();
+                if tail.ends_with(b"\n400000\n") {
                     return true;
                 }
             }
