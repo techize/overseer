@@ -970,5 +970,6 @@ async fn s0_started_fresh_gets_the_kickoff_last() {
     );
     // The coordinator role, not the worker role, was written for S0.
     let role = std::fs::read_to_string(d.state_dir.join("slots/S0/role.md")).unwrap();
-    assert!(role.contains("coordinator"), "{role}");
+    assert!(role.contains("bd ready --json"), "{role}");
+    assert!(!role.contains("You are S0 of an Overseer team"), "{role}");
 }

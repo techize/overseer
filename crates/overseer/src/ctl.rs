@@ -23,7 +23,7 @@ pub enum CtlCmd {
         #[arg(long, default_value = "")]
         label: String,
         /// First prompt, passed to claude at launch.
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         prompt: Option<String>,
         /// Command to run instead of the daemon default.
         #[arg(last = true)]
@@ -180,6 +180,25 @@ pub async fn run(cmd: CtlCmd) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(clap::Parser)]
+    struct Cli {
+        #[command(subcommand)]
+        cmd: CtlCmd,
+    }
+
+    #[test]
+    fn prompt_may_start_with_a_dash() {
+        use clap::Parser;
+        for p in ["- fix login", "--help me"] {
+            let cli =
+                Cli::try_parse_from(["t", "start", "3", "--cwd", "/tmp", "--prompt", p]).unwrap();
+            match cli.cmd {
+                CtlCmd::Start { prompt, .. } => assert_eq!(prompt.as_deref(), Some(p)),
+                _ => panic!("not start"),
+            }
+        }
+    }
 
     #[test]
     fn resumable_status_line() {

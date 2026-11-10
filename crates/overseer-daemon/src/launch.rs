@@ -176,6 +176,8 @@ pub fn claude_argv(
         files.role.to_string_lossy().into_owned(),
     ]);
     if let (true, Some(p)) = (fresh, prompt) {
+        // "--" so a prompt starting with "-" is not parsed as a flag.
+        argv.push("--".into());
         argv.push(p.to_string());
     }
     argv
@@ -313,7 +315,33 @@ mod tests {
             Some("do the thing"),
         );
         assert_eq!(argv.last().unwrap(), "do the thing");
-        assert_eq!(argv[argv.len() - 2], "/st/slots/S2/role.md");
+        assert_eq!(argv[argv.len() - 2], "--");
+        assert_eq!(argv[argv.len() - 3], "/st/slots/S2/role.md");
+    }
+
+    #[test]
+    fn dash_prompt_follows_double_dash() {
+        for p in ["--help me", "- fix login"] {
+            let argv = claude_argv(
+                &s(&["claude"]),
+                2,
+                "api",
+                &files(),
+                Start::New("u".into()),
+                Some(p),
+            );
+            assert_eq!(argv.last().unwrap(), p);
+            assert_eq!(argv[argv.len() - 2], "--");
+        }
+        let argv = claude_argv(
+            &s(&["claude"]),
+            2,
+            "api",
+            &files(),
+            Start::New("u".into()),
+            None,
+        );
+        assert!(!argv.contains(&"--".to_string()));
     }
 
     #[test]
@@ -370,8 +398,21 @@ mod tests {
         let o = Path::new("/Apps/overseer");
         let c = std::fs::read_to_string(write_slot_files(&dir, 0, "", o).unwrap().role).unwrap();
         let w = std::fs::read_to_string(write_slot_files(&dir, 4, "x", o).unwrap().role).unwrap();
-        assert!(c.contains("coordinator"), "{c}");
+        assert!(c.contains("bd ready --json"), "{c}");
+        assert!(!c.contains("You are S0 of an Overseer team"), "{c}");
         assert!(w.contains("You are S4 of an Overseer team"), "{w}");
+    }
+
+    #[test]
+    fn overseer_path_with_a_space_is_quoted() {
+        let dir = temp("space");
+        let o = Path::new("/Applications/My App/overseer");
+        let f = write_slot_files(&dir, 0, "", o).unwrap();
+        let role = std::fs::read_to_string(f.role).unwrap();
+        assert!(
+            role.contains("\"/Applications/My App/overseer\" ctl status"),
+            "{role}"
+        );
     }
 
     #[test]
@@ -379,7 +420,7 @@ mod tests {
         let dir = temp("fill");
         let f = write_slot_files(&dir, 0, "lbl", Path::new("/Apps/overseer")).unwrap();
         let role = std::fs::read_to_string(f.role).unwrap();
-        assert!(role.contains("/Apps/overseer ctl start"), "{role}");
+        assert!(role.contains("\"/Apps/overseer\" ctl start"), "{role}");
         assert!(
             !role.contains("{overseer}") && !role.contains("{slot}"),
             "{role}"
