@@ -10,6 +10,8 @@ pub struct RingBuffer {
     /// Fed every byte the ring drops, so it holds the terminal modes in
     /// force at the oldest retained byte.
     evicted: ModeTracker,
+    /// Bytes pushed since the ring was made.
+    total: u64,
 }
 
 impl RingBuffer {
@@ -18,11 +20,13 @@ impl RingBuffer {
             cap,
             buf: VecDeque::new(),
             evicted: ModeTracker::new(),
+            total: 0,
         }
     }
 
     /// Append bytes, dropping the oldest ones when over capacity.
     pub fn push(&mut self, data: &[u8]) {
+        self.total += data.len() as u64;
         let overflow = (self.buf.len() + data.len()).saturating_sub(self.cap);
         let from_buf = overflow.min(self.buf.len());
         if from_buf > 0 {
@@ -35,6 +39,22 @@ impl RingBuffer {
         let from_data = overflow - from_buf;
         self.evicted.feed(&data[..from_data]);
         self.buf.extend(&data[from_data..]);
+    }
+
+    /// Stream position just after the newest byte: every byte ever pushed
+    /// counts, including the ones the ring has dropped.
+    pub fn end(&self) -> u64 {
+        self.total
+    }
+
+    /// The bytes from stream position `pos` to the end, or `None` when the
+    /// ring has already dropped some of them.
+    pub fn since(&self, pos: u64) -> Option<Vec<u8>> {
+        let start = self.total - self.buf.len() as u64;
+        if pos < start || pos > self.total {
+            return None;
+        }
+        Some(self.buf.range((pos - start) as usize..).copied().collect())
     }
 
     pub fn contents(&self) -> Vec<u8> {
@@ -55,6 +75,20 @@ impl RingBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn since_returns_retained_bytes_by_stream_position() {
+        let mut r = RingBuffer::new(8);
+        r.push(b"abcdef");
+        assert_eq!(r.end(), 6);
+        assert_eq!(r.since(2), Some(b"cdef".to_vec()));
+        assert_eq!(r.since(6), Some(Vec::new()));
+        r.push(b"ghij");
+        assert_eq!(r.end(), 10);
+        assert_eq!(r.since(2), Some(b"cdefghij".to_vec()));
+        assert_eq!(r.since(1), None, "b was dropped");
+        assert_eq!(r.since(11), None, "past the end");
+    }
 
     #[test]
     fn ring_keeps_newest_when_full() {

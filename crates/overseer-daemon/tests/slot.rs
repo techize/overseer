@@ -155,3 +155,72 @@ async fn attach_mid_stream_has_no_gap_or_duplicate() {
     }
     assert_eq!(expect, 500000);
 }
+
+/// A receiver that lags (here, behind a two-chunk channel) loses chunks;
+/// `catch_up` from its stream position fills the gap from the ring and
+/// hands over a receiver that continues right after, so the bytes it ends
+/// up with are exactly the stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn catch_up_fills_a_lag_gap_from_the_ring() {
+    use overseer_daemon::slot::CatchUp;
+    let (tx, _keep) = broadcast::channel(2);
+    let slot = Slot::spawn(
+        7,
+        "test".into(),
+        Path::new("/tmp"),
+        &[
+            "/usr/bin/awk".into(),
+            "BEGIN { for (i = 0; i < 200000; i++) print i }".into(),
+        ],
+        80,
+        24,
+        tx,
+    )
+    .unwrap();
+    drop(_keep);
+    let (mut all, mut pos, rx) = slot.attach_at();
+    let mut rx = rx.expect("stream still open");
+    let mut lags = 0;
+    timeout(Duration::from_secs(20), async {
+        loop {
+            match rx.recv().await {
+                Ok(b) => {
+                    pos += b.len() as u64;
+                    all.extend_from_slice(&b);
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    lags += 1;
+                    let (missed, end, next) = slot.catch_up(pos);
+                    match missed {
+                        CatchUp::Missed(bytes) => all.extend_from_slice(&bytes),
+                        CatchUp::Resync(_) => panic!("the ring still holds the gap"),
+                    }
+                    pos = end;
+                    match next {
+                        Some(next) => rx = next,
+                        None => break,
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+            // Give the reader thread a head start so the channel overflows.
+            if lags == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(lags > 0, "the receiver never lagged");
+    let text = String::from_utf8(all).unwrap();
+    let mut expect = 0u32;
+    for line in text.lines() {
+        assert_eq!(
+            line.trim().parse::<u32>().unwrap(),
+            expect,
+            "gap or duplicate"
+        );
+        expect += 1;
+    }
+    assert_eq!(expect, 200000);
+}

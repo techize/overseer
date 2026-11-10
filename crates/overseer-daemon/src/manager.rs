@@ -51,6 +51,8 @@ pub struct Attachment {
     /// slot's output stream has already ended (the snapshot is all there is).
     pub live: Option<broadcast::Receiver<Bytes>>,
     pub snapshot: Vec<u8>,
+    /// Stream position `live` starts at, for catching up after a lag.
+    pub pos: u64,
 }
 
 impl SlotManager {
@@ -191,11 +193,12 @@ impl SlotManager {
         let entry = slots[id as usize]
             .as_ref()
             .ok_or_else(|| format!("{} is empty", slot_name(id)))?;
-        let (snapshot, live) = entry.slot.attach();
+        let (snapshot, pos, live) = entry.slot.attach_at();
         Ok(Attachment {
             slot: entry.slot.clone(),
             live,
             snapshot,
+            pos,
         })
     }
 

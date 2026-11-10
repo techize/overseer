@@ -269,8 +269,9 @@ async fn slow_client_dropped() {
     )
     .await
     .unwrap();
-    // Give the flood time to overrun the socket buffer and the queue.
-    sleep(Duration::from_secs(2)).await;
+    // Give the flood time to overrun the socket buffer and the queue, and
+    // the stream's grace for a full queue to run out.
+    sleep(overseer_daemon::server::SLOW_CLIENT_GRACE + Duration::from_secs(2)).await;
 
     let mut other = Client::connect(&d.socket).await;
     let slots = timeout(Duration::from_secs(1), other.list())
@@ -292,6 +293,59 @@ async fn slow_client_dropped() {
     })
     .await;
     assert!(closed.is_ok(), "slow connection was not closed");
+}
+
+/// A client that stops reading for a moment (less than the slow-client
+/// grace) is not cut off, and the output it gets once it reads again has no
+/// gap: chunks the daemon's stream lost while waiting are filled from the
+/// ring.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn paused_client_gets_the_whole_stream() {
+    let d = start_daemon().await;
+    let mut raw = UnixStream::connect(&d.socket).await.unwrap();
+    let req = |seq, req| Frame::Request { seq, req };
+    let count = "i=0; while [ $i -lt 400000 ]; do i=$((i+1)); echo $i; done; sleep 30";
+    let start = Request::StartSlot {
+        id: 4,
+        label: "t4".into(),
+        cwd: PathBuf::from("/tmp"),
+        command: Some(vec!["/bin/sh".into(), "-c".into(), count.into()]),
+    };
+    write_frame(&mut raw, &req(1, start)).await.unwrap();
+    write_frame(&mut raw, &req(2, Request::Attach { id: 4 }))
+        .await
+        .unwrap();
+    // Read nothing while the loop runs, so the socket and the queue fill.
+    sleep(overseer_daemon::server::SLOW_CLIENT_GRACE / 2).await;
+
+    let (mut rd, _w) = raw.into_split();
+    let mut text = Vec::new();
+    let done = timeout(Duration::from_secs(60), async {
+        while let Ok(Some(f)) = read_frame(&mut rd).await {
+            if let Frame::Output { id: 4, data } = f {
+                text.extend_from_slice(&data);
+                if text.ends_with(b"\r\n400000\r\n") {
+                    return true;
+                }
+            }
+        }
+        false
+    })
+    .await
+    .expect("timed out waiting for the end of the count");
+    assert!(done, "connection closed before the count ended");
+    let text = String::from_utf8_lossy(&text);
+    // A resync (ring overrun) starts over with a reset and a snapshot.
+    let text = text.rsplit("\x1bc").next().unwrap();
+    let mut prev: Option<u64> = None;
+    for line in text.split("\r\n").filter(|l| !l.is_empty()) {
+        let Ok(n) = line.parse::<u64>() else { continue };
+        if let Some(p) = prev {
+            assert_eq!(n, p + 1, "stream jumped from {p} to {n}");
+        }
+        prev = Some(n);
+    }
+    assert_eq!(prev, Some(400000));
 }
 
 #[tokio::test]
