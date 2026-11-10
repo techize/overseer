@@ -81,7 +81,7 @@ One table `sessions(slot INTEGER PRIMARY KEY, session_id TEXT NOT NULL, label TE
 Decisions:
 - Files live in `state_dir()/slots/S<n>/settings.json` and `role.md`, rewritten on every start.
 - `settings.json` holds only `"hooks"`: `SessionStart`, `UserPromptSubmit`, `Notification`, `Stop`, `PostToolUse` (matcher `*`), each one command hook `"<overseer_bin>" hook <Event>` with `"timeout": 2`. `overseer_bin` is `std::env::current_exe()` of the daemon.
-- `role.md` for S1 to S6: "You are S<n> of an Overseer team. Jonathan runs up to six Claude sessions side by side under Overseer; your slot is S<n>." plus the rule that Overseer tools will be added in later phases. S0 gets the coordinator text from the S0 kickoff decision (see the end of this plan); until that is decided, the same worker text with "S0".
+- `role.md` is copied from a template: `state_dir()/roles/worker.md` for S1 to S6, `state_dir()/roles/coordinator.md` for S0 (Task 8 writes that one). Missing templates are written from compiled-in defaults on first use and never overwritten, so Jonathan can edit them. `{slot}`, `{label}` and `{overseer}` (the binary path) are replaced on copy. Worker default: "You are {slot} of an Overseer team. Jonathan runs up to six Claude sessions side by side under Overseer, with S0 as coordinator. Your slot is {slot}, working on {label}."
 - Argv for `New(id)`: base argv, then `--session-id <id> --name "S<n> <label>" --settings <settings> --append-system-prompt-file <role>`. For `Resume(id)`: the same with `--resume <id>` in place of `--session-id <id>`.
 - Env adds `OVERSEER_SLOT=S<n>` for every slot (claude or not).
 - The ledger row is written with the new uuid at start.
@@ -162,12 +162,35 @@ Decisions:
 - [ ] **Step 4: Run** `cargo test --workspace`; pass. By hand: start a real claude slot, `launchctl kickstart -k` the agent, resume it from the board, check the conversation continues.
 - [ ] **Step 5: Commit** "Offer resume for sessions that were running when the daemon stopped".
 
-### Task 8: Phase 2 acceptance checklist
+### Task 8: S0 kickoff and first prompts
+
+**Files:**
+- Modify: `crates/overseer-proto/src/msg.rs` (`StartSlot` gains `#[serde(default)] prompt: Option<String>`), `crates/overseer-daemon/src/launch.rs`, `manager.rs`, `crates/overseer/src/ctl.rs` (`ctl start ... --prompt <text>`)
+- Create: `crates/overseer-daemon/src/roles/coordinator.md`, `roles/kickoff.md`, `roles/worker.md` (compiled-in defaults via `include_str!`)
+
+**Interfaces:**
+- Consumes: Task 3's `claude_argv`, `Start`, the template copy.
+- Produces: `claude_argv(..., prompt: Option<&str>)`, which adds the prompt as the final positional argument on `Start::New` only. `pub fn kickoff_prompt(dir: &Path) -> io::Result<String>` reads `state_dir()/roles/kickoff.md` (written from the default if missing).
+
+Decisions:
+- A first prompt is passed at launch, never typed in afterwards, because text sent before Claude's input box is ready can be lost.
+- S0 started fresh with a claude command and no `prompt` gets `kickoff_prompt` as its prompt. A resumed S0 gets none, and neither does any non-claude command.
+- Coordinator default role: S0 coordinates S1 to S6 from `~/Repos/2ndBrain`. Each round it checks `bd ready --json` in 2ndBrain, checks Jonathan's Jira items in open sprints with `acli` (JSON output), and runs `{overseer} ctl status`. It then proposes a table with one row per idle slot (slot, work item, folder, first prompt), plus anything it would leave for later and why. It does nothing until Jonathan says yes, and then only what he approved. Its tools are `{overseer} ctl start <n> --cwd <dir> --label "<item key>" --prompt "<text>"` for an empty or exited slot and `{overseer} ctl send <n> "<text>"` for a running one. It never stops a slot, never touches S0, and never starts a slot that `ctl status` shows running.
+- Kickoff default: "Run the start-of-day round: check beads and Jira, check the board, and propose who works on what."
+- Jonathan can start another round at any time by typing into S0 or with `overseer ctl send 0 "Run another round"`.
+
+- [ ] **Step 1: Write the failing tests:** `launch.rs` `prompt_is_last_positional_on_new`, `prompt_is_dropped_on_resume`, `s0_fresh_gets_the_kickoff`, `s0_resumed_gets_no_kickoff`, `edited_template_is_not_overwritten`, `placeholders_are_filled`; `crates/overseer-daemon/tests/server.rs` `start_with_prompt_reaches_the_command` (a stub `claude` records its argv).
+- [ ] **Step 2: Run**; fail.
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run** `cargo test --workspace`; pass. By hand: start S0 from the board, check it runs the round and proposes a table, approve one row, and check that slot starts in the right folder with its first prompt.
+- [ ] **Step 5: Commit** "Start S0 with a coordinator role and a kickoff round".
+
+### Task 9: Phase 2 acceptance checklist
 
 **Files:**
 - Create: `docs/acceptance/phase-2.md`
 
-Rows: I5b scrub checked in a slot started from inside a Claude session (`env | grep CLAUDE_CODE_ACCOUNT` empty); flags present (`ps -o args` for the slot's claude); each state shown on the card from a real session; notification fires once, click opens the session; daemon restart then resume continues the same conversation; `/clear` then restart resumes the new conversation; hook budget under 50 ms (`time overseer hook Stop </dev/null` with and without the daemon); non-claude slot unaffected.
+Rows: I5b scrub checked in a slot started from inside a Claude session (`env | grep CLAUDE_CODE_ACCOUNT` empty); flags present (`ps -o args` for the slot's claude); each state shown on the card from a real session; notification fires once, click opens the session; daemon restart then resume continues the same conversation; `/clear` then restart resumes the new conversation; hook budget under 50 ms (`time overseer hook Stop </dev/null` with and without the daemon); non-claude slot unaffected; S0 kickoff round proposes a table and starts an approved slot with its prompt; a resumed S0 does not rerun the kickoff.
 
 - [ ] **Step 1:** Write the checklist in the phase 1 format.
 - [ ] **Step 2:** Run every scriptable row, fill in results, leave hand rows for Jonathan.
@@ -175,6 +198,6 @@ Rows: I5b scrub checked in a slot started from inside a Claude session (`env | g
 
 ---
 
-## Open decision: how S0 gets started
+## Decision: how S0 gets started (2026-11-10)
 
-Jonathan wants S0 to start, check beads and Jira, and hand out work to S1 to S6. The spec puts the coordinator tools in phase 6 and the work-item cache in phase 3. Task 3's per-slot role file is where whichever approach is chosen plugs in; it is not part of this plan until Jonathan picks one.
+Jonathan chose a role prompt plus a kickoff over waiting for phase 6. The other option left S0 as a plain session until the coordinator tools exist. Task 8 builds the chosen approach on `overseer ctl` and the `bd` and `acli` CLIs, with Jonathan approving every allocation. The phase 6 MCP tools (`get_board`, `propose_plan` and the rest) later take the place of the shell commands, and the role text and approval rule stay the same.
