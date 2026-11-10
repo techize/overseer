@@ -127,6 +127,9 @@ pub async fn run(id: SlotId) -> anyhow::Result<()> {
             std::process::exit(1);
         }
         SlotState::Exited { code, .. } => bail!("{}", exited_message(id, code)),
+        SlotState::Resumable { .. } => {
+            bail!("{name} is resumable. Resume it with: overseer ctl resume {id}")
+        }
         SlotState::Running { .. } => {}
     }
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {

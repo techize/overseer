@@ -76,6 +76,17 @@ pub struct SlotManager {
     /// Set before daemon shutdown kills the children, so their exits are not
     /// recorded and those sessions stay live for resume.
     shutting_down: Arc<AtomicBool>,
+    /// Sessions found live in the ledger at startup, for slots that have no
+    /// process. Only ever set for a slot with no entry in `slots`; a start
+    /// or resume replaces it.
+    restored: [Option<Restored>; SLOT_COUNT],
+}
+
+/// A slot as the ledger left it: no process, but remembered.
+struct Restored {
+    info: SlotInfo,
+    /// The session to continue, empty when the slot is not resumable.
+    session_id: String,
 }
 
 #[derive(Clone)]
@@ -112,6 +123,58 @@ impl SlotManager {
             env: BaseEnv::ready(crate::env::own_env()),
             launch: None,
             shutting_down: Default::default(),
+            restored: Default::default(),
+        }
+    }
+
+    /// Turns the sessions the ledger still has as live (the daemon went down
+    /// under them) into `Resumable` slots. Anything that cannot be resumed
+    /// (not claude, no session id, unreadable command) shows as exited and is
+    /// marked exited in the ledger so it is not considered again.
+    pub fn restore(&mut self) {
+        let Some(launch) = self.launch.clone() else {
+            return;
+        };
+        let rows = match launch.ledger.live_at_shutdown() {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("ledger not readable, nothing to resume: {e:#}");
+                return;
+            }
+        };
+        for row in rows.into_iter().filter(|r| valid_id(r.slot)) {
+            let resumable =
+                !row.session_id.is_empty() && !row.command.is_empty() && is_claude(&row.command);
+            let state = if resumable {
+                SlotState::Resumable {
+                    session_id: row.session_id.clone(),
+                    at: row.started,
+                }
+            } else {
+                if let Err(e) = launch.ledger.record_exit(row.slot, None, row.started) {
+                    tracing::warn!("{} ledger exit not recorded: {e:#}", slot_name(row.slot));
+                }
+                SlotState::Exited {
+                    code: None,
+                    at: row.started,
+                }
+            };
+            let info = SlotInfo {
+                id: row.slot,
+                label: row.label,
+                cwd: Some(row.cwd),
+                command: Some(row.command).filter(|c| !c.is_empty()),
+                state,
+                cols: DEFAULT_COLS,
+                rows: DEFAULT_ROWS,
+                activity: None,
+            };
+            let session_id = if resumable {
+                row.session_id
+            } else {
+                String::new()
+            };
+            self.restored[row.slot as usize] = Some(Restored { info, session_id });
         }
     }
 
@@ -148,6 +211,37 @@ impl SlotManager {
         cwd: &Path,
         command: Option<Vec<String>>,
     ) -> Result<(), String> {
+        self.launch_slot(id, label, cwd, command, None)
+    }
+
+    /// Relaunches a `Resumable` slot with `claude --resume <id>`, in its own
+    /// cwd with its own base command and fresh generated files.
+    pub fn resume(&mut self, id: SlotId) -> Result<(), String> {
+        if !valid_id(id) {
+            return Err(invalid_id(id));
+        }
+        let offer = self.restored[id as usize]
+            .as_ref()
+            .filter(|r| matches!(r.info.state, SlotState::Resumable { .. }))
+            .ok_or_else(|| format!("{} is not resumable", slot_name(id)))?;
+        let (label, command, session_id) = (
+            offer.info.label.clone(),
+            offer.info.command.clone(),
+            offer.session_id.clone(),
+        );
+        let cwd = offer.info.cwd.clone().unwrap_or_default();
+        self.launch_slot(id, label, &cwd, command, Some(session_id))
+    }
+
+    /// The shared start path. `resume` is the session to continue, if any.
+    fn launch_slot(
+        &mut self,
+        id: SlotId,
+        label: String,
+        cwd: &Path,
+        command: Option<Vec<String>>,
+        resume: Option<String>,
+    ) -> Result<(), String> {
         if !valid_id(id) {
             return Err(invalid_id(id));
         }
@@ -176,8 +270,14 @@ impl SlotManager {
         if let Some(launch) = self.launch.as_ref().filter(|_| is_claude(&command)) {
             let files = write_slot_files(&launch.state_dir, id, &label, &launch.hook_program)
                 .map_err(|e| format!("cannot write {} launch files: {e}", slot_name(id)))?;
-            session_id = uuid::Uuid::new_v4().to_string();
-            argv = claude_argv(&command, id, &label, &files, Start::New(session_id.clone()));
+            let how = match &resume {
+                Some(sid) => Start::Resume(sid.clone()),
+                None => Start::New(uuid::Uuid::new_v4().to_string()),
+            };
+            session_id = match &how {
+                Start::New(sid) | Start::Resume(sid) => sid.clone(),
+            };
+            argv = claude_argv(&command, id, &label, &files, how);
         }
         let row_label = label.clone();
         let entry_session_id = session_id.clone();
@@ -205,8 +305,14 @@ impl SlotManager {
         // Ledger writes are single-row SQLite statements done synchronously
         // here: the start path already forks a process synchronously, so a
         // spawn_blocking hop would buy nothing. The base command is recorded
-        // (not the flagged argv) so a resume can rebuild its own flags.
-        if let Some(launch) = &self.launch {
+        // (not the flagged argv) so a resume can rebuild its own flags. A
+        // resume keeps its row (same session id) and only goes live again.
+        self.restored[id as usize] = None;
+        if let (Some(launch), Some(_)) = (&self.launch, &resume) {
+            if let Err(e) = launch.ledger.mark_resumed(id) {
+                tracing::warn!("{} ledger resume not recorded: {e:#}", slot_name(id));
+            }
+        } else if let Some(launch) = &self.launch {
             let row = SessionRow {
                 slot: id,
                 session_id,
@@ -266,9 +372,24 @@ impl SlotManager {
         }
     }
 
-    pub fn stop(&self, id: SlotId) -> Result<(), String> {
+    pub fn stop(&mut self, id: SlotId) -> Result<(), String> {
         if !valid_id(id) {
             return Err(invalid_id(id));
+        }
+        // Stopping a resumable slot declines the offer: it becomes empty and
+        // its session is not offered again after the next restart.
+        if matches!(
+            self.restored[id as usize].as_ref().map(|r| &r.info.state),
+            Some(SlotState::Resumable { .. })
+        ) {
+            self.restored[id as usize] = None;
+            if let Some(launch) = &self.launch {
+                if let Err(e) = launch.ledger.record_exit(id, None, unix_now()) {
+                    tracing::warn!("{} ledger exit not recorded: {e:#}", slot_name(id));
+                }
+            }
+            let _ = self.events.send(Event::SlotChanged(Self::empty_info(id)));
+            return Ok(());
         }
         match &self.slots.lock().unwrap()[id as usize] {
             Some(e) if matches!(e.slot.info().state, SlotState::Running { .. }) => {
@@ -284,18 +405,25 @@ impl SlotManager {
         (0..SLOT_COUNT as u8)
             .map(|id| match &slots[id as usize] {
                 Some(e) => e.info(),
-                None => SlotInfo {
-                    id,
-                    label: String::new(),
-                    cwd: None,
-                    command: None,
-                    state: SlotState::Empty,
-                    cols: DEFAULT_COLS,
-                    rows: DEFAULT_ROWS,
-                    activity: None,
+                None => match &self.restored[id as usize] {
+                    Some(r) => r.info.clone(),
+                    None => Self::empty_info(id),
                 },
             })
             .collect()
+    }
+
+    fn empty_info(id: SlotId) -> SlotInfo {
+        SlotInfo {
+            id,
+            label: String::new(),
+            cwd: None,
+            command: None,
+            state: SlotState::Empty,
+            cols: DEFAULT_COLS,
+            rows: DEFAULT_ROWS,
+            activity: None,
+        }
     }
 
     /// The slot, if the id is valid and occupied.
@@ -468,5 +596,58 @@ mod tests {
         assert!(err.contains("not a directory"), "{err}");
         assert_eq!(mgr.list()[2].state, SlotState::Empty);
         assert!(ev_rx.try_recv().is_err(), "no event for a refused start");
+    }
+}
+
+#[cfg(test)]
+mod restore_tests {
+    use super::*;
+    use crate::ledger::Ledger;
+
+    fn row(slot: SlotId, session_id: &str, command: &[&str]) -> SessionRow {
+        SessionRow {
+            slot,
+            session_id: session_id.into(),
+            label: "l".into(),
+            cwd: PathBuf::from("/tmp"),
+            command: command.iter().map(|s| s.to_string()).collect(),
+            started: 77,
+        }
+    }
+
+    fn manager(ledger: Arc<Ledger>) -> SlotManager {
+        let (events, _) = broadcast::channel(16);
+        SlotManager::new(vec!["claude".into()], events).with_launch(
+            std::env::temp_dir(),
+            PathBuf::from("/bin/true"),
+            ledger,
+        )
+    }
+
+    #[test]
+    fn corrupt_row_is_not_resumable() {
+        let ledger = Arc::new(Ledger::in_memory());
+        // A command that reads back as empty, as a corrupt row does.
+        ledger.record_start(&row(1, "abc", &[])).unwrap();
+        ledger.record_start(&row(2, "def", &["claude"])).unwrap();
+        let mut m = manager(ledger.clone());
+        m.restore();
+        let slots = m.list();
+        assert_eq!(slots[1].state, SlotState::Exited { code: None, at: 77 });
+        assert_eq!(
+            slots[2].state,
+            SlotState::Resumable {
+                session_id: "def".into(),
+                at: 77
+            }
+        );
+        assert!(m.resume(1).is_err());
+        let live: Vec<_> = ledger
+            .live_at_shutdown()
+            .unwrap()
+            .iter()
+            .map(|r| r.slot)
+            .collect();
+        assert_eq!(live, vec![2], "unresumable row recorded as exited");
     }
 }

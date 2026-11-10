@@ -37,6 +37,8 @@ pub struct PanelModel {
     pub can_restart: bool,
     /// Stopped: the start dialog can run the slot again with new settings.
     pub can_start_new: bool,
+    /// Resumable: Resume takes the place of Restart and Start.
+    pub can_resume: bool,
 }
 
 /// `14:05:12 (8m 05s ago)`. `clock` turns unix seconds into local time.
@@ -77,6 +79,11 @@ pub fn panel_model(
             },
             dash(),
         ),
+        SlotState::Resumable { at, .. } => (
+            dash(),
+            "Resumable".to_string(),
+            format_started(*at, now, &clock),
+        ),
     };
     let state = if restarting {
         format!("{state}, restarting")
@@ -105,8 +112,11 @@ pub fn panel_model(
         title: slot_title(info),
         rows,
         can_stop: running && !restarting,
-        can_restart: info.state != SlotState::Empty && info.cwd.is_some() && !restarting,
+        can_restart: !matches!(info.state, SlotState::Empty | SlotState::Resumable { .. })
+            && info.cwd.is_some()
+            && !restarting,
         can_start_new: matches!(info.state, SlotState::Exited { .. }) && !restarting,
+        can_resume: matches!(info.state, SlotState::Resumable { .. }),
     }
 }
 
@@ -125,7 +135,8 @@ pub fn incarnation(state: &SlotState) -> Incarnation {
 /// (a restart) or an empty slot drops it.
 pub fn keep_view(view: Incarnation, state: &SlotState) -> bool {
     match state {
-        SlotState::Empty => false,
+        // No process to show in either.
+        SlotState::Empty | SlotState::Resumable { .. } => false,
         SlotState::Running { .. } => view == incarnation(state),
         SlotState::Exited { .. } => true,
     }
@@ -161,7 +172,9 @@ pub fn restart_begin(info: &SlotInfo) -> Option<(Request, Option<RestartPlan>)> 
         command: info.command.clone(),
     };
     match info.state {
-        SlotState::Empty => None,
+        // Restarting would start fresh and lose the session; Resume is the
+        // way back in.
+        SlotState::Empty | SlotState::Resumable { .. } => None,
         SlotState::Running { .. } => Some((Request::StopSlot { id: info.id }, Some(plan))),
         SlotState::Exited { .. } => Some((plan.start_request(), None)),
     }
@@ -305,6 +318,21 @@ impl OverseerApp {
             button("start-new", "Start\u{2026}", m.can_start_new).when(m.can_start_new, |b| {
                 b.on_click(cx.listener(move |this, _, window, cx| this.open_dialog(id, window, cx)))
             });
+        let resume = button("resume", "Resume", m.can_resume).when(m.can_resume, |b| {
+            b.on_click(cx.listener(move |this, _, _, cx| this.resume_slot(id, cx)))
+        });
+        // Resume takes the place of Restart and Start while it is on offer.
+        let buttons = if m.can_resume {
+            div().flex().gap_2().pt_1().child(stop).child(resume)
+        } else {
+            div()
+                .flex()
+                .gap_2()
+                .pt_1()
+                .child(stop)
+                .child(restart)
+                .child(start_new)
+        };
         let focus = self.session_focus.clone();
         div()
             .flex_1()
@@ -319,15 +347,7 @@ impl OverseerApp {
                 panel_box("Session")
                     .child(div().font_weight(FontWeight::SEMIBOLD).child(m.title))
                     .children(rows)
-                    .child(
-                        div()
-                            .flex()
-                            .gap_2()
-                            .pt_1()
-                            .child(stop)
-                            .child(restart)
-                            .child(start_new),
-                    ),
+                    .child(buttons),
             )
             .child(placeholder("Owns", "phase 3"))
             .child(placeholder("Holds", "phase 3"))
@@ -376,6 +396,37 @@ impl OverseerApp {
                 .child(button("start-empty", "+ start", true).on_click(
                     cx.listener(move |this, _, window, cx| this.open_dialog(id, window, cx)),
                 )),
+        };
+        let resumable = matches!(self.slots[id as usize].state, SlotState::Resumable { .. });
+        let left = if resumable {
+            // `left` above is the empty-slot pane; this slot has a session
+            // to continue, not nothing to start.
+            div()
+                .w(relative(0.62))
+                .h_full()
+                .rounded(px(6.))
+                .border_1()
+                .border_color(rgb(colors::BORDER))
+                .bg(rgb(colors::TERM_EMPTY))
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .child(
+                    div()
+                        .text_color(rgb(colors::TEXT_DIM))
+                        .child(SharedString::from(format!(
+                            "{} was running when the daemon stopped",
+                            slot_name(id)
+                        ))),
+                )
+                .child(
+                    button("resume-pane", "Resume", true)
+                        .on_click(cx.listener(move |this, _, _, cx| this.resume_slot(id, cx))),
+                )
+        } else {
+            left
         };
         let tabs = self.render_tabs(id, cx);
         let panel = self.render_panel(id, now, cx);
@@ -459,6 +510,23 @@ mod tests {
             ]
         );
         assert!(m.can_stop && m.can_restart && !m.can_start_new);
+    }
+
+    #[test]
+    fn panel_resumable_offers_resume_not_restart() {
+        let st = SlotState::Resumable {
+            session_id: "abc".into(),
+            at: 100,
+        };
+        let m = panel_model(&info(st.clone()), 165, None, false, clock);
+        assert!(m.rows.contains(&("State", "Resumable".to_string())));
+        assert!(m
+            .rows
+            .contains(&("Started", "T100 (1m 05s ago)".to_string())));
+        assert!(m.can_resume && !m.can_stop && !m.can_restart && !m.can_start_new);
+        assert!(restart_begin(&info(st.clone())).is_none());
+        assert!(!keep_view(None, &st));
+        assert!(!panel_model(&info(RUN), 165, None, false, clock).can_resume);
     }
 
     #[test]

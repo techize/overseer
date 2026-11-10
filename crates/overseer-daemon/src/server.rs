@@ -90,11 +90,11 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
             Ledger::in_memory()
         }
     };
-    let manager: Manager = Arc::new(Mutex::new(
-        SlotManager::new(cfg.default_command, events)
-            .with_env(env.clone())
-            .with_launch(cfg.state_dir, cfg.hook_program, Arc::new(ledger)),
-    ));
+    let mut mgr = SlotManager::new(cfg.default_command, events)
+        .with_env(env.clone())
+        .with_launch(cfg.state_dir, cfg.hook_program, Arc::new(ledger));
+    mgr.restore();
+    let manager: Manager = Arc::new(Mutex::new(mgr));
     let shutdown = Arc::new(Notify::new());
     let mut conns = JoinSet::new();
 
@@ -278,7 +278,13 @@ async fn handle_conn(
                 Some(f) => {
                     // The first starts after launch wait for the login
                     // shell's environment (bounded by its timeout).
-                    if matches!(&f, Frame::Request { req: Request::StartSlot { .. }, .. }) {
+                    if matches!(
+                        &f,
+                        Frame::Request {
+                            req: Request::StartSlot { .. } | Request::ResumeSlot { .. },
+                            ..
+                        }
+                    ) {
                         env.wait().await;
                     }
                     handle_frame(f, &manager, &outbox, &shutdown, &mut streams)
@@ -371,6 +377,10 @@ fn handle_request(
             Err(m) => err(m),
         },
         Request::StopSlot { id } => match manager.lock().unwrap().stop(id) {
+            Ok(()) => Response::Ok,
+            Err(m) => err(m),
+        },
+        Request::ResumeSlot { id } => match manager.lock().unwrap().resume(id) {
             Ok(()) => Response::Ok,
             Err(m) => err(m),
         },

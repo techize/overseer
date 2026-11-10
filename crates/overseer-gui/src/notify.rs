@@ -344,6 +344,22 @@ mod tests {
     }
 
     #[test]
+    fn resumable_slots_never_notify() {
+        let mut s = slot(None, None);
+        s.state = SlotState::Resumable {
+            session_id: "abc".into(),
+            at: 1,
+        };
+        assert!(!should_notify(None, &s, false));
+        assert!(!should_notify(
+            Some(&slot(Some(ActivityKind::Working), None)),
+            &s,
+            false
+        ));
+        assert!(!should_notify(None, &s, true));
+    }
+
+    #[test]
     fn notification_text() {
         let n = note_for(&slot(
             Some(ActivityKind::NeedsYou),

@@ -72,6 +72,7 @@ actions!(
         SelectUp,
         SelectDown,
         OpenSelected,
+        ResumeSelected,
     ]
 );
 
@@ -105,6 +106,7 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("up", SelectUp, Some("Board")),
         KeyBinding::new("down", SelectDown, Some("Board")),
         KeyBinding::new("enter", OpenSelected, Some("Board")),
+        KeyBinding::new("r", ResumeSelected, Some("Board")),
         KeyBinding::new("cmd-q", Quit, None),
     ]
 }
@@ -154,6 +156,14 @@ pub fn start_target(screen: Screen, selected: SlotId, slots: &[SlotInfo]) -> Opt
     };
     let info = slots.get(id as usize)?;
     (!matches!(info.state, SlotState::Running { .. })).then_some(id)
+}
+
+/// The slot `r` resumes: the selected card, when it is resumable.
+pub fn resume_target(selected: SlotId, slots: &[SlotInfo]) -> Option<SlotId> {
+    slots
+        .get(selected as usize)
+        .filter(|i| matches!(i.state, SlotState::Resumable { .. }))
+        .map(|i| i.id)
 }
 
 /// What clicking a card does: open the session, or the start dialog for an
@@ -360,7 +370,8 @@ impl OverseerApp {
         cx: &mut Context<Self>,
     ) -> Option<Entity<TerminalView>> {
         let state = self.slots.get(id as usize)?.state.clone();
-        if state == SlotState::Empty {
+        // No process to attach to in either.
+        if matches!(state, SlotState::Empty | SlotState::Resumable { .. }) {
             return None;
         }
         let client = self.client.clone();
@@ -428,6 +439,14 @@ impl OverseerApp {
     pub(crate) fn stop_slot(&mut self, id: SlotId, cx: &mut Context<Self>) {
         self.status = None;
         self.send(Request::StopSlot { id }, cx);
+    }
+
+    /// Relaunches a resumable slot with its session continued and opens it.
+    pub(crate) fn resume_slot(&mut self, id: SlotId, cx: &mut Context<Self>) {
+        self.status = None;
+        self.focus_when_ready = Some(id);
+        self.send(Request::ResumeSlot { id }, cx);
+        cx.notify();
     }
 
     /// Stop, wait for Exited, then start with the same label, cwd and
@@ -637,6 +656,8 @@ mod tests {
         assert_eq!(routed("cmd-q", DIALOG), Some("overseer::Quit"));
         assert_eq!(routed("left", BOARD), Some("overseer::SelectLeft"));
         assert_eq!(routed("enter", BOARD), Some("overseer::OpenSelected"));
+        assert_eq!(routed("r", BOARD), Some("overseer::ResumeSelected"));
+        assert_eq!(routed("r", TERMINAL), None);
         // Arrows and Enter in a terminal are Claude Code's.
         assert_eq!(routed("left", TERMINAL), None);
         assert_eq!(routed("enter", TERMINAL), None);
@@ -673,6 +694,19 @@ mod tests {
         // Nothing running anywhere: no ticker.
         let mut idle = Ticker::default();
         assert!(!idle.on_change(Screen::Board, &slots_with(&[])));
+    }
+
+    #[test]
+    fn r_resumes_only_a_selected_resumable_card() {
+        let mut s = slots_with(&[1]);
+        s[2].state = SlotState::Resumable {
+            session_id: "abc".into(),
+            at: 0,
+        };
+        assert_eq!(resume_target(2, &s), Some(2));
+        assert_eq!(resume_target(1, &s), None);
+        assert_eq!(resume_target(4, &s), None);
+        assert_eq!(resume_target(9, &s), None);
     }
 
     #[test]

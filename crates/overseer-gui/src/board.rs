@@ -30,6 +30,8 @@ pub enum Tone {
     NeedsYou,
     Idle,
     Exited,
+    /// Was running when the daemon stopped; can be resumed.
+    Resumable,
     Empty,
 }
 
@@ -45,6 +47,8 @@ pub struct CardModel {
     pub pid: Option<String>,
     /// The tool while working, or the reason while it needs you.
     pub now_doing: Option<String>,
+    /// Shows a Resume button.
+    pub can_resume: bool,
 }
 
 /// `45s`, `8m 05s`, `2h 03m`. Negative input (clock skew) shows `0s`.
@@ -119,6 +123,7 @@ pub fn card_model(info: &SlotInfo, now: i64, home: Option<&Path>) -> CardModel {
             cwd: None,
             pid: None,
             now_doing: None,
+            can_resume: false,
         },
         SlotState::Running { pid, since } => {
             let (badge, tone, now_doing) = match &info.activity {
@@ -144,6 +149,7 @@ pub fn card_model(info: &SlotInfo, now: i64, home: Option<&Path>) -> CardModel {
                 cwd,
                 pid: Some(format!("pid {pid}")),
                 now_doing,
+                can_resume: false,
             }
         }
         SlotState::Exited { code, .. } => CardModel {
@@ -156,6 +162,16 @@ pub fn card_model(info: &SlotInfo, now: i64, home: Option<&Path>) -> CardModel {
             cwd,
             pid: None,
             now_doing: None,
+            can_resume: false,
+        },
+        SlotState::Resumable { .. } => CardModel {
+            title,
+            badge: "Resumable".into(),
+            tone: Tone::Resumable,
+            cwd,
+            pid: None,
+            now_doing: None,
+            can_resume: true,
         },
     }
 }
@@ -231,7 +247,7 @@ fn tone_color(tone: Tone) -> u32 {
     match tone {
         Tone::Running | Tone::Working => colors::GREEN,
         Tone::NeedsYou => colors::ORANGE,
-        Tone::Idle | Tone::Exited | Tone::Empty => colors::GREY,
+        Tone::Idle | Tone::Exited | Tone::Resumable | Tone::Empty => colors::GREY,
     }
 }
 
@@ -239,7 +255,7 @@ fn tone_color(tone: Tone) -> u32 {
 fn edge_color(tone: Tone) -> u32 {
     match tone {
         Tone::Running | Tone::Working | Tone::NeedsYou | Tone::Idle => tone_color(tone),
-        Tone::Exited | Tone::Empty => colors::EDGE_IDLE,
+        Tone::Exited | Tone::Resumable | Tone::Empty => colors::EDGE_IDLE,
     }
 }
 
@@ -304,6 +320,28 @@ impl OverseerApp {
                 m.pid
                     .map(|p| div().text_xs().text_color(rgb(colors::MUTED)).child(p)),
             )
+            .children(m.can_resume.then(|| {
+                div().flex().pt_1().child(
+                    div()
+                        .id(("card-resume", id as usize))
+                        .px_2()
+                        .py_1()
+                        .rounded(px(5.))
+                        .text_xs()
+                        .bg(rgb(colors::BUTTON))
+                        .border_1()
+                        .border_color(rgb(colors::BUTTON_BORDER))
+                        .text_color(rgb(colors::ACCENT))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(colors::CARD_HOVER)))
+                        .child("Resume")
+                        // The click must not also open the card behind it.
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.resume_slot(id, cx)
+                        })),
+                )
+            }))
             .cursor_pointer()
             .hover(|s| s.bg(rgb(colors::CARD_HOVER)))
             .on_click(cx.listener(move |this, _, window, cx| this.open_card(id, window, cx)))
@@ -341,6 +379,11 @@ impl OverseerApp {
             }))
             .on_action(cx.listener(|this, _: &crate::app::SelectDown, _, cx| {
                 this.move_selection(Dir::Down, cx)
+            }))
+            .on_action(cx.listener(|this, _: &crate::app::ResumeSelected, _, cx| {
+                if let Some(id) = crate::app::resume_target(this.selected, &this.slots) {
+                    this.resume_slot(id, cx);
+                }
             }))
             .on_action(
                 cx.listener(|this, _: &crate::app::OpenSelected, window, cx| {
@@ -461,6 +504,7 @@ mod tests {
                 cwd: None,
                 pid: None,
                 now_doing: None,
+                can_resume: false,
             }
         );
     }
@@ -596,6 +640,26 @@ mod tests {
         assert_eq!(m.pid, None);
         let killed = SlotState::Exited { code: None, at: 5 };
         assert_eq!(card_model(&info(3, "", killed), 9, None).badge, "Exited");
+    }
+
+    #[test]
+    fn resumable_card_model() {
+        let st = SlotState::Resumable {
+            session_id: "abc".into(),
+            at: 5,
+        };
+        let m = card_model(&info(3, "eks", st), 9, Some(Path::new(HOME)));
+        assert_eq!(m.title, "S3 · eks");
+        assert_eq!(m.badge, "Resumable");
+        assert_eq!(m.tone, Tone::Resumable);
+        assert_eq!(tone_color(m.tone), colors::GREY);
+        assert_eq!(m.cwd.as_deref(), Some("~/Repos/eks"));
+        assert_eq!(m.pid, None);
+        assert_eq!(m.now_doing, None);
+        assert!(m.can_resume);
+        // No other card offers it.
+        let ex = SlotState::Exited { code: None, at: 5 };
+        assert!(!card_model(&info(3, "eks", ex), 9, None).can_resume);
     }
 
     #[test]

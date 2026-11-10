@@ -15,8 +15,20 @@ pub fn slot_name(id: SlotId) -> String {
 #[serde(tag = "type")]
 pub enum SlotState {
     Empty,
-    Running { pid: u32, since: i64 },
-    Exited { code: Option<i32>, at: i64 },
+    Running {
+        pid: u32,
+        since: i64,
+    },
+    Exited {
+        code: Option<i32>,
+        at: i64,
+    },
+    /// Was running when the daemon last stopped and can be continued with
+    /// `claude --resume`. `at` is when that session started.
+    Resumable {
+        session_id: String,
+        at: i64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -92,6 +104,10 @@ pub enum Request {
     StopSlot {
         id: SlotId,
     },
+    /// Relaunches a `Resumable` slot with `claude --resume`.
+    ResumeSlot {
+        id: SlotId,
+    },
     Attach {
         id: SlotId,
     },
@@ -145,6 +161,18 @@ mod tests {
         });
         let back: Request = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
         assert_eq!(back, req);
+    }
+
+    #[test]
+    fn resume_shapes() {
+        let v = serde_json::to_value(Request::ResumeSlot { id: 2 }).unwrap();
+        assert_eq!(v, serde_json::json!({"type": "ResumeSlot", "id": 2}));
+        let st = SlotState::Resumable {
+            session_id: "abc".into(),
+            at: 5,
+        };
+        let back: SlotState = serde_json::from_str(&serde_json::to_string(&st).unwrap()).unwrap();
+        assert_eq!(back, st);
     }
 
     #[test]

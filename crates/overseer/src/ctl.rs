@@ -28,6 +28,8 @@ pub enum CtlCmd {
     },
     /// Stop the session in a slot.
     Stop { n: SlotId },
+    /// Continue a session that was running when the daemon stopped.
+    Resume { n: SlotId },
     /// Type text into a slot, followed by Enter.
     Send { n: SlotId, text: String },
     /// Stop the daemon and every session.
@@ -101,6 +103,7 @@ pub fn format_slot(s: &SlotInfo) -> String {
         SlotState::Running { pid, .. } => format!("{name}  running  pid {pid}"),
         SlotState::Exited { code: Some(c), .. } => format!("{name}  exited  code {c}"),
         SlotState::Exited { code: None, .. } => format!("{name}  exited"),
+        SlotState::Resumable { .. } => format!("{name}  resumable"),
     };
     if let Some(cwd) = &s.cwd {
         line.push_str(&format!("  {}", tilde(cwd)));
@@ -147,6 +150,7 @@ pub async fn run(cmd: CtlCmd) -> anyhow::Result<()> {
             )
         }
         CtlCmd::Stop { n } => expect_ok(client.request(Request::StopSlot { id: n }).await?),
+        CtlCmd::Resume { n } => expect_ok(client.request(Request::ResumeSlot { id: n }).await?),
         CtlCmd::Send { n, text } => {
             client.send_input(n, format!("{text}\r").as_bytes()).await?;
             // Input is fire-and-forget; a round trip proves the daemon read it
@@ -160,5 +164,28 @@ pub async fn run(cmd: CtlCmd) -> anyhow::Result<()> {
             )
         }
         CtlCmd::Shutdown => expect_ok(client.request(Request::Shutdown).await?),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resumable_status_line() {
+        let s = SlotInfo {
+            id: 3,
+            label: "eks".into(),
+            cwd: None,
+            command: None,
+            state: SlotState::Resumable {
+                session_id: "abc".into(),
+                at: 1,
+            },
+            cols: 80,
+            rows: 24,
+            activity: None,
+        };
+        assert_eq!(format_slot(&s), "S3  resumable  eks");
     }
 }
