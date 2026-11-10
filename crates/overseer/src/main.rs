@@ -47,7 +47,16 @@ fn default_command() -> Vec<String> {
 }
 
 fn main() {
-    let cli = Cli::parse();
+    // Exit 2 blocks a Claude hook, and clap prints usage errors, so on the
+    // hook path a parse failure is swallowed: silent, exit 0.
+    let cli = if std::env::args_os().nth(1).is_some_and(|a| a == "hook") {
+        match Cli::try_parse() {
+            Ok(cli) => cli,
+            Err(_) => return,
+        }
+    } else {
+        Cli::parse()
+    };
     let Some(command) = cli.command else {
         if let Err(e) = gui() {
             eprintln!("overseer: {e:#}");
