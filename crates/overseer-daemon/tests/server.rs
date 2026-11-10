@@ -324,7 +324,7 @@ async fn paused_client_gets_the_whole_stream() {
         while let Ok(Some(f)) = read_frame(&mut rd).await {
             if let Frame::Output { id: 4, data } = f {
                 text.extend_from_slice(&data);
-                if text.ends_with(b"\r\n400000\r\n") {
+                if text.ends_with(b"\n400000\r\n") {
                     return true;
                 }
             }
@@ -338,13 +338,20 @@ async fn paused_client_gets_the_whole_stream() {
     // A resync (ring overrun) starts over with a reset and a snapshot.
     let text = text.rsplit("\x1bc").next().unwrap();
     let mut prev: Option<u64> = None;
-    for line in text.split("\r\n").filter(|l| !l.is_empty()) {
+    // Split on LF and drop every CR: under output pressure the macOS line
+    // discipline can emit `\r\r\n` for one newline, which a terminal shows
+    // the same as `\r\n`.
+    for line in text
+        .split('\n')
+        .map(|l| l.trim_end_matches('\r'))
+        .filter(|l| !l.is_empty())
+    {
         let n: u64 = line
             .parse()
             .unwrap_or_else(|_| panic!("not a number: {line:?}"));
         if let Some(p) = prev {
             if n != p + 1 {
-                let at = text.find(&format!("\r\n{p}\r\n")).unwrap_or(0);
+                let at = text.find(&format!("\n{p}\r")).unwrap_or(0);
                 let around = &text[at..(at + 40).min(text.len())];
                 panic!("stream jumped from {p} to {n}: {around:?}");
             }
