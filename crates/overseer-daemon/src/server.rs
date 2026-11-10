@@ -14,6 +14,7 @@ use tokio::sync::{broadcast, mpsc, watch, Notify};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::env::{BaseEnv, EnvSource};
+use crate::ledger::Ledger;
 use crate::manager::{valid_id, Attachment, SlotManager};
 use crate::slot::CatchUp;
 
@@ -30,6 +31,10 @@ pub struct DaemonConfig {
     pub default_command: Vec<String>,
     /// Where sessions get their base environment.
     pub env: EnvSource,
+    /// Holds `overseer.db`, `slots/` (generated claude files) and `roles/`.
+    pub state_dir: PathBuf,
+    /// The binary the generated hooks call (`<hook_program> hook <Event>`).
+    pub hook_program: PathBuf,
 }
 
 /// `run` found another daemon serving the socket. Not a failure: the daemon
@@ -77,8 +82,18 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
     // StartSlot waits for it.
     let env = BaseEnv::start(&cfg.env);
     let (events, _) = broadcast::channel::<Event>(EVENT_CHANNEL_CAP);
+    let db = cfg.state_dir.join("overseer.db");
+    let ledger = match Ledger::open(&db) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!("ledger {} unusable, not persisting: {e:#}", db.display());
+            Ledger::in_memory()
+        }
+    };
     let manager: Manager = Arc::new(Mutex::new(
-        SlotManager::new(cfg.default_command, events).with_env(env.clone()),
+        SlotManager::new(cfg.default_command, events)
+            .with_env(env.clone())
+            .with_launch(cfg.state_dir, cfg.hook_program, Arc::new(ledger)),
     ));
     let shutdown = Arc::new(Notify::new());
     let mut conns = JoinSet::new();

@@ -1,6 +1,7 @@
 //! The seven slots (S0 to S6) and their lifecycle.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -9,6 +10,8 @@ use overseer_proto::{slot_name, Event, SlotId, SlotInfo, SlotState};
 use tokio::sync::broadcast;
 
 use crate::env::BaseEnv;
+use crate::launch::{claude_argv, is_claude, write_slot_files, Start};
+use crate::ledger::{Ledger, SessionRow};
 use crate::slot::Slot;
 
 pub const SLOT_COUNT: usize = 7;
@@ -42,6 +45,26 @@ pub struct SlotManager {
     events: broadcast::Sender<Event>,
     /// Environment every slot starts from.
     env: BaseEnv,
+    /// Where generated files go and the ledger lives; `None` runs commands
+    /// as given and records nothing.
+    launch: Option<Launch>,
+    /// Set before daemon shutdown kills the children, so their exits are not
+    /// recorded and those sessions stay live for resume.
+    shutting_down: Arc<AtomicBool>,
+}
+
+#[derive(Clone)]
+struct Launch {
+    state_dir: PathBuf,
+    /// The binary the generated hooks call.
+    hook_program: PathBuf,
+    ledger: Arc<Ledger>,
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 /// What a client needs to attach to a slot.
@@ -62,7 +85,25 @@ impl SlotManager {
             default_command,
             events,
             env: BaseEnv::ready(crate::env::own_env()),
+            launch: None,
+            shutting_down: Default::default(),
         }
+    }
+
+    /// Generates claude's per-slot files under `state_dir` and records every
+    /// start (and exit) in `ledger`.
+    pub fn with_launch(
+        mut self,
+        state_dir: PathBuf,
+        hook_program: PathBuf,
+        ledger: Arc<Ledger>,
+    ) -> Self {
+        self.launch = Some(Launch {
+            state_dir,
+            hook_program,
+            ledger,
+        });
+        self
     }
 
     /// Uses `env` as the base environment for slots started from now on.
@@ -103,22 +144,24 @@ impl SlotManager {
             }
         }
         let command = command.unwrap_or_else(|| self.default_command.clone());
+        // Claude gets Overseer's hooks, role prompt and a session id of our
+        // choosing; anything else runs as given and has no session id.
+        let mut session_id = String::new();
+        let mut argv = command.clone();
+        if let Some(launch) = self.launch.as_ref().filter(|_| is_claude(&command)) {
+            let files = write_slot_files(&launch.state_dir, id, &label, &launch.hook_program)
+                .map_err(|e| format!("cannot write {} launch files: {e}", slot_name(id)))?;
+            session_id = uuid::Uuid::new_v4().to_string();
+            argv = claude_argv(&command, id, &label, &files, Start::New(session_id.clone()));
+        }
+        let row_label = label.clone();
         let (tx, monitor_rx) = broadcast::channel(OUTPUT_CHANNEL_CAP);
         let env = self.env.get();
-        let slot = Slot::spawn_in(
-            id,
-            label,
-            cwd,
-            &command,
-            DEFAULT_COLS,
-            DEFAULT_ROWS,
-            tx,
-            &env,
-        )
-        .map_err(|e| {
-            tracing::warn!("{} failed to start {:?}: {e:#}", slot_name(id), command);
-            format!("{e:#}")
-        })?;
+        let slot = Slot::spawn_in(id, label, cwd, &argv, DEFAULT_COLS, DEFAULT_ROWS, tx, &env)
+            .map_err(|e| {
+                tracing::warn!("{} failed to start {:?}: {e:#}", slot_name(id), argv);
+                format!("{e:#}")
+            })?;
         let slot = Arc::new(slot);
         if let SlotState::Running { pid, .. } = slot.info().state {
             tracing::info!(
@@ -133,6 +176,23 @@ impl SlotManager {
         if let Some(old) = slots[id as usize].replace(Entry { slot: slot.clone() }) {
             old.slot.kill();
         }
+        // Ledger writes are single-row SQLite statements done synchronously
+        // here: the start path already forks a process synchronously, so a
+        // spawn_blocking hop would buy nothing. The base command is recorded
+        // (not the flagged argv) so a resume can rebuild its own flags.
+        if let Some(launch) = &self.launch {
+            let row = SessionRow {
+                slot: id,
+                session_id,
+                label: row_label,
+                cwd: cwd.to_path_buf(),
+                command: command.clone(),
+                started: unix_now(),
+            };
+            if let Err(e) = launch.ledger.record_start(&row) {
+                tracing::warn!("{} ledger start not recorded: {e:#}", slot_name(id));
+            }
+        }
         let _ = self.events.send(Event::SlotChanged(slot.info()));
         drop(slots);
         tokio::spawn(monitor_exit(
@@ -140,6 +200,8 @@ impl SlotManager {
             monitor_rx,
             self.events.clone(),
             self.slots.clone(),
+            self.launch.as_ref().map(|l| l.ledger.clone()),
+            self.shutting_down.clone(),
         ));
         Ok(())
     }
@@ -204,6 +266,8 @@ impl SlotManager {
 
     /// N4: kill every child. Called on daemon shutdown.
     pub fn shutdown_all(&mut self) {
+        // Before any kill: the exit monitors must see it when the children die.
+        self.shutting_down.store(true, Ordering::SeqCst);
         for entry in self
             .slots
             .lock()
@@ -227,6 +291,8 @@ async fn monitor_exit(
     mut rx: broadcast::Receiver<Bytes>,
     events: broadcast::Sender<Event>,
     slots: Slots,
+    ledger: Option<Arc<Ledger>>,
+    shutting_down: Arc<AtomicBool>,
 ) {
     slot.wait_exit().await;
     let _ = tokio::time::timeout(DRAIN_TIMEOUT, async {
@@ -252,6 +318,16 @@ async fn monitor_exit(
         .as_ref()
         .is_some_and(|e| Arc::ptr_eq(&e.slot, &slot));
     if current {
+        // A daemon shutdown kills the children too, but those sessions must
+        // stay live in the ledger so they can be resumed. Synchronous for the
+        // same reason as the start write.
+        if let (Some(ledger), SlotState::Exited { code, at }) = (&ledger, &info.state) {
+            if !shutting_down.load(Ordering::SeqCst) {
+                if let Err(e) = ledger.record_exit(info.id, *code, *at) {
+                    tracing::warn!("{} ledger exit not recorded: {e:#}", slot_name(info.id));
+                }
+            }
+        }
         let _ = events.send(Event::SlotChanged(info));
     } else {
         tracing::debug!("dropping stale exit event for replaced slot");
@@ -286,7 +362,14 @@ mod tests {
         );
         mgr.slots.lock().unwrap()[1] = Some(Entry { slot: old.clone() });
         old.wait_exit().await;
-        tokio::spawn(monitor_exit(old.clone(), rx, events, mgr.slots.clone()));
+        tokio::spawn(monitor_exit(
+            old.clone(),
+            rx,
+            events,
+            mgr.slots.clone(),
+            None,
+            Default::default(),
+        ));
 
         // The old slot reads as Exited, so a restart is allowed mid-drain.
         mgr.start(1, "new".into(), Path::new("/tmp"), None).unwrap();

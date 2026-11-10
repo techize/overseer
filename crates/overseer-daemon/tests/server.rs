@@ -28,6 +28,7 @@ fn temp_socket() -> PathBuf {
 
 struct Daemon {
     socket: PathBuf,
+    state_dir: PathBuf,
     task: JoinHandle<anyhow::Result<()>>,
 }
 
@@ -37,15 +38,22 @@ async fn start_daemon() -> Daemon {
 }
 
 async fn start_daemon_at(socket: PathBuf) -> Daemon {
+    let state_dir = socket.parent().unwrap().join("state");
     let cfg = DaemonConfig {
         socket: socket.clone(),
         default_command: vec![SCRIPT.to_string()],
         env: overseer_daemon::EnvSource::Inherit,
+        state_dir: state_dir.clone(),
+        hook_program: PathBuf::from("/bin/true"),
     };
     let task = tokio::spawn(run(cfg));
     for _ in 0..100 {
         if UnixStream::connect(&socket).await.is_ok() {
-            return Daemon { socket, task };
+            return Daemon {
+                socket,
+                state_dir,
+                task,
+            };
         }
         sleep(Duration::from_millis(20)).await;
     }
@@ -379,6 +387,8 @@ async fn second_daemon_refused() {
         socket: d.socket.clone(),
         default_command: vec![SCRIPT.to_string()],
         env: overseer_daemon::EnvSource::Inherit,
+        state_dir: d.state_dir.clone(),
+        hook_program: PathBuf::from("/bin/true"),
     })
     .await
     .unwrap_err();
@@ -493,4 +503,57 @@ async fn line_at_a_time_burst_does_not_drop_live_client() {
         .await
         .expect("burst did not arrive");
     assert!(out.contains("199999"));
+}
+
+fn live_slots(d: &Daemon) -> Vec<u8> {
+    let ledger = overseer_daemon::ledger::Ledger::open(&d.state_dir.join("overseer.db")).unwrap();
+    ledger
+        .live_at_shutdown()
+        .unwrap()
+        .iter()
+        .map(|r| r.slot)
+        .collect()
+}
+
+#[tokio::test]
+async fn exit_is_recorded_in_the_ledger() {
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    assert_eq!(c.start(4).await, Response::Ok);
+    assert_eq!(live_slots(&d), vec![4]);
+    c.send(Frame::Input {
+        id: 4,
+        data: Bytes::from_static(b"quit\r"),
+    })
+    .await;
+    c.exited_event(4).await;
+    assert!(live_slots(&d).is_empty(), "self exit not recorded");
+
+    // StopSlot counts too.
+    assert_eq!(c.start(5).await, Response::Ok);
+    assert_eq!(live_slots(&d), vec![5]);
+    assert_eq!(c.request(Request::StopSlot { id: 5 }).await, Response::Ok);
+    c.exited_event(5).await;
+    assert!(live_slots(&d).is_empty(), "stop not recorded");
+}
+
+#[tokio::test]
+async fn shutdown_does_not_record_exits() {
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    assert_eq!(c.start(6).await, Response::Ok);
+    assert_eq!(c.request(Request::Shutdown).await, Response::Ok);
+    let mut d = d;
+    timeout(WAIT, &mut d.task)
+        .await
+        .expect("run returned")
+        .unwrap()
+        .unwrap();
+    // Give the exit monitor time to see the killed child.
+    sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        live_slots(&d),
+        vec![6],
+        "shutdown kill was recorded as an exit"
+    );
 }

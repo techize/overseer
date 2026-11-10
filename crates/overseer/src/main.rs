@@ -69,6 +69,8 @@ fn main() {
                     socket,
                     default_command: default_command(),
                     env: overseer_daemon::EnvSource::LoginShell,
+                    state_dir: overseer_proto::paths::state_dir(),
+                    hook_program: std::env::current_exe()?,
                 }))
             });
             match &result {
