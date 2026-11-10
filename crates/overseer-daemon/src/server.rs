@@ -398,8 +398,12 @@ fn handle_request(
             None => err(format!("{} is empty", slot_name(id))),
         },
         Request::Shutdown => Response::Ok,
-        // Delivered only for now; the daemon starts acting on hooks later.
-        Request::Hook(_) => Response::Ok,
+        // Always Ok: a hook runs inside Claude and must never see a failure
+        // because of the daemon's state.
+        Request::Hook(ev) => {
+            manager.lock().unwrap().hook(&ev);
+            Response::Ok
+        }
     }
 }
 

@@ -6,7 +6,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use overseer_daemon::{run, DaemonConfig};
 use overseer_proto::{
-    read_frame, write_frame, Event, Frame, Request, Response, SlotInfo, SlotState,
+    read_frame, write_frame, Activity, ActivityKind, Event, Frame, HookEvent, HookKind, Request,
+    Response, SlotInfo, SlotState,
 };
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::UnixStream;
@@ -556,4 +557,143 @@ async fn shutdown_does_not_record_exits() {
         vec![6],
         "shutdown kill was recorded as an exit"
     );
+}
+
+fn hook(slot: u8, event: HookKind) -> HookEvent {
+    HookEvent {
+        slot,
+        event,
+        session_id: None,
+        tool: None,
+        detail: None,
+        notification: None,
+    }
+}
+
+impl Client {
+    /// The next SlotChanged for `id`, whatever it carries.
+    async fn next_change(&mut self, id: u8) -> SlotInfo {
+        loop {
+            match self.recv().await.expect("connection closed") {
+                Frame::Event(Event::SlotChanged(info)) if info.id == id => return info,
+                _ => {}
+            }
+        }
+    }
+
+    async fn hook(&mut self, ev: HookEvent) {
+        assert_eq!(self.request(Request::Hook(ev)).await, Response::Ok);
+    }
+}
+
+fn activity_of(info: &SlotInfo) -> &Activity {
+    info.activity.as_ref().expect("activity set")
+}
+
+#[tokio::test]
+async fn hook_requests_change_slot_activity() {
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    assert_eq!(c.start(2).await, Response::Ok);
+    // The start announcement carries no activity yet.
+    assert_eq!(c.next_change(2).await.activity, None);
+
+    c.hook(hook(2, HookKind::UserPromptSubmit)).await;
+    let info = c.next_change(2).await;
+    assert_eq!(activity_of(&info).kind, ActivityKind::Working);
+    let since = activity_of(&info).since;
+
+    let mut tool = hook(2, HookKind::PostToolUse);
+    tool.tool = Some("Bash".into());
+    tool.detail = Some("cargo test".into());
+    c.hook(tool).await;
+    let info = c.next_change(2).await;
+    let a = activity_of(&info);
+    assert_eq!(a.kind, ActivityKind::Working);
+    assert_eq!(a.since, since);
+    assert_eq!(a.now_doing.as_deref(), Some("Bash cargo test"));
+    // list agrees with the event.
+    assert_eq!(c.list().await[2].activity.as_ref(), Some(a));
+
+    let mut note = hook(2, HookKind::Notification);
+    note.notification = Some("needs permission".into());
+    c.hook(note).await;
+    let info = c.next_change(2).await;
+    assert_eq!(activity_of(&info).kind, ActivityKind::NeedsYou);
+    assert_eq!(
+        activity_of(&info).reason.as_deref(),
+        Some("needs permission")
+    );
+
+    c.hook(hook(2, HookKind::Stop)).await;
+    let info = c.next_change(2).await;
+    assert_eq!(activity_of(&info).kind, ActivityKind::Idle);
+
+    // A repeat changes nothing, so the next change seen is the exit.
+    c.hook(hook(2, HookKind::Stop)).await;
+    assert_eq!(c.request(Request::StopSlot { id: 2 }).await, Response::Ok);
+    let info = c.exited_event(2).await;
+    assert_eq!(info.activity, None, "exit clears activity");
+    assert_eq!(c.list().await[2].activity, None);
+}
+
+#[tokio::test]
+async fn hooks_for_slots_that_are_not_running_are_ignored() {
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    // Empty slot, and an id that does not exist: still Ok, nothing happens.
+    c.hook(hook(3, HookKind::UserPromptSubmit)).await;
+    c.hook(hook(99, HookKind::UserPromptSubmit)).await;
+    assert_eq!(c.start(4).await, Response::Ok);
+    assert_eq!(c.next_change(4).await.activity, None);
+    c.send(Frame::Input {
+        id: 4,
+        data: Bytes::from_static(b"quit\r"),
+    })
+    .await;
+    c.exited_event(4).await;
+    // A late hook after the exit must not revive the slot's activity.
+    c.hook(hook(4, HookKind::UserPromptSubmit)).await;
+    // The next observable change is slot 5's start, not slot 4's.
+    assert_eq!(c.start(5).await, Response::Ok);
+    loop {
+        let Frame::Event(Event::SlotChanged(info)) = c.recv().await.unwrap() else {
+            continue;
+        };
+        assert_ne!(info.id, 3, "empty slot announced");
+        assert_ne!(info.id, 4, "exited slot announced after its exit");
+        if info.id == 5 {
+            break;
+        }
+    }
+    assert_eq!(c.list().await[4].activity, None);
+}
+
+#[tokio::test]
+async fn session_start_with_new_id_updates_the_ledger() {
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    assert_eq!(c.start(1).await, Response::Ok);
+    let ledger = overseer_daemon::ledger::Ledger::open(&d.state_dir.join("overseer.db")).unwrap();
+    let id_of =
+        |l: &overseer_daemon::ledger::Ledger| l.live_at_shutdown().unwrap()[0].session_id.clone();
+    assert_eq!(id_of(&ledger), "", "non-claude slots start with no id");
+
+    let mut ev = hook(1, HookKind::SessionStart);
+    ev.session_id = Some("new-session-id".into());
+    c.hook(ev).await;
+    c.next_change(1).await; // start
+    let info = c.next_change(1).await;
+    assert_eq!(activity_of(&info).kind, ActivityKind::Idle);
+    assert_eq!(id_of(&ledger), "new-session-id");
+
+    // A later change is picked up too.
+    let mut ev = hook(1, HookKind::SessionStart);
+    ev.session_id = Some("later-id".into());
+    c.hook(ev).await;
+    // Already idle, so no change is announced; the next event proves the
+    // hook was handled before the ledger is read.
+    c.hook(hook(1, HookKind::UserPromptSubmit)).await;
+    c.next_change(1).await;
+    assert_eq!(id_of(&ledger), "later-id");
 }

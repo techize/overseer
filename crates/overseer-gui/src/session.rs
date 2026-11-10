@@ -413,6 +413,7 @@ mod tests {
             state,
             cols: 80,
             rows: 24,
+            activity: None,
         }
     }
 

@@ -6,9 +6,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use overseer_proto::{slot_name, Event, SlotId, SlotInfo, SlotState};
+use overseer_proto::{
+    slot_name, Activity, Event, HookEvent, HookKind, SlotId, SlotInfo, SlotState,
+};
 use tokio::sync::broadcast;
 
+use crate::activity::apply;
 use crate::env::BaseEnv;
 use crate::launch::{claude_argv, is_claude, write_slot_files, Start};
 use crate::ledger::{Ledger, SessionRow};
@@ -33,6 +36,28 @@ fn invalid_id(id: SlotId) -> String {
 
 struct Entry {
     slot: Arc<Slot>,
+    /// From hook events; cleared when the slot exits.
+    activity: Option<Activity>,
+    /// Claude's current session id, empty for commands that are not claude.
+    /// Kept so a hook only touches the ledger when the id really changed.
+    session_id: String,
+}
+
+impl Entry {
+    fn new(slot: Arc<Slot>, session_id: String) -> Self {
+        Entry {
+            slot,
+            activity: None,
+            session_id,
+        }
+    }
+
+    fn info(&self) -> SlotInfo {
+        SlotInfo {
+            activity: self.activity.clone(),
+            ..self.slot.info()
+        }
+    }
 }
 
 type Slots = Arc<Mutex<[Option<Entry>; SLOT_COUNT]>>;
@@ -155,6 +180,7 @@ impl SlotManager {
             argv = claude_argv(&command, id, &label, &files, Start::New(session_id.clone()));
         }
         let row_label = label.clone();
+        let entry_session_id = session_id.clone();
         let (tx, monitor_rx) = broadcast::channel(OUTPUT_CHANNEL_CAP);
         let env = self.env.get();
         let slot = Slot::spawn_in(id, label, cwd, &argv, DEFAULT_COLS, DEFAULT_ROWS, tx, &env)
@@ -173,7 +199,7 @@ impl SlotManager {
         }
         // N4: tear down whatever occupied the slot before (an exited child;
         // kill is a no-op then, but keeps the invariant in one place).
-        if let Some(old) = slots[id as usize].replace(Entry { slot: slot.clone() }) {
+        if let Some(old) = slots[id as usize].replace(Entry::new(slot.clone(), entry_session_id)) {
             old.slot.kill();
         }
         // Ledger writes are single-row SQLite statements done synchronously
@@ -206,6 +232,40 @@ impl SlotManager {
         Ok(())
     }
 
+    /// Applies a Claude Code hook event to its slot. Events for a slot that
+    /// is not running are dropped: the hook process never sees an error, and
+    /// a late event must not bring back the activity an exit cleared.
+    pub fn hook(&self, ev: &HookEvent) {
+        let mut slots = self.slots.lock().unwrap();
+        let Some(entry) = slots.get_mut(ev.slot as usize).and_then(Option::as_mut) else {
+            return;
+        };
+        if !matches!(entry.slot.info().state, SlotState::Running { .. }) {
+            return;
+        }
+        // A resumed or compacted session can report an id other than the one
+        // we generated; the ledger needs the real one to resume it. Written
+        // synchronously for the same reason as the start write.
+        if ev.event == HookKind::SessionStart {
+            if let Some(id) = ev.session_id.as_ref().filter(|id| **id != entry.session_id) {
+                if let Some(launch) = &self.launch {
+                    if let Err(e) = launch.ledger.set_session_id(ev.slot, id) {
+                        tracing::warn!(
+                            "{} ledger session id not updated: {e:#}",
+                            slot_name(ev.slot)
+                        );
+                    }
+                }
+                entry.session_id = id.clone();
+            }
+        }
+        let next = apply(entry.activity.as_ref(), ev, unix_now());
+        if next != entry.activity {
+            entry.activity = next;
+            let _ = self.events.send(Event::SlotChanged(entry.info()));
+        }
+    }
+
     pub fn stop(&self, id: SlotId) -> Result<(), String> {
         if !valid_id(id) {
             return Err(invalid_id(id));
@@ -223,7 +283,7 @@ impl SlotManager {
         let slots = self.slots.lock().unwrap();
         (0..SLOT_COUNT as u8)
             .map(|id| match &slots[id as usize] {
-                Some(e) => e.slot.info(),
+                Some(e) => e.info(),
                 None => SlotInfo {
                     id,
                     label: String::new(),
@@ -232,6 +292,7 @@ impl SlotManager {
                     state: SlotState::Empty,
                     cols: DEFAULT_COLS,
                     rows: DEFAULT_ROWS,
+                    activity: None,
                 },
             })
             .collect()
@@ -313,10 +374,12 @@ async fn monitor_exit(
     if let SlotState::Exited { code, .. } = &info.state {
         tracing::info!("{} exited (code {code:?})", slot_name(info.id));
     }
-    let slots = slots.lock().unwrap();
+    let mut slots = slots.lock().unwrap();
     let current = slots[info.id as usize]
-        .as_ref()
-        .is_some_and(|e| Arc::ptr_eq(&e.slot, &slot));
+        .as_mut()
+        .filter(|e| Arc::ptr_eq(&e.slot, &slot))
+        .map(|e| e.activity = None)
+        .is_some();
     if current {
         // A daemon shutdown kills the children too, but those sessions must
         // stay live in the ledger so they can be resumed. Synchronous for the
@@ -360,7 +423,7 @@ mod tests {
             )
             .unwrap(),
         );
-        mgr.slots.lock().unwrap()[1] = Some(Entry { slot: old.clone() });
+        mgr.slots.lock().unwrap()[1] = Some(Entry::new(old.clone(), String::new()));
         old.wait_exit().await;
         tokio::spawn(monitor_exit(
             old.clone(),

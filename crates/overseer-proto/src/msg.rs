@@ -28,6 +28,29 @@ pub struct SlotInfo {
     pub state: SlotState,
     pub cols: u16,
     pub rows: u16,
+    /// What the session in the slot is doing, from its hook events. `None`
+    /// until the first event, for slots that are not running and for
+    /// commands that send no hooks.
+    #[serde(default)]
+    pub activity: Option<Activity>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ActivityKind {
+    Working,
+    NeedsYou,
+    Idle,
+}
+
+/// A slot's current activity. `since` is unix seconds.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Activity {
+    pub kind: ActivityKind,
+    pub since: i64,
+    /// The latest tool, while working.
+    pub now_doing: Option<String>,
+    /// Why the session needs you.
+    pub reason: Option<String>,
 }
 
 /// Which Claude Code hook fired.

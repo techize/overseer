@@ -187,6 +187,7 @@ fn empty_slots() -> Vec<SlotInfo> {
             state: SlotState::Empty,
             cols: 80,
             rows: 24,
+            activity: None,
         })
         .collect()
 }

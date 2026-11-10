@@ -352,6 +352,7 @@ mod tests {
                 state: overseer_proto::SlotState::Empty,
                 cols: 80,
                 rows: 24,
+                activity: None,
             },
         ));
         assert_eq!(hub.routes.lock().unwrap().dispatch(ev.clone()), Some(ev));

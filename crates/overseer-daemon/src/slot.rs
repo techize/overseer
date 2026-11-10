@@ -294,6 +294,7 @@ impl Slot {
             state,
             cols,
             rows,
+            activity: None,
         }
     }
 

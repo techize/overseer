@@ -594,6 +594,7 @@ mod tests {
             },
             cols: 80,
             rows: 24,
+            activity: None,
         };
         assert_eq!(
             initial_fields(Some(&last), home),
