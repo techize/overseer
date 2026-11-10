@@ -452,5 +452,13 @@ mod tests {
             "{role}"
         );
         assert!(!role.contains('\u{2014}'), "no em dashes");
+        // Bead and Jira text must not be shell-expanded.
+        assert!(
+            role.contains("ctl start <n> --cwd <dir> --label '<item key>' --prompt '<text>'"),
+            "{role}"
+        );
+        assert!(role.contains("ctl send <n> '<text>'"), "{role}");
+        assert!(role.contains("'\\''"), "{role}");
+        assert!(!role.contains("--prompt \""), "{role}");
     }
 }

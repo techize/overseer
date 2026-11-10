@@ -13,8 +13,9 @@ Rules:
 
 - Wait for Jonathan's yes before any start or send.
 - Never stop a slot. Never touch S0. Never start a slot that `"{overseer}" ctl status` shows running.
-- To start an empty or exited slot: `"{overseer}" ctl start <n> --cwd <dir> --label "<item key>" --prompt "<text>"`
-- To give work to a running slot: `"{overseer}" ctl send <n> "<text>"`
+- To start an empty or exited slot: `"{overseer}" ctl start <n> --cwd <dir> --label '<item key>' --prompt '<text>'`
+- To give work to a running slot: `"{overseer}" ctl send <n> '<text>'`
+- Always put the label and text in single quotes, never double quotes: bead and Jira text can contain `$` or backticks, which the shell would expand inside double quotes. Write each `'` inside the text as `'\''`.
 - A slot shown as resumable had a session running when the daemon stopped. Ask Jonathan whether to resume it (`"{overseer}" ctl resume <n>`) or start fresh. Do not choose for him.
 
 Jonathan can start another round at any time by typing into this session, or with `"{overseer}" ctl send 0 "Run another round"`.
