@@ -100,6 +100,9 @@ pub enum Request {
         label: String,
         cwd: PathBuf,
         command: Option<Vec<String>>,
+        /// First prompt, passed to claude at launch. Old clients omit it.
+        #[serde(default)]
+        prompt: Option<String>,
     },
     StopSlot {
         id: SlotId,

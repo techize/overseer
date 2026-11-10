@@ -27,6 +27,7 @@ async fn attach_snapshot_precedes_live_output() {
             label: "t".into(),
             cwd: "/tmp".into(),
             command: None,
+            prompt: None,
         })
         .await
         .unwrap();

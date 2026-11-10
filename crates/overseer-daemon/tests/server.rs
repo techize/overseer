@@ -130,6 +130,7 @@ impl Client {
             label: format!("t{id}"),
             cwd: PathBuf::from("/tmp"),
             command: None,
+            prompt: None,
         })
         .await
     }
@@ -261,6 +262,7 @@ async fn slow_client_dropped() {
                 label: "t3".into(),
                 cwd: PathBuf::from("/tmp"),
                 command: None,
+                prompt: None,
             },
         ),
     )
@@ -319,6 +321,7 @@ async fn paused_client_gets_the_whole_stream() {
         label: "t4".into(),
         cwd: PathBuf::from("/tmp"),
         command: Some(vec!["/bin/sh".into(), "-c".into(), count.into()]),
+        prompt: None,
     };
     write_frame(&mut raw, &req(1, start)).await.unwrap();
     write_frame(&mut raw, &req(2, Request::Attach { id: 4 }))
@@ -497,6 +500,7 @@ async fn line_at_a_time_burst_does_not_drop_live_client() {
             "-c".into(),
             "sleep 0.5; seq 1 200000; echo BURST-END".into(),
         ]),
+        prompt: None,
     };
     assert_eq!(c.request(start).await, Response::Ok);
     assert_eq!(c.request(Request::Attach { id: 2 }).await, Response::Ok);
@@ -766,6 +770,7 @@ async fn restart_offers_resume() {
         label: "resumer".into(),
         cwd: cwd.clone(),
         command: Some(vec![bin.to_string_lossy().into_owned()]),
+        prompt: None,
     };
     assert_eq!(c.request(start).await, Response::Ok);
     let first = wait_for_log(&log, 1).await;
@@ -842,6 +847,7 @@ async fn exited_slot_is_not_resumable() {
         label: "x".into(),
         cwd: PathBuf::from("/tmp"),
         command: Some(vec![bin.to_string_lossy().into_owned()]),
+        prompt: None,
     };
     assert_eq!(c.request(start).await, Response::Ok);
     assert_eq!(c.request(Request::StopSlot { id: 1 }).await, Response::Ok);
@@ -871,6 +877,7 @@ async fn start_and_stop_on_a_resumable_slot() {
             label: format!("s{id}"),
             cwd: PathBuf::from("/tmp"),
             command: cmd.clone(),
+            prompt: None,
         };
         assert_eq!(c.request(start).await, Response::Ok);
     }
@@ -892,6 +899,7 @@ async fn start_and_stop_on_a_resumable_slot() {
         label: "s1".into(),
         cwd: PathBuf::from("/tmp"),
         command: cmd,
+        prompt: None,
     };
     assert_eq!(c.request(start).await, Response::Ok);
     let lines = wait_for_log(&log, 3).await;
@@ -900,4 +908,67 @@ async fn start_and_stop_on_a_resumable_slot() {
     assert!(matches!(c.list().await[1].state, SlotState::Running { .. }));
     // Only the running one is live in the ledger; the declined one is gone.
     assert_eq!(live_slots(&d), vec![1]);
+}
+
+/// The last argv element of a stub log line.
+fn last_arg(line: &str) -> String {
+    line.split_once('|')
+        .unwrap()
+        .1
+        .rsplit(' ')
+        .next()
+        .unwrap()
+        .to_string()
+}
+
+#[tokio::test]
+async fn start_with_prompt_reaches_the_command() {
+    let dir = std::env::temp_dir().join(format!("ovs-prompt-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (bin, log) = stub_claude(&dir);
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    let start = Request::StartSlot {
+        id: 2,
+        label: "p".into(),
+        cwd: dir.clone(),
+        command: Some(vec![bin.to_string_lossy().into_owned()]),
+        // One word: the stub joins argv with spaces.
+        prompt: Some("hello".into()),
+    };
+    assert_eq!(c.request(start).await, Response::Ok);
+    let lines = wait_for_log(&log, 1).await;
+    assert_eq!(last_arg(&lines[0]), "hello");
+}
+
+#[tokio::test]
+async fn s0_started_fresh_gets_the_kickoff_last() {
+    let dir = std::env::temp_dir().join(format!("ovs-kick-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (bin, log) = stub_claude(&dir);
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    let start = Request::StartSlot {
+        id: 0,
+        label: String::new(),
+        cwd: dir.clone(),
+        command: Some(vec![bin.to_string_lossy().into_owned()]),
+        prompt: None,
+    };
+    assert_eq!(c.request(start).await, Response::Ok);
+    let lines = wait_for_log(&log, 1).await;
+    // Kickoff ends in "what." so check the whole tail, not one word.
+    assert!(
+        lines[0].ends_with("propose who works on what."),
+        "{}",
+        lines[0]
+    );
+    assert!(
+        lines[0].contains("Run the start-of-day round:"),
+        "{}",
+        lines[0]
+    );
+    // The coordinator role, not the worker role, was written for S0.
+    let role = std::fs::read_to_string(d.state_dir.join("slots/S0/role.md")).unwrap();
+    assert!(role.contains("coordinator"), "{role}");
 }

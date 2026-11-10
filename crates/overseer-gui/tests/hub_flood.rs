@@ -34,6 +34,7 @@ async fn burst(tag: &str, command: Option<Vec<String>>, input: &[u8], end: &str)
         label: "t".into(),
         cwd: "/tmp".into(),
         command,
+        prompt: None,
     };
     assert_eq!(client.request(start).await.unwrap(), Response::Ok);
     tokio::time::sleep(Duration::from_millis(300)).await;

@@ -158,6 +158,7 @@ impl RestartPlan {
             label: self.label.clone(),
             cwd: self.cwd.clone(),
             command: self.command.clone(),
+            prompt: None,
         }
     }
 }
@@ -630,6 +631,7 @@ mod tests {
                 label: "magento".into(),
                 cwd: "/Users/me/Repos/m".into(),
                 command: Some(vec!["claude".into(), "--resume".into()]),
+                prompt: None,
             })
         );
     }

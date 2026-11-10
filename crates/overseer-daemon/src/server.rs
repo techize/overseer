@@ -372,7 +372,12 @@ fn handle_request(
             label,
             cwd,
             command,
-        } => match manager.lock().unwrap().start(id, label, &cwd, command) {
+            prompt,
+        } => match manager
+            .lock()
+            .unwrap()
+            .start(id, label, &cwd, command, prompt)
+        {
             Ok(()) => Response::Ok,
             Err(m) => err(m),
         },

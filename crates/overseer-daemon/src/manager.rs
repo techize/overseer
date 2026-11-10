@@ -13,7 +13,7 @@ use tokio::sync::broadcast;
 
 use crate::activity::apply;
 use crate::env::BaseEnv;
-use crate::launch::{claude_argv, is_claude, write_slot_files, Start};
+use crate::launch::{claude_argv, first_prompt, is_claude, write_slot_files, Start};
 use crate::ledger::{Ledger, SessionRow};
 use crate::slot::Slot;
 
@@ -210,8 +210,9 @@ impl SlotManager {
         label: String,
         cwd: &Path,
         command: Option<Vec<String>>,
+        prompt: Option<String>,
     ) -> Result<(), String> {
-        self.launch_slot(id, label, cwd, command, None)
+        self.launch_slot(id, label, cwd, command, None, prompt)
     }
 
     /// Relaunches a `Resumable` slot with `claude --resume <id>`, in its own
@@ -230,7 +231,7 @@ impl SlotManager {
             offer.session_id.clone(),
         );
         let cwd = offer.info.cwd.clone().unwrap_or_default();
-        self.launch_slot(id, label, &cwd, command, Some(session_id))
+        self.launch_slot(id, label, &cwd, command, Some(session_id), None)
     }
 
     /// The shared start path. `resume` is the session to continue, if any.
@@ -241,6 +242,7 @@ impl SlotManager {
         cwd: &Path,
         command: Option<Vec<String>>,
         resume: Option<String>,
+        prompt: Option<String>,
     ) -> Result<(), String> {
         if !valid_id(id) {
             return Err(invalid_id(id));
@@ -277,7 +279,9 @@ impl SlotManager {
             session_id = match &how {
                 Start::New(sid) | Start::Resume(sid) => sid.clone(),
             };
-            argv = claude_argv(&command, id, &label, &files, how);
+            let prompt = first_prompt(&launch.state_dir, id, &how, prompt)
+                .map_err(|e| format!("cannot read {} kickoff: {e}", slot_name(id)))?;
+            argv = claude_argv(&command, id, &label, &files, how, prompt.as_deref());
         }
         let row_label = label.clone();
         let entry_session_id = session_id.clone();
@@ -563,7 +567,8 @@ mod tests {
         ));
 
         // The old slot reads as Exited, so a restart is allowed mid-drain.
-        mgr.start(1, "new".into(), Path::new("/tmp"), None).unwrap();
+        mgr.start(1, "new".into(), Path::new("/tmp"), None, None)
+            .unwrap();
 
         // Wait past the drain timeout; the old monitor must stay silent.
         tokio::time::sleep(DRAIN_TIMEOUT + Duration::from_millis(500)).await;
@@ -583,7 +588,7 @@ mod tests {
         let (events, mut ev_rx) = broadcast::channel(16);
         let mut mgr = SlotManager::new(vec!["/bin/sleep".into(), "30".into()], events);
         let missing = Path::new("/tmp/overseer-no-such-dir-for-test");
-        let err = mgr.start(2, "x".into(), missing, None).unwrap_err();
+        let err = mgr.start(2, "x".into(), missing, None, None).unwrap_err();
         assert!(
             err.contains("does not exist or is not a directory"),
             "{err}"
@@ -591,7 +596,7 @@ mod tests {
         assert!(err.contains("overseer-no-such-dir-for-test"), "{err}");
         // A file is not a directory either.
         let err = mgr
-            .start(2, "x".into(), Path::new("/bin/sh"), None)
+            .start(2, "x".into(), Path::new("/bin/sh"), None, None)
             .unwrap_err();
         assert!(err.contains("not a directory"), "{err}");
         assert_eq!(mgr.list()[2].state, SlotState::Empty);

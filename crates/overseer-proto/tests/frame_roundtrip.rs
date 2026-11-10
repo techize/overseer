@@ -41,6 +41,7 @@ async fn roundtrip_every_frame_kind() {
                 label: "x".into(),
                 cwd: PathBuf::from("/tmp"),
                 command: None,
+                prompt: None,
             },
         },
         Frame::Request {

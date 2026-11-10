@@ -22,6 +22,9 @@ pub enum CtlCmd {
         cwd: PathBuf,
         #[arg(long, default_value = "")]
         label: String,
+        /// First prompt, passed to claude at launch.
+        #[arg(long)]
+        prompt: Option<String>,
         /// Command to run instead of the daemon default.
         #[arg(last = true)]
         cmd: Vec<String>,
@@ -135,7 +138,13 @@ pub async fn run(cmd: CtlCmd) -> anyhow::Result<()> {
             Response::Error { message } => bail!("{message}"),
             other => bail!("unexpected reply: {other:?}"),
         },
-        CtlCmd::Start { n, cwd, label, cmd } => {
+        CtlCmd::Start {
+            n,
+            cwd,
+            label,
+            prompt,
+            cmd,
+        } => {
             let cwd = std::path::absolute(&cwd).context("resolve --cwd")?;
             let command = (!cmd.is_empty()).then_some(cmd);
             expect_ok(
@@ -145,6 +154,7 @@ pub async fn run(cmd: CtlCmd) -> anyhow::Result<()> {
                         label,
                         cwd,
                         command,
+                        prompt,
                     })
                     .await?,
             )

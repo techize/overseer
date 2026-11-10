@@ -6,9 +6,51 @@ use std::path::{Path, PathBuf};
 
 use overseer_proto::msg::{slot_name, SlotId};
 
-/// Compiled-in default for the worker role, written to
-/// `<state>/roles/worker.md` on first use so Jonathan can edit the copy.
+/// Compiled-in defaults, written to `<state>/roles/` on first use so
+/// Jonathan can edit the copies. S0 uses the coordinator role, S1 to S6 the
+/// worker role, and kickoff.md is the first prompt S0 starts with.
 const WORKER_ROLE: &str = include_str!("roles/worker.md");
+const COORDINATOR_ROLE: &str = include_str!("roles/coordinator.md");
+const KICKOFF: &str = include_str!("roles/kickoff.md");
+
+/// Writes `default` to `roles/<name>` if the file is missing and returns its
+/// path. create_new: never clobber an edited template, even when two starts
+/// race.
+fn ensure_template(roles: &Path, name: &str, default: &str) -> io::Result<PathBuf> {
+    std::fs::create_dir_all(roles)?;
+    let path = roles.join(name);
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut f) => io::Write::write_all(&mut f, default.as_bytes())?,
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    Ok(path)
+}
+
+/// The text S0 starts with, from `<state>/roles/kickoff.md`.
+pub fn kickoff_prompt(state_dir: &Path) -> io::Result<String> {
+    let path = ensure_template(&state_dir.join("roles"), "kickoff.md", KICKOFF)?;
+    Ok(std::fs::read_to_string(path)?.trim().to_string())
+}
+
+/// The first prompt for a start. An explicit prompt wins; otherwise a fresh
+/// S0 gets the kickoff. Resumes get none (the session already has its
+/// history), and neither do other slots.
+pub fn first_prompt(
+    state_dir: &Path,
+    slot: SlotId,
+    start: &Start,
+    explicit: Option<String>,
+) -> io::Result<Option<String>> {
+    if explicit.is_some() || slot != 0 || !matches!(start, Start::New(_)) {
+        return Ok(explicit);
+    }
+    kickoff_prompt(state_dir).map(Some)
+}
 
 /// The hook events Overseer listens to.
 const HOOK_EVENTS: [&str; 5] = [
@@ -73,7 +115,7 @@ fn settings_json(overseer_bin: &Path) -> String {
 
 /// Writes `slots/S<n>/settings.json` and `role.md` under `state_dir`,
 /// replacing both on every start. The role is copied from
-/// `roles/worker.md` (created from the compiled-in default if missing, never
+/// `roles/coordinator.md` for S0 and `roles/worker.md` otherwise (created from the compiled-in default if missing, never
 /// overwritten) with `{slot}`, `{label}` and `{overseer}` filled in.
 pub fn write_slot_files(
     state_dir: &Path,
@@ -82,18 +124,11 @@ pub fn write_slot_files(
     overseer_bin: &Path,
 ) -> io::Result<LaunchFiles> {
     let roles = state_dir.join("roles");
-    std::fs::create_dir_all(&roles)?;
-    let template_path = roles.join("worker.md");
-    // create_new: never clobber an edited template, even when two starts race.
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&template_path)
-    {
-        Ok(mut f) => io::Write::write_all(&mut f, WORKER_ROLE.as_bytes())?,
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(e),
-    }
+    // All defaults are written so Jonathan finds every file to edit.
+    let worker = ensure_template(&roles, "worker.md", WORKER_ROLE)?;
+    let coordinator = ensure_template(&roles, "coordinator.md", COORDINATOR_ROLE)?;
+    ensure_template(&roles, "kickoff.md", KICKOFF)?;
+    let template_path = if slot == 0 { coordinator } else { worker };
     let template = std::fs::read_to_string(&template_path)?;
     // The label goes in last so braces inside it are not expanded again.
     let role_text = template
@@ -113,15 +148,19 @@ pub fn write_slot_files(
 }
 
 /// `base` plus Overseer's flags. Each value is its own argument, so a label
-/// with spaces needs no quoting.
+/// with spaces needs no quoting. A first prompt goes last, as the positional
+/// argument, on a fresh start only: it is passed at launch because text typed
+/// before Claude's input box is ready can be lost.
 pub fn claude_argv(
     base: &[String],
     slot: SlotId,
     label: &str,
     files: &LaunchFiles,
     start: Start,
+    prompt: Option<&str>,
 ) -> Vec<String> {
     let mut argv = base.to_vec();
+    let fresh = matches!(start, Start::New(_));
     match start {
         Start::New(id) => argv.extend(["--session-id".into(), id]),
         Start::Resume(id) => argv.extend(["--resume".into(), id]),
@@ -136,6 +175,9 @@ pub fn claude_argv(
         "--append-system-prompt-file".into(),
         files.role.to_string_lossy().into_owned(),
     ]);
+    if let (true, Some(p)) = (fresh, prompt) {
+        argv.push(p.to_string());
+    }
     argv
 }
 
@@ -168,7 +210,7 @@ mod tests {
         assert!(is_claude(&s(&["claude"])));
         assert!(!is_claude(&[]));
         let base = s(&["/opt/homebrew/bin/claude", "--model", "x"]);
-        let argv = claude_argv(&base, 2, "api", &files(), Start::New("uuid-1".into()));
+        let argv = claude_argv(&base, 2, "api", &files(), Start::New("uuid-1".into()), None);
         assert_eq!(&argv[..3], &base[..]);
         assert_eq!(
             &argv[3..],
@@ -193,6 +235,7 @@ mod tests {
             "api",
             &files(),
             Start::Resume("uuid-9".into()),
+            None,
         );
         assert!(!argv.contains(&"--session-id".to_string()));
         let i = argv.iter().position(|a| a == "--resume").unwrap();
@@ -253,8 +296,94 @@ mod tests {
             "fix the login bug",
             &files(),
             Start::New("u".into()),
+            None,
         );
         let i = argv.iter().position(|a| a == "--name").unwrap();
         assert_eq!(argv[i + 1], "S1 fix the login bug");
+    }
+
+    #[test]
+    fn prompt_is_last_positional_on_new() {
+        let argv = claude_argv(
+            &s(&["claude"]),
+            2,
+            "api",
+            &files(),
+            Start::New("u".into()),
+            Some("do the thing"),
+        );
+        assert_eq!(argv.last().unwrap(), "do the thing");
+        assert_eq!(argv[argv.len() - 2], "/st/slots/S2/role.md");
+    }
+
+    #[test]
+    fn prompt_is_dropped_on_resume() {
+        let argv = claude_argv(
+            &s(&["claude"]),
+            2,
+            "api",
+            &files(),
+            Start::Resume("u".into()),
+            Some("do the thing"),
+        );
+        assert!(!argv.contains(&"do the thing".to_string()));
+    }
+
+    #[test]
+    fn s0_fresh_gets_the_kickoff() {
+        let dir = temp("kick");
+        let p = first_prompt(&dir, 0, &Start::New("u".into()), None).unwrap();
+        assert_eq!(
+            p.as_deref(),
+            Some("Run the start-of-day round: check beads and Jira, check the board, and propose who works on what.")
+        );
+        // An explicit prompt wins; other slots get none.
+        let p = first_prompt(&dir, 0, &Start::New("u".into()), Some("mine".into())).unwrap();
+        assert_eq!(p.as_deref(), Some("mine"));
+        assert_eq!(
+            first_prompt(&dir, 2, &Start::New("u".into()), None).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn s0_resumed_gets_no_kickoff() {
+        let dir = temp("nokick");
+        let p = first_prompt(&dir, 0, &Start::Resume("u".into()), None).unwrap();
+        assert_eq!(p, None);
+    }
+
+    #[test]
+    fn edited_template_is_not_overwritten() {
+        let dir = temp("keep");
+        write_slot_files(&dir, 0, "a", Path::new("/o")).unwrap();
+        std::fs::write(dir.join("roles/coordinator.md"), "my coordinator").unwrap();
+        std::fs::write(dir.join("roles/kickoff.md"), "my kickoff").unwrap();
+        let f = write_slot_files(&dir, 0, "a", Path::new("/o")).unwrap();
+        assert_eq!(std::fs::read_to_string(f.role).unwrap(), "my coordinator");
+        assert_eq!(kickoff_prompt(&dir).unwrap(), "my kickoff");
+    }
+
+    #[test]
+    fn slot_zero_uses_the_coordinator_and_others_the_worker() {
+        let dir = temp("which");
+        let o = Path::new("/Apps/overseer");
+        let c = std::fs::read_to_string(write_slot_files(&dir, 0, "", o).unwrap().role).unwrap();
+        let w = std::fs::read_to_string(write_slot_files(&dir, 4, "x", o).unwrap().role).unwrap();
+        assert!(c.contains("coordinator"), "{c}");
+        assert!(w.contains("You are S4 of an Overseer team"), "{w}");
+    }
+
+    #[test]
+    fn placeholders_are_filled() {
+        let dir = temp("fill");
+        let f = write_slot_files(&dir, 0, "lbl", Path::new("/Apps/overseer")).unwrap();
+        let role = std::fs::read_to_string(f.role).unwrap();
+        assert!(role.contains("/Apps/overseer ctl start"), "{role}");
+        assert!(
+            !role.contains("{overseer}") && !role.contains("{slot}"),
+            "{role}"
+        );
+        assert!(!role.contains('\u{2014}'), "no em dashes");
     }
 }

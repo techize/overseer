@@ -277,6 +277,7 @@ pub fn build_request(
         label,
         cwd: path,
         command,
+        prompt: None,
     })
 }
 
@@ -716,6 +717,7 @@ mod tests {
                 label: "2ndBrain".into(),
                 cwd: "/Users/me/Repos/2ndBrain".into(),
                 command: None,
+                prompt: None,
             }
         );
     }
@@ -730,6 +732,7 @@ mod tests {
                 label: "eks".into(),
                 cwd: "/tmp".into(),
                 command: Some(vec!["claude".into(), "--resume".into()]),
+                prompt: None,
             }
         );
     }
