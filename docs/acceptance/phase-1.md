@@ -63,7 +63,7 @@ box and its `!` bash mode rather than model answers.
 
 | # | Item | Steps | Passes when | Result |
 |---|------|-------|-------------|--------|
-| C1 | `overseer attach` with real Claude in iTerm2 | Start S1 with Claude. In iTerm2 run `overseer attach 1`, type into Claude, press Ctrl-] | Claude is mirrored and usable; Ctrl-] returns to the shell with the prompt where it was, no cursor jump or blank screen (the restore writes `\x1b[?1049l` every time) | **Failed 2026-11-10.** In a new iTerm2 window, `overseer attach 1` mirrored Claude and typed text reached its input. After Ctrl-] the shell screen was not restored: the lines from before the attach (including a marker echoed just before it) were replaced by Claude's replayed startup screen, and `Detached from S1...` left old characters after it on the same line. See finding F1 |
+| C1 | `overseer attach` with real Claude in iTerm2 | Start S1 with Claude. In iTerm2 run `overseer attach 1`, type into Claude, press Ctrl-] | Claude is mirrored and usable; Ctrl-] returns to the shell with the prompt where it was, no cursor jump or blank screen (the restore writes `\x1b[?1049l` every time) | Failed 2026-11-10 on the first run (F1). Verified 2026-11-10 after the fix: in a new iTerm2 window, `overseer attach 1` mirrored Claude and typed text reached its input; after Ctrl-] the screen from before the attach (a marker echoed just before it and the prompt) was back as it was, `Detached from S1. The session is still running.` sat on a clean line, the title was `-zsh` again and iTerm2 showed no clipboard warning |
 | C2 | Image paste via gpui clipboard | As T4 | `[Image #1]` in Claude | Verified 2026-11-10, as T4 |
 | C3 | IME | As T10, both dead keys and CJK | As T10 | Dead keys verified 2026-11-10, as T10. CJK: awaiting Jonathan |
 | C4 | Typing latency and CPU | Type quickly in Claude in Overseer and in iTerm2 side by side. Run `top -pid <gui pid> -pid <daemon pid>` with the board idle, with a session idle, and while Claude streams a long answer | Typing feels no slower than iTerm2; idle CPU near 0 | Partly verified 2026-11-09: release build, board open with no running session: GUI 0.8 to 0.9 % CPU, daemon 0.0 % (top, 1 s samples). Latency and CPU under output: awaiting Jonathan. 2026-11-10: GUI 1.1 to 1.4 % with S1's session view open and idle, 1.7 to 2.4 % while 600 lines streamed through Claude's bash mode, daemon 0.0 % throughout. Claude collapses bash output, so a long model answer may cost more. Typing feel against iTerm2: awaiting Jonathan |
@@ -89,17 +89,18 @@ box and its `!` bash mode rather than model answers.
 
 ## Findings from the 2026-11-10 run
 
-- **F1 (fails C1): attach does not protect the outer screen.** `overseer attach`
+- **F1 (failed C1, fixed): attach did not protect the outer screen.** `overseer attach`
   writes the replay straight onto the outer terminal's primary screen. The bytes
   Claude wrote before it entered its alternate screen overwrite the user's shell
-  screen, so the `\x1b[?1049l` at detach has nothing to restore. Fix: enter the
-  alternate screen before the replay and drop the session's own 1049, 1047 and 47
-  switches from the stream, then print the detach message after the restore.
-- **F2: the attach replay re-sends clipboard writes.** Claude's OSC 52 from an
+  screen, so the `\x1b[?1049l` at detach has nothing to restore. Fixed: attach
+  now enters the outer alternate screen before the replay and replaces the
+  session's own 1049, 1047 and 47 switches with clears (`outer.rs`).
+- **F2 (fixed): the attach replay re-sent clipboard writes.** Claude's OSC 52 from an
   earlier selection is in the ring, so attaching tried to set iTerm2's clipboard
-  (iTerm2 blocked it). The replay should drop OSC 52 writes as it drops queries.
-- **F3 (minor): attach leaves the window title.** After detach iTerm2 still said
-  "Claude Code". Save and restore the title (`\x1b[22;0t` and `\x1b[23;0t`).
+  (iTerm2 blocked it). Fixed: the replay now drops every OSC 52 sequence.
+- **F3 (minor, fixed): attach left the window title.** After detach iTerm2 still
+  said "Claude Code". Attach now saves and restores it (`\x1b[22;0t`,
+  `\x1b[23;0t`).
 - **F4 (minor): the folder picker ignores the current field** and opens in the
   last folder macOS remembers.
 - **Not Overseer:** `~/.claude/settings.json` points hooks at

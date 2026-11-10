@@ -342,10 +342,11 @@ fn csi_is_query(params: &[u8], intermediates: &[u8], fin: u8) -> bool {
     }
 }
 
-/// Whether an OSC body (without the leading `ESC ]` and the terminator) asks
-/// for a value: colour queries (4, 5, 10 to 19 and friends) and clipboard
-/// reads (52) carry a `?` field.
-fn osc_is_query(body: &[u8]) -> bool {
+/// Whether an OSC body (without the leading `ESC ]` and the terminator) must
+/// not be replayed: colour queries (4, 5, 10 to 19 and friends) carry a `?`
+/// field, and every clipboard sequence (52) goes, since a replayed write would
+/// set the viewer's clipboard to stale text.
+fn osc_skips_replay(body: &[u8]) -> bool {
     let mut fields = body.split(|&c| c == b';');
     let Some(Ok(Ok(ps))) = fields
         .next()
@@ -353,7 +354,7 @@ fn osc_is_query(body: &[u8]) -> bool {
     else {
         return false;
     };
-    matches!(ps, 4 | 5 | 10..=19 | 52) && fields.any(|f| f == b"?")
+    ps == 52 || (matches!(ps, 4 | 5 | 10..=19) && fields.any(|f| f == b"?"))
 }
 
 /// Whether a DCS body asks for a value: DECRQSS (`$q`) or XTGETTCAP (`+q`).
@@ -361,7 +362,8 @@ fn dcs_is_query(body: &[u8]) -> bool {
     body.starts_with(b"$q") || body.starts_with(b"+q")
 }
 
-/// Returns `data` without the complete terminal queries in it. Sequences cut
+/// Returns `data` without the complete terminal queries and clipboard
+/// sequences in it. Sequences cut
 /// off at the end are kept, so a query whose tail arrives live is still
 /// answered.
 pub fn strip_queries(data: &[u8]) -> Vec<u8> {
@@ -414,7 +416,7 @@ pub fn strip_queries(data: &[u8]) -> Vec<u8> {
                     Some((body_end, end)) => {
                         let body = &data[body_start..body_end];
                         let q = if kind == b']' {
-                            osc_is_query(body)
+                            osc_skips_replay(body)
                         } else {
                             dcs_is_query(body)
                         };
@@ -522,6 +524,13 @@ mod tests {
             out,
             b"ab\x1b[8;24;80t\x1b]4;1;rgb:00/00/00\x07\x1b]0;title\x07\x1b[>1u\x1b[31mc".to_vec()
         );
+    }
+
+    #[test]
+    fn strips_clipboard_writes_from_the_replay() {
+        // A replayed OSC 52 would set the viewer's clipboard to stale text.
+        let out = strip_queries(b"a\x1b]52;c;aGVsbG8=\x07b\x1b]52;p;aGk=\x1b\\c\x1b]2;t\x07");
+        assert_eq!(out, b"abc\x1b]2;t\x07".to_vec());
     }
 
     #[test]
