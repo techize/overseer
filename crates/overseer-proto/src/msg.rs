@@ -30,6 +30,29 @@ pub struct SlotInfo {
     pub rows: u16,
 }
 
+/// Which Claude Code hook fired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HookKind {
+    SessionStart,
+    UserPromptSubmit,
+    Notification,
+    Stop,
+    PostToolUse,
+}
+
+/// What `overseer hook` tells the daemon about one hook call. Every field
+/// but `slot` and `event` is whatever Claude put in its event JSON.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HookEvent {
+    pub slot: SlotId,
+    pub event: HookKind,
+    pub session_id: Option<String>,
+    pub tool: Option<String>,
+    /// One line, at most 80 chars, summarising the tool input.
+    pub detail: Option<String>,
+    pub notification: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum Request {
@@ -58,6 +81,8 @@ pub enum Request {
         rows: u16,
     },
     Shutdown,
+    /// A Claude Code hook event, relayed by `overseer hook`.
+    Hook(HookEvent),
 }
 
 // Adjacent tagging because `Slots` is a tuple variant.
@@ -83,6 +108,20 @@ mod tests {
     #[test]
     fn names() {
         assert_eq!(slot_name(3), "S3");
+    }
+
+    #[test]
+    fn hook_request_round_trips() {
+        let req = Request::Hook(HookEvent {
+            slot: 1,
+            event: HookKind::Stop,
+            session_id: Some("abc".into()),
+            tool: None,
+            detail: None,
+            notification: None,
+        });
+        let back: Request = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        assert_eq!(back, req);
     }
 
     #[test]

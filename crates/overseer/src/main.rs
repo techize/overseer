@@ -1,6 +1,7 @@
 mod agent;
 mod attach;
 mod ctl;
+mod hook;
 mod outer;
 
 use clap::{Parser, Subcommand};
@@ -30,6 +31,8 @@ enum Cmd {
     },
     /// Mirror one slot in this terminal. Ctrl-] detaches.
     Attach { n: overseer_proto::SlotId },
+    /// Relay a Claude Code hook event to the daemon (run by Claude, not by hand).
+    Hook { event: String },
     /// Install the LaunchAgent that keeps the daemon running.
     InstallAgent,
     /// Remove the LaunchAgent.
@@ -53,6 +56,11 @@ fn main() {
         return;
     };
     let result = match command {
+        // No logger and no stderr: a hook must be silent and always exit 0.
+        Cmd::Hook { event } => {
+            hook::run(&event);
+            return;
+        }
         Cmd::InstallAgent => agent::install(),
         Cmd::UninstallAgent => agent::uninstall(),
         Cmd::Daemon { foreground: _ } => {

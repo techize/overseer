@@ -11,6 +11,7 @@ overseer-daemon = { path = "../overseer-daemon" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync"] }
 clap.workspace = true
 anyhow.workspace = true
+serde_json.workspace = true
 crossterm.workspace = true
 libc = "0.2"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "env-filter", "std"] }

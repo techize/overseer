@@ -398,6 +398,8 @@ fn handle_request(
             None => err(format!("{} is empty", slot_name(id))),
         },
         Request::Shutdown => Response::Ok,
+        // Delivered only for now; the daemon starts acting on hooks later.
+        Request::Hook(_) => Response::Ok,
     }
 }
 

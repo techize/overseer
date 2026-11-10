@@ -3431,6 +3431,7 @@ dependencies = [
  "overseer-gui",
  "overseer-proto",
  "portable-pty",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

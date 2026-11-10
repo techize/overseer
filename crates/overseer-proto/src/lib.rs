@@ -7,4 +7,6 @@ pub mod paths;
 
 pub use client::Client;
 pub use frame::{read_frame, write_frame, Frame, MAX_FRAME};
-pub use msg::{slot_name, Event, Request, Response, SlotId, SlotInfo, SlotState};
+pub use msg::{
+    slot_name, Event, HookEvent, HookKind, Request, Response, SlotId, SlotInfo, SlotState,
+};
