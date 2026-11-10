@@ -39,17 +39,20 @@ pub fn kickoff_prompt(state_dir: &Path) -> io::Result<String> {
 
 /// The first prompt for a start. An explicit prompt wins; otherwise a fresh
 /// S0 gets the kickoff. Resumes get none (the session already has its
-/// history), and neither do other slots.
+/// history), and neither do other slots. An empty or whitespace-only prompt
+/// (`--prompt ""`, an emptied kickoff.md) counts as none: claude would
+/// otherwise be started with an empty positional prompt.
 pub fn first_prompt(
     state_dir: &Path,
     slot: SlotId,
     start: &Start,
     explicit: Option<String>,
 ) -> io::Result<Option<String>> {
+    let explicit = explicit.filter(|p| !p.trim().is_empty());
     if explicit.is_some() || slot != 0 || !matches!(start, Start::New(_)) {
         return Ok(explicit);
     }
-    kickoff_prompt(state_dir).map(Some)
+    Ok(Some(kickoff_prompt(state_dir)?).filter(|p| !p.is_empty()))
 }
 
 /// The hook events Overseer listens to.
@@ -372,6 +375,29 @@ mod tests {
             first_prompt(&dir, 2, &Start::New("u".into()), None).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn empty_prompts_are_none() {
+        let dir = temp("empty");
+        let fresh = Start::New("u".into());
+        for p in ["", "  \n\t "] {
+            assert_eq!(
+                first_prompt(&dir, 2, &fresh, Some(p.into())).unwrap(),
+                None,
+                "{p:?}"
+            );
+            // On S0 an empty prompt counts as none given, so the kickoff runs.
+            assert_eq!(
+                first_prompt(&dir, 0, &fresh, Some(p.into())).unwrap(),
+                Some(kickoff_prompt(&dir).unwrap()),
+                "{p:?}"
+            );
+        }
+        // An emptied kickoff.md gives no prompt rather than `-- ""`.
+        std::fs::create_dir_all(dir.join("roles")).unwrap();
+        std::fs::write(dir.join("roles/kickoff.md"), " \n").unwrap();
+        assert_eq!(first_prompt(&dir, 0, &fresh, None).unwrap(), None);
     }
 
     #[test]
