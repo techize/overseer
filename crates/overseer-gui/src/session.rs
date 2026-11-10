@@ -320,7 +320,7 @@ impl OverseerApp {
                 b.on_click(cx.listener(move |this, _, window, cx| this.open_dialog(id, window, cx)))
             });
         let resume = button("resume", "Resume", m.can_resume).when(m.can_resume, |b| {
-            b.on_click(cx.listener(move |this, _, _, cx| this.resume_slot(id, cx)))
+            b.on_click(cx.listener(move |this, _, window, cx| this.resume_slot(id, window, cx)))
         });
         // Resume takes the place of Restart and Start while it is on offer.
         let buttons = if m.can_resume {
@@ -422,10 +422,9 @@ impl OverseerApp {
                             slot_name(id)
                         ))),
                 )
-                .child(
-                    button("resume-pane", "Resume", true)
-                        .on_click(cx.listener(move |this, _, _, cx| this.resume_slot(id, cx))),
-                )
+                .child(button("resume-pane", "Resume", true).on_click(
+                    cx.listener(move |this, _, window, cx| this.resume_slot(id, window, cx)),
+                ))
         } else {
             left
         };

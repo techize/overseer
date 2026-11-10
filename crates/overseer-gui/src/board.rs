@@ -336,9 +336,9 @@ impl OverseerApp {
                         .hover(|s| s.bg(rgb(colors::CARD_HOVER)))
                         .child("Resume")
                         // The click must not also open the card behind it.
-                        .on_click(cx.listener(move |this, _, _, cx| {
+                        .on_click(cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();
-                            this.resume_slot(id, cx)
+                            this.resume_slot(id, window, cx)
                         })),
                 )
             }))
@@ -380,11 +380,13 @@ impl OverseerApp {
             .on_action(cx.listener(|this, _: &crate::app::SelectDown, _, cx| {
                 this.move_selection(Dir::Down, cx)
             }))
-            .on_action(cx.listener(|this, _: &crate::app::ResumeSelected, _, cx| {
-                if let Some(id) = crate::app::resume_target(this.selected, &this.slots) {
-                    this.resume_slot(id, cx);
-                }
-            }))
+            .on_action(
+                cx.listener(|this, _: &crate::app::ResumeSelected, window, cx| {
+                    if let Some(id) = crate::app::resume_target(this.selected, &this.slots) {
+                        this.resume_slot(id, window, cx);
+                    }
+                }),
+            )
             .on_action(
                 cx.listener(|this, _: &crate::app::OpenSelected, window, cx| {
                     this.open_card(this.selected, window, cx)

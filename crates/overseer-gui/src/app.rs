@@ -442,11 +442,12 @@ impl OverseerApp {
     }
 
     /// Relaunches a resumable slot with its session continued and opens it.
-    pub(crate) fn resume_slot(&mut self, id: SlotId, cx: &mut Context<Self>) {
+    /// The slot is still Resumable here, so `go_session` leaves the terminal
+    /// to be focused once the Running event arrives.
+    pub(crate) fn resume_slot(&mut self, id: SlotId, window: &mut Window, cx: &mut Context<Self>) {
         self.status = None;
-        self.focus_when_ready = Some(id);
         self.send(Request::ResumeSlot { id }, cx);
-        cx.notify();
+        self.go_session(id, window, cx);
     }
 
     /// Stop, wait for Exited, then start with the same label, cwd and
