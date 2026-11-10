@@ -218,6 +218,7 @@ pub struct OverseerApp {
     ticker: Ticker,
     _ticker: Option<Task<()>>,
     _events: Task<()>,
+    _clicks: Task<()>,
 }
 
 impl OverseerApp {
@@ -243,6 +244,17 @@ impl OverseerApp {
                 this.status = Some(crate::terminal_view::LOST_DAEMON.into());
                 cx.notify();
             });
+        });
+        let mut clicks = crate::notify::clicks();
+        let clicked = cx.spawn_in(window, async move |this, cx| {
+            while let Some(id) = clicks.recv().await {
+                let alive = this.update_in(cx, |this, window, cx| {
+                    this.notification_clicked(id, window, cx)
+                });
+                if alive.is_err() {
+                    return;
+                }
+            }
         });
         // The list comes back through the event stream (a marked reply), so
         // it is applied in order with the events around it.
@@ -276,28 +288,40 @@ impl OverseerApp {
             ticker: Ticker::default(),
             _ticker: None,
             _events: events,
+            _clicks: clicked,
         }
     }
 
     fn on_frame(&mut self, frame: Frame, window: &mut Window, cx: &mut Context<Self>) {
         match frame {
-            Frame::Event(Event::SlotChanged(info)) => self.apply_info(info, window, cx),
+            Frame::Event(Event::SlotChanged(info)) => self.apply_info(info, false, window, cx),
+            // The GUI asks for the list once, right after connecting, so a
+            // NeedsYou in it was already waiting and does not notify.
             Frame::Response {
                 resp: Response::Slots(list),
                 ..
             } => {
                 for info in list {
-                    self.apply_info(info, window, cx);
+                    self.apply_info(info, true, window, cx);
                 }
             }
             _ => {}
         }
     }
 
-    fn apply_info(&mut self, info: SlotInfo, window: &mut Window, cx: &mut Context<Self>) {
+    fn apply_info(
+        &mut self,
+        info: SlotInfo,
+        first_sync: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let id = info.id;
         if id as usize >= self.slots.len() {
             return;
+        }
+        if crate::notify::should_notify(self.slots.get(id as usize), &info, first_sync) {
+            crate::notify::post(&crate::notify::note_for(&info));
         }
         let dropped = match self.terminals.get(&id) {
             Some(t) if !keep_view(t.incarnation, &info.state) => {
@@ -453,6 +477,17 @@ impl OverseerApp {
             }
         }
         cx.notify();
+    }
+
+    /// A notification was clicked: bring the window forward on that
+    /// session. With the start dialog open only the window comes forward,
+    /// as Cmd+digit does nothing there either.
+    fn notification_clicked(&mut self, id: SlotId, window: &mut Window, cx: &mut Context<Self>) {
+        cx.activate(true);
+        window.activate_window();
+        if self.dialog.is_none() {
+            self.go_session(id, window, cx);
+        }
     }
 
     pub(crate) fn open_card(&mut self, id: SlotId, window: &mut Window, cx: &mut Context<Self>) {

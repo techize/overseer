@@ -3459,6 +3459,7 @@ name = "overseer-gui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "block",
  "bytes",
  "gpui",
  "libc",
@@ -3469,6 +3470,7 @@ dependencies = [
  "serde",
  "tokio",
  "toml 0.8.23",
+ "tracing",
 ]
 
 [[package]]

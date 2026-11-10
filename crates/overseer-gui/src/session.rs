@@ -8,10 +8,10 @@
 use std::path::{Path, PathBuf};
 
 use gpui::{div, prelude::*, px, relative, rgb, Context, FontWeight, SharedString, Window};
-use overseer_proto::{slot_name, Request, SlotId, SlotInfo, SlotState};
+use overseer_proto::{slot_name, ActivityKind, Request, SlotId, SlotInfo, SlotState};
 
 use crate::app::{colors, OverseerApp};
-use crate::board::{format_elapsed, slot_title, tilde};
+use crate::board::{activity_detail, activity_state, format_elapsed, slot_title, tilde};
 
 // ---------------------------------------------------------------------------
 // Pure logic
@@ -30,7 +30,8 @@ pub fn tab_label(info: &SlotInfo) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PanelModel {
     pub title: String,
-    /// (name, value) rows: label, cwd, pid, state, started.
+    /// (name, value) rows: label, cwd, pid, state, started, then activity
+    /// and its reason or tool when the slot reports one.
     pub rows: Vec<(&'static str, String)>,
     pub can_stop: bool,
     pub can_restart: bool,
@@ -83,15 +84,26 @@ pub fn panel_model(
         state
     };
     let running = matches!(info.state, SlotState::Running { .. });
+    let mut rows = vec![
+        ("Label", label),
+        ("Cwd", cwd),
+        ("Pid", pid),
+        ("State", state),
+        ("Started", started),
+    ];
+    if let Some(a) = &info.activity {
+        rows.push(("Activity", activity_state(a, now)));
+        if let Some(detail) = activity_detail(a) {
+            let name = match a.kind {
+                ActivityKind::NeedsYou => "Reason",
+                _ => "Doing",
+            };
+            rows.push((name, detail));
+        }
+    }
     PanelModel {
         title: slot_title(info),
-        rows: vec![
-            ("Label", label),
-            ("Cwd", cwd),
-            ("Pid", pid),
-            ("State", state),
-            ("Started", started),
-        ],
+        rows,
         can_stop: running && !restarting,
         can_restart: info.state != SlotState::Empty && info.cwd.is_some() && !restarting,
         can_start_new: matches!(info.state, SlotState::Exited { .. }) && !restarting,
@@ -447,6 +459,43 @@ mod tests {
             ]
         );
         assert!(m.can_stop && m.can_restart && !m.can_start_new);
+    }
+
+    #[test]
+    fn panel_shows_activity_and_reason() {
+        use overseer_proto::{Activity, ActivityKind};
+        let mut i = info(RUN);
+        i.activity = Some(Activity {
+            kind: ActivityKind::NeedsYou,
+            since: 105,
+            now_doing: Some("Bash".into()),
+            reason: Some("Permission to run Bash".into()),
+        });
+        let m = panel_model(&i, 165, None, false, clock);
+        assert_eq!(m.rows[3], ("State", "Running".to_string()));
+        assert_eq!(m.rows[5], ("Activity", "Needs you 1m 00s".to_string()));
+        assert_eq!(m.rows[6], ("Reason", "Permission to run Bash".to_string()));
+        assert_eq!(m.rows.len(), 7);
+
+        i.activity = Some(Activity {
+            kind: ActivityKind::Working,
+            since: 160,
+            now_doing: Some("Edit".into()),
+            reason: None,
+        });
+        let m = panel_model(&i, 165, None, false, clock);
+        assert_eq!(m.rows[5], ("Activity", "Working 5s".to_string()));
+        assert_eq!(m.rows[6], ("Doing", "Edit".to_string()));
+
+        i.activity = Some(Activity {
+            kind: ActivityKind::Idle,
+            since: 160,
+            now_doing: None,
+            reason: None,
+        });
+        let m = panel_model(&i, 165, None, false, clock);
+        assert_eq!(m.rows[5], ("Activity", "Idle 5s".to_string()));
+        assert_eq!(m.rows.len(), 6);
     }
 
     #[test]
