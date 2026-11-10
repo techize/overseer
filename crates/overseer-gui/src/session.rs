@@ -34,6 +34,8 @@ pub struct PanelModel {
     pub rows: Vec<(&'static str, String)>,
     pub can_stop: bool,
     pub can_restart: bool,
+    /// Stopped: the start dialog can run the slot again with new settings.
+    pub can_start_new: bool,
 }
 
 /// `14:05:12 (8m 05s ago)`. `clock` turns unix seconds into local time.
@@ -92,6 +94,7 @@ pub fn panel_model(
         ],
         can_stop: running && !restarting,
         can_restart: info.state != SlotState::Empty && info.cwd.is_some() && !restarting,
+        can_start_new: matches!(info.state, SlotState::Exited { .. }) && !restarting,
     }
 }
 
@@ -286,6 +289,10 @@ impl OverseerApp {
         let restart = button("restart", "Restart", m.can_restart).when(m.can_restart, |b| {
             b.on_click(cx.listener(move |this, _, _, cx| this.restart_slot(id, cx)))
         });
+        let start_new =
+            button("start-new", "Start\u{2026}", m.can_start_new).when(m.can_start_new, |b| {
+                b.on_click(cx.listener(move |this, _, window, cx| this.open_dialog(id, window, cx)))
+            });
         let focus = self.session_focus.clone();
         div()
             .flex_1()
@@ -300,7 +307,15 @@ impl OverseerApp {
                 panel_box("Session")
                     .child(div().font_weight(FontWeight::SEMIBOLD).child(m.title))
                     .children(rows)
-                    .child(div().flex().gap_2().pt_1().child(stop).child(restart)),
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .pt_1()
+                            .child(stop)
+                            .child(restart)
+                            .child(start_new),
+                    ),
             )
             .child(placeholder("Owns", "phase 3"))
             .child(placeholder("Holds", "phase 3"))
@@ -430,7 +445,7 @@ mod tests {
                 ("Started", "T100 (1m 05s ago)".to_string()),
             ]
         );
-        assert!(m.can_stop && m.can_restart);
+        assert!(m.can_stop && m.can_restart && !m.can_start_new);
     }
 
     #[test]
@@ -442,7 +457,7 @@ mod tests {
         let m = panel_model(&info(ex), 60, None, false, clock);
         assert_eq!(m.rows[3].1, "Exited (code 1) at T50");
         assert_eq!(m.rows[2].1, "-");
-        assert!(!m.can_stop && m.can_restart);
+        assert!(!m.can_stop && m.can_restart && m.can_start_new);
 
         let mut empty = info(SlotState::Empty);
         empty.cwd = None;
@@ -450,7 +465,7 @@ mod tests {
         let m = panel_model(&empty, 60, None, false, clock);
         assert_eq!(m.title, "S2");
         assert_eq!(m.rows[0].1, "-");
-        assert!(!m.can_stop && !m.can_restart);
+        assert!(!m.can_stop && !m.can_restart && !m.can_start_new);
     }
 
     #[test]

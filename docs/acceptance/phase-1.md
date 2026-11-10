@@ -52,11 +52,11 @@ box and its `!` bash mode rather than model answers.
 | T3 | Shift+Enter | Type a line in Claude, Shift+Enter, type another, Enter | One message with two lines | Verified 2026-11-10 in real Claude: `line one`, Shift+Enter, `line two` gave one input with two lines |
 | T4 | Image paste | Cmd+Ctrl+Shift+4 a region to the clipboard, Cmd+V in Claude | Claude shows `[Image #1]`; confirms gpui `read_from_clipboard` sees the screenshot image | Verified 2026-11-10: `screencapture -c` of a screen region (a PNG on the clipboard, as Cmd+Ctrl+Shift+4 leaves it), then Cmd+V in Claude showed `[Image #1]` |
 | T5 | Option as Meta | In Claude's input, Option+B and Option+F over a few words, Option+Backspace | Word jumps and word delete work | Verified 2026-11-10 in real Claude: Option+B twice then X gave `alpha Xbeta gamma`; Option+F then Option+Backspace left `alpha gamma` |
-| T6 | Cmd+click links and paths | Cmd+hover and Cmd+click an http(s) URL in Claude output; Cmd+click `crates/overseer/src/main.rs:1` in a slot whose cwd is the repo | URL underlines and opens in the default browser; path opens in the editor (VS Code at line 1) | Verified 2026-11-10 in real Claude output, app launched with `open`: Cmd+click on `https://example.com/overseer-test` brought the default browser forward; Cmd+click on `crates/overseer/src/main.rs:1` opened VS Code on main.rs. Underline on Cmd+hover was not seen with a synthetic Cmd key: awaiting Jonathan |
+| T6 | Cmd+click links and paths | Cmd+hover and Cmd+click an http(s) URL in Claude output; Cmd+click `crates/overseer/src/main.rs:1` in a slot whose cwd is the repo | URL underlines and opens in the default browser; path opens in the editor (VS Code at line 1) | Verified 2026-11-10 in real Claude output, app launched with `open`: Cmd+click on `https://example.com/overseer-test` brought the default browser forward; Cmd+click on `crates/overseer/src/main.rs:1` opened VS Code on main.rs. Underline on Cmd+hover was not seen with a synthetic Cmd key. Jonathan confirmed Cmd+click on a URL by hand 2026-11-10 |
 | T7 | Mouse selection and copy | Drag, double-click and triple-click in Claude output, Cmd+C, paste elsewhere | Copied text matches the highlight | Verified 2026-11-10 in real Claude. Claude turns mouse reporting on, so a plain drag uses Claude's own selection and Shift selects locally: Shift double-click copied `error`, Shift triple-click a whole line, Shift-drag rows 91 to 93, each matching the highlight |
 | T8 | Cmd+F search | After a long Claude answer, Cmd+F "error", Enter and Shift+Enter, Esc | Matches tinted, current one orange, view scrolls to it, i/n count right | Verified 2026-11-10 in real Claude: Cmd+F `error` tinted both visible matches with the current one orange, count 2/2; Enter went to 1/2, Shift+Enter back to 2/2, Esc closed it. Scrolling to an off-screen match was not exercised. Note: Claude runs with `CLAUDE_CODE_NO_FLICKER=1` from the login shell and draws on the alternate screen, so search only sees what Claude has on screen (rows 30 and 60 had scrolled inside Claude and were not found). iTerm2 behaves the same |
 | T9 | Font, size and theme from config | Put `[terminal]` with `font_family`, `font_size`, `background`, `foreground` in `~/.config/overseer/config.toml`, relaunch the app | Terminal uses them | Verified 2026-11-10: `[terminal]` with Courier New, 18, `#1a2b4c`, `#ffd700`; after a relaunch the terminal used all four. Config removed afterwards |
-| T10 | IME | Option+E then E in Claude's input; switch to a Japanese or Chinese input source and type a word, pick a candidate | é appears; candidate window sits at the cursor and the committed text is inserted | Dead keys verified 2026-11-10 in real Claude: Option+E E gave é, Option+U U gave ü. CJK: awaiting Jonathan |
+| T10 | IME | Option+E then E in Claude's input; switch to a Japanese or Chinese input source and type a word, pick a candidate | é appears; candidate window sits at the cursor and the committed text is inserted | Dead keys verified 2026-11-10 in real Claude: Option+E E gave é, Option+U U gave ü. CJK: waived 2026-11-10, Jonathan does not use CJK input |
 | T11 | Bracketed paste | Copy 3 lines, Cmd+V into Claude's input | One paste with 3 lines, not three submissions | Verified 2026-11-10 in real Claude: three copied lines pasted as one input with three lines, nothing submitted |
 
 ## Carried over from earlier tasks
@@ -65,10 +65,10 @@ box and its `!` bash mode rather than model answers.
 |---|------|-------|-------------|--------|
 | C1 | `overseer attach` with real Claude in iTerm2 | Start S1 with Claude. In iTerm2 run `overseer attach 1`, type into Claude, press Ctrl-] | Claude is mirrored and usable; Ctrl-] returns to the shell with the prompt where it was, no cursor jump or blank screen (the restore writes `\x1b[?1049l` every time) | Failed 2026-11-10 on the first run (F1). Verified 2026-11-10 after the fix: in a new iTerm2 window, `overseer attach 1` mirrored Claude and typed text reached its input; after Ctrl-] the screen from before the attach (a marker echoed just before it and the prompt) was back as it was, `Detached from S1. The session is still running.` sat on a clean line, the title was `-zsh` again and iTerm2 showed no clipboard warning |
 | C2 | Image paste via gpui clipboard | As T4 | `[Image #1]` in Claude | Verified 2026-11-10, as T4 |
-| C3 | IME | As T10, both dead keys and CJK | As T10 | Dead keys verified 2026-11-10, as T10. CJK: awaiting Jonathan |
-| C4 | Typing latency and CPU | Type quickly in Claude in Overseer and in iTerm2 side by side. Run `top -pid <gui pid> -pid <daemon pid>` with the board idle, with a session idle, and while Claude streams a long answer | Typing feels no slower than iTerm2; idle CPU near 0 | Partly verified 2026-11-09: release build, board open with no running session: GUI 0.8 to 0.9 % CPU, daemon 0.0 % (top, 1 s samples). Latency and CPU under output: awaiting Jonathan. 2026-11-10: GUI 1.1 to 1.4 % with S1's session view open and idle, 1.7 to 2.4 % while 600 lines streamed through Claude's bash mode, daemon 0.0 % throughout. Claude collapses bash output, so a long model answer may cost more. Typing feel against iTerm2: awaiting Jonathan |
-| C5 | Trackpad and alt-screen scrolling | Trackpad-scroll a long Claude answer; scroll in Claude's full-screen views and in `vim` with mouse off | Smooth scrollback in normal screen; alt screen gets arrows (1007) or mouse reports, per R9 | Verified 2026-11-10 with the mouse wheel: in Claude (alternate screen, mouse reporting on) the wheel went to Claude, which scrolled its own view and showed `Jump to bottom`; in `vim -u NONE` (mouse off) the wheel sent arrows; after `:set mouse=a` it sent mouse reports. Real trackpad: awaiting Jonathan |
-| C6 | Font rendering by eye | Compare Overseer and iTerm2 with the same font and size | Crisp, correctly spaced glyphs, box drawing joins up | awaiting Jonathan (screenshots of Overseer and iTerm2 look alike, but this is a judgement by eye) |
+| C3 | IME | As T10, both dead keys and CJK | As T10 | Dead keys verified 2026-11-10, as T10. CJK: waived 2026-11-10, as T10 |
+| C4 | Typing latency and CPU | Type quickly in Claude in Overseer and in iTerm2 side by side. Run `top -pid <gui pid> -pid <daemon pid>` with the board idle, with a session idle, and while Claude streams a long answer | Typing feels no slower than iTerm2; idle CPU near 0 | Partly verified 2026-11-09: release build, board open with no running session: GUI 0.8 to 0.9 % CPU, daemon 0.0 % (top, 1 s samples). Latency and CPU under output: awaiting Jonathan. 2026-11-10: GUI 1.1 to 1.4 % with S1's session view open and idle, 1.7 to 2.4 % while 600 lines streamed through Claude's bash mode, daemon 0.0 % throughout. Claude collapses bash output, so a long model answer may cost more. Typing feel against iTerm2: OK, Jonathan 2026-11-10 |
+| C5 | Trackpad and alt-screen scrolling | Trackpad-scroll a long Claude answer; scroll in Claude's full-screen views and in `vim` with mouse off | Smooth scrollback in normal screen; alt screen gets arrows (1007) or mouse reports, per R9 | Verified 2026-11-10 with the mouse wheel: in Claude (alternate screen, mouse reporting on) the wheel went to Claude, which scrolled its own view and showed `Jump to bottom`; in `vim -u NONE` (mouse off) the wheel sent arrows; after `:set mouse=a` it sent mouse reports. Real trackpad: works, Jonathan 2026-11-10 |
+| C6 | Font rendering by eye | Compare Overseer and iTerm2 with the same font and size | Crisp, correctly spaced glyphs, box drawing joins up | Verified 2026-11-10 by Jonathan: the font looks good. Screenshots of Overseer and iTerm2 also look alike |
 | C7 | Cmd+click URL and path | As T6 | As T6 | As T6 |
 | C8 | Shift-drag with mouse mode on | In Claude (or anything with mouse reporting on), Shift-drag across text, Cmd+C | Local selection, correct text copied, click without Shift goes to the app | Verified 2026-11-10 in real Claude: a plain click reached Claude (it jumped to the bottom), Shift-drag selected locally and Cmd+C copied the highlighted rows |
 | C9 | Folder picker in the start dialog | Board, `+ start` on S5, use the folder picker | Native picker opens, the chosen folder fills the cwd | Verified 2026-11-10: Choose... opened the native folder picker; choosing `~/overseer` filled the folder field. Minor: the picker opened in Documents, not at the folder already in the field |
@@ -84,8 +84,8 @@ box and its `!` bash mode rather than model answers.
 | C19 | Task 9 item 5 | Cmd+click an http(s) URL in Claude output | Opens in the default browser | As T6 (URL) |
 | C20 | Task 9 item 6 | Cmd+click `crates/overseer/src/main.rs:1` in a slot whose cwd is the repo | VS Code opens at line 1 | As T6 (path) |
 | C21 | Task 9 item 7 | Option+E E, Option+U U, Option+B in Claude's input | é, ü, and a word jump back | Verified 2026-11-10: é, ü, and the Option+B word jump (T5) |
-| C22 | Task 9 item 8 | Trackpad scroll on the alt screen (Claude full-screen UI, or vim with mouse off) | Per R9: arrows with 1007, scrolls the app when mouse mode is on | Verified 2026-11-10 with the mouse wheel, as C5. Trackpad: awaiting Jonathan |
-| C23 | Task 9 item 9 | Japanese or Chinese IME in Claude | Candidate window at the cursor; committing inserts the text | awaiting Jonathan |
+| C22 | Task 9 item 8 | Trackpad scroll on the alt screen (Claude full-screen UI, or vim with mouse off) | Per R9: arrows with 1007, scrolls the app when mouse mode is on | Verified 2026-11-10 with the mouse wheel, as C5. Trackpad: works, Jonathan 2026-11-10 |
+| C23 | Task 9 item 9 | Japanese or Chinese IME in Claude | Candidate window at the cursor; committing inserts the text | Waived 2026-11-10, as T10 |
 
 ## Findings from the 2026-11-10 run
 
@@ -101,11 +101,21 @@ box and its `!` bash mode rather than model answers.
 - **F3 (minor, fixed): attach left the window title.** After detach iTerm2 still
   said "Claude Code". Attach now saves and restores it (`\x1b[22;0t`,
   `\x1b[23;0t`).
-- **F4 (minor): the folder picker ignores the current field** and opens in the
-  last folder macOS remembers.
-- **Not Overseer:** `~/.claude/settings.json` points hooks at
-  `/Users/jonathan.gill/...`, so every session on home.local shows SessionStart
-  hook errors.
+- **F4 (minor, fixed): the folder picker ignored the current field** and opened
+  in the last folder macOS remembered. It now opens in the folder typed in the
+  field, or the nearest existing folder above it, else the home folder.
+- **F5 (fixed): a session's folder could not be changed once started.** Restart
+  reused it and nothing else could start the slot again. A stopped session now
+  has a Start… button that opens the start dialog filled in with its last
+  label, folder and command. The dialog's default folder is now
+  `~/Repos/2ndBrain`.
+- **CI (fixed): the daemon could drop output for a slow viewer.** On a busy
+  GitHub runner the per-viewer stream fell behind and skipped chunks, or the
+  client was cut off. Lagging streams now fill the gap from the ring.
+- **Not Overseer:** `~/.claude/settings.json` points hooks and the status line
+  at `/Users/jonathan.gill/...`, so sessions on home.local show SessionStart and
+  Stop hook errors such as `Cannot find module
+  '/Users/jonathan.gill/.claude/hooks/gsd-context-monitor.js'`.
 
 ## Sign-off
 
