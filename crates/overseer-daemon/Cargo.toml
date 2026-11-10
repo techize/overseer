@@ -12,6 +12,8 @@ bytes.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 libc = "0.2"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde_json.workspace = true
 
 [dev-dependencies]
 overseer-term = { path = "../overseer-term" }
