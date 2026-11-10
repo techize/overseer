@@ -339,9 +339,15 @@ async fn paused_client_gets_the_whole_stream() {
     let text = text.rsplit("\x1bc").next().unwrap();
     let mut prev: Option<u64> = None;
     for line in text.split("\r\n").filter(|l| !l.is_empty()) {
-        let Ok(n) = line.parse::<u64>() else { continue };
+        let n: u64 = line
+            .parse()
+            .unwrap_or_else(|_| panic!("not a number: {line:?}"));
         if let Some(p) = prev {
-            assert_eq!(n, p + 1, "stream jumped from {p} to {n}");
+            if n != p + 1 {
+                let at = text.find(&format!("\r\n{p}\r\n")).unwrap_or(0);
+                let around = &text[at..(at + 40).min(text.len())];
+                panic!("stream jumped from {p} to {n}: {around:?}");
+            }
         }
         prev = Some(n);
     }
