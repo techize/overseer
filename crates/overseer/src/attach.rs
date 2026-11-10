@@ -10,6 +10,7 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
 
 use crate::ctl;
+use crate::outer::{self, ScreenFilter};
 
 /// Ctrl-] as a raw byte.
 const DETACH_KEY: u8 = 0x1d;
@@ -33,14 +34,21 @@ pub fn split_detach(input: &[u8]) -> (Vec<u8>, bool) {
 /// Restores the terminal on drop, so every exit path (including a panic
 /// unwinding through `run`) leaves the user's shell usable. The session's TUI
 /// may have switched on mouse reporting, bracketed paste, application cursor
-/// keys, the kitty keyboard protocol or the alternate screen; those are
-/// switched off again here.
+/// keys or the kitty keyboard protocol; those are switched off again here.
+/// The mirror runs on the outer terminal's alternate screen (see
+/// [`outer`]), so leaving it brings back the user's screen and cursor as
+/// they were, and the window title saved on entry is restored.
 struct TerminalGuard;
 
 impl TerminalGuard {
     fn enter() -> anyhow::Result<TerminalGuard> {
         terminal::enable_raw_mode().context("enable raw mode")?;
-        Ok(TerminalGuard)
+        let guard = TerminalGuard;
+        let mut out = std::io::stdout();
+        out.write_all(outer::ENTER)
+            .and_then(|()| out.flush())
+            .context("switch to the alternate screen")?;
+        Ok(guard)
     }
 }
 
@@ -49,7 +57,7 @@ impl Drop for TerminalGuard {
         let _ = terminal::disable_raw_mode();
         let mut out = std::io::stdout();
         let _ = out.write_all(
-            b"\x1b[<u\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1l\x1b>\x1b[?1049l\x1b[0m\x1b[?25h\n",
+            b"\x1b[<u\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1l\x1b>\x1b[?1049l\x1b[23;0t\x1b[0m\x1b[?25h",
         );
         let _ = out.flush();
     }
@@ -163,10 +171,12 @@ async fn pump(id: SlotId, frames: &mut mpsc::Receiver<Frame>, client: &Client) -
         Err(e) => return Ending::Lost(anyhow!(e).context("watch for terminal resizes")),
     };
     let mut stdout = std::io::stdout();
+    let mut screen = ScreenFilter::new();
     loop {
         tokio::select! {
             frame = frames.recv() => match frame {
                 Some(Frame::Output { id: fid, data }) if fid == id => {
+                    let data = screen.feed(&data);
                     if let Err(e) = stdout.write_all(&data).and_then(|()| stdout.flush()) {
                         return Ending::Lost(anyhow!(e).context("write to terminal"));
                     }

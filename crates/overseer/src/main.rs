@@ -1,6 +1,7 @@
 mod agent;
 mod attach;
 mod ctl;
+mod outer;
 
 use clap::{Parser, Subcommand};
 use overseer_daemon::DaemonConfig;

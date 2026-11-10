@@ -15,6 +15,7 @@ use tokio::task::{JoinHandle, JoinSet};
 
 use crate::env::{BaseEnv, EnvSource};
 use crate::manager::{valid_id, Attachment, SlotManager};
+use crate::slot::CatchUp;
 
 /// Frames queued per connection before it is considered too slow.
 const OUTBOUND_QUEUE: usize = 256;
@@ -159,6 +160,17 @@ impl StreamGate {
             return false;
         }
         outbox.send(Frame::Output { id: self.id, data })
+    }
+
+    /// `send` into a queue slot already reserved, so it cannot find the
+    /// queue full.
+    fn send_with(&self, permit: mpsc::Permit<'_, Frame>, data: Bytes) -> bool {
+        let epochs = self.epochs.lock().unwrap();
+        if epochs[self.id as usize] != self.epoch {
+            return false;
+        }
+        permit.send(Frame::Output { id: self.id, data });
+        true
     }
 }
 
@@ -381,27 +393,76 @@ const COALESCE_MAX: usize = 64 * 1024;
 /// `COALESCE_MAX` bytes, so a program that writes one line per syscall (each
 /// a tiny PTY read) costs one frame per wakeup instead of one per line. The
 /// outbound queue counts frames, so without this a client that keeps up is
-/// still cut off as slow during a burst. Returns the bytes and whether the
-/// stream has closed.
-fn coalesce(first: Bytes, live: &mut broadcast::Receiver<Bytes>, id: SlotId) -> (Bytes, bool) {
+/// still cut off as slow during a burst.
+fn coalesce(first: Bytes, live: &mut broadcast::Receiver<Bytes>) -> Merged {
     let mut buf: Option<Vec<u8>> = None;
-    let mut closed = false;
+    let mut end = None;
     while buf.as_ref().map_or(first.len(), Vec::len) < COALESCE_MAX {
         match live.try_recv() {
             Ok(more) => buf
                 .get_or_insert_with(|| first.to_vec())
                 .extend_from_slice(&more),
-            Err(broadcast::error::TryRecvError::Lagged(n)) => {
-                tracing::warn!("{} output lagged by {n} chunks", slot_name(id));
+            Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                end = Some(StreamEnd::Lagged);
+                break;
             }
             Err(broadcast::error::TryRecvError::Empty) => break,
             Err(broadcast::error::TryRecvError::Closed) => {
-                closed = true;
+                end = Some(StreamEnd::Closed);
                 break;
             }
         }
     }
-    (buf.map_or(first, Bytes::from), closed)
+    Merged {
+        data: buf.map_or(first, Bytes::from),
+        end,
+    }
+}
+
+/// Output merged by `coalesce`, and why merging stopped early, if it did.
+struct Merged {
+    data: Bytes,
+    end: Option<StreamEnd>,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum StreamEnd {
+    /// The receiver fell behind and lost chunks after `data`.
+    Lagged,
+    /// The output stream ended after `data`.
+    Closed,
+}
+
+/// Free outbound slots a stream leaves for replies and events. A stream
+/// waits for room above this instead of filling the queue, so a burst
+/// cannot crowd out a reply and get the client cut off.
+const STREAM_HEADROOM: usize = 32;
+/// How long a stream waits for room in the outbound queue before the client
+/// counts as too slow and is disconnected.
+pub const SLOW_CLIENT_GRACE: Duration = Duration::from_secs(2);
+
+/// Queues one `Output` frame for a live stream, waiting (up to
+/// `SLOW_CLIENT_GRACE`) while the client drains its queue. Meanwhile the
+/// slot's output piles up in the broadcast, and the next frame carries more
+/// of it. Returns false when the stream should stop.
+async fn send_live(gate: &StreamGate, outbox: &Outbox, data: Bytes) -> bool {
+    let wait = outbox.tx.reserve_many(STREAM_HEADROOM + 1);
+    match tokio::time::timeout(SLOW_CLIENT_GRACE, wait).await {
+        Ok(Ok(mut permits)) => match permits.next() {
+            Some(permit) => gate.send_with(permit, data),
+            None => false,
+        },
+        Ok(Err(_)) => {
+            outbox.dead.send_replace(true);
+            false
+        }
+        Err(_) => {
+            if !outbox.dead.send_replace(true) {
+                tracing::warn!("client too slow, disconnected");
+            }
+            false
+        }
+    }
 }
 
 /// Sends the snapshot as one `Output` frame, then forwards live output until
@@ -413,25 +474,51 @@ fn start_stream(gate: StreamGate, att: Attachment, outbox: &Outbox, streams: &mu
         return;
     }
     let Some(mut live) = att.live else { return };
+    let (slot, mut pos) = (att.slot, att.pos);
     let outbox = outbox.clone();
     streams.tasks[id as usize] = Some(tokio::spawn(async move {
         loop {
-            let first = match live.recv().await {
-                Ok(data) => data,
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!("{} output lagged by {n} chunks", slot_name(id));
-                    continue;
-                }
+            let merged = match live.recv().await {
+                Ok(first) => coalesce(first, &mut live),
+                Err(broadcast::error::RecvError::Lagged(_)) => Merged {
+                    data: Bytes::new(),
+                    end: Some(StreamEnd::Lagged),
+                },
                 // Output ended (child exited and the PTY drained). Everything
                 // buffered before the close has already been delivered.
                 Err(broadcast::error::RecvError::Closed) => break,
             };
-            let (data, closed) = coalesce(first, &mut live, id);
-            if !data.is_empty() && !gate.send(&outbox, data) {
+            pos += merged.data.len() as u64;
+            if !merged.data.is_empty() && !send_live(&gate, &outbox, merged.data).await {
                 break;
             }
-            if closed {
-                break;
+            match merged.end {
+                None => {}
+                Some(StreamEnd::Closed) => break,
+                // Chunks were lost: fill the gap from the ring and carry on
+                // with a fresh receiver, so the client sees the exact stream.
+                Some(StreamEnd::Lagged) => {
+                    let (missed, end, rx) = slot.catch_up(pos);
+                    let bytes = match missed {
+                        CatchUp::Missed(bytes) => bytes,
+                        CatchUp::Resync(bytes) => {
+                            tracing::warn!(
+                                "{} output lagged past the ring, resyncing",
+                                slot_name(id)
+                            );
+                            bytes
+                        }
+                    };
+                    pos = end;
+                    if !bytes.is_empty() && !send_live(&gate, &outbox, Bytes::from(bytes)).await {
+                        break;
+                    }
+                    match rx {
+                        Some(rx) => live = rx,
+                        // The stream has ended; the catch-up held all of it.
+                        None => break,
+                    }
+                }
             }
         }
     }));

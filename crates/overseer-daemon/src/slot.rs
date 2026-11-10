@@ -15,6 +15,15 @@ use tokio::sync::{broadcast, watch};
 use crate::ring::RingBuffer;
 
 /// Ring capacity used by the daemon.
+/// What a lagging receiver gets from [`Slot::catch_up`].
+#[derive(Debug, PartialEq)]
+pub enum CatchUp {
+    /// Exactly the output it missed.
+    Missed(Vec<u8>),
+    /// The missed output is gone: a terminal reset and a full snapshot.
+    Resync(Vec<u8>),
+}
+
 pub const RING_CAP: usize = 4 * 1024 * 1024;
 
 fn now_secs() -> i64 {
@@ -225,12 +234,44 @@ impl Slot {
     /// queries reach the receiver untouched.
     /// The receiver is `None` once the output stream has ended.
     pub fn attach(&self) -> (Vec<u8>, Option<broadcast::Receiver<Bytes>>) {
-        let (snapshot, rx) = {
+        let (snapshot, _, rx) = self.attach_at();
+        (snapshot, rx)
+    }
+
+    /// [`Slot::attach`], plus the stream position the receiver starts at.
+    pub fn attach_at(&self) -> (Vec<u8>, u64, Option<broadcast::Receiver<Bytes>>) {
+        let (snapshot, end, rx) = {
             let ring = self.ring.lock().unwrap();
             let rx = self.out.upgrade().map(|tx| tx.subscribe());
-            (ring.snapshot(), rx)
+            (ring.snapshot(), ring.end(), rx)
         };
-        (crate::vt::strip_queries(&snapshot), rx)
+        (crate::vt::strip_queries(&snapshot), end, rx)
+    }
+
+    /// For a receiver that lagged and lost chunks: the output from stream
+    /// position `pos` on, a fresh receiver that continues exactly after it,
+    /// and the position that receiver starts at. Taken under the ring lock,
+    /// like `attach`, so there is no gap and no duplicate.
+    ///
+    /// If the ring has already dropped bytes after `pos`, the gap cannot be
+    /// filled; the output is then a terminal reset and a full snapshot, so
+    /// the client redraws from scratch instead of showing a corrupt screen.
+    pub fn catch_up(&self, pos: u64) -> (CatchUp, u64, Option<broadcast::Receiver<Bytes>>) {
+        let (missed, end, rx) = {
+            let ring = self.ring.lock().unwrap();
+            let rx = self.out.upgrade().map(|tx| tx.subscribe());
+            let missed = ring.since(pos).ok_or_else(|| ring.snapshot());
+            (missed, ring.end(), rx)
+        };
+        let out = match missed {
+            Ok(bytes) => CatchUp::Missed(bytes),
+            Err(snapshot) => {
+                let mut bytes = b"\x1bc".to_vec();
+                bytes.extend(crate::vt::strip_queries(&snapshot));
+                CatchUp::Resync(bytes)
+            }
+        };
+        (out, end, rx)
     }
 
     pub fn info(&self) -> SlotInfo {
