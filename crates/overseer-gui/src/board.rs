@@ -8,7 +8,8 @@
 //! A running claude slot also carries its hook-reported activity: the badge
 //! then says Working, Needs you or Idle with the time in that state, and a
 //! line under the cwd says what it is doing or why it needs you. A running
-//! slot without activity (any other command) keeps the plain Running look.
+//! slot without activity (any other command) keeps the plain Running badge,
+//! with its command (`htop`) on the line under the cwd.
 
 use std::path::Path;
 
@@ -112,6 +113,28 @@ pub fn slot_title(info: &SlotInfo) -> String {
 }
 
 /// The card for `info` at unix time `now`.
+/// The detail line for a running slot without activity, such as `htop`: the
+/// program's file name and its arguments, cut to 80 characters.
+fn command_line(command: &[String]) -> Option<String> {
+    let (program, args) = command.split_first()?;
+    let program = Path::new(program)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(program);
+    let line = std::iter::once(program)
+        .chain(args.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    Some(match line.char_indices().nth(80) {
+        Some((cut, _)) => format!("{}…", &line[..cut]),
+        None => line.to_string(),
+    })
+}
+
 pub fn card_model(info: &SlotInfo, now: i64, home: Option<&Path>) -> CardModel {
     let cwd = info.cwd.as_deref().map(|p| tilde(p, home));
     let title = slot_title(info);
@@ -130,7 +153,7 @@ pub fn card_model(info: &SlotInfo, now: i64, home: Option<&Path>) -> CardModel {
                 None => (
                     format!("● Running {}", format_elapsed(now - since)),
                     Tone::Running,
-                    None,
+                    info.command.as_deref().and_then(command_line),
                 ),
                 Some(a) => (
                     format!("● {}", activity_state(a, now)),
@@ -609,6 +632,30 @@ mod tests {
         assert_eq!(m.tone, Tone::Running);
         assert_eq!(tone_color(m.tone), colors::GREEN);
         assert_eq!(m.now_doing, None);
+    }
+
+    #[test]
+    fn running_without_activity_shows_the_command() {
+        let st = SlotState::Running {
+            pid: 4321,
+            since: 1000,
+        };
+        let mut i = info(2, "", st);
+        i.command = Some(vec![
+            "/opt/homebrew/bin/htop".into(),
+            "-d".into(),
+            "10".into(),
+        ]);
+        assert_eq!(
+            card_model(&i, 1000, None).now_doing.as_deref(),
+            Some("htop -d 10")
+        );
+        i.command = Some(vec!["x".repeat(100)]);
+        let long = card_model(&i, 1000, None).now_doing.unwrap();
+        assert_eq!(long.chars().count(), 81);
+        assert!(long.ends_with('…'));
+        i.command = Some(vec![]);
+        assert_eq!(card_model(&i, 1000, None).now_doing, None);
     }
 
     #[test]
