@@ -217,6 +217,10 @@ impl WorkStore {
     /// The cached items with their owners and folders, owned items that have
     /// left the cache (marked `in_list: false`), the source statuses and all
     /// notices.
+    pub fn brain_dir(&self) -> &Path {
+        &self.brain_dir
+    }
+
     pub fn view(&self) -> WorkView {
         let read = self
             .ledger
@@ -622,6 +626,74 @@ async fn label_worker(store: Weak<WorkStore>, mut rx: mpsc::UnboundedReceiver<La
     }
 }
 
+/// The first prompt for a slot, built from `template` and the items it
+/// owns. `None` when it owns none. A bead whose ticket is also in `items`
+/// is listed under it; any other item is a top-level line.
+pub fn kickoff_text(
+    template: &str,
+    slot: SlotId,
+    items: &[WorkItem],
+    brain_dir: &Path,
+) -> Option<String> {
+    let mine: Vec<&WorkItem> = items.iter().collect();
+    if mine.is_empty() {
+        return None;
+    }
+    let line =
+        |i: &WorkItem, indent: &str| format!("{indent}- {} ({}): {}", i.key, i.status, i.title);
+    let in_set = |key: &str| mine.iter().any(|i| i.key == key);
+    let mut lines = Vec::new();
+    for top in &mine {
+        if top.parent.as_deref().is_some_and(in_set) {
+            continue;
+        }
+        lines.push(line(top, ""));
+        for child in mine
+            .iter()
+            .filter(|c| c.parent.as_deref() == Some(&top.key))
+        {
+            lines.push(line(child, "  "));
+        }
+    }
+    let mut folders: Vec<String> = Vec::new();
+    for f in mine.iter().filter_map(|i| i.folder.as_ref()) {
+        let f = f.display().to_string();
+        if !folders.contains(&f) {
+            folders.push(f);
+        }
+    }
+    let folders = if folders.is_empty() {
+        "none found".to_string()
+    } else {
+        folders.join(", ")
+    };
+    let values = [
+        ("slot", slot_name(slot)),
+        ("items", lines.join("\n")),
+        ("folders", folders),
+        ("brain", brain_dir.display().to_string()),
+    ];
+    // One pass, so braces inside a title or path are never expanded again.
+    let mut out = String::new();
+    let mut rest = template;
+    'scan: while let Some(at) = rest.find('{') {
+        out.push_str(&rest[..at]);
+        rest = &rest[at..];
+        for (name, value) in &values {
+            let tag = format!("{{{name}}}");
+            if let Some(after) = rest.strip_prefix(tag.as_str()) {
+                out.push_str(value);
+                rest = after;
+                continue 'scan;
+            }
+        }
+        out.push('{');
+        rest = &rest[1..];
+    }
+    out.push_str(rest);
+    Some(out.trim().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -719,5 +791,104 @@ mod tests {
         // Seen once only.
         s.regroup(3);
         assert_eq!(s.ledger.notices().unwrap().len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod kickoff_tests {
+    use super::*;
+    use crate::launch::ASSIGNMENT;
+
+    fn it(key: &str, kind: ItemKind, status: &str, title: &str, parent: Option<&str>) -> WorkItem {
+        WorkItem {
+            key: key.into(),
+            kind,
+            title: title.into(),
+            status: status.into(),
+            priority: None,
+            parent: parent.map(String::from),
+            owner: Some(3),
+            in_list: true,
+            folder: None,
+        }
+    }
+
+    #[test]
+    fn kickoff_lists_items_and_folders() {
+        let mut t = it(
+            "DEMO-12",
+            ItemKind::Ticket,
+            "In Progress",
+            "Widget wiring",
+            None,
+        );
+        t.folder = Some(PathBuf::from("/b/Sprints/s1/DEMO-12-widget"));
+        let text = kickoff_text(ASSIGNMENT, 3, &[t], Path::new("/b")).unwrap();
+        assert!(text.starts_with("You are S3. Overseer has assigned you this work:\n\n"));
+        assert!(
+            text.contains("\n- DEMO-12 (In Progress): Widget wiring\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Ticket folders in 2ndBrain: /b/Sprints/s1/DEMO-12-widget\n"),
+            "{text}"
+        );
+        assert!(!text.contains('{'), "{text}");
+    }
+
+    #[test]
+    fn kickoff_none_without_items() {
+        assert_eq!(kickoff_text(ASSIGNMENT, 3, &[], Path::new("/b")), None);
+    }
+
+    #[test]
+    fn kickoff_says_none_found_without_folders() {
+        let b = it("ov-3", ItemKind::Bead, "open", "Fix {slot} thing", None);
+        let text = kickoff_text(ASSIGNMENT, 3, &[b], Path::new("/b")).unwrap();
+        assert!(
+            text.contains("Ticket folders in 2ndBrain: none found"),
+            "{text}"
+        );
+        // Braces in a title are not expanded again.
+        assert!(text.contains("- ov-3 (open): Fix {slot} thing"), "{text}");
+    }
+
+    #[test]
+    fn bead_under_ticket_is_indented() {
+        let items = [
+            it(
+                "DEMO-12",
+                ItemKind::Ticket,
+                "In Progress",
+                "Widget wiring",
+                None,
+            ),
+            it("ov-2", ItemKind::Bead, "open", "Wire it", Some("DEMO-12")),
+            it(
+                "ov-9",
+                ItemKind::Bead,
+                "open",
+                "Loose bead",
+                Some("DEMO-40"),
+            ),
+        ];
+        let text = kickoff_text("{items}", 3, &items, Path::new("/b")).unwrap();
+        assert_eq!(
+            text,
+            "- DEMO-12 (In Progress): Widget wiring\n  - ov-2 (open): Wire it\n- ov-9 (open): Loose bead"
+        );
+    }
+
+    #[test]
+    fn child_listed_before_its_ticket_still_nests() {
+        let items = [
+            it("ov-2", ItemKind::Bead, "open", "Wire it", Some("DEMO-12")),
+            it("DEMO-12", ItemKind::Ticket, "To Do", "Widget wiring", None),
+        ];
+        let text = kickoff_text("{items}", 3, &items, Path::new("/b")).unwrap();
+        assert_eq!(
+            text,
+            "- DEMO-12 (To Do): Widget wiring\n  - ov-2 (open): Wire it"
+        );
     }
 }

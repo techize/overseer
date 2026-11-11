@@ -13,6 +13,8 @@ use overseer_proto::msg::{slot_name, SlotId};
 const WORKER_ROLE: &str = include_str!("roles/worker.md");
 const COORDINATOR_ROLE: &str = include_str!("roles/coordinator.md");
 const KICKOFF: &str = include_str!("roles/kickoff.md");
+/// The prompt built from a slot's assigned work items.
+pub const ASSIGNMENT: &str = include_str!("roles/assignment.md");
 
 /// Writes `default` to `roles/<name>` if the file is missing and returns its
 /// path. create_new: never clobber an edited template, even when two starts
@@ -36,6 +38,12 @@ fn ensure_template(roles: &Path, name: &str, default: &str) -> io::Result<PathBu
 pub fn kickoff_prompt(state_dir: &Path) -> io::Result<String> {
     let path = ensure_template(&state_dir.join("roles"), "kickoff.md", KICKOFF)?;
     Ok(std::fs::read_to_string(path)?.trim().to_string())
+}
+
+/// The assignment template from `<state>/roles/assignment.md`.
+pub fn assignment_template(state_dir: &Path) -> io::Result<String> {
+    let path = ensure_template(&state_dir.join("roles"), "assignment.md", ASSIGNMENT)?;
+    std::fs::read_to_string(path)
 }
 
 /// The first prompt for a start. An explicit prompt wins; otherwise a fresh
@@ -156,6 +164,7 @@ pub fn write_slot_files(
     let worker = ensure_template(&roles, "worker.md", WORKER_ROLE)?;
     let coordinator = ensure_template(&roles, "coordinator.md", COORDINATOR_ROLE)?;
     ensure_template(&roles, "kickoff.md", KICKOFF)?;
+    ensure_template(&roles, "assignment.md", ASSIGNMENT)?;
     let template_path = if slot == 0 { coordinator } else { worker };
     let template = std::fs::read_to_string(&template_path)?;
     // The label goes in last so braces inside it are not expanded again.

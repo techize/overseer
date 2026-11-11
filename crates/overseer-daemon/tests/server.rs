@@ -1718,3 +1718,31 @@ async fn shutdown_stops_hung_sources_and_requested_refreshes() {
     let running: Vec<_> = all.lines().filter(|p| alive(p)).collect();
     assert!(running.is_empty(), "still running: {running:?} of {all:?}");
 }
+
+#[tokio::test]
+async fn kickoff_request_returns_text() {
+    let s = stub_sources("kickoff", false);
+    let d = s.daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    c.refresh().await;
+    // Nothing assigned yet.
+    assert_eq!(
+        c.request(Request::Kickoff { slot: 3 }).await,
+        Response::Error {
+            message: "S3 owns no work items".into()
+        }
+    );
+    assert_eq!(c.assign("DEMO-12", 3, false, false).await, Response::Ok);
+    let text = match c.request(Request::Kickoff { slot: 3 }).await {
+        Response::Text { text } => text,
+        other => panic!("unexpected {other:?}"),
+    };
+    assert!(text.starts_with("You are S3."), "{text}");
+    assert!(
+        text.contains("- DEMO-12 (") && text.contains("): Widget wiring"),
+        "{text}"
+    );
+    assert!(text.contains("DEMO-12-widget"), "{text}");
+    // The template is written for Jonathan to edit.
+    assert!(d.state_dir.join("roles/assignment.md").is_file());
+}

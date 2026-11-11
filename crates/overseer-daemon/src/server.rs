@@ -1,7 +1,7 @@
 //! Unix socket server: one reader task, one writer task and one handler per
 //! connection.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -96,6 +96,7 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
     };
     let ledger = Arc::new(ledger);
     let store = WorkStore::new(&cfg.settings, ledger.clone(), events.clone(), env.clone());
+    let state_dir = cfg.state_dir.clone();
     let mut mgr = SlotManager::new(cfg.default_command, events)
         .with_env(env.clone())
         .with_launch(cfg.state_dir, cfg.hook_program, ledger);
@@ -113,6 +114,7 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
                         stream,
                         manager.clone(),
                         store.clone(),
+                        state_dir.clone(),
                         shutdown.clone(),
                         env.clone(),
                     ));
@@ -240,6 +242,7 @@ async fn handle_conn(
     stream: UnixStream,
     manager: Manager,
     store: Arc<WorkStore>,
+    state_dir: PathBuf,
     shutdown: Arc<Notify>,
     mut env: BaseEnv,
 ) {
@@ -302,7 +305,7 @@ async fn handle_conn(
                     ) {
                         env.wait().await;
                     }
-                    handle_frame(f, &manager, &store, &outbox, &shutdown, &mut streams)
+                    handle_frame(f, &manager, &store, &state_dir, &outbox, &shutdown, &mut streams)
                 }
                 None => break, // client hung up
             },
@@ -328,6 +331,7 @@ fn handle_frame(
     frame: Frame,
     manager: &Manager,
     store: &Arc<WorkStore>,
+    state_dir: &Path,
     outbox: &Outbox,
     shutdown: &Notify,
     streams: &mut Streams,
@@ -352,7 +356,7 @@ fn handle_frame(
         Frame::Request { seq, req } => {
             let is_shutdown = matches!(req, Request::Shutdown);
             let mut pending_attach = None;
-            let resp = handle_request(req, manager, store, streams, &mut pending_attach);
+            let resp = handle_request(req, manager, store, state_dir, streams, &mut pending_attach);
             // A re-attach ends the earlier stream before its Ok is queued.
             let gate = pending_attach.as_ref().map(|(id, _)| streams.cut(*id));
             outbox.send(Frame::Response { seq, resp });
@@ -390,6 +394,7 @@ fn handle_request(
     req: Request,
     manager: &Manager,
     store: &Arc<WorkStore>,
+    state_dir: &Path,
     streams: &mut Streams,
     pending_attach: &mut Option<(SlotId, Attachment)>,
 ) -> Response {
@@ -411,7 +416,25 @@ fn handle_request(
         } => store.assign(&key, slot, confirm, move_owner, unix_now()),
         Request::Release { key } => store.release(&key, unix_now()),
         Request::ClearNotices { slot } => store.clear_notices(slot),
-        Request::Kickoff { .. } => err("not supported yet".into()),
+        Request::Kickoff { slot } => {
+            let mine: Vec<_> = store
+                .view()
+                .items
+                .into_iter()
+                .filter(|i| i.owner == Some(slot))
+                .collect();
+            let template = match crate::launch::assignment_template(state_dir) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!("assignment template unreadable, using the default: {e}");
+                    crate::launch::ASSIGNMENT.to_string()
+                }
+            };
+            match crate::work::store::kickoff_text(&template, slot, &mine, store.brain_dir()) {
+                Some(text) => Response::Text { text },
+                None => err(format!("{} owns no work items", slot_name(slot))),
+            }
+        }
         Request::StartSlot {
             id,
             label,
