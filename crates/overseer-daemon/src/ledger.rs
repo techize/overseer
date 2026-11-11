@@ -445,18 +445,18 @@ mod tests {
     #[test]
     fn assign_release_round_trip() {
         let l = Ledger::in_memory();
-        l.assign("PLAT-1", 2, 10).unwrap();
-        l.assign("PLAT-2", 3, 11).unwrap();
-        l.assign("PLAT-1", 4, 12).unwrap();
+        l.assign("DEMO-1", 2, 10).unwrap();
+        l.assign("DEMO-2", 3, 11).unwrap();
+        l.assign("DEMO-1", 4, 12).unwrap();
         let mut got = l.assignments().unwrap();
         got.sort();
         assert_eq!(
             got,
-            vec![("PLAT-1".to_string(), 4), ("PLAT-2".to_string(), 3)]
+            vec![("DEMO-1".to_string(), 4), ("DEMO-2".to_string(), 3)]
         );
-        assert_eq!(l.release("PLAT-1").unwrap(), Some(4));
-        assert_eq!(l.release("PLAT-1").unwrap(), None);
-        l.log(13, "PLAT-2", Some(3), "assigned", "by hand").unwrap();
+        assert_eq!(l.release("DEMO-1").unwrap(), Some(4));
+        assert_eq!(l.release("DEMO-1").unwrap(), None);
+        l.log(13, "DEMO-2", Some(3), "assigned", "by hand").unwrap();
     }
 
     #[test]
@@ -464,10 +464,10 @@ mod tests {
         let path = temp_db("assign-reopen");
         {
             let l = Ledger::open(&path).unwrap();
-            l.assign("PLAT-9", 5, 20).unwrap();
+            l.assign("DEMO-9", 5, 20).unwrap();
         }
         let l = Ledger::open(&path).unwrap();
-        assert_eq!(l.assignments().unwrap(), vec![("PLAT-9".to_string(), 5)]);
+        assert_eq!(l.assignments().unwrap(), vec![("DEMO-9".to_string(), 5)]);
         let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
     }
 

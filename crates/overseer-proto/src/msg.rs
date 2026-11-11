@@ -269,7 +269,7 @@ mod tests {
         WorkView {
             items: vec![
                 WorkItem {
-                    key: "PLAT-1".into(),
+                    key: "DEMO-1".into(),
                     kind: ItemKind::Ticket,
                     title: "A ticket".into(),
                     status: "In Progress".into(),
@@ -277,7 +277,7 @@ mod tests {
                     parent: None,
                     owner: Some(2),
                     in_list: true,
-                    folder: Some(PathBuf::from("/tmp/PLAT-1")),
+                    folder: Some(PathBuf::from("/tmp/DEMO-1")),
                 },
                 WorkItem {
                     key: "bd-9".into(),
@@ -285,7 +285,7 @@ mod tests {
                     title: "A bead".into(),
                     status: "open".into(),
                     priority: None,
-                    parent: Some("PLAT-1".into()),
+                    parent: Some("DEMO-1".into()),
                     owner: None,
                     in_list: false,
                     folder: None,
@@ -312,13 +312,13 @@ mod tests {
             Request::ListWorkItems,
             Request::RefreshWorkItems,
             Request::Assign {
-                key: "PLAT-1".into(),
+                key: "DEMO-1".into(),
                 slot: 2,
                 confirm: true,
                 move_owner: true,
             },
             Request::Release {
-                key: "PLAT-1".into(),
+                key: "DEMO-1".into(),
             },
             Request::Kickoff { slot: 3 },
             Request::ClearNotices { slot: 3 },
@@ -331,11 +331,11 @@ mod tests {
     #[test]
     fn assign_defaults_flags() {
         let req: Request =
-            serde_json::from_str(r#"{"type":"Assign","key":"PLAT-1","slot":2}"#).unwrap();
+            serde_json::from_str(r#"{"type":"Assign","key":"DEMO-1","slot":2}"#).unwrap();
         assert_eq!(
             req,
             Request::Assign {
-                key: "PLAT-1".into(),
+                key: "DEMO-1".into(),
                 slot: 2,
                 confirm: false,
                 move_owner: false,

@@ -30,8 +30,9 @@ afterwards. The examples in this file (`DEMO-12`, `ov-3`) are invented.
 
 1. `make install` in `~/overseer`.
 2. Write `~/.config/overseer/config.toml` only if the defaults do not suit
-   (beads and brain folders default to `~/Repos/2ndBrain`). Quit and reopen
-   Overseer from `~/Applications` in Finder so the daemon rereads it.
+   (beads and brain folders default to `~/Repos/2ndBrain`). Then run
+   `launchctl kickstart -k gui/$(id -u)/uk.co.techize.overseer` so the daemon
+   rereads it.
 3. Have a real claude login, and for the Jira rows `acli` installed and logged
    in. Until then the Jira source says `acli not found`, which is a normal
    state (J1).

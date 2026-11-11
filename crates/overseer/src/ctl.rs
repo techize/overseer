@@ -47,7 +47,8 @@ pub enum CtlCmd {
     Assign {
         slot: SlotId,
         key: String,
-        /// Accept the warning about a busy slot or an owned ticket.
+        /// Accept the warning about overlapping work: a bead whose ticket
+        /// another slot owns, or a ticket with beads another slot owns.
         #[arg(long)]
         yes: bool,
         /// Take the item from its current owner.

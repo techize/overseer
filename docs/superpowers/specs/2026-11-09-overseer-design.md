@@ -9,7 +9,7 @@
 
 ## 1. Intent and why
 
-Jonathan runs 4 to 6 Claude Code CLI sessions in parallel on his work laptop. Today they live in Warp split panes (sometimes iTerm2), and each one picks up a Jira ticket when he says "work on PLAT-12345". The sessions then use Jira and Bitbucket CLIs or MCPs, his skills, and his 2ndBrain Obsidian vault to work out the context.
+Jonathan runs 4 to 6 Claude Code CLI sessions in parallel on his work laptop. Today they live in Warp split panes (sometimes iTerm2), and each one picks up a Jira ticket when he says "work on DEMO-21". The sessions then use Jira and Bitbucket CLIs or MCPs, his skills, and his 2ndBrain Obsidian vault to work out the context.
 
 The cost lands on Jonathan's memory:
 
@@ -133,7 +133,7 @@ If hooks fail, a light fallback reads the terminal screen for a visible permissi
 - **Grouping.** A bead whose title or `external_ref` contains `PLAT-\d+` groups under that ticket. Other beads stand alone. When a standalone bead later gets a ticket, the item keeps its owner and history.
 - **Ownership rules (decided):**
   - A **ticket**, or a standalone bead, has at most one owner session. Assigning it to a second session is **refused**, and the board says who owns it. Jonathan can explicitly move it, which releases it from the old owner and tells that session.
-  - A **bead under a ticket owned by another session** can be assigned with a **warning** ("This bead is under PLAT-12179, owned by S3. Assign to S4 anyway?"). If confirmed, S3 is told that S4 has that slice.
+  - A **bead under a ticket owned by another session** can be assigned with a **warning** ("This bead is under DEMO-12, owned by S3. Assign to S4 anyway?"). If confirmed, S3 is told that S4 has that slice.
 - **Writing back to beads.** On assignment, the app records ownership on the bead (`bd update` assignee, or a label such as `overseer:S3`), so the history is visible in beads itself.
 - **Promotion conflict.** If a standalone bead owned by one session gets linked to a ticket owned by another, the app shows the same warning as a split-off bead and tells both sessions.
 - **Picker.** Assigning work uses a picker that lists Jira tickets with their beads nested underneath, plus standalone beads, showing owner, status, priority and the link to the 2ndBrain ticket folder.
@@ -149,7 +149,7 @@ If hooks fail, a light fallback reads the terminal screen for a visible permissi
 
 **Claims:**
 - A session claims a target through the MCP tool `claim_target(target, reason)` before writing, and releases it with `release_target`.
-- If the target is held, the caller joins a **wait queue**, and the tool returns "held by S1 since 08:40 for PLAT-12334".
+- If the target is held, the caller joins a **wait queue**, and the tool returns "held by S1 since 08:40 for DEMO-33".
 - Jonathan can claim, release or force-release any target from the GUI.
 - Kickoffs (7.7) can pre-assign targets.
 

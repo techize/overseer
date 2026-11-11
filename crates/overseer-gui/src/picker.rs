@@ -1,8 +1,10 @@
 //! The work-item picker: assigns an item from the work view to one slot.
 //!
 //! Type to filter, Up and Down to move, Enter to assign, Esc to close. A
-//! busy-slot warning (`NeedsConfirm`) asks again with "Assign anyway", and an
-//! item owned by another slot offers "Move to S<n>"; Enter accepts either.
+//! warning about overlapping work (`NeedsConfirm`: a bead whose ticket another
+//! slot owns, or a ticket with beads another slot owns) asks again with
+//! "Assign anyway", and an item owned by another slot offers "Move to S<n>";
+//! Enter accepts either.
 //!
 //! The rows, the filter, the key handling and the reply handling are pure
 //! (`rows`, `PickerState`) and unit tested.

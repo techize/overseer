@@ -37,7 +37,7 @@
 2. **`bd` slow or hanging.** Slot requests, attach and hooks keep responding while a refresh is in flight. The 30 s timeout ends it.
 3. **Assigning the same item from two clients at once** (GUI and `ctl`). Exactly one wins and the other is refused. The decision and the ledger write happen under one lock.
 4. **A restart with assignments in place.** Cards show the same pills after a daemon restart, before the first refresh has finished.
-5. **A ticket key inside other text** (`PLAT-123:` in a title, `jira-PLAT-123` in external_ref, two keys in one title). The first match groups the bead, and `PLAT-1234` does not match `PLAT-123`.
+5. **A ticket key inside other text** (`DEMO-123:` in a title, `jira-DEMO-123` in external_ref, two keys in one title). The first match groups the bead, and `DEMO-1234` does not match `DEMO-123`.
 
 Each line has its test in the owning task below.
 
@@ -74,7 +74,7 @@ Each line has its test in the owning task below.
 - `Response::Work(WorkView)`, `Response::NeedsConfirm { message: String }`, `Response::Text { text: String }`
 - `Event::WorkChanged(WorkView)`
 
-- [ ] **Step 1: Tests** round-trip each new request, response and event through JSON. `assign_defaults_flags` checks `{"type":"Assign","key":"PLAT-1","slot":2}` parses with both flags false.
+- [ ] **Step 1: Tests** round-trip each new request, response and event through JSON. `assign_defaults_flags` checks `{"type":"Assign","key":"DEMO-1","slot":2}` parses with both flags false.
 - [ ] **Step 2: Run** `cargo test -p overseer-proto` and see them fail.
 - [ ] **Step 3: Implement.** Add match arms that answer `Response::Error { message: "not supported yet" }` in the daemon, and make the GUI ignore `Event::WorkChanged` for now, so the workspace builds.
 - [ ] **Step 4: Run** `cargo test --workspace`.
@@ -95,7 +95,7 @@ Each line has its test in the owning task below.
 - `group(tickets: &[Ticket], beads: &[Bead], pattern: &Regex) -> Vec<WorkItem>`: tickets first in Jira order, each followed by its beads, then the ticket nodes made from beads alone (title = key, status "unknown"), then standalone beads. `owner`, `folder` empty here; `in_list` true.
 - `async fn run_source(cmd: &[String], cwd: &Path, timeout: Duration, env: &[(OsString, OsString)]) -> Result<String, String>`: runs the command with tokio::process, returns stdout. Not found gives `"<program> not found"`, a timeout gives `"timed out after 30 s"`, a non-zero exit gives the exit code and the first stderr line.
 
-- [ ] **Step 1: Tests:** `parses_bd_list_fixture`, `jira_with_a_leading_warning_line`, `jira_object_with_issues`, `jira_junk_is_an_error`, `ticket_in_title_or_external_ref`, `pattern_does_not_match_a_longer_key` (`PLAT-1234` vs `PLAT-123`), `first_of_two_keys_wins`, `bead_without_jira_ticket_gets_a_ticket_node`, `standalone_beads_last`, `run_source_missing_program`, `run_source_times_out` (`sleep 5` with a 200 ms timeout).
+- [ ] **Step 1: Tests:** `parses_bd_list_fixture`, `jira_with_a_leading_warning_line`, `jira_object_with_issues`, `jira_junk_is_an_error`, `ticket_in_title_or_external_ref`, `pattern_does_not_match_a_longer_key` (`DEMO-1234` vs `DEMO-123`), `first_of_two_keys_wins`, `bead_without_jira_ticket_gets_a_ticket_node`, `standalone_beads_last`, `run_source_missing_program`, `run_source_times_out` (`sleep 5` with a 200 ms timeout).
 - [ ] **Step 2: Run** `cargo test -p overseer-daemon work::` and see them fail.
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run** the tests.
@@ -127,7 +127,7 @@ Each line has its test in the owning task below.
 - `fn decide(items: &[WorkItem], owners: &HashMap<String, SlotId>, key: &str, slot: SlotId, confirm: bool, move_owner: bool) -> Result<Decision, String>`. Rules from spec 7.4:
   - Unknown key (not in `items` and not owned): `Err("no work item <key>")`.
   - A ticket, or a standalone bead, owned by another slot: `Refuse`. With `move_owner`: `Move { from }`.
-  - A bead whose parent ticket is owned by another slot: without `confirm`, `Warn` with the text `This bead is under PLAT-12179, owned by S3. Assign to S4 anyway?` and `tell: [3]`. With `confirm`, the same `Warn` is returned as accepted (the caller assigns and stores the notice).
+  - A bead whose parent ticket is owned by another slot: without `confirm`, `Warn` with the text `This bead is under DEMO-12, owned by S3. Assign to S4 anyway?` and `tell: [3]`. With `confirm`, the same `Warn` is returned as accepted (the caller assigns and stores the notice).
   - A ticket some of whose beads are owned by other slots: the same warn and confirm flow, naming those beads and slots.
   - Owned by this slot already: `AlreadyYours`.
 - `fn promotions(before: &[WorkItem], after: &[WorkItem], owners: &HashMap<String, SlotId>) -> Vec<(String, SlotId, SlotId)>`: a bead that was standalone in `before`, owned by A, and is under a ticket owned by B in `after` (A different from B) yields `(bead, A, B)`.
@@ -148,7 +148,7 @@ Each line has its test in the owning task below.
 - `WorkStore::new(cfg: &Config, ledger: Arc<Ledger>, events: broadcast::Sender<Event>, env: BaseEnv) -> Arc<WorkStore>`.
 - `fn view(&self) -> WorkView`: the cached items with owners from the ledger, owned items missing from the cache added with `in_list: false`, and `folder` filled from a listing of `<brain_dir>/Sprints/*/` (a folder named `<KEY>` or starting with `<KEY>-`, cached per refresh).
 - `async fn refresh(&self, which: Source)`: runs the source with `run_source`, regroups, detects promotions (each one logs history and adds a notice to both slots), stores the status, and sends `Event::WorkChanged`. Refreshes of one source never overlap; a request during a refresh waits for it.
-- `fn assign(&self, key, slot, confirm, move_owner, now) -> Response`: under the ledger transaction, `decide`, then write the assignment, history and notices. `Warn` without `confirm` returns `NeedsConfirm`. `Refuse` returns `Error` naming the owner (`PLAT-1 is owned by S3`). After commit, for a bead, `bd update <id> --add-label overseer:S<n>` (plus `--remove-label overseer:S<old>` on a move) runs in a spawned task, and a failure is logged and stored as a notice for that slot (`could not label <id> in beads: <reason>`).
+- `fn assign(&self, key, slot, confirm, move_owner, now) -> Response`: under the ledger transaction, `decide`, then write the assignment, history and notices. `Warn` without `confirm` returns `NeedsConfirm`. `Refuse` returns `Error` naming the owner (`DEMO-1 is owned by S3`). After commit, for a bead, `bd update <id> --add-label overseer:S<n>` (plus `--remove-label overseer:S<old>` on a move) runs in a spawned task, and a failure is logged and stored as a notice for that slot (`could not label <id> in beads: <reason>`).
 - `fn release(&self, key, now) -> Response`: removes the assignment, logs it, removes the bead label in the background.
 - Poll tasks: beads every `beads_poll_secs`, Jira every `jira_poll_secs`, both once at start.
 - Server: `ListWorkItems` answers `Work(view)`, `RefreshWorkItems` refreshes both and then answers `Work`, `Assign`, `Release`, `ClearNotices` as above.
@@ -166,7 +166,7 @@ Each line has its test in the owning task below.
 - Modify: `crates/overseer-daemon/src/launch.rs` (template written to `<state>/roles/assignment.md` like the others), `src/work/store.rs`, `src/server.rs`
 
 **Interfaces:**
-- `fn kickoff_text(template: &str, slot: SlotId, items: &[WorkItem], brain_dir: &Path) -> Option<String>`: `None` when the slot owns nothing. Fills `{slot}`, `{items}` (one line per item: `- PLAT-123 (In Progress): title`, a bead under it indented), `{folders}` (each item's `folder`, or `none found`) and `{brain}`.
+- `fn kickoff_text(template: &str, slot: SlotId, items: &[WorkItem], brain_dir: &Path) -> Option<String>`: `None` when the slot owns nothing. Fills `{slot}`, `{items}` (one line per item: `- DEMO-123 (In Progress): title`, a bead under it indented), `{folders}` (each item's `folder`, or `none found`) and `{brain}`.
 - Default template text (exact):
 
 ```
@@ -193,7 +193,7 @@ Work only on these items. Before starting, read the ticket folder and run `bd sh
 - Modify: `crates/overseer/src/ctl.rs`, `crates/overseer-daemon/src/roles/coordinator.md`, `roles/worker.md`, `crates/overseer/tests/cli.rs`
 
 **Interfaces:**
-- `overseer ctl items [--json]`: one line per item, beads indented under their ticket: `PLAT-123  In Progress  S3  title` (owner `-` when free). Source status lines first (`jira  ok  12 items  14:05`, or `jira  acli not found`). Notices last. `--json` prints the `WorkView`.
+- `overseer ctl items [--json]`: one line per item, beads indented under their ticket: `DEMO-123  In Progress  S3  title` (owner `-` when free). Source status lines first (`jira  ok  12 items  14:05`, or `jira  acli not found`). Notices last. `--json` prints the `WorkView`.
 - `overseer ctl assign <slot> <key> [--yes] [--move]`: prints the confirm question and exits 2 on `NeedsConfirm`, exits 1 on `Error`.
 - `overseer ctl release <key>`, `overseer ctl refresh`, `overseer ctl kickoff <slot>` (prints the text).
 - Coordinator role: step 4's table gains a "work items" column, and after Jonathan approves a row, S0 runs `ctl assign <slot> <key>` for each item before `ctl start`. It never passes `--yes` or `--move` unless Jonathan said so for that item. `ctl items` replaces its own `bd ready` and Jira reads for the board picture (it may still run `bd ready --json` for readiness).
