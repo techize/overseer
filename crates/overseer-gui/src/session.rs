@@ -163,6 +163,19 @@ pub fn can_kickoff(info: &SlotInfo) -> bool {
             .is_some_and(|a| a.kind == ActivityKind::Idle)
 }
 
+/// Send kickoff is on offer: the session is idle and no kickoff for it is
+/// already on its way (a double click must not type it twice).
+pub fn kickoff_enabled(info: &SlotInfo, pending: bool) -> bool {
+    can_kickoff(info) && !pending
+}
+
+/// The kickoff text as the terminal would get it from a Cmd+V paste: one
+/// bracketed paste when the session turned that mode on, newlines as CR.
+/// Return is sent on its own afterwards.
+pub fn kickoff_bytes(text: &str, modes: &overseer_term::TermModes) -> Vec<u8> {
+    overseer_term::encode_paste(text, modes)
+}
+
 /// Identifies one run of a slot: the pid and start time while running.
 pub type Incarnation = Option<(u32, i64)>;
 
@@ -418,8 +431,22 @@ impl OverseerApp {
                     .items_center()
                     .gap_2()
                     .text_sm()
-                    .child(div().font_weight(FontWeight::SEMIBOLD).child(row.key))
-                    .child(div().text_color(rgb(colors::MUTED)).child(row.status))
+                    .child(
+                        div()
+                            .flex_shrink()
+                            .min_w(px(0.))
+                            .truncate()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(row.key),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_color(rgb(colors::MUTED))
+                            .child(row.status),
+                    )
                     .child(
                         div()
                             .flex_1()
@@ -434,9 +461,13 @@ impl OverseerApp {
                                     .child("not in the current list")
                             })),
                     )
-                    .child(button(("release", n), "Release", true).on_click(
-                        cx.listener(move |this, _, _, cx| this.release_item(key.clone(), cx)),
-                    ))
+                    .child(
+                        button(("release", n), "Release", true)
+                            .flex_none()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.release_item(key.clone(), cx)
+                            })),
+                    )
             })
             .collect();
         let notices: Vec<_> = slot_notices(&self.work, id)
@@ -450,7 +481,7 @@ impl OverseerApp {
             .collect();
         let has_notices = !notices.is_empty();
         let empty = rows.is_empty();
-        let kickoff = can_kickoff(&self.slots[id as usize]);
+        let kickoff = kickoff_enabled(&self.slots[id as usize], self.kickoff_pending(id));
         panel_box("Owns")
             .children(empty.then(|| {
                 div()
@@ -831,6 +862,38 @@ mod tests {
         }
         i.state = SlotState::Exited { code: None, at: 2 };
         assert!(!can_kickoff(&i));
+    }
+
+    #[test]
+    fn kickoff_disabled_while_one_is_in_flight() {
+        use overseer_proto::Activity;
+        let mut i = info(RUN);
+        i.activity = Some(Activity {
+            kind: ActivityKind::Idle,
+            since: 1,
+            now_doing: None,
+            reason: None,
+        });
+        assert!(kickoff_enabled(&i, false));
+        assert!(!kickoff_enabled(&i, true));
+        i.activity = None;
+        assert!(!kickoff_enabled(&i, false));
+    }
+
+    #[test]
+    fn kickoff_text_is_pasted() {
+        use overseer_term::TermModes;
+        let text = "Work on DEMO-12\nand ov-3";
+        let plain = kickoff_bytes(text, &TermModes::default());
+        assert_eq!(plain, b"Work on DEMO-12\rand ov-3");
+        let bracketed = TermModes {
+            bracketed_paste: true,
+            ..TermModes::default()
+        };
+        assert_eq!(
+            kickoff_bytes(text, &bracketed),
+            b"\x1b[200~Work on DEMO-12\rand ov-3\x1b[201~"
+        );
     }
 
     #[test]

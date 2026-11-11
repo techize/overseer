@@ -109,7 +109,8 @@ pub fn source_line(view: &WorkView, clock: impl Fn(i64) -> String) -> String {
             if s.ok {
                 format!("{} {}", s.name, s.count)
             } else {
-                format!("{}: {}", s.name, s.message.as_deref().unwrap_or("failed"))
+                let msg = s.message.as_deref().unwrap_or("failed");
+                format!("{}: {}", s.name, short_message(msg))
             }
         })
         .collect();
@@ -117,6 +118,18 @@ pub fn source_line(view: &WorkView, clock: impl Fn(i64) -> String) -> String {
         parts.push(clock(at));
     }
     parts.join(" · ")
+}
+
+/// Longest source error the header shows before cutting it.
+const MAX_SOURCE_MESSAGE: usize = 40;
+
+/// `msg` cut to 40 characters with an ellipsis, so a long source error
+/// does not crowd the header.
+pub fn short_message(msg: &str) -> String {
+    match msg.char_indices().nth(MAX_SOURCE_MESSAGE) {
+        Some((cut, _)) => format!("{}…", &msg[..cut]),
+        None => msg.to_string(),
+    }
 }
 
 /// Local `HH:MM` for unix seconds.
@@ -403,13 +416,29 @@ impl OverseerApp {
                     .child(
                         div()
                             .flex()
+                            .flex_1()
+                            .min_w(px(0.))
                             .gap_2()
-                            .child(div().w(px(4.)).h(px(16.)).rounded(px(2.)).bg(rgb(edge)))
-                            .child(div().font_weight(FontWeight::SEMIBOLD).child(m.title)),
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .w(px(4.))
+                                    .h(px(16.))
+                                    .rounded(px(2.))
+                                    .bg(rgb(edge)),
+                            )
+                            .child(
+                                div()
+                                    .min_w(px(0.))
+                                    .truncate()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(m.title),
+                            ),
                     )
                     .child(
                         div()
                             .flex()
+                            .flex_none()
                             .gap_2()
                             .children(empty.then(|| {
                                 div()
@@ -745,6 +774,20 @@ mod tests {
             "jira: acli not found · beads: not read yet"
         );
         assert_eq!(source_line(&no_work(), hhmm), "");
+    }
+
+    #[test]
+    fn source_line_cuts_long_errors() {
+        let long = format!("acli: {}", "x".repeat(80));
+        let mut v = no_work();
+        v.sources = vec![source("jira", false, 0, None, Some(&long))];
+        let line = source_line(&v, hhmm);
+        let msg = line.strip_prefix("jira: ").unwrap();
+        assert_eq!(msg.chars().count(), 41);
+        assert!(msg.ends_with('…'));
+        assert!(long.starts_with(msg.trim_end_matches('…')));
+        assert_eq!(short_message("acli not found"), "acli not found");
+        assert_eq!(short_message(&"y".repeat(40)), "y".repeat(40));
     }
 
     #[test]

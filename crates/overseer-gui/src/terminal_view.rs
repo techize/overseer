@@ -1589,6 +1589,12 @@ impl TerminalView {
         self.shared.bridge.lock().unwrap().modes()
     }
 
+    /// The modes the session has set, for input sent from outside the view
+    /// (the kickoff paste).
+    pub fn term_modes(&self) -> TermModes {
+        self.modes()
+    }
+
     /// Sends `bytes` typed or pasted by the user, returning to live output.
     fn send_user_input(&self, bytes: &[u8]) {
         self.shared.bridge.lock().unwrap().scroll_to_bottom();

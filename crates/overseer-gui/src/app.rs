@@ -14,7 +14,7 @@
 //! `Board`, `Session`, `Terminal` and `StartDialog`; `key_bindings` is tested
 //! against GPUI's `Keymap` directly.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -189,6 +189,9 @@ pub fn now_secs() -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
+/// How long after the kickoff paste its Return is sent.
+const KICKOFF_RETURN_DELAY: Duration = Duration::from_millis(100);
+
 /// The work view before the daemon's first answer.
 pub fn empty_work() -> WorkView {
     WorkView {
@@ -233,6 +236,8 @@ pub struct OverseerApp {
     terminals: HashMap<SlotId, TermEntry>,
     dialog: Option<(Entity<StartDialog>, Subscription)>,
     restarts: HashMap<SlotId, RestartPlan>,
+    /// Slots with a kickoff on its way; see `send_kickoff`.
+    kickoffs: HashSet<SlotId>,
     /// Focus this slot's terminal as soon as it exists.
     focus_when_ready: Option<SlotId>,
     root_focus: FocusHandle,
@@ -311,6 +316,7 @@ impl OverseerApp {
             terminals: HashMap::new(),
             dialog: None,
             restarts: HashMap::new(),
+            kickoffs: HashSet::new(),
             focus_when_ready: None,
             root_focus: cx.focus_handle(),
             board_focus,
@@ -490,18 +496,34 @@ impl OverseerApp {
         self.send(Request::ClearNotices { slot }, cx);
     }
 
-    /// Asks the daemon for the slot's kickoff prompt and types it into the
-    /// session, then presses Return.
+    pub(crate) fn kickoff_pending(&self, slot: SlotId) -> bool {
+        self.kickoffs.contains(&slot)
+    }
+
+    /// Asks the daemon for the slot's kickoff prompt and pastes it into the
+    /// session, then presses Return. Return goes a moment after the paste so
+    /// it lands once the paste has closed instead of inside it. The button
+    /// stays off until this is done.
     pub(crate) fn send_kickoff(&mut self, slot: SlotId, cx: &mut Context<Self>) {
+        if !self.kickoffs.insert(slot) {
+            return;
+        }
         self.status = None;
+        cx.notify();
         let client = self.client.clone();
         cx.spawn(async move |this, cx| {
-            let err = match client.request(Request::Kickoff { slot }).await {
+            let reply = client.request(Request::Kickoff { slot }).await;
+            let mut err = match reply {
                 Ok(Response::Text { text }) => {
-                    let typed = match client.send_input(slot, text.as_bytes()).await {
-                        Ok(()) => client.send_input(slot, b"\r").await,
-                        Err(e) => Err(e),
-                    };
+                    let modes = this
+                        .update(cx, |this, cx| this.term_modes(slot, cx))
+                        .unwrap_or_default();
+                    let bytes = crate::session::kickoff_bytes(&text, &modes);
+                    let mut typed = client.send_input(slot, &bytes).await;
+                    if typed.is_ok() {
+                        cx.background_executor().timer(KICKOFF_RETURN_DELAY).await;
+                        typed = client.send_input(slot, b"\r").await;
+                    }
                     typed
                         .err()
                         .map(|e| format!("{} ({e})", crate::terminal_view::LOST_DAEMON))
@@ -510,14 +532,24 @@ impl OverseerApp {
                 Ok(other) => Some(format!("unexpected reply to kickoff: {other:?}")),
                 Err(e) => Some(format!("{} ({e:#})", crate::terminal_view::LOST_DAEMON)),
             };
-            if let Some(e) = err {
-                let _ = this.update(cx, |this, cx| {
+            let _ = this.update(cx, |this, cx| {
+                this.kickoffs.remove(&slot);
+                if let Some(e) = err.take() {
                     this.status = Some(e);
-                    cx.notify();
-                });
-            }
+                }
+                cx.notify();
+            });
         })
         .detach();
+    }
+
+    /// The modes the slot's session set on its terminal (bracketed paste
+    /// and so on). Defaults when no terminal view was made for it.
+    fn term_modes(&self, slot: SlotId, cx: &App) -> overseer_term::TermModes {
+        self.terminals
+            .get(&slot)
+            .map(|t| t.view.read(cx).term_modes())
+            .unwrap_or_default()
     }
 
     /// The `+ assign` button on an empty card. The work-item picker it opens
