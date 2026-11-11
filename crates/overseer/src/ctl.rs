@@ -167,7 +167,10 @@ fn local_hhmm(at: i64) -> String {
 fn item_line(i: &WorkItem, indent: &str) -> String {
     let owner = i.owner.map(slot_name).unwrap_or_else(|| "-".into());
     let gone = if i.in_list { "" } else { "  (left the list)" };
-    format!("{indent}{}  {}  {owner}  {}{gone}", i.key, i.status, i.title)
+    format!(
+        "{indent}{}  {}  {owner}  {}{gone}",
+        i.key, i.status, i.title
+    )
 }
 
 /// Source lines, then tickets with their beads indented beneath, then
@@ -177,7 +180,9 @@ pub fn format_work(v: &WorkView) -> Vec<String> {
     for s in &v.sources {
         let name = &s.name;
         out.push(if s.ok {
-            let at = s.at.map(|a| format!("  {}", local_hhmm(a))).unwrap_or_default();
+            let at =
+                s.at.map(|a| format!("  {}", local_hhmm(a)))
+                    .unwrap_or_default();
             format!("{name}  ok  {} items{at}", s.count)
         } else {
             format!("{name}  {}", s.message.as_deref().unwrap_or("failed"))

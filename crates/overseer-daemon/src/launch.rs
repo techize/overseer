@@ -16,10 +16,36 @@ const KICKOFF: &str = include_str!("roles/kickoff.md");
 /// The prompt built from a slot's assigned work items.
 pub const ASSIGNMENT: &str = include_str!("roles/assignment.md");
 
-/// Writes `default` to `roles/<name>` if the file is missing and returns its
-/// path. create_new: never clobber an edited template, even when two starts
-/// race.
-fn ensure_template(roles: &Path, name: &str, default: &str) -> io::Result<PathBuf> {
+/// Stable hashes (FNV-1a 64 over the text with trailing whitespace removed)
+/// of role files Overseer shipped before and since replaced. A file on disk
+/// that matches one was never edited and is upgraded in place.
+const PREVIOUS_COORDINATOR: &[u64] = &[
+    0x79c8ca136fcc4cb5,
+    0x2053126dcf7ec248,
+    0xfb1eff022d50a360,
+    0x4baeb879ce73cf13,
+];
+const PREVIOUS_WORKER: &[u64] = &[0x215de771dfd84eb4];
+const PREVIOUS_KICKOFF: &[u64] = &[];
+const PREVIOUS_ASSIGNMENT: &[u64] = &[];
+
+fn text_hash(text: &str) -> u64 {
+    text.trim_end().bytes().fold(0xcbf29ce484222325, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
+    })
+}
+
+/// Makes `roles/<name>` usable and returns its path. A missing file is
+/// created with `default` (create_new, so two racing starts cannot clobber
+/// each other). A file equal to `default` or to a `previous` default was not
+/// edited: it is replaced by `default` through a temp file and a rename. An
+/// edited file is kept and `default` is written beside it as `<name>.new`.
+fn ensure_template(
+    roles: &Path,
+    name: &str,
+    default: &str,
+    previous: &[u64],
+) -> io::Result<PathBuf> {
     std::fs::create_dir_all(roles)?;
     let path = roles.join(name);
     match std::fs::OpenOptions::new()
@@ -27,22 +53,72 @@ fn ensure_template(roles: &Path, name: &str, default: &str) -> io::Result<PathBu
         .create_new(true)
         .open(&path)
     {
-        Ok(mut f) => io::Write::write_all(&mut f, default.as_bytes())?,
+        Ok(mut f) => {
+            io::Write::write_all(&mut f, default.as_bytes())?;
+            return Ok(path);
+        }
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(e),
+    }
+    let Ok(on_disk) = std::fs::read(&path) else {
+        return Ok(path);
+    };
+    let Ok(on_disk) = String::from_utf8(on_disk) else {
+        return Ok(path);
+    };
+    let current = text_hash(default);
+    let have = text_hash(&on_disk);
+    if have == current {
+        return Ok(path);
+    }
+    if previous.contains(&have) {
+        replace_file(&path, default)?;
+        tracing::info!(
+            "upgraded role template {} to the current default",
+            path.display()
+        );
+    } else {
+        let new = roles.join(format!("{name}.new"));
+        replace_file(&new, default)?;
+        tracing::warn!(
+            "role template {} was edited; the current default is in {}",
+            path.display(),
+            new.display()
+        );
     }
     Ok(path)
 }
 
+/// Writes `text` to `path` through a temp file in the same folder.
+fn replace_file(path: &Path, text: &str) -> io::Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".tmp{}", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
 /// The text S0 starts with, from `<state>/roles/kickoff.md`.
 pub fn kickoff_prompt(state_dir: &Path) -> io::Result<String> {
-    let path = ensure_template(&state_dir.join("roles"), "kickoff.md", KICKOFF)?;
+    let path = ensure_template(
+        &state_dir.join("roles"),
+        "kickoff.md",
+        KICKOFF,
+        PREVIOUS_KICKOFF,
+    )?;
     Ok(std::fs::read_to_string(path)?.trim().to_string())
 }
 
 /// The assignment template from `<state>/roles/assignment.md`.
 pub fn assignment_template(state_dir: &Path) -> io::Result<String> {
-    let path = ensure_template(&state_dir.join("roles"), "assignment.md", ASSIGNMENT)?;
+    let path = ensure_template(
+        &state_dir.join("roles"),
+        "assignment.md",
+        ASSIGNMENT,
+        PREVIOUS_ASSIGNMENT,
+    )?;
     std::fs::read_to_string(path)
 }
 
@@ -161,10 +237,15 @@ pub fn write_slot_files(
 ) -> io::Result<LaunchFiles> {
     let roles = state_dir.join("roles");
     // All defaults are written so Jonathan finds every file to edit.
-    let worker = ensure_template(&roles, "worker.md", WORKER_ROLE)?;
-    let coordinator = ensure_template(&roles, "coordinator.md", COORDINATOR_ROLE)?;
-    ensure_template(&roles, "kickoff.md", KICKOFF)?;
-    ensure_template(&roles, "assignment.md", ASSIGNMENT)?;
+    let worker = ensure_template(&roles, "worker.md", WORKER_ROLE, PREVIOUS_WORKER)?;
+    let coordinator = ensure_template(
+        &roles,
+        "coordinator.md",
+        COORDINATOR_ROLE,
+        PREVIOUS_COORDINATOR,
+    )?;
+    ensure_template(&roles, "kickoff.md", KICKOFF, PREVIOUS_KICKOFF)?;
+    ensure_template(&roles, "assignment.md", ASSIGNMENT, PREVIOUS_ASSIGNMENT)?;
     let template_path = if slot == 0 { coordinator } else { worker };
     let template = std::fs::read_to_string(&template_path)?;
     // The label goes in last so braces inside it are not expanded again.
@@ -352,6 +433,45 @@ mod tests {
             std::fs::read_to_string(f.role).unwrap(),
             "mine S1 {slot} /o"
         );
+    }
+
+    #[test]
+    fn old_shipped_default_is_upgraded() {
+        let dir = temp("upgrade");
+        let roles = dir.join("roles");
+        std::fs::create_dir_all(&roles).unwrap();
+        let old = "old shipped text\n";
+        std::fs::write(roles.join("x.md"), format!("{old}\n")).unwrap();
+        let prev = [text_hash(old)];
+        let p = ensure_template(&roles, "x.md", "new default\n", &prev).unwrap();
+        assert_eq!(std::fs::read_to_string(p).unwrap(), "new default\n");
+        assert!(!roles.join("x.md.new").exists());
+    }
+
+    #[test]
+    fn edited_template_is_kept_and_new_default_written_beside_it() {
+        let dir = temp("edited");
+        let roles = dir.join("roles");
+        std::fs::create_dir_all(&roles).unwrap();
+        std::fs::write(roles.join("x.md"), "mine").unwrap();
+        std::fs::write(roles.join("x.md.new"), "stale").unwrap();
+        let p = ensure_template(&roles, "x.md", "new default\n", &[1]).unwrap();
+        assert_eq!(std::fs::read_to_string(p).unwrap(), "mine");
+        assert_eq!(
+            std::fs::read_to_string(roles.join("x.md.new")).unwrap(),
+            "new default\n"
+        );
+    }
+
+    #[test]
+    fn current_default_is_left_alone() {
+        let dir = temp("current");
+        let roles = dir.join("roles");
+        std::fs::create_dir_all(&roles).unwrap();
+        std::fs::write(roles.join("x.md"), "cur").unwrap();
+        ensure_template(&roles, "x.md", "cur\n", &[]).unwrap();
+        assert_eq!(std::fs::read_to_string(roles.join("x.md")).unwrap(), "cur");
+        assert!(!roles.join("x.md.new").exists());
     }
 
     #[test]

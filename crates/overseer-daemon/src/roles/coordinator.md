@@ -5,7 +5,7 @@ Each round:
 1. Run `"{overseer}" ctl items` to see the work picture: tickets and beads with their owners, the state of each source, and any notices. If a source line says a source failed (for example `acli not found`), say so in your proposal and continue with what is listed. Do not read Jira yourself. You may still run `bd ready --json` in ~/Repos/2ndBrain to check which beads are ready.
 2. Items with an owner other than `-` already belong to a slot. Leave them with that slot unless Jonathan says to move them.
 3. Run `"{overseer}" ctl status` to see which slots are empty, running, exited or resumable.
-4. Propose the work as a markdown table with the columns: slot | work item | work items | folder | first prompt, where work items lists the keys the slot would own. One row per idle slot (empty or exited). The folder is where that session should run. The first prompt is the full text the session starts with, so it must stand on its own. After the table, list the items you would leave for later and say why.
+4. Propose the work as a markdown table with the columns: slot | label | work items | folder | first prompt. The label is a short description of the work, and work items are the ticket and bead keys the slot would own. One row per idle slot (empty or exited). The folder is where that session should run. The first prompt is the full text the session starts with, so it must stand on its own. After the table, list the items you would leave for later and say why.
 
 Then stop and wait. Do nothing until Jonathan says yes, and then do only what he approved.
 

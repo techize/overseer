@@ -75,11 +75,10 @@ EOF
             .env("OVERSEER_CONFIG", self.home.join("config.toml"))
             .env("OVERSEER_DEFAULT_COMMAND", SCRIPT);
         if self.bin.is_some() {
-            c.env("HOME", self.home.join("home")).env("SHELL", "/bin/sh");
+            c.env("HOME", self.home.join("home"))
+                .env("SHELL", "/bin/sh");
         }
-        c.arg("ctl")
-            .args(args)
-            .timeout(Duration::from_secs(10));
+        c.arg("ctl").args(args).timeout(Duration::from_secs(10));
         c
     }
 }
@@ -351,11 +350,21 @@ fn items_prints_tickets_then_indented_beads() {
     env.ctl(&["refresh"]).assert().success();
     let out = stdout_of(&mut env.ctl(&["items"]));
     let lines: Vec<&str> = out.lines().collect();
-    assert!(lines[0].starts_with("beads  ok  1 items"), "{out}");
-    assert!(lines[1].starts_with("jira  ok  1 items"), "{out}");
-    assert_eq!(lines[2], "DEMO-12  In Progress  -  Widget wiring", "{out}");
-    assert!(lines[3].starts_with("  ov-3  "), "{out}");
-    assert!(lines[3].ends_with("DEMO-12 wire the widget"), "{out}");
+    // Source lines come first, tickets next, then beads under their ticket.
+    let pos = |pre: &str| lines.iter().position(|l| l.starts_with(pre)).expect(pre);
+    assert!(lines[pos("beads  ok  1 items")].contains("items"), "{out}");
+    let jira = pos("jira  ok  1 items");
+    let ticket = pos("DEMO-12  In Progress  -  Widget wiring");
+    assert!(jira < ticket, "{out}");
+    assert_eq!(
+        lines[ticket], "DEMO-12  In Progress  -  Widget wiring",
+        "{out}"
+    );
+    assert!(lines[ticket + 1].starts_with("  ov-3  "), "{out}");
+    assert!(
+        lines[ticket + 1].ends_with("DEMO-12 wire the widget"),
+        "{out}"
+    );
     let json = stdout_of(&mut env.ctl(&["items", "--json"]));
     assert!(json.contains("\"key\":\"DEMO-12\""), "{json}");
 }
@@ -373,7 +382,9 @@ fn assign_needs_confirm_exits_2() {
         .clone();
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("Assign to S2 anyway?"), "{stdout}");
-    env.ctl(&["assign", "2", "ov-3", "--yes"]).assert().success();
+    env.ctl(&["assign", "2", "ov-3", "--yes"])
+        .assert()
+        .success();
     let out = stdout_of(&mut env.ctl(&["items"]));
     assert!(out.contains("  ov-3  open  S2  "), "{out}");
     env.ctl(&["assign", "3", "DEMO-12"]).assert().code(1);
