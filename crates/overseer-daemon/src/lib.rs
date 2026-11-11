@@ -10,6 +10,7 @@ pub mod ring;
 pub mod server;
 pub mod slot;
 pub mod vt;
+pub mod work;
 
 pub use config::Config;
 pub use env::EnvSource;

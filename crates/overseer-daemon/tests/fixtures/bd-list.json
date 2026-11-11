@@ -1,0 +1,6 @@
+[
+  {"id":"ov-1","title":"DEMO-12 wire the widget","status":"open","priority":1,"external_ref":null,"labels":["ui"]},
+  {"id":"ov-2","title":"Tidy the fixtures","status":"in_progress","priority":2,"external_ref":"https://jira.example.test/browse/DEMO-12","labels":[]},
+  {"id":"ov-3","title":"Spike on caching","status":"open","priority":3},
+  {"id":"ov-4","title":"Follow up on DEMO-30","status":"blocked","priority":0,"labels":["ops","later"]}
+]

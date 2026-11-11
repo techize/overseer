@@ -3447,6 +3447,7 @@ dependencies = [
  "overseer-proto",
  "overseer-term",
  "portable-pty",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",
