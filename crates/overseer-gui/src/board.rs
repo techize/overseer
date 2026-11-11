@@ -449,9 +449,9 @@ impl OverseerApp {
                                     .cursor_pointer()
                                     .child("+ assign")
                                     // Not also the start dialog behind it.
-                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                    .on_click(cx.listener(move |this, _, window, cx| {
                                         cx.stop_propagation();
-                                        this.open_picker(id, cx)
+                                        this.open_picker(id, window, cx)
                                     }))
                             }))
                             .child(
@@ -557,6 +557,11 @@ impl OverseerApp {
                 }),
             )
             .on_action(
+                cx.listener(|this, _: &crate::app::AssignSelected, window, cx| {
+                    this.open_picker(this.selected, window, cx)
+                }),
+            )
+            .on_action(
                 cx.listener(|this, _: &crate::app::OpenSelected, window, cx| {
                     this.open_card(this.selected, window, cx)
                 }),
@@ -635,7 +640,7 @@ impl OverseerApp {
                     .mt_auto()
                     .text_xs()
                     .text_color(rgb(colors::MUTED))
-                    .child("Click a card or press Enter to open it · Cmd+0 to Cmd+6 open a session · Cmd+N starts the selected slot"),
+                    .child("Click a card or press Enter to open it · A assigns work · Cmd+0 to Cmd+6 open a session · Cmd+N starts the selected slot"),
             )
     }
 }

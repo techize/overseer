@@ -202,6 +202,36 @@ pub fn initial_fields(slot: SlotId, last: Option<&SlotInfo>, home: Option<&Path>
     }
 }
 
+/// A dialog opened by "Assign and start": the label and the kickoff prompt
+/// the session starts with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Prefill {
+    pub label: String,
+    /// Sent as is; it is several lines, so it is never put in a field.
+    pub prompt: String,
+    /// The keys the kickoff names, for the note under the fields.
+    pub keys: Vec<String>,
+}
+
+/// `initial_fields` with the label from `prefill`.
+pub fn prefilled_fields(
+    slot: SlotId,
+    last: Option<&SlotInfo>,
+    home: Option<&Path>,
+    prefill: Option<&Prefill>,
+) -> [String; 3] {
+    let mut fields = initial_fields(slot, last, home);
+    if let Some(p) = prefill {
+        fields[0] = p.label.clone();
+    }
+    fields
+}
+
+/// The note a prefilled dialog shows instead of its prompt.
+pub fn kickoff_note(keys: &[String]) -> String {
+    format!("Starts with the kickoff for {}", keys.join(", "))
+}
+
 /// Where the folder picker opens: the folder typed in the field, or the
 /// nearest folder above it that exists, falling back to `home`.
 pub fn picker_start(
@@ -250,6 +280,7 @@ pub fn build_request(
     label: &str,
     cwd: &str,
     command: &str,
+    prompt: Option<&str>,
     home: Option<&Path>,
     is_dir: impl Fn(&Path) -> bool,
 ) -> Result<Request, String> {
@@ -281,7 +312,7 @@ pub fn build_request(
         label,
         cwd: path,
         command,
-        prompt: None,
+        prompt: prompt.map(String::from),
     })
 }
 
@@ -304,6 +335,8 @@ pub struct StartDialog {
     home: Option<PathBuf>,
     fields: [TextField; 3],
     active: usize,
+    /// From "Assign and start": its prompt goes with the start request.
+    prefill: Option<Prefill>,
     error: Option<String>,
     busy: bool,
     focus_handle: FocusHandle,
@@ -319,15 +352,17 @@ impl Focusable for StartDialog {
 
 impl StartDialog {
     /// The dialog for `slot`, filled in from `last` (the slot's previous
-    /// run) when there is one, else with the defaults.
+    /// run) when there is one, else with the defaults. With `prefill` the
+    /// label is its own and the session starts with its prompt.
     pub fn new(
         slot: SlotId,
         client: Arc<Client>,
         last: Option<&SlotInfo>,
+        prefill: Option<Prefill>,
         cx: &mut Context<Self>,
     ) -> Self {
         let home = std::env::var_os("HOME").map(PathBuf::from);
-        let [label, cwd, command] = initial_fields(slot, last, home.as_deref());
+        let [label, cwd, command] = prefilled_fields(slot, last, home.as_deref(), prefill.as_ref());
         StartDialog {
             slot,
             client,
@@ -338,6 +373,7 @@ impl StartDialog {
                 TextField::new(&command),
             ],
             active: 0,
+            prefill,
             error: None,
             busy: false,
             focus_handle: cx.focus_handle(),
@@ -403,6 +439,7 @@ impl StartDialog {
             &label.text,
             &cwd.text,
             &command.text,
+            self.prefill.as_ref().map(|p| p.prompt.as_str()),
             self.home.as_deref(),
             Path::is_dir,
         ) {
@@ -530,6 +567,11 @@ impl Render for StartDialog {
                     .child(format!("Start a session in {}", slot_name(self.slot))),
             )
             .children(rows)
+            .children(self.prefill.as_ref().map(|p| {
+                div()
+                    .text_color(rgb(colors::TEXT_DIM))
+                    .child(kickoff_note(&p.keys))
+            }))
             .children(
                 self.error
                     .clone()
@@ -715,7 +757,7 @@ mod tests {
 
     #[test]
     fn defaults_build_a_default_command_request() {
-        let r = build_request(5, "", DEFAULT_CWD, DEFAULT_COMMAND, home(), |_| true).unwrap();
+        let r = build_request(5, "", DEFAULT_CWD, DEFAULT_COMMAND, None, home(), |_| true).unwrap();
         assert_eq!(
             r,
             Request::StartSlot {
@@ -730,7 +772,16 @@ mod tests {
 
     #[test]
     fn custom_command_and_label() {
-        let r = build_request(2, " eks ", "/tmp", " claude  --resume ", home(), |_| true).unwrap();
+        let r = build_request(
+            2,
+            " eks ",
+            "/tmp",
+            " claude  --resume ",
+            None,
+            home(),
+            |_| true,
+        )
+        .unwrap();
         assert_eq!(
             r,
             Request::StartSlot {
@@ -744,12 +795,68 @@ mod tests {
     }
 
     #[test]
+    fn prefilled_dialog_carries_the_kickoff() {
+        let kickoff = "You are S3.\n\n- DEMO-12 (open): Login page\n  - ov-3 (open): Fix it\n";
+        let prefill = Prefill {
+            label: "DEMO-12".into(),
+            prompt: kickoff.into(),
+            keys: vec!["DEMO-12".into(), "ov-3".into()],
+        };
+        let [label, cwd, command] = prefilled_fields(3, None, home(), Some(&prefill));
+        assert_eq!(label, "DEMO-12");
+        assert_eq!(cwd, DEFAULT_CWD);
+        let r = build_request(
+            3,
+            &label,
+            &cwd,
+            &command,
+            Some(&prefill.prompt),
+            home(),
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(
+            r,
+            Request::StartSlot {
+                id: 3,
+                label: "DEMO-12".into(),
+                cwd: "/Users/me/Repos/2ndBrain".into(),
+                command: None,
+                prompt: Some(kickoff.into()),
+            }
+        );
+        // An exited slot keeps its folder and command but takes the label.
+        let last = SlotInfo {
+            id: 3,
+            label: "old".into(),
+            cwd: Some("/Users/me/Repos/eks".into()),
+            command: None,
+            state: overseer_proto::SlotState::Exited { code: None, at: 1 },
+            cols: 80,
+            rows: 24,
+            activity: None,
+        };
+        assert_eq!(
+            prefilled_fields(3, Some(&last), home(), Some(&prefill)),
+            [
+                "DEMO-12".to_string(),
+                "~/Repos/eks".into(),
+                DEFAULT_COMMAND.into()
+            ]
+        );
+        assert_eq!(
+            kickoff_note(&prefill.keys),
+            "Starts with the kickoff for DEMO-12, ov-3"
+        );
+    }
+
+    #[test]
     fn validation_errors() {
         let ok = |_: &Path| true;
-        assert!(build_request(1, "", "  ", "claude", home(), ok).is_err());
-        assert!(build_request(1, "", "Repos", "claude", home(), ok).is_err());
-        assert!(build_request(1, "", "/tmp", "   ", home(), ok).is_err());
-        let e = build_request(1, "", "/nope", "claude", home(), |_| false).unwrap_err();
+        assert!(build_request(1, "", "  ", "claude", None, home(), ok).is_err());
+        assert!(build_request(1, "", "Repos", "claude", None, home(), ok).is_err());
+        assert!(build_request(1, "", "/tmp", "   ", None, home(), ok).is_err());
+        let e = build_request(1, "", "/nope", "claude", None, home(), |_| false).unwrap_err();
         assert_eq!(e, "/nope is not a folder.");
     }
 }

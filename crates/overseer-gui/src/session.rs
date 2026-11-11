@@ -6,7 +6,7 @@
 //! for Exited, start again with the same label, cwd and command).
 //!
 //! The Owns box lists the work the slot owns with a Release button each,
-//! the slot's notices, and Send kickoff, which types the daemon's kickoff
+//! the slot's notices, Assign (the work-item picker) and Send kickoff, which types the daemon's kickoff
 //! prompt into an idle session.
 
 use std::path::{Path, PathBuf};
@@ -496,6 +496,9 @@ impl OverseerApp {
                     .flex()
                     .gap_2()
                     .pt_1()
+                    .child(button("assign", "Assign\u{2026}", true).on_click(
+                        cx.listener(move |this, _, window, cx| this.open_picker(id, window, cx)),
+                    ))
                     .child(
                         button("kickoff", "Send kickoff", kickoff).when(kickoff, |b| {
                             b.on_click(cx.listener(move |this, _, _, cx| this.send_kickoff(id, cx)))
