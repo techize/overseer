@@ -6,8 +6,8 @@
 //! for Exited, start again with the same label, cwd and command).
 //!
 //! The Owns box lists the work the slot owns with a Release button each,
-//! the slot's notices, Assign (the work-item picker) and Send kickoff, which types the daemon's kickoff
-//! prompt into an idle session.
+//! the slot's notices, Assign (the work-item picker) and Send kickoff,
+//! which types the daemon's kickoff prompt into an idle session.
 
 use std::path::{Path, PathBuf};
 

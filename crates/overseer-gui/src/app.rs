@@ -261,6 +261,8 @@ pub struct OverseerApp {
     terminals: HashMap<SlotId, TermEntry>,
     dialog: Option<(Entity<StartDialog>, Subscription)>,
     picker: Option<(Entity<Picker>, Subscription)>,
+    /// Pickers closed with an assign on its way; see `PickerEvent::Late`.
+    leaving: Vec<(Entity<Picker>, Subscription)>,
     restarts: HashMap<SlotId, RestartPlan>,
     /// Slots with a kickoff on its way; see `send_kickoff`.
     kickoffs: HashSet<SlotId>,
@@ -342,6 +344,7 @@ impl OverseerApp {
             terminals: HashMap::new(),
             dialog: None,
             picker: None,
+            leaving: Vec::new(),
             restarts: HashMap::new(),
             kickoffs: HashSet::new(),
             focus_when_ready: None,
@@ -602,17 +605,38 @@ impl OverseerApp {
         let client = self.client.clone();
         let view = self.work.clone();
         let picker = cx.new(|cx| Picker::new(slot, client, view, cx));
-        let sub = cx.subscribe_in(&picker, window, |this, _, ev: &PickerEvent, window, cx| {
-            this.picker = None;
-            this.restore_focus(window, cx);
-            if let PickerEvent::Assigned { slot, key } = ev {
-                let start = this.slots.get(*slot as usize).is_some_and(assign_starts);
-                if start {
-                    this.assign_and_start(*slot, key.clone(), window, cx);
+        let sub = cx.subscribe_in(
+            &picker,
+            window,
+            |this, picker, ev: &PickerEvent, window, cx| {
+                match ev {
+                    PickerEvent::Assigned { slot, key } => {
+                        this.picker = None;
+                        this.restore_focus(window, cx);
+                        let start = this.slots.get(*slot as usize).is_some_and(assign_starts);
+                        if start {
+                            this.assign_and_start(*slot, key.clone(), window, cx);
+                        }
+                    }
+                    PickerEvent::Closed => {
+                        // Kept until its request is answered, for `Late`.
+                        if let Some(open) = this.picker.take() {
+                            if open.0.read(cx).busy() {
+                                this.leaving.push(open);
+                            }
+                        }
+                        this.restore_focus(window, cx);
+                    }
+                    PickerEvent::Late(line) => {
+                        this.leaving.retain(|(p, _)| p != picker);
+                        if !line.is_empty() {
+                            this.status = Some(line.clone());
+                        }
+                    }
                 }
-            }
-            cx.notify();
-        });
+                cx.notify();
+            },
+        );
         window.focus(&picker.focus_handle(cx));
         self.picker = Some((picker, sub));
         cx.notify();

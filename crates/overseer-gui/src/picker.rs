@@ -185,10 +185,14 @@ impl PickerState {
                 _ => {}
             }
         }
+        let before = self.filter.text.clone();
         match edit_key(&mut self.filter, ks) {
             DialogKey::Edited => {
-                self.selected = 0;
-                self.reset();
+                // Moving the cursor is not a new filter.
+                if self.filter.text != before {
+                    self.selected = 0;
+                    self.reset();
+                }
                 PickerAction::Redraw
             }
             DialogKey::Submit => self.accept(rows),
@@ -202,9 +206,12 @@ impl PickerState {
 
     /// Adds pasted text to the filter.
     pub fn paste(&mut self, text: &str) {
+        let before = self.filter.text.clone();
         self.filter.insert(text);
-        self.selected = 0;
-        self.reset();
+        if self.filter.text != before {
+            self.selected = 0;
+            self.reset();
+        }
     }
 
     /// Selects row `n` (a click on it).
@@ -213,6 +220,37 @@ impl PickerState {
             self.selected = n;
             self.reset();
         }
+    }
+
+    /// A click on row `n` assigns it. A click never answers a question:
+    /// on the row being asked about it does nothing, and on another row it
+    /// drops the question and assigns that row afresh.
+    pub fn click(&mut self, n: usize, rows: &[PickerRow]) -> PickerAction {
+        if self.in_flight.is_some() || (self.question.is_some() && n == self.selected) {
+            return PickerAction::Ignored;
+        }
+        self.select(n);
+        self.question = None;
+        self.accept(rows)
+    }
+
+    /// The status line for a reply that came after the picker closed.
+    pub fn late_reply(&mut self, reply: Result<Response, String>) -> String {
+        let Some(Request::Assign { key, slot, .. }) = self.in_flight.take() else {
+            return String::new();
+        };
+        let why = match reply {
+            Ok(Response::Ok) => return format!("{key} assigned to {}", slot_name(slot)),
+            Ok(Response::NeedsConfirm { message }) | Ok(Response::Error { message }) => message,
+            Ok(other) => format!("Unexpected reply: {other:?}"),
+            Err(e) => e,
+        };
+        format!("{key} not assigned to {}: {why}", slot_name(slot))
+    }
+
+    /// Whether a request is on its way.
+    pub fn busy(&self) -> bool {
+        self.in_flight.is_some()
     }
 
     /// Keeps the selection in range after the list changed.
@@ -294,12 +332,20 @@ impl PickerState {
 /// What the picker tells the app.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PickerEvent {
-    Assigned { slot: SlotId, key: String },
+    Assigned {
+        slot: SlotId,
+        key: String,
+    },
     Closed,
+    /// The reply to a request sent before the picker closed, as a status
+    /// line.
+    Late(String),
 }
 
 pub struct Picker {
     state: PickerState,
+    /// Closed with a request on its way; its reply becomes `Late`.
+    closed: bool,
     view: WorkView,
     client: Arc<Client>,
     scroll: ScrollHandle,
@@ -318,6 +364,7 @@ impl Picker {
     pub fn new(slot: SlotId, client: Arc<Client>, view: WorkView, cx: &mut Context<Self>) -> Self {
         Picker {
             state: PickerState::new(slot),
+            closed: false,
             view,
             client,
             scroll: ScrollHandle::new(),
@@ -327,6 +374,17 @@ impl Picker {
 
     pub fn slot(&self) -> SlotId {
         self.state.slot
+    }
+
+    /// A request is on its way; the app keeps a closed picker until it is
+    /// answered.
+    pub fn busy(&self) -> bool {
+        self.state.busy()
+    }
+
+    fn close(&mut self, cx: &mut Context<Self>) {
+        self.closed = true;
+        cx.emit(PickerEvent::Closed);
     }
 
     /// The daemon's new work view. The selection stays on the same key when
@@ -339,6 +397,7 @@ impl Picker {
             self.state.selected = n;
         }
         self.state.clamp(&rows);
+        self.scroll.scroll_to_item(self.state.selected);
         cx.notify();
     }
 
@@ -360,7 +419,7 @@ impl Picker {
         match action {
             PickerAction::Ignored => return,
             PickerAction::Redraw => {}
-            PickerAction::Close => cx.emit(PickerEvent::Closed),
+            PickerAction::Close => self.close(cx),
             PickerAction::Paste => {
                 if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
                     self.state.paste(&text);
@@ -374,7 +433,11 @@ impl Picker {
                         .await
                         .map_err(|e| format!("{} ({e:#})", crate::terminal_view::LOST_DAEMON));
                     let _ = this.update(cx, |this, cx| {
-                        if let ReplyOutcome::Assigned { slot, key } = this.state.reply(reply) {
+                        if this.closed {
+                            let line = this.state.late_reply(reply);
+                            cx.emit(PickerEvent::Late(line));
+                        } else if let ReplyOutcome::Assigned { slot, key } = this.state.reply(reply)
+                        {
                             cx.emit(PickerEvent::Assigned { slot, key });
                         }
                         cx.notify();
@@ -388,12 +451,8 @@ impl Picker {
     }
 
     fn click_row(&mut self, n: usize, cx: &mut Context<Self>) {
-        if self.state.in_flight.is_some() {
-            return;
-        }
-        self.state.select(n);
         let rows = self.rows();
-        let action = self.state.accept(&rows);
+        let action = self.state.click(n, &rows);
         self.run(action, cx);
     }
 }
@@ -564,7 +623,7 @@ impl Render for Picker {
                     )
                     .child(
                         button("picker-close", "Close".into(), false)
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(PickerEvent::Closed))),
+                            .on_click(cx.listener(|this, _, _, cx| this.close(cx))),
                     )
                     .children(answer.map(|label| {
                         button("picker-answer", label, true).on_click(cx.listener(
@@ -591,7 +650,7 @@ impl Render for Picker {
             .occlude()
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|_, _, _, cx| cx.emit(PickerEvent::Closed)),
+                cx.listener(|this, _, _, cx| this.close(cx)),
             )
             .child(card)
     }
@@ -827,6 +886,108 @@ mod tests {
         p.key(&key("x", Some("x")), &all);
         assert_eq!(p.question, None);
         assert_eq!(p.answer_label(), None);
+    }
+
+    /// The picker with a Move question up on row 1 (ov-3, owned by S2).
+    fn moving_ov3() -> (Vec<PickerRow>, PickerState) {
+        let all = rows(&view(), "");
+        let mut p = PickerState::new(4);
+        p.selected = 1;
+        p.accept(&all);
+        p.reply(Ok(Response::Error {
+            message: "ov-3 is owned by S2".into(),
+        }));
+        assert!(p.question.is_some());
+        (all, p)
+    }
+
+    #[test]
+    fn cursor_keys_keep_the_selection_and_question() {
+        let (all, mut p) = moving_ov3();
+        p.filter.set("ov");
+        for k in [
+            "left",
+            "right",
+            "home",
+            "end",
+            "cmd-left",
+            "cmd-right",
+            "left",
+        ] {
+            p.key(&key(k, None), &all);
+            assert_eq!(p.selected, 1, "{k}");
+            assert!(p.question.is_some(), "{k}");
+        }
+        assert_eq!(p.filter.text, "ov");
+        // Backspace at the start changes nothing either.
+        p.key(&key("home", None), &all);
+        p.key(&key("backspace", None), &all);
+        assert_eq!(p.selected, 1);
+        assert!(p.question.is_some());
+        // A real edit does reset.
+        p.key(&key("end", None), &all);
+        p.key(&key("backspace", None), &all);
+        assert_eq!(p.filter.text, "o");
+        assert_eq!(p.selected, 0);
+        assert!(p.question.is_none());
+        // So does a paste that adds text, but not an empty one.
+        let (_, mut p) = moving_ov3();
+        p.paste("\n");
+        assert!(p.question.is_some());
+        p.paste("x");
+        assert!(p.question.is_none());
+    }
+
+    #[test]
+    fn clicking_the_question_row_does_not_answer() {
+        let (all, mut p) = moving_ov3();
+        assert_eq!(p.click(1, &all), PickerAction::Ignored);
+        assert_eq!(p.question.as_ref().unwrap().prompt, Prompt::Move(2));
+        assert_eq!(p.in_flight, None);
+        // Another row is a fresh plain assign of that row.
+        assert_eq!(
+            p.click(3, &all),
+            PickerAction::Send(assign("DEMO-40", false, false))
+        );
+        assert_eq!(p.question, None);
+        // Only Enter or the answer button answers.
+        let (all, mut p) = moving_ov3();
+        assert_eq!(
+            p.key(&key("enter", None), &all),
+            PickerAction::Send(assign("ov-3", false, true))
+        );
+    }
+
+    #[test]
+    fn late_replies_become_a_status_line() {
+        let all = rows(&view(), "");
+        let sent = |p: &mut PickerState| {
+            *p = PickerState::new(3);
+            p.accept(&all);
+        };
+        let mut p = PickerState::new(3);
+        sent(&mut p);
+        assert_eq!(p.late_reply(Ok(Response::Ok)), "DEMO-12 assigned to S3");
+        sent(&mut p);
+        assert_eq!(
+            p.late_reply(Ok(Response::NeedsConfirm {
+                message: "S3 is busy".into()
+            })),
+            "DEMO-12 not assigned to S3: S3 is busy"
+        );
+        sent(&mut p);
+        assert_eq!(
+            p.late_reply(Ok(Response::Error {
+                message: "DEMO-12 is owned by S2".into()
+            })),
+            "DEMO-12 not assigned to S3: DEMO-12 is owned by S2"
+        );
+        sent(&mut p);
+        assert_eq!(
+            p.late_reply(Err("lost the daemon".into())),
+            "DEMO-12 not assigned to S3: lost the daemon"
+        );
+        assert_eq!(p.in_flight, None);
     }
 
     #[test]
