@@ -184,5 +184,6 @@ a small client (`ListSlots` and `SlotChanged` events) and the screen through
 Phase 2 is done when every Result above reads as passed. Record the date and
 any failures here.
 
-- Signed off by:
-- Date:
+- Signed off by: Jonathan Gill
+- Date: Wednesday 11 November 2026
+- Open follow-ups: F9 (the window does not reconnect after a daemon restart), L1 to L3 above, and the folder-trust prompt blocking a new slot (F6)
