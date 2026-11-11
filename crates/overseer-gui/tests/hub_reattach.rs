@@ -77,6 +77,7 @@ async fn setup(name: &str) -> Setup {
         env: overseer_daemon::EnvSource::Inherit,
         state_dir: dir.join("state"),
         hook_program: std::path::PathBuf::from("/bin/true"),
+        settings: overseer_daemon::Config::default(),
     }));
     let client = Arc::new(Client::connect_or_start(&socket, || Ok(())).await.unwrap());
     let hub = FrameHub::start(&client, tokio::runtime::Handle::current());

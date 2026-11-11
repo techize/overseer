@@ -35,6 +35,8 @@ pub struct DaemonConfig {
     pub state_dir: PathBuf,
     /// The binary the generated hooks call (`<hook_program> hook <Event>`).
     pub hook_program: PathBuf,
+    /// Settings from `config.toml`.
+    pub settings: crate::config::Config,
 }
 
 /// `run` found another daemon serving the socket. Not a failure: the daemon

@@ -50,6 +50,7 @@ async fn start_daemon_with(socket: PathBuf, env: overseer_daemon::EnvSource) -> 
         env,
         state_dir: state_dir.clone(),
         hook_program: PathBuf::from("/bin/true"),
+        settings: overseer_daemon::Config::default(),
     };
     let task = tokio::spawn(run(cfg));
     for _ in 0..100 {
@@ -397,6 +398,7 @@ async fn second_daemon_refused() {
         env: overseer_daemon::EnvSource::Inherit,
         state_dir: d.state_dir.clone(),
         hook_program: PathBuf::from("/bin/true"),
+        settings: overseer_daemon::Config::default(),
     })
     .await
     .unwrap_err();
