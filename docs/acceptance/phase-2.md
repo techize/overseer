@@ -65,8 +65,8 @@ a small client (`ListSlots` and `SlotChanged` events) and the screen through
 
 | # | Item | Steps | Passes when | Result |
 |---|------|-------|-------------|--------|
-| N1 | Authorization in the ad hoc signed bundle | First launch of `~/Applications/Overseer.app` from Finder after `make install`. Then System Settings, Notifications, Overseer | macOS asks to allow notifications; Alerts are allowed afterwards. Record whether the prompt appeared for an ad hoc signed bundle. If it does not, the board still works but there are no banners | awaiting Jonathan |
-| N2 | A notification fires once on needs-you | As A1, make S3 ask for permission | Exactly one banner, title `S3 needs you`, body `notify test: <reason>`, with sound; none when the turn ends and none when only the reason changes. The idle Notification about 60 s after a finished turn is a separate needs-you with its own banner (L6), so judge "none when the turn ends" within that minute | awaiting Jonathan |
+| N1 | Authorization in the ad hoc signed bundle | First launch of `~/Applications/Overseer.app` from Finder after `make install`. Then System Settings, Notifications, Overseer | macOS asks to allow notifications; Alerts are allowed afterwards. Record whether the prompt appeared for an ad hoc signed bundle. If it does not, the board still works but there are no banners | Passed 2026-11-11 after a fix (F8): the first launch was refused. With the stale Trash copy unregistered and the app opened through Finder, the ad hoc signed bundle can post banners |
+| N2 | A notification fires once on needs-you | As A1, make S3 ask for permission | Exactly one banner, title `S3 needs you`, body `notify test: <reason>`, with sound; none when the turn ends and none when only the reason changes. The idle Notification about 60 s after a finished turn is a separate needs-you with its own banner (L6), so judge "none when the turn ends" within that minute | Banner seen by Jonathan 2026-11-11: an `S3 needs you` banner appeared when S3 went from Working to Needs you (driven by `overseer hook UserPromptSubmit` then `hook Notification` on S3). The once-only and reason-change parts are awaiting Jonathan |
 | N3 | Click opens the session while the app is running | With another app frontmost and Overseer open on the board, cause a permission request and click the banner | Overseer comes forward on the S3 session view | awaiting Jonathan |
 | N4 | Click from a cold launch (known gap) | Quit Overseer, click an old notification in Notification Center | The app launches. It may open on the board, not S3, because the delegate is installed inside the launch callback | awaiting Jonathan. Known limitation L2 |
 | N5 | Denied notifications | Turn notifications off for Overseer, repeat N2 | No banner; card and header still show Needs you; the GUI log may show `notification for S3 not delivered` | awaiting Jonathan |
@@ -127,6 +127,15 @@ a small client (`ListSlots` and `SlotChanged` events) and the screen through
   GUI log on 2026-11-10 at 16:43 says `notifications not allowed:
   Notifications are not allowed for this application`. Whether macOS showed
   a prompt is for Jonathan to record.
+- **F8 (finding): notifications were refused while an old copy sat in the
+  Trash.** On 2026-11-10 macOS refused Overseer's notification request and
+  listed no entry for it. LaunchServices knew two bundles with the id
+  `uk.co.techize.overseer`, the installed one and an old one in `~/.Trash`.
+  After the Trash copy was deleted, its registration removed with
+  `lsregister -u`, and the window reopened through Finder (a Cmd+Q had left
+  the old window process running), banners appeared. If notifications fail
+  after a reinstall, check `lsregister -dump | grep Overseer.app` for
+  duplicates.
 - **Environment note:** the temp state dir had to be under `/tmp` and not the
   session scratch directory, because the unix socket path would have been 112
   characters (the limit is 104).
