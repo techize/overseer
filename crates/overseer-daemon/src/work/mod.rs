@@ -1,6 +1,7 @@
 //! Work items from beads and Jira, grouped into one list.
 
 pub mod group;
+pub mod ownership;
 pub mod sources;
 
 pub use group::{group, ticket_of};
