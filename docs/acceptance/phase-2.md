@@ -186,4 +186,4 @@ any failures here.
 
 - Signed off by: Jonathan Gill
 - Date: Wednesday 11 November 2026
-- Open follow-ups: F9 (the window does not reconnect after a daemon restart), L1 to L3 above, and the folder-trust prompt blocking a new slot (F6)
+- Open follow-ups: F9 (the window does not reconnect after a daemon restart), L1 to L6 above, and the folder-trust prompt blocking a new slot (F6)
