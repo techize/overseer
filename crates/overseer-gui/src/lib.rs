@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod board;
+pub mod notify;
 pub mod session;
 pub mod start_dialog;
 pub mod startup_error;
@@ -210,6 +211,7 @@ pub fn run_gui(client: Arc<Client>, runtime: Handle) {
     Application::new().run(move |cx: &mut App| {
         cx.set_global(FrameHub::start(&client, runtime));
         app::install(cx);
+        notify::install();
         let theme = Theme::load();
         let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
         cx.open_window(
@@ -352,6 +354,7 @@ mod tests {
                 state: overseer_proto::SlotState::Empty,
                 cols: 80,
                 rows: 24,
+                activity: None,
             },
         ));
         assert_eq!(hub.routes.lock().unwrap().dispatch(ev.clone()), Some(ev));

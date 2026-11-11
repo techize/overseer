@@ -72,6 +72,7 @@ actions!(
         SelectUp,
         SelectDown,
         OpenSelected,
+        ResumeSelected,
     ]
 );
 
@@ -105,6 +106,7 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("up", SelectUp, Some("Board")),
         KeyBinding::new("down", SelectDown, Some("Board")),
         KeyBinding::new("enter", OpenSelected, Some("Board")),
+        KeyBinding::new("r", ResumeSelected, Some("Board")),
         KeyBinding::new("cmd-q", Quit, None),
     ]
 }
@@ -156,6 +158,14 @@ pub fn start_target(screen: Screen, selected: SlotId, slots: &[SlotInfo]) -> Opt
     (!matches!(info.state, SlotState::Running { .. })).then_some(id)
 }
 
+/// The slot `r` resumes: the selected card, when it is resumable.
+pub fn resume_target(selected: SlotId, slots: &[SlotInfo]) -> Option<SlotId> {
+    slots
+        .get(selected as usize)
+        .filter(|i| matches!(i.state, SlotState::Resumable { .. }))
+        .map(|i| i.id)
+}
+
 /// What clicking a card does: open the session, or the start dialog for an
 /// empty slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,6 +197,7 @@ fn empty_slots() -> Vec<SlotInfo> {
             state: SlotState::Empty,
             cols: 80,
             rows: 24,
+            activity: None,
         })
         .collect()
 }
@@ -217,6 +228,7 @@ pub struct OverseerApp {
     ticker: Ticker,
     _ticker: Option<Task<()>>,
     _events: Task<()>,
+    _clicks: Task<()>,
 }
 
 impl OverseerApp {
@@ -242,6 +254,17 @@ impl OverseerApp {
                 this.status = Some(crate::terminal_view::LOST_DAEMON.into());
                 cx.notify();
             });
+        });
+        let mut clicks = crate::notify::clicks();
+        let clicked = cx.spawn_in(window, async move |this, cx| {
+            while let Some(id) = clicks.recv().await {
+                let alive = this.update_in(cx, |this, window, cx| {
+                    this.notification_clicked(id, window, cx)
+                });
+                if alive.is_err() {
+                    return;
+                }
+            }
         });
         // The list comes back through the event stream (a marked reply), so
         // it is applied in order with the events around it.
@@ -275,28 +298,40 @@ impl OverseerApp {
             ticker: Ticker::default(),
             _ticker: None,
             _events: events,
+            _clicks: clicked,
         }
     }
 
     fn on_frame(&mut self, frame: Frame, window: &mut Window, cx: &mut Context<Self>) {
         match frame {
-            Frame::Event(Event::SlotChanged(info)) => self.apply_info(info, window, cx),
+            Frame::Event(Event::SlotChanged(info)) => self.apply_info(info, false, window, cx),
+            // The GUI asks for the list once, right after connecting, so a
+            // NeedsYou in it was already waiting and does not notify.
             Frame::Response {
                 resp: Response::Slots(list),
                 ..
             } => {
                 for info in list {
-                    self.apply_info(info, window, cx);
+                    self.apply_info(info, true, window, cx);
                 }
             }
             _ => {}
         }
     }
 
-    fn apply_info(&mut self, info: SlotInfo, window: &mut Window, cx: &mut Context<Self>) {
+    fn apply_info(
+        &mut self,
+        info: SlotInfo,
+        first_sync: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let id = info.id;
         if id as usize >= self.slots.len() {
             return;
+        }
+        if crate::notify::should_notify(self.slots.get(id as usize), &info, first_sync) {
+            crate::notify::post(&crate::notify::note_for(&info));
         }
         let dropped = match self.terminals.get(&id) {
             Some(t) if !keep_view(t.incarnation, &info.state) => {
@@ -335,7 +370,8 @@ impl OverseerApp {
         cx: &mut Context<Self>,
     ) -> Option<Entity<TerminalView>> {
         let state = self.slots.get(id as usize)?.state.clone();
-        if state == SlotState::Empty {
+        // No process to attach to in either.
+        if matches!(state, SlotState::Empty | SlotState::Resumable { .. }) {
             return None;
         }
         let client = self.client.clone();
@@ -405,6 +441,15 @@ impl OverseerApp {
         self.send(Request::StopSlot { id }, cx);
     }
 
+    /// Relaunches a resumable slot with its session continued and opens it.
+    /// The slot is still Resumable here, so `go_session` leaves the terminal
+    /// to be focused once the Running event arrives.
+    pub(crate) fn resume_slot(&mut self, id: SlotId, window: &mut Window, cx: &mut Context<Self>) {
+        self.status = None;
+        self.send(Request::ResumeSlot { id }, cx);
+        self.go_session(id, window, cx);
+    }
+
     /// Stop, wait for Exited, then start with the same label, cwd and
     /// command. The new run replaces the terminal view (see `apply_info`).
     pub(crate) fn restart_slot(&mut self, id: SlotId, cx: &mut Context<Self>) {
@@ -452,6 +497,17 @@ impl OverseerApp {
             }
         }
         cx.notify();
+    }
+
+    /// A notification was clicked: bring the window forward on that
+    /// session. With the start dialog open only the window comes forward,
+    /// as Cmd+digit does nothing there either.
+    fn notification_clicked(&mut self, id: SlotId, window: &mut Window, cx: &mut Context<Self>) {
+        cx.activate(true);
+        window.activate_window();
+        if self.dialog.is_none() {
+            self.go_session(id, window, cx);
+        }
     }
 
     pub(crate) fn open_card(&mut self, id: SlotId, window: &mut Window, cx: &mut Context<Self>) {
@@ -601,6 +657,8 @@ mod tests {
         assert_eq!(routed("cmd-q", DIALOG), Some("overseer::Quit"));
         assert_eq!(routed("left", BOARD), Some("overseer::SelectLeft"));
         assert_eq!(routed("enter", BOARD), Some("overseer::OpenSelected"));
+        assert_eq!(routed("r", BOARD), Some("overseer::ResumeSelected"));
+        assert_eq!(routed("r", TERMINAL), None);
         // Arrows and Enter in a terminal are Claude Code's.
         assert_eq!(routed("left", TERMINAL), None);
         assert_eq!(routed("enter", TERMINAL), None);
@@ -637,6 +695,19 @@ mod tests {
         // Nothing running anywhere: no ticker.
         let mut idle = Ticker::default();
         assert!(!idle.on_change(Screen::Board, &slots_with(&[])));
+    }
+
+    #[test]
+    fn r_resumes_only_a_selected_resumable_card() {
+        let mut s = slots_with(&[1]);
+        s[2].state = SlotState::Resumable {
+            session_id: "abc".into(),
+            at: 0,
+        };
+        assert_eq!(resume_target(2, &s), Some(2));
+        assert_eq!(resume_target(1, &s), None);
+        assert_eq!(resume_target(4, &s), None);
+        assert_eq!(resume_target(9, &s), None);
     }
 
     #[test]

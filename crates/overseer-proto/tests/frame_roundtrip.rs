@@ -17,6 +17,7 @@ fn sample_info() -> SlotInfo {
         },
         cols: 120,
         rows: 40,
+        activity: None,
     }
 }
 
@@ -40,6 +41,7 @@ async fn roundtrip_every_frame_kind() {
                 label: "x".into(),
                 cwd: PathBuf::from("/tmp"),
                 command: None,
+                prompt: None,
             },
         },
         Frame::Request {

@@ -53,6 +53,39 @@ pub const SESSION_PREFIXES: &[&str] = &["CLAUDE_CODE_SESSION"];
 /// login shell starts with, so a token the user's rc files set survives.
 pub const PARENT_TOKEN_VARS: &[&str] = &["CLAUDE_CODE_OAUTH_TOKEN"];
 
+/// Variables the Claude desktop parent sets for its own sessions (account,
+/// host plumbing, feature switches, `GIT_EDITOR`). A slot session must not
+/// inherit them. Names already in [`SESSION_VARS`] are not repeated here.
+/// Removed like [`PARENT_TOKEN_VARS`]: only inside a parent session and only
+/// from the environment the login shell starts with, so values the user's rc
+/// files set (`GIT_EDITOR=vim`) survive. User preferences a parent also sets
+/// (`CLAUDE_CODE_NO_FLICKER`, `CLAUDE_CODE_DISABLE_TERMINAL_TITLE`,
+/// `CLAUDE_CODE_ENABLE_TELEMETRY`) are deliberately not listed.
+pub const PARENT_HOST_VARS: &[&str] = &[
+    "ANTHROPIC_BASE_URL",
+    "CLAUDE_CODE_ACCOUNT_UUID",
+    "CLAUDE_CODE_ORGANIZATION_UUID",
+    "CLAUDE_CODE_USER_EMAIL",
+    "CLAUDE_CODE_OAUTH_SCOPES",
+    "CLAUDE_CODE_HOST_SHORT_TEMP_DIRS",
+    "CLAUDE_CODE_EMIT_STARTUP_TIMING",
+    "CLAUDE_CODE_EMIT_TOOL_USE_SUMMARIES",
+    "CLAUDE_CODE_STARTUP_FAILURE_RESULTS",
+    "CLAUDE_CODE_REPORT_FINDINGS",
+    "CLAUDE_CODE_TERMINAL_MCP_TOOLS",
+    "CLAUDE_CODE_ENABLE_ASK_USER_QUESTION_TOOL",
+    "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING",
+    "CLAUDE_CODE_EAGER_FLUSH",
+    "CLAUDE_CODE_DISABLE_CRON",
+    "CLAUDE_CODE_SIMPLE",
+    "CLAUDE_EFFORT",
+    "CLAUDE_PREVIEW_CLASSIFIER_FLOOR",
+    "GIT_EDITOR",
+];
+
+/// Prefixes of host variables, removed like [`PARENT_HOST_VARS`].
+pub const PARENT_HOST_PREFIXES: &[&str] = &["CLAUDE_CODE_DESKTOP_", "CLAUDE_AGENT_SDK_", "MCP_"];
+
 /// Shell bookkeeping that means nothing to a new process.
 const SHELL_LOCAL_VARS: &[&str] = &["PWD", "OLDPWD", "SHLVL", "_"];
 
@@ -69,17 +102,22 @@ fn is_session_var(name: &OsStr) -> bool {
     SESSION_VARS.contains(&name) || SESSION_PREFIXES.iter().any(|p| name.starts_with(p))
 }
 
+fn is_parent_only_var(name: &str) -> bool {
+    PARENT_TOKEN_VARS.contains(&name)
+        || PARENT_HOST_VARS.contains(&name)
+        || PARENT_HOST_PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
 fn inside_parent_session(vars: &[(OsString, OsString)]) -> bool {
     vars.iter().any(|(k, _)| k == "CLAUDECODE")
 }
 
-/// Removes parent-session variables. With `drop_tokens`, also removes
-/// [`PARENT_TOKEN_VARS`].
-pub fn scrub(vars: Vars, drop_tokens: bool) -> Vars {
+/// Removes parent-session variables. With `from_parent`, also removes
+/// [`PARENT_TOKEN_VARS`], [`PARENT_HOST_VARS`] and [`PARENT_HOST_PREFIXES`].
+pub fn scrub(vars: Vars, from_parent: bool) -> Vars {
     vars.into_iter()
         .filter(|(k, _)| {
-            !is_session_var(k)
-                && !(drop_tokens && k.to_str().is_some_and(|k| PARENT_TOKEN_VARS.contains(&k)))
+            !is_session_var(k) && !(from_parent && k.to_str().is_some_and(is_parent_only_var))
         })
         .collect()
 }
@@ -256,6 +294,9 @@ pub fn resolve_base_env(shell: &Path, timeout: Duration) -> Vars {
 pub enum EnvSource {
     /// The daemon's own environment, scrubbed. Used by tests.
     Inherit,
+    /// As `Inherit`, with these variables set on top. Used by tests that
+    /// must point a slot somewhere without touching the process environment.
+    InheritWith(Vec<(String, String)>),
     /// The user's login shell, read once in the background at startup.
     LoginShell,
 }
@@ -275,6 +316,14 @@ impl BaseEnv {
     pub fn start(source: &EnvSource) -> BaseEnv {
         match source {
             EnvSource::Inherit => BaseEnv::ready(own_env()),
+            EnvSource::InheritWith(extra) => {
+                let mut vars = own_env();
+                for (k, v) in extra {
+                    vars.retain(|(name, _)| name != k.as_str());
+                    vars.push((k.into(), v.into()));
+                }
+                BaseEnv::ready(vars)
+            }
             EnvSource::LoginShell => {
                 let (tx, rx) = watch::channel(None);
                 let shell = user_shell();
@@ -355,6 +404,87 @@ mod tests {
         let kept = names(&scrub(vars, true));
         assert!(!kept.contains(&"CLAUDE_CODE_OAUTH_TOKEN".to_string()));
         assert!(kept.contains(&"CLAUDE_CODE_USE_BEDROCK".to_string()));
+    }
+
+    #[test]
+    fn host_vars_dropped_inside_a_parent_session() {
+        let host_names = [
+            "ANTHROPIC_BASE_URL",
+            "CLAUDE_CODE_ACCOUNT_UUID",
+            "CLAUDE_CODE_ORGANIZATION_UUID",
+            "CLAUDE_CODE_USER_EMAIL",
+            "CLAUDE_CODE_OAUTH_SCOPES",
+            "CLAUDE_CODE_CHILD_SESSION",
+            "CLAUDE_CODE_HOST_SESSION_ID",
+            "CLAUDE_CODE_HOST_SHORT_TEMP_DIRS",
+            "CLAUDE_CODE_MESSAGING_SOCKET",
+            "CLAUDE_CODE_MESSAGING_TOKEN",
+            "CLAUDE_CODE_EXECPATH",
+            "CLAUDE_CODE_EMIT_STARTUP_TIMING",
+            "CLAUDE_CODE_EMIT_TOOL_USE_SUMMARIES",
+            "CLAUDE_CODE_STARTUP_FAILURE_RESULTS",
+            "CLAUDE_CODE_REPORT_FINDINGS",
+            "CLAUDE_CODE_TERMINAL_MCP_TOOLS",
+            "CLAUDE_CODE_ENABLE_ASK_USER_QUESTION_TOOL",
+            "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING",
+            "CLAUDE_CODE_EAGER_FLUSH",
+            "CLAUDE_CODE_DISABLE_CRON",
+            "CLAUDE_CODE_SIMPLE",
+            "CLAUDE_EFFORT",
+            "CLAUDE_PID",
+            "CLAUDE_PREVIEW_CLASSIFIER_FLOOR",
+            "GIT_EDITOR",
+            "CLAUDE_CODE_DESKTOP_FOO",
+            "CLAUDE_AGENT_SDK_FOO",
+            "MCP_FOO",
+        ];
+        let mut pairs: Vec<(&str, &str)> = host_names.iter().map(|n| (*n, "x")).collect();
+        pairs.extend([
+            ("CLAUDECODE", "1"),
+            ("CLAUDE_CODE_NO_FLICKER", "1"),
+            ("CLAUDE_CODE_DISABLE_TERMINAL_TITLE", "1"),
+            ("CLAUDE_CODE_ENABLE_TELEMETRY", "1"),
+            ("PATH", "/usr/bin"),
+        ]);
+        let vars = v(&pairs);
+        let parent = inside_parent_session(&vars);
+        assert!(parent);
+        let kept = names(&scrub(vars, parent));
+        for n in host_names {
+            assert!(!kept.contains(&n.to_string()), "{n} survived");
+        }
+        assert_eq!(
+            kept,
+            [
+                "CLAUDE_CODE_NO_FLICKER",
+                "CLAUDE_CODE_DISABLE_TERMINAL_TITLE",
+                "CLAUDE_CODE_ENABLE_TELEMETRY",
+                "PATH"
+            ]
+        );
+    }
+
+    #[test]
+    fn host_vars_from_rc_files_survive() {
+        let dir = temp_dir("hostrc");
+        // The login shell's own rc files set these; its output is scrubbed
+        // with from_parent = false, so they must stay.
+        let shell = script(
+            &dir,
+            "rc-shell",
+            "export GIT_EDITOR=vim MCP_TIMEOUT=5\nshift 3\neval \"$1\"",
+        );
+        let vars = login_shell_env(&shell, &path(), LOGIN_SHELL_TIMEOUT).unwrap();
+        let kept = finish(scrub(vars, false));
+        assert!(
+            kept.contains(&("GIT_EDITOR".into(), "vim".into())),
+            "{kept:?}"
+        );
+        assert!(
+            kept.contains(&("MCP_TIMEOUT".into(), "5".into())),
+            "{kept:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

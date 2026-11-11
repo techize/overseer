@@ -6,7 +6,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use overseer_daemon::{run, DaemonConfig};
 use overseer_proto::{
-    read_frame, write_frame, Event, Frame, Request, Response, SlotInfo, SlotState,
+    read_frame, write_frame, Activity, ActivityKind, Event, Frame, HookEvent, HookKind, Request,
+    Response, SlotInfo, SlotState,
 };
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::UnixStream;
@@ -28,6 +29,7 @@ fn temp_socket() -> PathBuf {
 
 struct Daemon {
     socket: PathBuf,
+    state_dir: PathBuf,
     task: JoinHandle<anyhow::Result<()>>,
 }
 
@@ -37,15 +39,26 @@ async fn start_daemon() -> Daemon {
 }
 
 async fn start_daemon_at(socket: PathBuf) -> Daemon {
+    start_daemon_with(socket, overseer_daemon::EnvSource::Inherit).await
+}
+
+async fn start_daemon_with(socket: PathBuf, env: overseer_daemon::EnvSource) -> Daemon {
+    let state_dir = socket.parent().unwrap().join("state");
     let cfg = DaemonConfig {
         socket: socket.clone(),
         default_command: vec![SCRIPT.to_string()],
-        env: overseer_daemon::EnvSource::Inherit,
+        env,
+        state_dir: state_dir.clone(),
+        hook_program: PathBuf::from("/bin/true"),
     };
     let task = tokio::spawn(run(cfg));
     for _ in 0..100 {
         if UnixStream::connect(&socket).await.is_ok() {
-            return Daemon { socket, task };
+            return Daemon {
+                socket,
+                state_dir,
+                task,
+            };
         }
         sleep(Duration::from_millis(20)).await;
     }
@@ -121,6 +134,7 @@ impl Client {
             label: format!("t{id}"),
             cwd: PathBuf::from("/tmp"),
             command: None,
+            prompt: None,
         })
         .await
     }
@@ -252,6 +266,7 @@ async fn slow_client_dropped() {
                 label: "t3".into(),
                 cwd: PathBuf::from("/tmp"),
                 command: None,
+                prompt: None,
             },
         ),
     )
@@ -310,6 +325,7 @@ async fn paused_client_gets_the_whole_stream() {
         label: "t4".into(),
         cwd: PathBuf::from("/tmp"),
         command: Some(vec!["/bin/sh".into(), "-c".into(), count.into()]),
+        prompt: None,
     };
     write_frame(&mut raw, &req(1, start)).await.unwrap();
     write_frame(&mut raw, &req(2, Request::Attach { id: 4 }))
@@ -379,6 +395,8 @@ async fn second_daemon_refused() {
         socket: d.socket.clone(),
         default_command: vec![SCRIPT.to_string()],
         env: overseer_daemon::EnvSource::Inherit,
+        state_dir: d.state_dir.clone(),
+        hook_program: PathBuf::from("/bin/true"),
     })
     .await
     .unwrap_err();
@@ -486,6 +504,7 @@ async fn line_at_a_time_burst_does_not_drop_live_client() {
             "-c".into(),
             "sleep 0.5; seq 1 200000; echo BURST-END".into(),
         ]),
+        prompt: None,
     };
     assert_eq!(c.request(start).await, Response::Ok);
     assert_eq!(c.request(Request::Attach { id: 2 }).await, Response::Ok);
@@ -493,4 +512,610 @@ async fn line_at_a_time_burst_does_not_drop_live_client() {
         .await
         .expect("burst did not arrive");
     assert!(out.contains("199999"));
+}
+
+fn live_slots(d: &Daemon) -> Vec<u8> {
+    let ledger = overseer_daemon::ledger::Ledger::open(&d.state_dir.join("overseer.db")).unwrap();
+    ledger
+        .live_at_shutdown()
+        .unwrap()
+        .iter()
+        .map(|r| r.slot)
+        .collect()
+}
+
+#[tokio::test]
+async fn exit_is_recorded_in_the_ledger() {
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    assert_eq!(c.start(4).await, Response::Ok);
+    assert_eq!(live_slots(&d), vec![4]);
+    c.send(Frame::Input {
+        id: 4,
+        data: Bytes::from_static(b"quit\r"),
+    })
+    .await;
+    c.exited_event(4).await;
+    assert!(live_slots(&d).is_empty(), "self exit not recorded");
+
+    // StopSlot counts too.
+    assert_eq!(c.start(5).await, Response::Ok);
+    assert_eq!(live_slots(&d), vec![5]);
+    assert_eq!(c.request(Request::StopSlot { id: 5 }).await, Response::Ok);
+    c.exited_event(5).await;
+    assert!(live_slots(&d).is_empty(), "stop not recorded");
+}
+
+#[tokio::test]
+async fn shutdown_does_not_record_exits() {
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    assert_eq!(c.start(6).await, Response::Ok);
+    assert_eq!(c.request(Request::Shutdown).await, Response::Ok);
+    let mut d = d;
+    timeout(WAIT, &mut d.task)
+        .await
+        .expect("run returned")
+        .unwrap()
+        .unwrap();
+    // Give the exit monitor time to see the killed child.
+    sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        live_slots(&d),
+        vec![6],
+        "shutdown kill was recorded as an exit"
+    );
+}
+
+fn hook(slot: u8, event: HookKind) -> HookEvent {
+    HookEvent {
+        slot,
+        event,
+        session_id: None,
+        tool: None,
+        detail: None,
+        notification: None,
+    }
+}
+
+impl Client {
+    /// The next SlotChanged for `id`, whatever it carries.
+    async fn next_change(&mut self, id: u8) -> SlotInfo {
+        loop {
+            match self.recv().await.expect("connection closed") {
+                Frame::Event(Event::SlotChanged(info)) if info.id == id => return info,
+                _ => {}
+            }
+        }
+    }
+
+    async fn hook(&mut self, ev: HookEvent) {
+        assert_eq!(self.request(Request::Hook(ev)).await, Response::Ok);
+    }
+}
+
+fn activity_of(info: &SlotInfo) -> &Activity {
+    info.activity.as_ref().expect("activity set")
+}
+
+#[tokio::test]
+async fn hook_requests_change_slot_activity() {
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    assert_eq!(c.start(2).await, Response::Ok);
+    // The start announcement carries no activity yet.
+    assert_eq!(c.next_change(2).await.activity, None);
+
+    c.hook(hook(2, HookKind::UserPromptSubmit)).await;
+    let info = c.next_change(2).await;
+    assert_eq!(activity_of(&info).kind, ActivityKind::Working);
+    let since = activity_of(&info).since;
+
+    let mut tool = hook(2, HookKind::PostToolUse);
+    tool.tool = Some("Bash".into());
+    tool.detail = Some("cargo test".into());
+    c.hook(tool).await;
+    let info = c.next_change(2).await;
+    let a = activity_of(&info);
+    assert_eq!(a.kind, ActivityKind::Working);
+    assert_eq!(a.since, since);
+    assert_eq!(a.now_doing.as_deref(), Some("Bash cargo test"));
+    // list agrees with the event.
+    assert_eq!(c.list().await[2].activity.as_ref(), Some(a));
+
+    let mut note = hook(2, HookKind::Notification);
+    note.notification = Some("needs permission".into());
+    c.hook(note).await;
+    let info = c.next_change(2).await;
+    assert_eq!(activity_of(&info).kind, ActivityKind::NeedsYou);
+    assert_eq!(
+        activity_of(&info).reason.as_deref(),
+        Some("needs permission")
+    );
+
+    c.hook(hook(2, HookKind::Stop)).await;
+    let info = c.next_change(2).await;
+    assert_eq!(activity_of(&info).kind, ActivityKind::Idle);
+
+    // A repeat changes nothing, so the next change seen is the exit.
+    c.hook(hook(2, HookKind::Stop)).await;
+    assert_eq!(c.request(Request::StopSlot { id: 2 }).await, Response::Ok);
+    let info = c.exited_event(2).await;
+    assert_eq!(info.activity, None, "exit clears activity");
+    assert_eq!(c.list().await[2].activity, None);
+}
+
+#[tokio::test]
+async fn hooks_for_slots_that_are_not_running_are_ignored() {
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    // Empty slot, and an id that does not exist: still Ok, nothing happens.
+    c.hook(hook(3, HookKind::UserPromptSubmit)).await;
+    c.hook(hook(99, HookKind::UserPromptSubmit)).await;
+    assert_eq!(c.start(4).await, Response::Ok);
+    assert_eq!(c.next_change(4).await.activity, None);
+    c.send(Frame::Input {
+        id: 4,
+        data: Bytes::from_static(b"quit\r"),
+    })
+    .await;
+    c.exited_event(4).await;
+    // A late hook after the exit must not revive the slot's activity.
+    c.hook(hook(4, HookKind::UserPromptSubmit)).await;
+    // The next observable change is slot 5's start, not slot 4's.
+    assert_eq!(c.start(5).await, Response::Ok);
+    loop {
+        let Frame::Event(Event::SlotChanged(info)) = c.recv().await.unwrap() else {
+            continue;
+        };
+        assert_ne!(info.id, 3, "empty slot announced");
+        assert_ne!(info.id, 4, "exited slot announced after its exit");
+        if info.id == 5 {
+            break;
+        }
+    }
+    assert_eq!(c.list().await[4].activity, None);
+}
+
+#[tokio::test]
+async fn session_start_with_new_id_updates_the_ledger() {
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    assert_eq!(c.start(1).await, Response::Ok);
+    let ledger = overseer_daemon::ledger::Ledger::open(&d.state_dir.join("overseer.db")).unwrap();
+    let id_of =
+        |l: &overseer_daemon::ledger::Ledger| l.live_at_shutdown().unwrap()[0].session_id.clone();
+    assert_eq!(id_of(&ledger), "", "non-claude slots start with no id");
+
+    let mut ev = hook(1, HookKind::SessionStart);
+    ev.session_id = Some("new-session-id".into());
+    c.hook(ev).await;
+    c.next_change(1).await; // start
+    let info = c.next_change(1).await;
+    assert_eq!(activity_of(&info).kind, ActivityKind::Idle);
+    assert_eq!(id_of(&ledger), "new-session-id");
+
+    // A later change is picked up too.
+    let mut ev = hook(1, HookKind::SessionStart);
+    ev.session_id = Some("later-id".into());
+    c.hook(ev).await;
+    // Already idle, so no change is announced; the next event proves the
+    // hook was handled before the ledger is read.
+    c.hook(hook(1, HookKind::UserPromptSubmit)).await;
+    c.next_change(1).await;
+    assert_eq!(id_of(&ledger), "later-id");
+}
+
+/// A script named `claude` that logs its cwd and argv, then sleeps.
+fn stub_claude(dir: &std::path::Path) -> (PathBuf, PathBuf) {
+    std::fs::create_dir_all(dir).unwrap();
+    let log = dir.join("calls.log");
+    let bin = dir.join("claude");
+    std::fs::write(
+        &bin,
+        format!(
+            "#!/bin/sh\nprintf '%s|%s\\n' \"$(pwd -P)\" \"$*\" >> '{}'\n\
+             # Like claude, save the conversation for a new session id.\n\
+             if [ \"$1\" = --session-id ] && [ -n \"$STUB_SAVES\" ]; then\n\
+             mkdir -p \"$CLAUDE_CONFIG_DIR/projects/p\" && : > \"$CLAUDE_CONFIG_DIR/projects/p/$2.jsonl\"\n\
+             fi\nexec sleep 30\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (bin, log)
+}
+
+/// Stops the daemon through its shutdown path, so exits are not recorded.
+async fn shutdown(mut d: Daemon) -> PathBuf {
+    let socket = d.socket.clone();
+    let mut c = Client::connect(&socket).await;
+    assert_eq!(c.request(Request::Shutdown).await, Response::Ok);
+    timeout(WAIT, &mut d.task)
+        .await
+        .expect("run returned")
+        .unwrap()
+        .unwrap();
+    // Give the exit monitors time to see the killed children.
+    sleep(Duration::from_millis(500)).await;
+    socket
+}
+
+async fn wait_for_log(log: &std::path::Path, lines: usize) -> Vec<String> {
+    for _ in 0..100 {
+        if let Ok(s) = std::fs::read_to_string(log) {
+            if s.lines().count() >= lines {
+                return s.lines().map(String::from).collect();
+            }
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    panic!("stub never logged {lines} lines");
+}
+
+fn arg_after(line: &str, flag: &str) -> Option<String> {
+    let args = line.split_once('|').unwrap().1;
+    let mut it = args.split(' ');
+    it.find(|a| *a == flag)?;
+    it.next().map(String::from)
+}
+
+/// Slots see their own Claude config folder; with `saves` the stub writes a
+/// transcript for each new session, as claude does once it has a message.
+fn claude_env(dir: &std::path::Path, saves: bool) -> overseer_daemon::EnvSource {
+    let mut vars = vec![(
+        "CLAUDE_CONFIG_DIR".to_string(),
+        dir.join("cfg").to_string_lossy().into_owned(),
+    )];
+    if saves {
+        vars.push(("STUB_SAVES".into(), "1".into()));
+    }
+    std::fs::create_dir_all(dir.join("cfg/projects")).unwrap();
+    overseer_daemon::EnvSource::InheritWith(vars)
+}
+
+#[tokio::test]
+async fn restart_offers_resume() {
+    let dir = std::env::temp_dir().join(format!("ovs-resume-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (bin, log) = stub_claude(&dir);
+    let cwd = dir.join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let cwd = cwd.canonicalize().unwrap();
+
+    let d = start_daemon_with(temp_socket(), claude_env(&dir, true)).await;
+    let mut c = Client::connect(&d.socket).await;
+    let start = Request::StartSlot {
+        id: 3,
+        label: "resumer".into(),
+        cwd: cwd.clone(),
+        command: Some(vec![bin.to_string_lossy().into_owned()]),
+        prompt: None,
+    };
+    assert_eq!(c.request(start).await, Response::Ok);
+    let first = wait_for_log(&log, 1).await;
+    let session_id = arg_after(&first[0], "--session-id").expect("fresh start has an id");
+    drop(c);
+
+    let socket = shutdown(d).await;
+    let d = start_daemon_with(socket, claude_env(&dir, true)).await;
+    let mut c = Client::connect(&d.socket).await;
+    let info = c.list().await.remove(3);
+    assert_eq!(
+        info.state,
+        SlotState::Resumable {
+            session_id: session_id.clone(),
+            at: match info.state {
+                SlotState::Resumable { at, .. } => at,
+                _ => 0,
+            }
+        }
+    );
+    assert_eq!(info.label, "resumer");
+    assert_eq!(info.cwd.as_deref(), Some(cwd.as_path()));
+
+    assert_eq!(c.request(Request::ResumeSlot { id: 3 }).await, Response::Ok);
+    let lines = wait_for_log(&log, 2).await;
+    assert_eq!(lines[1].split_once('|').unwrap().0, cwd.to_string_lossy());
+    assert_eq!(
+        arg_after(&lines[1], "--resume").as_deref(),
+        Some(session_id.as_str())
+    );
+    assert!(!lines[1].contains("--session-id"), "{}", lines[1]);
+    assert!(matches!(c.list().await[3].state, SlotState::Running { .. }));
+    // Same ledger row, same id, live again.
+    let ledger = overseer_daemon::ledger::Ledger::open(&d.state_dir.join("overseer.db")).unwrap();
+    let live = ledger.live_at_shutdown().unwrap();
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].session_id, session_id);
+    // A second resume is refused: it is running now.
+    assert!(matches!(
+        c.request(Request::ResumeSlot { id: 3 }).await,
+        Response::Error { .. }
+    ));
+}
+
+#[tokio::test]
+async fn non_claude_slot_is_not_resumable() {
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    assert_eq!(c.start(2).await, Response::Ok);
+    drop(c);
+    let socket = shutdown(d).await;
+    let d = start_daemon_at(socket).await;
+    let mut c = Client::connect(&d.socket).await;
+    assert!(matches!(
+        c.list().await[2].state,
+        SlotState::Exited { code: None, .. }
+    ));
+    assert!(matches!(
+        c.request(Request::ResumeSlot { id: 2 }).await,
+        Response::Error { .. }
+    ));
+    assert!(live_slots(&d).is_empty(), "row marked exited");
+}
+
+#[tokio::test]
+async fn exited_slot_is_not_resumable() {
+    let dir = std::env::temp_dir().join(format!("ovs-exited-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (bin, _log) = stub_claude(&dir);
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    let start = Request::StartSlot {
+        id: 1,
+        label: "x".into(),
+        cwd: PathBuf::from("/tmp"),
+        command: Some(vec![bin.to_string_lossy().into_owned()]),
+        prompt: None,
+    };
+    assert_eq!(c.request(start).await, Response::Ok);
+    assert_eq!(c.request(Request::StopSlot { id: 1 }).await, Response::Ok);
+    c.exited_event(1).await;
+    drop(c);
+    let socket = shutdown(d).await;
+    let d = start_daemon_at(socket).await;
+    let mut c = Client::connect(&d.socket).await;
+    assert_eq!(c.list().await[1].state, SlotState::Empty);
+    assert!(matches!(
+        c.request(Request::ResumeSlot { id: 1 }).await,
+        Response::Error { .. }
+    ));
+}
+
+#[tokio::test]
+async fn start_and_stop_on_a_resumable_slot() {
+    let dir = std::env::temp_dir().join(format!("ovs-offer-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (bin, log) = stub_claude(&dir);
+    let cmd = Some(vec![bin.to_string_lossy().into_owned()]);
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    for id in [0u8, 1] {
+        let start = Request::StartSlot {
+            id,
+            label: format!("s{id}"),
+            cwd: PathBuf::from("/tmp"),
+            command: cmd.clone(),
+            prompt: None,
+        };
+        assert_eq!(c.request(start).await, Response::Ok);
+    }
+    wait_for_log(&log, 2).await;
+    drop(c);
+    let socket = shutdown(d).await;
+    let d = start_daemon_at(socket).await;
+    let mut c = Client::connect(&d.socket).await;
+    let slots = c.list().await;
+    assert!(matches!(slots[0].state, SlotState::Resumable { .. }));
+    assert!(matches!(slots[1].state, SlotState::Resumable { .. }));
+
+    // Stop declines the offer.
+    assert_eq!(c.request(Request::StopSlot { id: 0 }).await, Response::Ok);
+    assert_eq!(c.list().await[0].state, SlotState::Empty);
+    // Start goes fresh, with a new session id and no --resume.
+    let start = Request::StartSlot {
+        id: 1,
+        label: "s1".into(),
+        cwd: PathBuf::from("/tmp"),
+        command: cmd,
+        prompt: None,
+    };
+    assert_eq!(c.request(start).await, Response::Ok);
+    let lines = wait_for_log(&log, 3).await;
+    assert!(lines[2].contains("--session-id"), "{}", lines[2]);
+    assert!(!lines[2].contains("--resume"), "{}", lines[2]);
+    assert!(matches!(c.list().await[1].state, SlotState::Running { .. }));
+    // Only the running one is live in the ledger; the declined one is gone.
+    assert_eq!(live_slots(&d), vec![1]);
+}
+
+/// The last argv element of a stub log line.
+fn last_arg(line: &str) -> String {
+    line.split_once('|')
+        .unwrap()
+        .1
+        .rsplit(' ')
+        .next()
+        .unwrap()
+        .to_string()
+}
+
+#[tokio::test]
+async fn start_with_prompt_reaches_the_command() {
+    let dir = std::env::temp_dir().join(format!("ovs-prompt-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (bin, log) = stub_claude(&dir);
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    let start = Request::StartSlot {
+        id: 2,
+        label: "p".into(),
+        cwd: dir.clone(),
+        command: Some(vec![bin.to_string_lossy().into_owned()]),
+        // One word: the stub joins argv with spaces.
+        prompt: Some("hello".into()),
+    };
+    assert_eq!(c.request(start).await, Response::Ok);
+    let lines = wait_for_log(&log, 1).await;
+    assert_eq!(last_arg(&lines[0]), "hello");
+}
+
+#[tokio::test]
+async fn s0_started_fresh_gets_the_kickoff_last() {
+    let dir = std::env::temp_dir().join(format!("ovs-kick-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (bin, log) = stub_claude(&dir);
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    let start = Request::StartSlot {
+        id: 0,
+        label: String::new(),
+        cwd: dir.clone(),
+        command: Some(vec![bin.to_string_lossy().into_owned()]),
+        prompt: None,
+    };
+    assert_eq!(c.request(start).await, Response::Ok);
+    let lines = wait_for_log(&log, 1).await;
+    // Kickoff ends in "what." so check the whole tail, not one word.
+    assert!(
+        lines[0].ends_with("propose who works on what."),
+        "{}",
+        lines[0]
+    );
+    assert!(
+        lines[0].contains("Run the start-of-day round:"),
+        "{}",
+        lines[0]
+    );
+    // The coordinator role, not the worker role, was written for S0.
+    let role = std::fs::read_to_string(d.state_dir.join("slots/S0/role.md")).unwrap();
+    assert!(role.contains("bd ready --json"), "{role}");
+    assert!(!role.contains("You are S0 of an Overseer team"), "{role}");
+}
+
+/// How many argv elements of a stub log line equal `arg`.
+fn count_arg(line: &str, arg: &str) -> usize {
+    line.split_once('|')
+        .unwrap()
+        .1
+        .split(' ')
+        .filter(|a| *a == arg)
+        .count()
+}
+
+/// Starts `id` with `command`, stops it, then starts it again with the
+/// command `list` reports, as the GUI's Restart and Start dialog do. Returns
+/// the second argv line and the slot info after the second start.
+async fn restart_with_listed_command(
+    c: &mut Client,
+    log: &std::path::Path,
+    id: u8,
+    command: Vec<String>,
+    cwd: &std::path::Path,
+) -> (String, SlotInfo) {
+    let start = |command| Request::StartSlot {
+        id,
+        label: "again".into(),
+        cwd: cwd.to_path_buf(),
+        command: Some(command),
+        prompt: None,
+    };
+    assert_eq!(c.request(start(command.clone())).await, Response::Ok);
+    wait_for_log(log, 1).await;
+    assert_eq!(c.list().await[id as usize].command, Some(command.clone()));
+    assert_eq!(c.request(Request::StopSlot { id }).await, Response::Ok);
+    c.exited_event(id).await;
+    let listed = c.list().await[id as usize]
+        .command
+        .clone()
+        .expect("exited slot keeps its command");
+    assert_eq!(listed, command, "exited slot reports the base command");
+    assert_eq!(c.request(start(listed)).await, Response::Ok);
+    let lines = wait_for_log(log, 2).await;
+    let info = c.list().await.remove(id as usize);
+    (lines[1].clone(), info)
+}
+
+#[tokio::test]
+async fn restart_with_listed_command_does_not_double_the_flags() {
+    let dir = std::env::temp_dir().join(format!("ovs-again-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (bin, log) = stub_claude(&dir);
+    let base = vec![bin.to_string_lossy().into_owned()];
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    let (line, info) = restart_with_listed_command(&mut c, &log, 2, base.clone(), &dir).await;
+    for flag in ["--session-id", "--name", "--settings"] {
+        assert_eq!(count_arg(&line, flag), 1, "{flag} in {line}");
+    }
+    assert_eq!(info.command, Some(base.clone()));
+    let ledger = overseer_daemon::ledger::Ledger::open(&d.state_dir.join("overseer.db")).unwrap();
+    let live = ledger.live_at_shutdown().unwrap();
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].command, base, "ledger keeps the base command");
+}
+
+#[tokio::test]
+async fn s0_restart_with_listed_command_gets_one_kickoff() {
+    let dir = std::env::temp_dir().join(format!("ovs-again0-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (bin, log) = stub_claude(&dir);
+    let base = vec![bin.to_string_lossy().into_owned()];
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    let (line, info) = restart_with_listed_command(&mut c, &log, 0, base.clone(), &dir).await;
+    let kickoff = overseer_daemon::launch::kickoff_prompt(&d.state_dir).unwrap();
+    assert!(line.ends_with(&format!(" -- {kickoff}")), "{line}");
+    assert_eq!(count_arg(&line, "--"), 1, "{line}");
+    assert_eq!(line.matches(kickoff.as_str()).count(), 1, "{line}");
+    for flag in ["--session-id", "--name", "--settings"] {
+        assert_eq!(count_arg(&line, flag), 1, "{flag} in {line}");
+    }
+    assert_eq!(info.command, Some(base.clone()));
+    let ledger = overseer_daemon::ledger::Ledger::open(&d.state_dir.join("overseer.db")).unwrap();
+    assert_eq!(ledger.live_at_shutdown().unwrap()[0].command, base);
+}
+
+#[tokio::test]
+async fn resume_without_a_saved_conversation_starts_fresh_under_the_same_id() {
+    let dir = std::env::temp_dir().join(format!("ovs-unsaved-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (bin, log) = stub_claude(&dir);
+    let cwd = dir.join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    // Started and never used: claude saved nothing for this session.
+    let d = start_daemon_with(temp_socket(), claude_env(&dir, false)).await;
+    let mut c = Client::connect(&d.socket).await;
+    let start = Request::StartSlot {
+        id: 1,
+        label: "unused".into(),
+        cwd: cwd.clone(),
+        command: Some(vec![bin.to_string_lossy().into_owned()]),
+        prompt: None,
+    };
+    assert_eq!(c.request(start).await, Response::Ok);
+    let first = wait_for_log(&log, 1).await;
+    let session_id = arg_after(&first[0], "--session-id").expect("fresh start has an id");
+    drop(c);
+
+    let socket = shutdown(d).await;
+    let d = start_daemon_with(socket, claude_env(&dir, false)).await;
+    let mut c = Client::connect(&d.socket).await;
+    assert!(matches!(
+        c.list().await[1].state,
+        SlotState::Resumable { .. }
+    ));
+    assert_eq!(c.request(Request::ResumeSlot { id: 1 }).await, Response::Ok);
+    let lines = wait_for_log(&log, 2).await;
+    assert!(!lines[1].contains("--resume"), "{}", lines[1]);
+    assert_eq!(
+        arg_after(&lines[1], "--session-id").as_deref(),
+        Some(session_id.as_str())
+    );
+    assert!(matches!(c.list().await[1].state, SlotState::Running { .. }));
+    let _ = std::fs::remove_dir_all(&dir);
 }

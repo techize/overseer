@@ -1,0 +1,1 @@
+Run the start-of-day round: check beads and Jira, check the board, and propose who works on what.

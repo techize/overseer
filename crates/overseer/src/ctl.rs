@@ -22,12 +22,17 @@ pub enum CtlCmd {
         cwd: PathBuf,
         #[arg(long, default_value = "")]
         label: String,
+        /// First prompt, passed to claude at launch.
+        #[arg(long, allow_hyphen_values = true)]
+        prompt: Option<String>,
         /// Command to run instead of the daemon default.
         #[arg(last = true)]
         cmd: Vec<String>,
     },
     /// Stop the session in a slot.
     Stop { n: SlotId },
+    /// Continue a session that was running when the daemon stopped.
+    Resume { n: SlotId },
     /// Type text into a slot, followed by Enter.
     Send { n: SlotId, text: String },
     /// Stop the daemon and every session.
@@ -101,6 +106,7 @@ pub fn format_slot(s: &SlotInfo) -> String {
         SlotState::Running { pid, .. } => format!("{name}  running  pid {pid}"),
         SlotState::Exited { code: Some(c), .. } => format!("{name}  exited  code {c}"),
         SlotState::Exited { code: None, .. } => format!("{name}  exited"),
+        SlotState::Resumable { .. } => format!("{name}  resumable"),
     };
     if let Some(cwd) = &s.cwd {
         line.push_str(&format!("  {}", tilde(cwd)));
@@ -132,7 +138,13 @@ pub async fn run(cmd: CtlCmd) -> anyhow::Result<()> {
             Response::Error { message } => bail!("{message}"),
             other => bail!("unexpected reply: {other:?}"),
         },
-        CtlCmd::Start { n, cwd, label, cmd } => {
+        CtlCmd::Start {
+            n,
+            cwd,
+            label,
+            prompt,
+            cmd,
+        } => {
             let cwd = std::path::absolute(&cwd).context("resolve --cwd")?;
             let command = (!cmd.is_empty()).then_some(cmd);
             expect_ok(
@@ -142,11 +154,13 @@ pub async fn run(cmd: CtlCmd) -> anyhow::Result<()> {
                         label,
                         cwd,
                         command,
+                        prompt,
                     })
                     .await?,
             )
         }
         CtlCmd::Stop { n } => expect_ok(client.request(Request::StopSlot { id: n }).await?),
+        CtlCmd::Resume { n } => expect_ok(client.request(Request::ResumeSlot { id: n }).await?),
         CtlCmd::Send { n, text } => {
             client.send_input(n, format!("{text}\r").as_bytes()).await?;
             // Input is fire-and-forget; a round trip proves the daemon read it
@@ -160,5 +174,47 @@ pub async fn run(cmd: CtlCmd) -> anyhow::Result<()> {
             )
         }
         CtlCmd::Shutdown => expect_ok(client.request(Request::Shutdown).await?),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(clap::Parser)]
+    struct Cli {
+        #[command(subcommand)]
+        cmd: CtlCmd,
+    }
+
+    #[test]
+    fn prompt_may_start_with_a_dash() {
+        use clap::Parser;
+        for p in ["- fix login", "--help me"] {
+            let cli =
+                Cli::try_parse_from(["t", "start", "3", "--cwd", "/tmp", "--prompt", p]).unwrap();
+            match cli.cmd {
+                CtlCmd::Start { prompt, .. } => assert_eq!(prompt.as_deref(), Some(p)),
+                _ => panic!("not start"),
+            }
+        }
+    }
+
+    #[test]
+    fn resumable_status_line() {
+        let s = SlotInfo {
+            id: 3,
+            label: "eks".into(),
+            cwd: None,
+            command: None,
+            state: SlotState::Resumable {
+                session_id: "abc".into(),
+                at: 1,
+            },
+            cols: 80,
+            rows: 24,
+            activity: None,
+        };
+        assert_eq!(format_slot(&s), "S3  resumable  eks");
     }
 }

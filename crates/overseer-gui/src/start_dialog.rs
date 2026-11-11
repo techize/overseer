@@ -184,8 +184,9 @@ pub fn expand_tilde(s: &str, home: Option<&Path>) -> PathBuf {
 }
 
 /// Label, folder and command the dialog starts with: those of `last` when
-/// it ran before, else an empty label and the defaults.
-pub fn initial_fields(last: Option<&SlotInfo>, home: Option<&Path>) -> [String; 3] {
+/// it ran before, else the defaults, with the label `coordinator` for S0
+/// and empty for the others.
+pub fn initial_fields(slot: SlotId, last: Option<&SlotInfo>, home: Option<&Path>) -> [String; 3] {
     match last.and_then(|i| Some((i, i.cwd.as_deref()?))) {
         Some((info, cwd)) => [
             info.label.clone(),
@@ -194,7 +195,10 @@ pub fn initial_fields(last: Option<&SlotInfo>, home: Option<&Path>) -> [String; 
                 .as_ref()
                 .map_or_else(|| DEFAULT_COMMAND.to_string(), |c| c.join(" ")),
         ],
-        None => [String::new(), DEFAULT_CWD.into(), DEFAULT_COMMAND.into()],
+        None => {
+            let label = if slot == 0 { "coordinator" } else { "" };
+            [label.into(), DEFAULT_CWD.into(), DEFAULT_COMMAND.into()]
+        }
     }
 }
 
@@ -277,6 +281,7 @@ pub fn build_request(
         label,
         cwd: path,
         command,
+        prompt: None,
     })
 }
 
@@ -322,7 +327,7 @@ impl StartDialog {
         cx: &mut Context<Self>,
     ) -> Self {
         let home = std::env::var_os("HOME").map(PathBuf::from);
-        let [label, cwd, command] = initial_fields(last, home.as_deref());
+        let [label, cwd, command] = initial_fields(slot, last, home.as_deref());
         StartDialog {
             slot,
             client,
@@ -594,9 +599,10 @@ mod tests {
             },
             cols: 80,
             rows: 24,
+            activity: None,
         };
         assert_eq!(
-            initial_fields(Some(&last), home),
+            initial_fields(2, Some(&last), home),
             [
                 "eks".to_string(),
                 "~/Repos/eks".into(),
@@ -604,13 +610,15 @@ mod tests {
             ]
         );
         last.command = None;
-        assert_eq!(initial_fields(Some(&last), home)[2], DEFAULT_COMMAND);
+        assert_eq!(initial_fields(2, Some(&last), home)[2], DEFAULT_COMMAND);
         last.cwd = None;
         assert_eq!(
-            initial_fields(Some(&last), home),
+            initial_fields(2, Some(&last), home),
             [String::new(), DEFAULT_CWD.into(), DEFAULT_COMMAND.into()]
         );
-        assert_eq!(initial_fields(None, home)[1], "~/Repos/2ndBrain");
+        assert_eq!(initial_fields(2, None, home)[1], "~/Repos/2ndBrain");
+        assert_eq!(initial_fields(0, None, home)[0], "coordinator");
+        assert_eq!(initial_fields(2, None, home)[0], "");
     }
 
     #[test]
@@ -715,6 +723,7 @@ mod tests {
                 label: "2ndBrain".into(),
                 cwd: "/Users/me/Repos/2ndBrain".into(),
                 command: None,
+                prompt: None,
             }
         );
     }
@@ -729,6 +738,7 @@ mod tests {
                 label: "eks".into(),
                 cwd: "/tmp".into(),
                 command: Some(vec!["claude".into(), "--resume".into()]),
+                prompt: None,
             }
         );
     }

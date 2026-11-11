@@ -20,6 +20,7 @@ fn info(id: SlotId) -> Event {
         state: SlotState::Empty,
         cols: 80,
         rows: 24,
+        activity: None,
     })
 }
 

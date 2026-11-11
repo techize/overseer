@@ -14,6 +14,7 @@ use tokio::sync::{broadcast, mpsc, watch, Notify};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::env::{BaseEnv, EnvSource};
+use crate::ledger::Ledger;
 use crate::manager::{valid_id, Attachment, SlotManager};
 use crate::slot::CatchUp;
 
@@ -30,6 +31,10 @@ pub struct DaemonConfig {
     pub default_command: Vec<String>,
     /// Where sessions get their base environment.
     pub env: EnvSource,
+    /// Holds `overseer.db`, `slots/` (generated claude files) and `roles/`.
+    pub state_dir: PathBuf,
+    /// The binary the generated hooks call (`<hook_program> hook <Event>`).
+    pub hook_program: PathBuf,
 }
 
 /// `run` found another daemon serving the socket. Not a failure: the daemon
@@ -77,9 +82,19 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
     // StartSlot waits for it.
     let env = BaseEnv::start(&cfg.env);
     let (events, _) = broadcast::channel::<Event>(EVENT_CHANNEL_CAP);
-    let manager: Manager = Arc::new(Mutex::new(
-        SlotManager::new(cfg.default_command, events).with_env(env.clone()),
-    ));
+    let db = cfg.state_dir.join("overseer.db");
+    let ledger = match Ledger::open(&db) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!("ledger {} unusable, not persisting: {e:#}", db.display());
+            Ledger::in_memory()
+        }
+    };
+    let mut mgr = SlotManager::new(cfg.default_command, events)
+        .with_env(env.clone())
+        .with_launch(cfg.state_dir, cfg.hook_program, Arc::new(ledger));
+    mgr.restore();
+    let manager: Manager = Arc::new(Mutex::new(mgr));
     let shutdown = Arc::new(Notify::new());
     let mut conns = JoinSet::new();
 
@@ -263,7 +278,13 @@ async fn handle_conn(
                 Some(f) => {
                     // The first starts after launch wait for the login
                     // shell's environment (bounded by its timeout).
-                    if matches!(&f, Frame::Request { req: Request::StartSlot { .. }, .. }) {
+                    if matches!(
+                        &f,
+                        Frame::Request {
+                            req: Request::StartSlot { .. } | Request::ResumeSlot { .. },
+                            ..
+                        }
+                    ) {
                         env.wait().await;
                     }
                     handle_frame(f, &manager, &outbox, &shutdown, &mut streams)
@@ -351,11 +372,20 @@ fn handle_request(
             label,
             cwd,
             command,
-        } => match manager.lock().unwrap().start(id, label, &cwd, command) {
+            prompt,
+        } => match manager
+            .lock()
+            .unwrap()
+            .start(id, label, &cwd, command, prompt)
+        {
             Ok(()) => Response::Ok,
             Err(m) => err(m),
         },
         Request::StopSlot { id } => match manager.lock().unwrap().stop(id) {
+            Ok(()) => Response::Ok,
+            Err(m) => err(m),
+        },
+        Request::ResumeSlot { id } => match manager.lock().unwrap().resume(id) {
             Ok(()) => Response::Ok,
             Err(m) => err(m),
         },
@@ -383,6 +413,12 @@ fn handle_request(
             None => err(format!("{} is empty", slot_name(id))),
         },
         Request::Shutdown => Response::Ok,
+        // Always Ok: a hook runs inside Claude and must never see a failure
+        // because of the daemon's state.
+        Request::Hook(ev) => {
+            manager.lock().unwrap().hook(&ev);
+            Response::Ok
+        }
     }
 }
 
