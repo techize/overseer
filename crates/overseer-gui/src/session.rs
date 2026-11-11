@@ -4,14 +4,20 @@
 //! Also the pure rules behind it: tab and panel text, when a slot's
 //! `TerminalView` is kept or dropped, and the restart sequence (stop, wait
 //! for Exited, start again with the same label, cwd and command).
+//!
+//! The Owns box lists the work the slot owns with a Release button each,
+//! the slot's notices, and Send kickoff, which types the daemon's kickoff
+//! prompt into an idle session.
 
 use std::path::{Path, PathBuf};
 
 use gpui::{div, prelude::*, px, relative, rgb, Context, FontWeight, SharedString, Window};
-use overseer_proto::{slot_name, ActivityKind, Request, SlotId, SlotInfo, SlotState};
+use overseer_proto::{
+    slot_name, ActivityKind, Notice, Request, SlotId, SlotInfo, SlotState, WorkView,
+};
 
 use crate::app::{colors, OverseerApp};
-use crate::board::{activity_detail, activity_state, format_elapsed, slot_title, tilde};
+use crate::board::{activity_detail, activity_state, format_elapsed, owned_by, slot_title, tilde};
 
 // ---------------------------------------------------------------------------
 // Pure logic
@@ -120,6 +126,43 @@ pub fn panel_model(
     }
 }
 
+/// One line of the Owns box.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnsRow {
+    pub key: String,
+    pub title: String,
+    pub status: String,
+    /// The item has left the source's list but is still owned.
+    pub gone: bool,
+}
+
+/// What the Owns box lists for `slot`, in `owned_by` order.
+pub fn owns_rows(view: &WorkView, slot: SlotId) -> Vec<OwnsRow> {
+    owned_by(view, slot)
+        .into_iter()
+        .map(|i| OwnsRow {
+            key: i.key.clone(),
+            title: i.title.clone(),
+            status: i.status.clone(),
+            gone: !i.in_list,
+        })
+        .collect()
+}
+
+/// The notices addressed to `slot`.
+pub fn slot_notices(view: &WorkView, slot: SlotId) -> Vec<&Notice> {
+    view.notices.iter().filter(|n| n.slot == slot).collect()
+}
+
+/// Send kickoff types into the session, so only while it waits for input.
+pub fn can_kickoff(info: &SlotInfo) -> bool {
+    matches!(info.state, SlotState::Running { .. })
+        && info
+            .activity
+            .as_ref()
+            .is_some_and(|a| a.kind == ActivityKind::Idle)
+}
+
 /// Identifies one run of a slot: the pid and start time while running.
 pub type Incarnation = Option<(u32, i64)>;
 
@@ -191,7 +234,11 @@ pub fn restart_on_change(plan: &RestartPlan, info: &SlotInfo) -> Option<Request>
 // Rendering
 // ---------------------------------------------------------------------------
 
-fn button(id: &'static str, text: &'static str, enabled: bool) -> gpui::Stateful<gpui::Div> {
+fn button(
+    id: impl Into<gpui::ElementId>,
+    text: &'static str,
+    enabled: bool,
+) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .px_2()
@@ -350,13 +397,83 @@ impl OverseerApp {
                     .children(rows)
                     .child(buttons),
             )
-            .child(placeholder("Owns", "phase 3"))
-            .child(placeholder("Holds", "phase 3"))
+            .child(self.render_owns(id, cx))
+            .child(placeholder("Holds", "phase 4"))
             .child(placeholder("Progress", "phase 4"))
             .children(
                 self.status
                     .clone()
                     .map(|s| div().text_sm().text_color(rgb(colors::ORANGE)).child(s)),
+            )
+    }
+
+    fn render_owns(&self, id: SlotId, cx: &mut Context<Self>) -> impl IntoElement {
+        let rows: Vec<_> = owns_rows(&self.work, id)
+            .into_iter()
+            .enumerate()
+            .map(|(n, row)| {
+                let key = row.key.clone();
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_sm()
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child(row.key))
+                    .child(div().text_color(rgb(colors::MUTED)).child(row.status))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .flex()
+                            .flex_col()
+                            .child(div().truncate().child(row.title))
+                            .children(row.gone.then(|| {
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(colors::ORANGE))
+                                    .child("not in the current list")
+                            })),
+                    )
+                    .child(button(("release", n), "Release", true).on_click(
+                        cx.listener(move |this, _, _, cx| this.release_item(key.clone(), cx)),
+                    ))
+            })
+            .collect();
+        let notices: Vec<_> = slot_notices(&self.work, id)
+            .into_iter()
+            .map(|n| {
+                div()
+                    .text_sm()
+                    .text_color(rgb(colors::ORANGE))
+                    .child(format!("{} {}", crate::board::local_hhmm(n.at), n.text))
+            })
+            .collect();
+        let has_notices = !notices.is_empty();
+        let empty = rows.is_empty();
+        let kickoff = can_kickoff(&self.slots[id as usize]);
+        panel_box("Owns")
+            .children(empty.then(|| {
+                div()
+                    .text_sm()
+                    .text_color(rgb(colors::TEXT_DIM))
+                    .child("Nothing assigned")
+            }))
+            .children(rows)
+            .children(notices)
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .pt_1()
+                    .child(
+                        button("kickoff", "Send kickoff", kickoff).when(kickoff, |b| {
+                            b.on_click(cx.listener(move |this, _, _, cx| this.send_kickoff(id, cx)))
+                        }),
+                    )
+                    .children(has_notices.then(|| {
+                        button("clear-notices", "Clear", true)
+                            .on_click(cx.listener(move |this, _, _, cx| this.clear_notices(id, cx)))
+                    })),
             )
     }
 
@@ -645,6 +762,75 @@ mod tests {
         assert!(matches!(first, Request::StartSlot { id: 2, .. }));
         assert!(plan.is_none());
         assert!(restart_begin(&info(SlotState::Empty)).is_none());
+    }
+
+    #[test]
+    fn owns_rows_mark_items_off_the_list() {
+        use overseer_proto::{ItemKind, WorkItem};
+        let item = |key: &str, kind, owner, in_list| WorkItem {
+            key: key.into(),
+            kind,
+            title: format!("title of {key}"),
+            status: "In Progress".into(),
+            priority: None,
+            parent: None,
+            owner,
+            in_list,
+            folder: None,
+        };
+        let view = WorkView {
+            items: vec![
+                item("ov-3", ItemKind::Bead, Some(2), true),
+                item("DEMO-12", ItemKind::Ticket, Some(2), false),
+                item("DEMO-7", ItemKind::Ticket, Some(4), true),
+            ],
+            sources: vec![],
+            notices: vec![
+                Notice {
+                    slot: 2,
+                    at: 5,
+                    text: "DEMO-9 moved to S4".into(),
+                },
+                Notice {
+                    slot: 4,
+                    at: 6,
+                    text: "other".into(),
+                },
+            ],
+        };
+        let rows = owns_rows(&view, 2);
+        assert_eq!(
+            rows.iter()
+                .map(|r| (r.key.as_str(), r.gone))
+                .collect::<Vec<_>>(),
+            [("DEMO-12", true), ("ov-3", false)]
+        );
+        assert_eq!(rows[0].status, "In Progress");
+        let notes = slot_notices(&view, 2);
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].text, "DEMO-9 moved to S4");
+    }
+
+    #[test]
+    fn kickoff_only_when_idle() {
+        use overseer_proto::Activity;
+        let mut i = info(RUN);
+        assert!(!can_kickoff(&i), "no activity reported");
+        for (kind, ok) in [
+            (ActivityKind::Idle, true),
+            (ActivityKind::Working, false),
+            (ActivityKind::NeedsYou, false),
+        ] {
+            i.activity = Some(Activity {
+                kind,
+                since: 1,
+                now_doing: None,
+                reason: None,
+            });
+            assert_eq!(can_kickoff(&i), ok);
+        }
+        i.state = SlotState::Exited { code: None, at: 2 };
+        assert!(!can_kickoff(&i));
     }
 
     #[test]

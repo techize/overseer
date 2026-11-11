@@ -23,7 +23,9 @@ use gpui::{
     actions, div, prelude::*, rgb, App, Context, Entity, FocusHandle, Focusable, KeyBinding,
     Subscription, Task, Window,
 };
-use overseer_proto::{Client, Event, Frame, Request, Response, SlotId, SlotInfo, SlotState};
+use overseer_proto::{
+    Client, Event, Frame, Request, Response, SlotId, SlotInfo, SlotState, WorkView,
+};
 
 use crate::board::Dir;
 use crate::session::RestartPlan;
@@ -187,6 +189,15 @@ pub fn now_secs() -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
+/// The work view before the daemon's first answer.
+pub fn empty_work() -> WorkView {
+    WorkView {
+        items: Vec::new(),
+        sources: Vec::new(),
+        notices: Vec::new(),
+    }
+}
+
 fn empty_slots() -> Vec<SlotInfo> {
     (0..7)
         .map(|id| SlotInfo {
@@ -212,6 +223,8 @@ pub struct OverseerApp {
     client: Arc<Client>,
     theme: Theme,
     pub(crate) slots: Vec<SlotInfo>,
+    /// Work items, owners, source health and notices from the daemon.
+    pub(crate) work: WorkView,
     pub(crate) screen: Screen,
     pub(crate) selected: SlotId,
     pub(crate) home: Option<PathBuf>,
@@ -266,11 +279,17 @@ impl OverseerApp {
                 }
             }
         });
-        // The list comes back through the event stream (a marked reply), so
-        // it is applied in order with the events around it.
+        // The lists come back through the event stream (marked replies), so
+        // they are applied in order with the events around them.
         let lister = client.clone();
         cx.spawn(async move |this, cx| {
-            if let Err(e) = lister.request_marked(Request::ListSlots, |_| true).await {
+            let mut result = lister.request_marked(Request::ListSlots, |_| true).await;
+            if result.is_ok() {
+                result = lister
+                    .request_marked(Request::ListWorkItems, |_| true)
+                    .await;
+            }
+            if let Err(e) = result {
                 let _ = this.update(cx, |this, cx| {
                     this.status = Some(format!("{} ({e:#})", crate::terminal_view::LOST_DAEMON));
                     cx.notify();
@@ -284,6 +303,7 @@ impl OverseerApp {
             client,
             theme,
             slots: empty_slots(),
+            work: empty_work(),
             screen: Screen::Board,
             selected: 1,
             home: std::env::var_os("HOME").map(PathBuf::from),
@@ -315,8 +335,14 @@ impl OverseerApp {
                     self.apply_info(info, true, window, cx);
                 }
             }
-            // Work items are not shown yet.
-            Frame::Event(Event::WorkChanged(_)) => {}
+            Frame::Event(Event::WorkChanged(view))
+            | Frame::Response {
+                resp: Response::Work(view),
+                ..
+            } => {
+                self.work = view;
+                cx.notify();
+            }
             _ => {}
         }
     }
@@ -451,6 +477,52 @@ impl OverseerApp {
         self.send(Request::ResumeSlot { id }, cx);
         self.go_session(id, window, cx);
     }
+
+    /// Gives up the slot's hold on a work item. The new state comes back as
+    /// a `WorkChanged` event.
+    pub(crate) fn release_item(&mut self, key: String, cx: &mut Context<Self>) {
+        self.status = None;
+        self.send(Request::Release { key }, cx);
+    }
+
+    pub(crate) fn clear_notices(&mut self, slot: SlotId, cx: &mut Context<Self>) {
+        self.status = None;
+        self.send(Request::ClearNotices { slot }, cx);
+    }
+
+    /// Asks the daemon for the slot's kickoff prompt and types it into the
+    /// session, then presses Return.
+    pub(crate) fn send_kickoff(&mut self, slot: SlotId, cx: &mut Context<Self>) {
+        self.status = None;
+        let client = self.client.clone();
+        cx.spawn(async move |this, cx| {
+            let err = match client.request(Request::Kickoff { slot }).await {
+                Ok(Response::Text { text }) => {
+                    let typed = match client.send_input(slot, text.as_bytes()).await {
+                        Ok(()) => client.send_input(slot, b"\r").await,
+                        Err(e) => Err(e),
+                    };
+                    typed
+                        .err()
+                        .map(|e| format!("{} ({e})", crate::terminal_view::LOST_DAEMON))
+                }
+                Ok(Response::Error { message }) => Some(message),
+                Ok(other) => Some(format!("unexpected reply to kickoff: {other:?}")),
+                Err(e) => Some(format!("{} ({e:#})", crate::terminal_view::LOST_DAEMON)),
+            };
+            if let Some(e) = err {
+                let _ = this.update(cx, |this, cx| {
+                    this.status = Some(e);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// The `+ assign` button on an empty card. The work-item picker it opens
+    /// is the next piece of work; until then the click does nothing.
+    pub(crate) fn open_picker(&mut self, _slot: SlotId, _cx: &mut Context<Self>) {}
 
     /// Stop, wait for Exited, then start with the same label, cwd and
     /// command. The new run replaces the terminal view (see `apply_info`).
