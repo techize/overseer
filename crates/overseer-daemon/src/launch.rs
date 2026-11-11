@@ -71,20 +71,28 @@ fn ensure_template(
     if have == current {
         return Ok(path);
     }
+    // Best effort from here: the file on disk is usable either way.
     if previous.contains(&have) {
-        replace_file(&path, default)?;
-        tracing::info!(
-            "upgraded role template {} to the current default",
-            path.display()
-        );
+        match replace_file(&path, default) {
+            Ok(()) => tracing::info!(
+                "upgraded role template {} to the current default",
+                path.display()
+            ),
+            Err(e) => tracing::warn!("cannot upgrade role template {}: {e}", path.display()),
+        }
     } else {
         let new = roles.join(format!("{name}.new"));
-        replace_file(&new, default)?;
-        tracing::warn!(
-            "role template {} was edited; the current default is in {}",
-            path.display(),
-            new.display()
-        );
+        let up_to_date = std::fs::read_to_string(&new).is_ok_and(|t| t == default);
+        if !up_to_date {
+            match replace_file(&new, default) {
+                Ok(()) => tracing::warn!(
+                    "role template {} was edited; the current default is in {}",
+                    path.display(),
+                    new.display()
+                ),
+                Err(e) => tracing::warn!("cannot write {}: {e}", new.display()),
+            }
+        }
     }
     Ok(path)
 }
@@ -92,7 +100,9 @@ fn ensure_template(
 /// Writes `text` to `path` through a temp file in the same folder.
 fn replace_file(path: &Path, text: &str) -> io::Result<()> {
     let mut tmp = path.as_os_str().to_owned();
-    tmp.push(format!(".tmp{}", std::process::id()));
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    tmp.push(format!(".tmp{}-{n}", std::process::id()));
     let tmp = PathBuf::from(tmp);
     std::fs::write(&tmp, text)?;
     std::fs::rename(&tmp, path).inspect_err(|_| {
@@ -227,8 +237,8 @@ fn settings_json(overseer_bin: &Path) -> String {
 
 /// Writes `slots/S<n>/settings.json` and `role.md` under `state_dir`,
 /// replacing both on every start. The role is copied from
-/// `roles/coordinator.md` for S0 and `roles/worker.md` otherwise (created from the compiled-in default if missing, never
-/// overwritten) with `{slot}`, `{label}` and `{overseer}` filled in.
+/// `roles/coordinator.md` for S0 and `roles/worker.md` otherwise (created from the compiled-in default if missing;
+/// an unedited older default is upgraded, an edited file is kept) with `{slot}`, `{label}` and `{overseer}` filled in.
 pub fn write_slot_files(
     state_dir: &Path,
     slot: SlotId,
@@ -461,6 +471,39 @@ mod tests {
             std::fs::read_to_string(roles.join("x.md.new")).unwrap(),
             "new default\n"
         );
+    }
+
+    #[test]
+    fn read_only_roles_dir_with_edited_file_still_works() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp("ro");
+        let roles = dir.join("roles");
+        std::fs::create_dir_all(&roles).unwrap();
+        std::fs::write(roles.join("x.md"), "mine").unwrap();
+        std::fs::write(roles.join("y.md"), "old").unwrap();
+        std::fs::set_permissions(&roles, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let edited = ensure_template(&roles, "x.md", "new\n", &[1]);
+        let old = ensure_template(&roles, "y.md", "new\n", &[text_hash("old")]);
+        std::fs::set_permissions(&roles, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(std::fs::read_to_string(edited.unwrap()).unwrap(), "mine");
+        assert_eq!(std::fs::read_to_string(old.unwrap()).unwrap(), "old");
+    }
+
+    #[test]
+    fn temp_names_are_unique() {
+        let dir = temp("tmpnames");
+        let p = dir.join("f");
+        // Many concurrent writers of one file never trip over a shared temp.
+        std::thread::scope(|sc| {
+            for _ in 0..8 {
+                sc.spawn(|| {
+                    for _ in 0..50 {
+                        replace_file(&p, "x").unwrap();
+                    }
+                });
+            }
+        });
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "x");
     }
 
     #[test]
