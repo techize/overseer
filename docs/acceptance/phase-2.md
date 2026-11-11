@@ -79,7 +79,7 @@ a small client (`ListSlots` and `SlotChanged` events) and the screen through
 | R2 | A resumed session gets the Overseer flags | Same run as R1, read the stub's argv | `--settings`, `--append-system-prompt-file` and `--name` are present next to `--resume` | Verified 2026-11-10: `[--dangerously-skip-permissions] [--resume] [<id>] [--name] [S2 flags] [--settings] [.../settings.json] [--append-system-prompt-file] [.../role.md]` |
 | R3 | `ctl resume` on a slot that is not resumable | `ctl resume 5` | Clear error, nothing starts | Verified 2026-11-10: `overseer: S5 is not resumable` |
 | R4 | Stop on a resumable slot drops the offer | Stub `claude` in S3, `ctl stop 3`, `ctl status`, then `ctl shutdown` and start the daemon again, twice, `ctl status` after each | S3 is empty after each restart and never `resumable` | Verified 2026-11-10: `ctl status` right after the stop showed `S3  exited` (the stop was of a running slot), the ledger row `3\|9002d721-...\|1794315758` had a non-empty exited time, and after restart 1 and restart 2 `S3  empty`. A slot stopped while it was already resumable was only checked by `ctl status` showing `S3  empty` on the first run, and by the server test `start_and_stop_on_a_resumable_slot` |
-| R5 | Real resume with the installed agent | Real claude in S2, talk to it, in Terminal (not as a slot command, where `$(...)` is not expanded) `launchctl kickstart -k gui/$(id -u)/uk.co.techize.overseer`, `overseer ctl status`, then Resume on the card (or `r`, or `ctl resume 2`) | Card is a grey `Resumable` with a Resume button; Resume on the card and `r` both open S2's session screen, and resuming shows the earlier conversation in S2 with its terminal focused | 2026-11-11: not run. The kickstart command was entered as a slot command, where `$UID` is not expanded, and launchctl rejected the target. The step now says to run it in Terminal with `$(id -u)` |
+| R5 | Real resume with the installed agent | Real claude in S2, talk to it, in Terminal (not as a slot command, where `$(...)` is not expanded) `launchctl kickstart -k gui/$(id -u)/uk.co.techize.overseer`, `overseer ctl status`, quit and reopen Overseer (the window does not reconnect, F9), then Resume on the card (or `r`, or `ctl resume 2`) | Card is a grey `Resumable` with a Resume button; Resume on the card and `r` both open S2's session screen, and resuming shows the earlier conversation in S2 with its terminal focused | 2026-11-11, partial. The first try was entered as a slot command, where `$UID` is not expanded, and launchctl rejected the target; the step now says Terminal and `$(id -u)`. Run again from Terminal: the daemon restarted cleanly three times, S1 and S3 (claude) came back `Resumable` with their session ids, and htop in S2 came back `Exited`. Resume needed the window reopened first (F9). S3 then resumed its earlier conversation. S1 exited at once with code 1, because it was started and never used, so claude had saved nothing and `--resume` said "No conversation found" (F10, fixed). `r` on S1 was not seen to work; Jonathan used the button. Retest S1 and `r` after `make install` |
 | R6 | `/clear` then restart resumes the new conversation | In a real claude slot run `/clear`, send a message, restart the daemon as R5, resume | The slot resumes the post-`/clear` conversation (the SessionStart hook updated the ledger id), not the first one | Verified 2026-11-10 (daemon side, real claude, temp daemon from `target/release` at 2a5a83f, see the note below the setup): after `/clear` the ledger id for S2 changed from `bf41724c-...` to `04d9e500-...`; after a restart `ctl resume 2` used `--resume 04d9e500-...` and the session recalled a codeword given only after the `/clear` |
 
 ## S0 coordinator
@@ -136,6 +136,19 @@ a small client (`ListSlots` and `SlotChanged` events) and the screen through
   the old window process running), banners appeared. If notifications fail
   after a reinstall, check `lsregister -dump | grep Overseer.app` for
   duplicates.
+- **F9 (finding): the window does not reconnect after a daemon restart.**
+  After the R5 kickstart the board kept the old slot states and showed
+  "Lost the connection to the daemon. Quit and reopen Overseer to
+  reconnect." Resume did nothing until the window was reopened. Reconnecting
+  on its own is a follow-up. A `Resumable` card's "Started" line also shows
+  the first start (18h earlier in this run), not the last time it ran.
+- **F10 (fixed): resuming a session that was never used failed.** Claude
+  saves a conversation only once it has a message, so `claude --resume <id>`
+  on an unused session exits with code 1 and "No conversation found". The
+  daemon now looks for `<id>.jsonl` under Claude's projects folder
+  (`$CLAUDE_CONFIG_DIR/projects`, else `~/.claude/projects`) and, when there
+  is none, starts the slot fresh with `--session-id <id>` instead. Covered by
+  `resume_without_a_saved_conversation_starts_fresh_under_the_same_id`.
 - **Environment note:** the temp state dir had to be under `/tmp` and not the
   session scratch directory, because the unix socket path would have been 112
   characters (the limit is 104).
