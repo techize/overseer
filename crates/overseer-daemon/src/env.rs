@@ -294,6 +294,9 @@ pub fn resolve_base_env(shell: &Path, timeout: Duration) -> Vars {
 pub enum EnvSource {
     /// The daemon's own environment, scrubbed. Used by tests.
     Inherit,
+    /// As `Inherit`, with these variables set on top. Used by tests that
+    /// must point a slot somewhere without touching the process environment.
+    InheritWith(Vec<(String, String)>),
     /// The user's login shell, read once in the background at startup.
     LoginShell,
 }
@@ -313,6 +316,14 @@ impl BaseEnv {
     pub fn start(source: &EnvSource) -> BaseEnv {
         match source {
             EnvSource::Inherit => BaseEnv::ready(own_env()),
+            EnvSource::InheritWith(extra) => {
+                let mut vars = own_env();
+                for (k, v) in extra {
+                    vars.retain(|(name, _)| name != k.as_str());
+                    vars.push((k.into(), v.into()));
+                }
+                BaseEnv::ready(vars)
+            }
             EnvSource::LoginShell => {
                 let (tx, rx) = watch::channel(None);
                 let shell = user_shell();

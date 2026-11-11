@@ -1,6 +1,7 @@
 //! What it takes to start `claude` the way Overseer wants: generated
 //! per-slot settings (the hooks), a role prompt and a session id.
 
+use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -78,6 +79,30 @@ pub enum Start {
     New(String),
     /// Continue the session with this id.
     Resume(String),
+}
+
+/// Claude's folder of saved conversations: `$CLAUDE_CONFIG_DIR/projects`,
+/// else `$HOME/.claude/projects`, read from the slots' environment.
+pub fn claude_projects_dir(env: &[(OsString, OsString)]) -> Option<PathBuf> {
+    let var = |name: &str| {
+        env.iter()
+            .find(|(k, v)| k == name && !v.is_empty())
+            .map(|(_, v)| PathBuf::from(v))
+    };
+    var("CLAUDE_CONFIG_DIR")
+        .or_else(|| var("HOME").map(|h| h.join(".claude")))
+        .map(|d| d.join("projects"))
+}
+
+/// True when a project folder under `projects` holds `<session_id>.jsonl`.
+/// Claude writes it only once the session has a message, so a slot started
+/// and never used has none, and `--resume` on it exits at once with "No
+/// conversation found". The folder name is Claude's encoding of the working
+/// directory, so every folder is checked rather than guessing the encoding.
+pub fn has_transcript(projects: &Path, session_id: &str) -> bool {
+    let file = format!("{session_id}.jsonl");
+    std::fs::read_dir(projects)
+        .is_ok_and(|dirs| dirs.flatten().any(|d| d.path().join(&file).is_file()))
 }
 
 /// True when the command is Claude Code (basename of `argv[0]` is `claude`).
@@ -189,6 +214,33 @@ pub fn claude_argv(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn projects_dir_prefers_claude_config_dir() {
+        let home = vec![(OsString::from("HOME"), OsString::from("/Users/j"))];
+        assert_eq!(
+            claude_projects_dir(&home),
+            Some(PathBuf::from("/Users/j/.claude/projects"))
+        );
+        let mut both = home.clone();
+        both.push(("CLAUDE_CONFIG_DIR".into(), "/cfg".into()));
+        assert_eq!(
+            claude_projects_dir(&both),
+            Some(PathBuf::from("/cfg/projects"))
+        );
+        assert_eq!(claude_projects_dir(&[]), None);
+    }
+
+    #[test]
+    fn transcript_is_found_in_any_project_folder() {
+        let projects = temp("transcript").join("projects");
+        assert!(!has_transcript(&projects, "abc"), "missing folder");
+        std::fs::create_dir_all(projects.join("-Users-j-repo")).unwrap();
+        assert!(!has_transcript(&projects, "abc"));
+        std::fs::write(projects.join("-Users-j-repo").join("abc.jsonl"), "{}").unwrap();
+        assert!(has_transcript(&projects, "abc"));
+        assert!(!has_transcript(&projects, "ab"));
+    }
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()

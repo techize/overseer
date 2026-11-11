@@ -39,11 +39,15 @@ async fn start_daemon() -> Daemon {
 }
 
 async fn start_daemon_at(socket: PathBuf) -> Daemon {
+    start_daemon_with(socket, overseer_daemon::EnvSource::Inherit).await
+}
+
+async fn start_daemon_with(socket: PathBuf, env: overseer_daemon::EnvSource) -> Daemon {
     let state_dir = socket.parent().unwrap().join("state");
     let cfg = DaemonConfig {
         socket: socket.clone(),
         default_command: vec![SCRIPT.to_string()],
-        env: overseer_daemon::EnvSource::Inherit,
+        env,
         state_dir: state_dir.clone(),
         hook_program: PathBuf::from("/bin/true"),
     };
@@ -710,7 +714,11 @@ fn stub_claude(dir: &std::path::Path) -> (PathBuf, PathBuf) {
     std::fs::write(
         &bin,
         format!(
-            "#!/bin/sh\nprintf '%s|%s\\n' \"$(pwd -P)\" \"$*\" >> '{}'\nexec sleep 30\n",
+            "#!/bin/sh\nprintf '%s|%s\\n' \"$(pwd -P)\" \"$*\" >> '{}'\n\
+             # Like claude, save the conversation for a new session id.\n\
+             if [ \"$1\" = --session-id ] && [ -n \"$STUB_SAVES\" ]; then\n\
+             mkdir -p \"$CLAUDE_CONFIG_DIR/projects/p\" && : > \"$CLAUDE_CONFIG_DIR/projects/p/$2.jsonl\"\n\
+             fi\nexec sleep 30\n",
             log.display()
         ),
     )
@@ -754,6 +762,20 @@ fn arg_after(line: &str, flag: &str) -> Option<String> {
     it.next().map(String::from)
 }
 
+/// Slots see their own Claude config folder; with `saves` the stub writes a
+/// transcript for each new session, as claude does once it has a message.
+fn claude_env(dir: &std::path::Path, saves: bool) -> overseer_daemon::EnvSource {
+    let mut vars = vec![(
+        "CLAUDE_CONFIG_DIR".to_string(),
+        dir.join("cfg").to_string_lossy().into_owned(),
+    )];
+    if saves {
+        vars.push(("STUB_SAVES".into(), "1".into()));
+    }
+    std::fs::create_dir_all(dir.join("cfg/projects")).unwrap();
+    overseer_daemon::EnvSource::InheritWith(vars)
+}
+
 #[tokio::test]
 async fn restart_offers_resume() {
     let dir = std::env::temp_dir().join(format!("ovs-resume-{}", std::process::id()));
@@ -763,7 +785,7 @@ async fn restart_offers_resume() {
     std::fs::create_dir_all(&cwd).unwrap();
     let cwd = cwd.canonicalize().unwrap();
 
-    let d = start_daemon().await;
+    let d = start_daemon_with(temp_socket(), claude_env(&dir, true)).await;
     let mut c = Client::connect(&d.socket).await;
     let start = Request::StartSlot {
         id: 3,
@@ -778,7 +800,7 @@ async fn restart_offers_resume() {
     drop(c);
 
     let socket = shutdown(d).await;
-    let d = start_daemon_at(socket).await;
+    let d = start_daemon_with(socket, claude_env(&dir, true)).await;
     let mut c = Client::connect(&d.socket).await;
     let info = c.list().await.remove(3);
     assert_eq!(
@@ -1055,4 +1077,45 @@ async fn s0_restart_with_listed_command_gets_one_kickoff() {
     assert_eq!(info.command, Some(base.clone()));
     let ledger = overseer_daemon::ledger::Ledger::open(&d.state_dir.join("overseer.db")).unwrap();
     assert_eq!(ledger.live_at_shutdown().unwrap()[0].command, base);
+}
+
+#[tokio::test]
+async fn resume_without_a_saved_conversation_starts_fresh_under_the_same_id() {
+    let dir = std::env::temp_dir().join(format!("ovs-unsaved-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (bin, log) = stub_claude(&dir);
+    let cwd = dir.join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    // Started and never used: claude saved nothing for this session.
+    let d = start_daemon_with(temp_socket(), claude_env(&dir, false)).await;
+    let mut c = Client::connect(&d.socket).await;
+    let start = Request::StartSlot {
+        id: 1,
+        label: "unused".into(),
+        cwd: cwd.clone(),
+        command: Some(vec![bin.to_string_lossy().into_owned()]),
+        prompt: None,
+    };
+    assert_eq!(c.request(start).await, Response::Ok);
+    let first = wait_for_log(&log, 1).await;
+    let session_id = arg_after(&first[0], "--session-id").expect("fresh start has an id");
+    drop(c);
+
+    let socket = shutdown(d).await;
+    let d = start_daemon_with(socket, claude_env(&dir, false)).await;
+    let mut c = Client::connect(&d.socket).await;
+    assert!(matches!(
+        c.list().await[1].state,
+        SlotState::Resumable { .. }
+    ));
+    assert_eq!(c.request(Request::ResumeSlot { id: 1 }).await, Response::Ok);
+    let lines = wait_for_log(&log, 2).await;
+    assert!(!lines[1].contains("--resume"), "{}", lines[1]);
+    assert_eq!(
+        arg_after(&lines[1], "--session-id").as_deref(),
+        Some(session_id.as_str())
+    );
+    assert!(matches!(c.list().await[1].state, SlotState::Running { .. }));
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -13,7 +13,10 @@ use tokio::sync::broadcast;
 
 use crate::activity::apply;
 use crate::env::BaseEnv;
-use crate::launch::{claude_argv, first_prompt, is_claude, write_slot_files, Start};
+use crate::launch::{
+    claude_argv, claude_projects_dir, first_prompt, has_transcript, is_claude, write_slot_files,
+    Start,
+};
 use crate::ledger::{Ledger, SessionRow};
 use crate::slot::Slot;
 
@@ -275,10 +278,24 @@ impl SlotManager {
         // choosing; anything else runs as given and has no session id.
         let mut session_id = String::new();
         let mut argv = command.clone();
+        let env = self.env.get();
         if let Some(launch) = self.launch.as_ref().filter(|_| is_claude(&command)) {
             let files = write_slot_files(&launch.state_dir, id, &label, &launch.hook_program)
                 .map_err(|e| format!("cannot write {} launch files: {e}", slot_name(id)))?;
             let how = match &resume {
+                // A session that never had a message has nothing to resume,
+                // and `--resume` would exit at once, so it starts fresh under
+                // the same id. If the folder cannot be found, resume as asked.
+                Some(sid)
+                    if claude_projects_dir(&env)
+                        .is_some_and(|p| p.is_dir() && !has_transcript(&p, sid)) =>
+                {
+                    tracing::info!(
+                        "{} session {sid} has no saved conversation; starting it fresh",
+                        slot_name(id)
+                    );
+                    Start::New(sid.clone())
+                }
                 Some(sid) => Start::Resume(sid.clone()),
                 None => Start::New(uuid::Uuid::new_v4().to_string()),
             };
@@ -292,7 +309,6 @@ impl SlotManager {
         let row_label = label.clone();
         let entry_session_id = session_id.clone();
         let (tx, monitor_rx) = broadcast::channel(OUTPUT_CHANNEL_CAP);
-        let env = self.env.get();
         let slot = Slot::spawn_in(id, label, cwd, &argv, DEFAULT_COLS, DEFAULT_ROWS, tx, &env)
             .map_err(|e| {
                 tracing::warn!("{} failed to start {:?}: {e:#}", slot_name(id), argv);
