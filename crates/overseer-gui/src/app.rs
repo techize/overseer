@@ -315,6 +315,8 @@ impl OverseerApp {
                     self.apply_info(info, true, window, cx);
                 }
             }
+            // Work items are not shown yet.
+            Frame::Event(Event::WorkChanged(_)) => {}
             _ => {}
         }
     }

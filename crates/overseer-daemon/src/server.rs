@@ -369,6 +369,12 @@ fn handle_request(
             Response::Ok
         }
         Request::ListSlots => Response::Slots(manager.lock().unwrap().list()),
+        Request::ListWorkItems
+        | Request::RefreshWorkItems
+        | Request::Assign { .. }
+        | Request::Release { .. }
+        | Request::Kickoff { .. }
+        | Request::ClearNotices { .. } => err("not supported yet".into()),
         Request::StartSlot {
             id,
             label,
