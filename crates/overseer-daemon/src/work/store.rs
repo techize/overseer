@@ -19,7 +19,7 @@ use overseer_proto::{
 };
 use regex::Regex;
 use tokio::sync::{broadcast, mpsc};
-use tokio::task::JoinHandle;
+use tokio::task::JoinSet;
 
 use super::ownership::{decide, promotions, Decision};
 use super::{compile_pattern, group, parse_beads, parse_jira, run_source, Bead, Ticket};
@@ -87,6 +87,14 @@ pub struct WorkStore {
     /// Bead label changes, run in order by one task (started on first use)
     /// so a quick assign and move cannot reach `bd` swapped.
     labels: Mutex<Option<mpsc::UnboundedSender<Label>>>,
+    /// Every task the store runs (polls, requested refreshes, the label
+    /// worker), so `shutdown` can stop them and the source children they own.
+    tasks: Mutex<Tasks>,
+}
+
+struct Tasks {
+    set: JoinSet<()>,
+    closed: bool,
 }
 
 fn status(name: &str, message: Option<String>) -> SourceStatus {
@@ -195,6 +203,10 @@ impl WorkStore {
             beads_turn: tokio::sync::Mutex::new(()),
             jira_turn: tokio::sync::Mutex::new(()),
             labels: Mutex::new(None),
+            tasks: Mutex::new(Tasks {
+                set: JoinSet::new(),
+                closed: false,
+            }),
         })
     }
 
@@ -529,7 +541,7 @@ impl WorkStore {
         let mut tx = self.labels.lock().unwrap_or_else(|e| e.into_inner());
         let tx = tx.get_or_insert_with(|| {
             let (tx, rx) = mpsc::unbounded_channel();
-            tokio::spawn(label_worker(Arc::downgrade(self), rx));
+            self.spawn(label_worker(Arc::downgrade(self), rx));
             tx
         });
         let _ = tx.send(label);
@@ -546,7 +558,10 @@ impl WorkStore {
                 format!("overseer:{}", slot_name(s)),
             ]);
         }
-        let vars = self.env.get();
+        // Right after start the login shell's PATH may not be in yet.
+        let mut env = self.env.clone();
+        env.wait().await;
+        let vars = env.get();
         if let Err(e) = run_source(&cmd, &self.beads_dir, SOURCE_TIMEOUT, &vars).await {
             let text = format!("could not label {} in beads: {e}", l.id);
             tracing::warn!("{text}");
@@ -560,24 +575,43 @@ impl WorkStore {
         }
     }
 
-    /// Polls each source on its own timer, once at start. The caller aborts
-    /// the tasks on shutdown.
-    pub fn start_polling(self: &Arc<Self>) -> Vec<JoinHandle<()>> {
-        [
+    /// Runs `fut` as one of the store's tasks. After `shutdown` it is
+    /// dropped instead.
+    pub fn spawn<F>(&self, fut: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        if tasks.closed {
+            return;
+        }
+        // Reap finished tasks so the set does not grow.
+        while tasks.set.try_join_next().is_some() {}
+        tasks.set.spawn(fut);
+    }
+
+    /// Stops every task the store runs. Dropping a running source kills its
+    /// child (`kill_on_drop`).
+    pub fn shutdown(&self) {
+        let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        tasks.closed = true;
+        tasks.set.abort_all();
+    }
+
+    /// Polls each source on its own timer, once at start, until `shutdown`.
+    pub fn start_polling(self: &Arc<Self>) {
+        for (which, every) in [
             (Source::Beads, self.beads_poll),
             (Source::Jira, self.jira_poll),
-        ]
-        .into_iter()
-        .map(|(which, every)| {
+        ] {
             let store = self.clone();
-            tokio::spawn(async move {
+            self.spawn(async move {
                 loop {
                     store.refresh(which).await;
                     tokio::time::sleep(every).await;
                 }
-            })
-        })
-        .collect()
+            });
+        }
     }
 }
 

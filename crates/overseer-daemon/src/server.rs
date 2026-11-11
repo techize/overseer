@@ -101,7 +101,7 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
         .with_launch(cfg.state_dir, cfg.hook_program, ledger);
     mgr.restore();
     let manager: Manager = Arc::new(Mutex::new(mgr));
-    let polls = store.start_polling();
+    store.start_polling();
     let shutdown = Arc::new(Notify::new());
     let mut conns = JoinSet::new();
 
@@ -124,9 +124,7 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
         }
     }
 
-    for p in polls {
-        p.abort();
-    }
+    store.shutdown();
     manager.lock().unwrap().shutdown_all();
     let _ = std::fs::remove_file(&cfg.socket);
     tokio::time::sleep(SHUTDOWN_GRACE).await;
@@ -341,13 +339,13 @@ fn handle_frame(
             seq,
             req: Request::RefreshWorkItems,
         } => {
-            let store = store.clone();
+            let task_store = store.clone();
             let outbox = outbox.clone();
-            tokio::spawn(async move {
-                store.refresh_all().await;
+            store.spawn(async move {
+                task_store.refresh_all().await;
                 outbox.send(Frame::Response {
                     seq,
-                    resp: Response::Work(store.view()),
+                    resp: Response::Work(task_store.view()),
                 });
             });
         }

@@ -1181,7 +1181,11 @@ fn stub_sources(name: &str, hang: bool) -> Sources {
         )
     };
     let (bd_body, jira_body) = if hang {
-        ("exec sleep 10\n".to_string(), "exec sleep 10\n".to_string())
+        let hang = format!(
+            "echo $$ >> '{}'\nexec sleep 10\n",
+            dir.join("pids").display()
+        );
+        (hang.clone(), hang)
     } else {
         (
             format!(
@@ -1368,8 +1372,7 @@ async fn move_releases_old_owner_and_adds_a_notice() {
     assert_eq!(item(&v, "DEMO-40").owner, Some(2));
     let for_s1: Vec<_> = v.notices.iter().filter(|n| n.slot == 1).collect();
     assert_eq!(for_s1.len(), 1, "{:?}", v.notices);
-    assert!(for_s1[0].text.contains("DEMO-40"), "{:?}", for_s1[0]);
-    assert!(for_s1[0].text.contains("S2"), "{:?}", for_s1[0]);
+    assert_eq!(for_s1[0].text, "DEMO-40 was moved to S2");
     // Clearing the notices empties S1's list only.
     assert_eq!(
         c.request(Request::ClearNotices { slot: 1 }).await,
@@ -1627,24 +1630,91 @@ async fn hanging_source_does_not_block_list_slots() {
         .expect("another client is answered too");
 }
 
+/// Several clients race for the same item, round after round on a
+/// multi-thread runtime; each round exactly one may win. A decision and its
+/// write that were not under one lock would let two through now and then.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_assigns_one_wins() {
+    const CLIENTS: u8 = 4;
+    const ROUNDS: usize = 10;
+    const KEYS: [&str; 5] = ["DEMO-12", "DEMO-40", "DEMO-7", "DEMO-30", "ov-3"];
     let s = stub_sources("race", false);
     let d = s.daemon().await;
-    let mut a = Client::connect(&d.socket).await;
-    let mut b = Client::connect(&d.socket).await;
-    a.refresh().await;
-    for key in ["DEMO-12", "DEMO-40", "DEMO-7", "ov-3"] {
-        let (ra, rb) = tokio::join!(
-            a.assign(key, 1, false, false),
-            b.assign(key, 2, false, false)
-        );
-        let oks = [&ra, &rb].iter().filter(|r| ***r == Response::Ok).count();
-        assert_eq!(oks, 1, "{key}: {ra:?} {rb:?}");
-        let loser = if ra == Response::Ok { &rb } else { &ra };
-        assert!(
-            matches!(loser, Response::Error { message } if message.starts_with(&format!("{key} is owned by S"))),
-            "{loser:?}"
-        );
+    Client::connect(&d.socket).await.refresh().await;
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(CLIENTS as usize));
+    let mut tasks = Vec::new();
+    for slot in 1..=CLIENTS {
+        let mut c = Client::connect(&d.socket).await;
+        let barrier = barrier.clone();
+        // No asserts in here: a panicking client would leave the others
+        // waiting at the barrier. Everything is checked after the join.
+        tasks.push(tokio::spawn(async move {
+            let mut got = Vec::new();
+            for _ in 0..ROUNDS {
+                for key in KEYS {
+                    barrier.wait().await;
+                    let r = c.assign(key, slot, false, false).await;
+                    barrier.wait().await;
+                    // The winner frees it for the next round.
+                    if r == Response::Ok {
+                        c.request(Request::Release { key: key.into() }).await;
+                    }
+                    got.push(r);
+                }
+            }
+            got
+        }));
     }
+    let mut results = Vec::new();
+    for t in tasks {
+        results.push(t.await.unwrap());
+    }
+    for round in 0..ROUNDS * KEYS.len() {
+        let key = KEYS[round % KEYS.len()];
+        let here: Vec<_> = results.iter().map(|r| &r[round]).collect();
+        let wins = here.iter().filter(|r| ***r == Response::Ok).count();
+        assert_eq!(wins, 1, "contest {round} ({key}): {here:?}");
+        for r in here.iter().filter(|r| ***r != Response::Ok) {
+            assert!(
+                matches!(r, Response::Error { message }
+                    if message.starts_with(&format!("{key} is owned by S"))),
+                "{key}: {r:?}"
+            );
+        }
+    }
+}
+
+/// True while `pid` runs (a zombie counts as gone).
+fn alive(pid: &str) -> bool {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", pid])
+        .output()
+        .unwrap();
+    let stat = String::from_utf8_lossy(&out.stdout);
+    let stat = stat.trim();
+    !stat.is_empty() && !stat.starts_with('Z')
+}
+
+#[tokio::test]
+async fn shutdown_stops_hung_sources_and_requested_refreshes() {
+    let s = stub_sources("hang-stop", true);
+    let pids = s.dir.join("pids");
+    let d = s.daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    // A requested refresh queues behind the hung polls.
+    c.seq += 1;
+    let seq = c.seq;
+    c.send(Frame::Request {
+        seq,
+        req: Request::RefreshWorkItems,
+    })
+    .await;
+    wait_for_log(&pids, 2).await;
+    drop(c);
+    shutdown(d).await;
+    // Had the refresh outlived the daemon it would start new stubs now.
+    sleep(Duration::from_millis(500)).await;
+    let all = std::fs::read_to_string(&pids).unwrap();
+    let running: Vec<_> = all.lines().filter(|p| alive(p)).collect();
+    assert!(running.is_empty(), "still running: {running:?} of {all:?}");
 }
