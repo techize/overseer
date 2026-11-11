@@ -121,6 +121,9 @@ pub async fn run_source(
     env: &[(OsString, OsString)],
 ) -> Result<String, String> {
     let (prog, args) = cmd.split_first().ok_or("empty command")?;
+    if !cwd.is_dir() {
+        return Err(format!("folder {} not found", cwd.display()));
+    }
     let mut c = Command::new(prog);
     c.args(args)
         .current_dir(cwd)
@@ -129,6 +132,7 @@ pub async fn run_source(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0)
         .kill_on_drop(true);
     let child = c.spawn().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -137,8 +141,15 @@ pub async fn run_source(
             format!("{prog}: {e}")
         }
     })?;
+    let pgid = child.id();
     let out = match tokio::time::timeout(timeout, child.wait_with_output()).await {
-        Err(_) => return Err(format!("timed out after {}", describe(timeout))),
+        Err(_) => {
+            // The child leads its own group; kill it and anything it started.
+            if let Some(pgid) = pgid {
+                unsafe { libc::killpg(pgid as libc::pid_t, libc::SIGKILL) };
+            }
+            return Err(format!("timed out after {}", describe(timeout)));
+        }
         Ok(r) => r.map_err(|e| format!("{prog}: {e}"))?,
     };
     if !out.status.success() {
@@ -260,5 +271,57 @@ mod tests {
         .await
         .unwrap_err();
         assert!(e.starts_with("timed out after"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn run_source_timeout_kills_the_process_group() {
+        let dir = std::env::temp_dir().join(format!("ov-pg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pidfile = dir.join("pid");
+        let script = format!("sleep 30 & echo $! > {}; wait", pidfile.display());
+        let e = run_source(
+            &["sh".into(), "-c".into(), script],
+            &dir,
+            Duration::from_millis(500),
+            &env(),
+        )
+        .await
+        .unwrap_err();
+        assert!(e.starts_with("timed out"), "{e}");
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let mut gone = false;
+        for _ in 0..50 {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(gone, "grandchild {pid} survived the timeout");
+    }
+
+    #[tokio::test]
+    async fn run_source_missing_folder() {
+        let e = run_source(
+            &["echo".into()],
+            Path::new("/no/such/folder-xyz"),
+            Duration::from_secs(5),
+            &env(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e, "folder /no/such/folder-xyz not found");
+    }
+
+    #[test]
+    fn jira_malformed_entries_are_skipped() {
+        let t = parse_jira(r#"[{"key":"DEMO-1"}, 7, {"key":5}, "x", {"key":"DEMO-2"}]"#).unwrap();
+        let keys: Vec<_> = t.iter().map(|t| t.key.as_str()).collect();
+        assert_eq!(keys, ["DEMO-1", "DEMO-2"]);
     }
 }

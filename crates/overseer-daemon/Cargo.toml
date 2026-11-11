@@ -8,7 +8,7 @@ license.workspace = true
 overseer-proto = { path = "../overseer-proto" }
 portable-pty.workspace = true
 tokio = { workspace = true, features = ["sync", "rt", "time", "macros", "net", "io-util", "process"] }
-regex = "1"
+regex.workspace = true
 bytes.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
