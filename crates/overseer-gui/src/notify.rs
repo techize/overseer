@@ -61,15 +61,21 @@ pub fn note_for(info: &SlotInfo) -> Note {
 
 const ID_PREFIX: &str = "overseer-slot-";
 
-/// The request identifier for `slot`'s notification. One per slot, so a
-/// newer one replaces an older one still on screen.
-pub fn identifier(slot: SlotId) -> String {
-    format!("{ID_PREFIX}{slot}")
+/// The request identifier for `slot`'s `seq`th notification. Each post
+/// needs a new identifier: macOS updates a delivered notification with the
+/// same identifier in place, without a banner, so reusing one per slot
+/// showed only the first banner. The previous one for the slot is removed
+/// before a new one is posted, so Notification Center keeps one per slot.
+pub fn identifier(slot: SlotId, seq: u64) -> String {
+    format!("{ID_PREFIX}{slot}-{seq}")
 }
 
-/// The slot a clicked notification was for.
+/// The slot a clicked notification was for. Also accepts the older
+/// `overseer-slot-<n>` form, which may still be in Notification Center.
 pub fn slot_from_identifier(id: &str) -> Option<SlotId> {
-    let slot: SlotId = id.strip_prefix(ID_PREFIX)?.parse().ok()?;
+    let rest = id.strip_prefix(ID_PREFIX)?;
+    let slot = rest.split_once('-').map_or(rest, |(slot, _)| slot);
+    let slot: SlotId = slot.parse().ok()?;
     (slot <= 6).then_some(slot)
 }
 
@@ -107,7 +113,8 @@ pub fn post(note: &Note) {
 mod platform {
     use std::ffi::{CStr, CString};
     use std::os::raw::c_char;
-    use std::sync::Once;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, Once};
 
     use block::{Block, ConcreteBlock};
     use objc::declare::ClassDecl;
@@ -246,6 +253,18 @@ mod platform {
         }
     }
 
+    /// A fresh identifier for `slot`, and the one it replaces, if any.
+    fn next_identifier(slot: super::SlotId) -> (String, Option<String>) {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        static LAST: Mutex<[Option<String>; 7]> = Mutex::new([const { None }; 7]);
+        let ident = super::identifier(slot, SEQ.fetch_add(1, Ordering::Relaxed));
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = last
+            .get_mut(slot as usize)
+            .and_then(|l| l.replace(ident.clone()));
+        (ident, previous)
+    }
+
     pub fn post(note: &Note) {
         let Some(center) = center() else { return };
         let (Some(content_cls), Some(request_cls), Some(sound_cls)) = (
@@ -256,6 +275,7 @@ mod platform {
             return;
         };
         let slot = note.slot;
+        let (ident, previous) = next_identifier(slot);
         let done = ConcreteBlock::new(move |err: Id| {
             if !err.is_null() {
                 // SAFETY: an NSError from the framework.
@@ -274,8 +294,12 @@ mod platform {
             let sound: Id = msg_send![sound_cls, defaultSound];
             let _: () = msg_send![content, setSound: sound];
             let nil: Id = std::ptr::null_mut();
+            if let (Some(previous), Some(array_cls)) = (previous, Class::get("NSArray")) {
+                let old: Id = msg_send![array_cls, arrayWithObject: nsstring(&previous)];
+                let _: () = msg_send![center, removeDeliveredNotificationsWithIdentifiers: old];
+            }
             let request: Id = msg_send![request_cls,
-                requestWithIdentifier: nsstring(&super::identifier(slot))
+                requestWithIdentifier: nsstring(&ident)
                 content: content
                 trigger: nil];
             let _: () = msg_send![content, release];
@@ -380,8 +404,12 @@ mod tests {
 
     #[test]
     fn identifier_round_trips() {
-        assert_eq!(identifier(4), "overseer-slot-4");
+        assert_eq!(identifier(4, 17), "overseer-slot-4-17");
+        assert_ne!(identifier(4, 17), identifier(4, 18));
+        assert_eq!(slot_from_identifier(&identifier(4, 17)), Some(4));
         assert_eq!(slot_from_identifier("overseer-slot-4"), Some(4));
+        assert_eq!(slot_from_identifier("overseer-slot-9-1"), None);
+        assert_eq!(slot_from_identifier("overseer-slot-x-1"), None);
         assert_eq!(slot_from_identifier("overseer-slot-9"), None);
         assert_eq!(slot_from_identifier("something-else"), None);
     }
