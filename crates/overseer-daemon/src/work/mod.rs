@@ -3,9 +3,11 @@
 pub mod group;
 pub mod ownership;
 pub mod sources;
+pub mod store;
 
 pub use group::{group, ticket_of};
 pub use sources::{parse_beads, parse_jira, run_source, Bead, Ticket};
+pub use store::{Source, WorkStore};
 
 /// Compile a ticket pattern. A bad pattern is an error the caller can show.
 pub fn compile_pattern(pattern: &str) -> Result<regex::Regex, String> {

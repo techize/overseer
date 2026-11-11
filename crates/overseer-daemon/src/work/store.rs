@@ -1,0 +1,689 @@
+//! The work-item cache and its assignments, shared by every connection.
+//!
+//! Two sources fill the cache: `bd list --json` in the beads folder and the
+//! configured Jira command. Each runs off the request path with a 30 s
+//! timeout, so a slow source never stalls a slot request. Ownership lives in
+//! the ledger; every decision and its writes happen in one ledger
+//! transaction, so two clients assigning the same item cannot both win.
+//!
+//! Lock order: the ledger's lock, then the cache's. Neither is held across
+//! an await.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
+
+use overseer_proto::{
+    slot_name, Event, ItemKind, Response, SlotId, SourceStatus, WorkItem, WorkView,
+};
+use regex::Regex;
+use tokio::sync::{broadcast, mpsc};
+use tokio::task::JoinHandle;
+
+use super::ownership::{decide, promotions, Decision};
+use super::{compile_pattern, group, parse_beads, parse_jira, run_source, Bead, Ticket};
+use crate::config::Config;
+use crate::env::BaseEnv;
+use crate::ledger::{self, Ledger};
+use crate::manager::valid_id;
+
+/// How long `bd` or the Jira command may run.
+pub const SOURCE_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    Beads,
+    Jira,
+}
+
+pub(crate) fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// What the sources last returned.
+struct Cache {
+    beads: Vec<Bead>,
+    tickets: Vec<Ticket>,
+    /// `group` of the two lists, without owners or folders.
+    items: Vec<WorkItem>,
+    beads_status: SourceStatus,
+    jira_status: SourceStatus,
+    /// Ticket folders under `<brain_dir>/Sprints/*/`, as (name, path),
+    /// sorted by path. Listed again on every refresh.
+    folders: Vec<(String, PathBuf)>,
+}
+
+/// A label change to make on a bead with `bd update`.
+struct Label {
+    id: String,
+    add: Option<SlotId>,
+    remove: Option<SlotId>,
+}
+
+pub struct WorkStore {
+    beads_dir: PathBuf,
+    brain_dir: PathBuf,
+    /// `None` when the configured command is empty: Jira is off.
+    jira_command: Option<Vec<String>>,
+    jql: String,
+    beads_poll: Duration,
+    jira_poll: Duration,
+    /// The ticket pattern, or one that never matches when the configured
+    /// pattern is bad (beads then stay ungrouped).
+    pattern: Regex,
+    pattern_error: Option<String>,
+    ledger: Arc<Ledger>,
+    events: broadcast::Sender<Event>,
+    env: BaseEnv,
+    cache: Mutex<Cache>,
+    /// Held for the length of one source's refresh, so refreshes of the same
+    /// source run one after another.
+    beads_turn: tokio::sync::Mutex<()>,
+    jira_turn: tokio::sync::Mutex<()>,
+    /// Bead label changes, run in order by one task (started on first use)
+    /// so a quick assign and move cannot reach `bd` swapped.
+    labels: Mutex<Option<mpsc::UnboundedSender<Label>>>,
+}
+
+fn status(name: &str, message: Option<String>) -> SourceStatus {
+    SourceStatus {
+        name: name.into(),
+        ok: false,
+        count: 0,
+        at: None,
+        message,
+    }
+}
+
+/// Joins a source error and a settings problem into one status message.
+fn join_messages(a: Option<String>, b: Option<&String>) -> Option<String> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(format!("{a}; {b}")),
+        (Some(a), None) => Some(a),
+        (None, b) => b.cloned(),
+    }
+}
+
+/// Every folder one level under `<brain>/Sprints/*/`.
+fn list_folders(brain: &Path) -> Vec<(String, PathBuf)> {
+    let mut out = Vec::new();
+    let Ok(sprints) = std::fs::read_dir(brain.join("Sprints")) else {
+        return out;
+    };
+    for sprint in sprints.flatten() {
+        if !sprint.path().is_dir() {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(sprint.path()) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let path = e.path();
+            if path.is_dir() {
+                out.push((e.file_name().to_string_lossy().into_owned(), path));
+            }
+        }
+    }
+    out.sort_by(|a, b| a.1.cmp(&b.1));
+    out
+}
+
+/// The folder named `key` or starting with `key-`. When several sprints have
+/// one, the last by path (normally the latest sprint) wins.
+fn folder_for(folders: &[(String, PathBuf)], key: &str) -> Option<PathBuf> {
+    let prefix = format!("{key}-");
+    folders
+        .iter()
+        .rev()
+        .find(|(name, _)| name == key || name.starts_with(&prefix))
+        .map(|(_, p)| p.clone())
+}
+
+enum Outcome {
+    Reply(Response),
+    Changed(Option<Label>),
+}
+
+impl WorkStore {
+    pub fn new(
+        cfg: &Config,
+        ledger: Arc<Ledger>,
+        events: broadcast::Sender<Event>,
+        env: BaseEnv,
+    ) -> Arc<WorkStore> {
+        let (pattern, pattern_error) = match compile_pattern(&cfg.ticket_pattern) {
+            Ok(p) => (p, None),
+            Err(e) => {
+                tracing::warn!("{e}; beads will not be grouped under tickets");
+                // `\b\B` never matches.
+                (Regex::new(r"\b\B").expect("static regex"), Some(e))
+            }
+        };
+        let jira_command = (!cfg.jira_command.is_empty()).then(|| cfg.jira_command.clone());
+        let jira_status = status(
+            "jira",
+            Some(if jira_command.is_some() {
+                "not read yet".into()
+            } else {
+                "jira_command is empty; Jira is off".into()
+            }),
+        );
+        Arc::new(WorkStore {
+            beads_dir: cfg.beads_dir.clone(),
+            brain_dir: cfg.brain_dir.clone(),
+            jira_command,
+            jql: cfg.jql.clone(),
+            beads_poll: Duration::from_secs(cfg.beads_poll_secs.max(1)),
+            jira_poll: Duration::from_secs(cfg.jira_poll_secs.max(1)),
+            pattern,
+            pattern_error,
+            ledger,
+            events,
+            env,
+            cache: Mutex::new(Cache {
+                beads: Vec::new(),
+                tickets: Vec::new(),
+                items: Vec::new(),
+                beads_status: status("beads", Some("not read yet".into())),
+                jira_status,
+                folders: Vec::new(),
+            }),
+            beads_turn: tokio::sync::Mutex::new(()),
+            jira_turn: tokio::sync::Mutex::new(()),
+            labels: Mutex::new(None),
+        })
+    }
+
+    fn cache(&self) -> std::sync::MutexGuard<'_, Cache> {
+        self.cache.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The cached items with their owners and folders, owned items that have
+    /// left the cache (marked `in_list: false`), the source statuses and all
+    /// notices.
+    pub fn view(&self) -> WorkView {
+        let read = self
+            .ledger
+            .transaction(|conn| Ok((ledger::assignments_on(conn)?, ledger::notices_on(conn)?)));
+        let (assigned, notices) = read.unwrap_or_else(|e| {
+            tracing::warn!("ledger read failed: {e:#}");
+            (Vec::new(), Vec::new())
+        });
+        let owners: HashMap<&str, SlotId> =
+            assigned.iter().map(|(k, s)| (k.as_str(), *s)).collect();
+        let cache = self.cache();
+        let mut items = cache.items.clone();
+        for it in &mut items {
+            it.owner = owners.get(it.key.as_str()).copied();
+            it.folder = folder_for(&cache.folders, &it.key);
+        }
+        for (key, slot) in &assigned {
+            if items.iter().any(|i| &i.key == key) {
+                continue;
+            }
+            items.push(WorkItem {
+                key: key.clone(),
+                kind: self.guess_kind(key),
+                title: key.clone(),
+                status: "unknown".into(),
+                priority: None,
+                parent: None,
+                owner: Some(*slot),
+                in_list: false,
+                folder: folder_for(&cache.folders, key),
+            });
+        }
+        WorkView {
+            items,
+            sources: vec![cache.beads_status.clone(), cache.jira_status.clone()],
+            notices,
+        }
+    }
+
+    /// A key not in the cache is a ticket when the whole key matches the
+    /// ticket pattern, else a bead.
+    fn guess_kind(&self, key: &str) -> ItemKind {
+        match self.pattern.find(key) {
+            Some(m) if m.as_str() == key => ItemKind::Ticket,
+            _ => ItemKind::Bead,
+        }
+    }
+
+    fn kind_of(&self, key: &str) -> ItemKind {
+        let known = self
+            .cache()
+            .items
+            .iter()
+            .find(|i| i.key == key)
+            .map(|i| i.kind.clone());
+        known.unwrap_or_else(|| self.guess_kind(key))
+    }
+
+    fn announce(&self) {
+        let _ = self.events.send(Event::WorkChanged(self.view()));
+    }
+
+    /// Reads one source, regroups, records promotions and tells clients.
+    /// Waits for a refresh of the same source that is already running.
+    pub async fn refresh(&self, which: Source) {
+        let _turn = match which {
+            Source::Beads => self.beads_turn.lock().await,
+            Source::Jira => self.jira_turn.lock().await,
+        };
+        // The login shell's PATH is what finds `bd` and `acli`.
+        let mut env = self.env.clone();
+        env.wait().await;
+        let vars = env.get();
+        match which {
+            Source::Beads => {
+                let cmd = ["bd", "list", "--json"].map(String::from);
+                let got = run_source(&cmd, &self.beads_dir, SOURCE_TIMEOUT, &vars)
+                    .await
+                    .and_then(|out| parse_beads(&out));
+                let now = unix_now();
+                let mut cache = self.cache();
+                match got {
+                    Ok(beads) => {
+                        cache.beads_status = SourceStatus {
+                            name: "beads".into(),
+                            ok: true,
+                            count: beads.len(),
+                            at: Some(now),
+                            message: self.pattern_error.clone(),
+                        };
+                        cache.beads = beads;
+                    }
+                    Err(e) => {
+                        tracing::warn!("beads source: {e}");
+                        let s = &mut cache.beads_status;
+                        s.ok = false;
+                        s.message = join_messages(Some(e), self.pattern_error.as_ref());
+                    }
+                }
+            }
+            Source::Jira => {
+                let Some(cmd) = &self.jira_command else {
+                    self.announce();
+                    return;
+                };
+                let cmd: Vec<String> = cmd.iter().map(|a| a.replace("{jql}", &self.jql)).collect();
+                let got = run_source(&cmd, Path::new("/"), SOURCE_TIMEOUT, &vars)
+                    .await
+                    .and_then(|out| parse_jira(&out));
+                let now = unix_now();
+                let mut cache = self.cache();
+                match got {
+                    Ok(tickets) => {
+                        cache.jira_status = SourceStatus {
+                            name: "jira".into(),
+                            ok: true,
+                            count: tickets.len(),
+                            at: Some(now),
+                            message: None,
+                        };
+                        cache.tickets = tickets;
+                    }
+                    Err(e) => {
+                        tracing::warn!("jira source: {e}");
+                        cache.jira_status.ok = false;
+                        cache.jira_status.message = Some(e);
+                    }
+                }
+            }
+        }
+        self.regroup(unix_now());
+        self.announce();
+    }
+
+    /// Both sources at once; returns when both are done.
+    pub async fn refresh_all(&self) {
+        tokio::join!(self.refresh(Source::Beads), self.refresh(Source::Jira));
+    }
+
+    /// Rebuilds the grouped list. A bead that was standalone and owned and is
+    /// now under a ticket owned by another slot is a promotion: it is logged
+    /// and both slots get a notice.
+    fn regroup(&self, now: i64) {
+        let folders = list_folders(&self.brain_dir);
+        let mut folders = Some(folders);
+        let done = self.ledger.transaction(|conn| {
+            let owners: HashMap<String, SlotId> =
+                ledger::assignments_on(conn)?.into_iter().collect();
+            let mut cache = self.cache();
+            let after = group(&cache.tickets, &cache.beads, &self.pattern);
+            for (bead, was, ticket_owner) in promotions(&cache.items, &after, &owners) {
+                let parent = after
+                    .iter()
+                    .find(|i| i.key == bead)
+                    .and_then(|i| i.parent.clone())
+                    .unwrap_or_default();
+                let text = format!(
+                    "{bead} (owned by {}) is now under {parent}, owned by {}",
+                    slot_name(was),
+                    slot_name(ticket_owner)
+                );
+                ledger::log_on(conn, now, &bead, Some(was), "promoted", &text)?;
+                ledger::add_notice_on(conn, was, now, &text)?;
+                ledger::add_notice_on(conn, ticket_owner, now, &text)?;
+            }
+            cache.items = after;
+            if let Some(f) = folders.take() {
+                cache.folders = f;
+            }
+            Ok(())
+        });
+        if let Err(e) = done {
+            // The list still updates; only the promotion notices are lost.
+            tracing::warn!("recording promotions failed: {e:#}");
+            let mut cache = self.cache();
+            cache.items = group(&cache.tickets, &cache.beads, &self.pattern);
+            if let Some(f) = folders.take() {
+                cache.folders = f;
+            }
+        }
+    }
+
+    /// Decides and records an assignment in one ledger transaction.
+    pub fn assign(
+        self: &Arc<Self>,
+        key: &str,
+        slot: SlotId,
+        confirm: bool,
+        move_owner: bool,
+        now: i64,
+    ) -> Response {
+        if !valid_id(slot) {
+            return Response::Error {
+                message: format!("invalid slot id {slot}"),
+            };
+        }
+        let done = self.ledger.transaction(|conn| {
+            let owners: HashMap<String, SlotId> =
+                ledger::assignments_on(conn)?.into_iter().collect();
+            let decision = {
+                let cache = self.cache();
+                decide(&cache.items, &owners, key, slot, confirm, move_owner)
+            };
+            let decision = match decision {
+                Ok(d) => d,
+                Err(message) => return Ok(Outcome::Reply(Response::Error { message })),
+            };
+            let label = |remove| Label {
+                id: key.to_owned(),
+                add: Some(slot),
+                remove,
+            };
+            Ok(match decision {
+                Decision::AlreadyYours => Outcome::Reply(Response::Ok),
+                Decision::Refuse { owner } => Outcome::Reply(Response::Error {
+                    message: format!("{key} is owned by {}", slot_name(owner)),
+                }),
+                Decision::Warn { message, .. } if !confirm => {
+                    Outcome::Reply(Response::NeedsConfirm { message })
+                }
+                Decision::Warn { message, tell } => {
+                    ledger::assign_on(conn, key, slot, now)?;
+                    ledger::log_on(
+                        conn,
+                        now,
+                        key,
+                        Some(slot),
+                        "assigned",
+                        &format!("confirmed: {message}"),
+                    )?;
+                    let text = format!("{} took {key}, which overlaps your work", slot_name(slot));
+                    for t in tell {
+                        ledger::add_notice_on(conn, t, now, &text)?;
+                    }
+                    Outcome::Changed(Some(label(None)))
+                }
+                Decision::Assign => {
+                    ledger::assign_on(conn, key, slot, now)?;
+                    ledger::log_on(conn, now, key, Some(slot), "assigned", "")?;
+                    Outcome::Changed(Some(label(None)))
+                }
+                Decision::Move { from } => {
+                    ledger::assign_on(conn, key, slot, now)?;
+                    ledger::log_on(
+                        conn,
+                        now,
+                        key,
+                        Some(slot),
+                        "moved",
+                        &format!("from {}", slot_name(from)),
+                    )?;
+                    ledger::add_notice_on(
+                        conn,
+                        from,
+                        now,
+                        &format!("{key} was moved to {}", slot_name(slot)),
+                    )?;
+                    Outcome::Changed(Some(label(Some(from))))
+                }
+            })
+        });
+        self.finish(done)
+    }
+
+    /// Removes `key`'s assignment and logs it.
+    pub fn release(self: &Arc<Self>, key: &str, now: i64) -> Response {
+        let done = self.ledger.transaction(|conn| {
+            Ok(match ledger::release_on(conn, key)? {
+                None => Outcome::Reply(Response::Error {
+                    message: format!("{key} is not assigned"),
+                }),
+                Some(old) => {
+                    ledger::log_on(conn, now, key, Some(old), "released", "")?;
+                    Outcome::Changed(Some(Label {
+                        id: key.to_owned(),
+                        add: None,
+                        remove: Some(old),
+                    }))
+                }
+            })
+        });
+        self.finish(done)
+    }
+
+    /// After a committed change: labels a bead in the background and tells
+    /// clients.
+    fn finish(self: &Arc<Self>, done: anyhow::Result<Outcome>) -> Response {
+        match done {
+            Err(e) => Response::Error {
+                message: format!("ledger: {e:#}"),
+            },
+            Ok(Outcome::Reply(r)) => r,
+            Ok(Outcome::Changed(label)) => {
+                // Only a directly assigned bead is labelled, never a ticket.
+                if let Some(l) = label.filter(|l| self.kind_of(&l.id) == ItemKind::Bead) {
+                    self.queue_label(l);
+                }
+                self.announce();
+                Response::Ok
+            }
+        }
+    }
+
+    pub fn clear_notices(&self, slot: SlotId) -> Response {
+        if !valid_id(slot) {
+            return Response::Error {
+                message: format!("invalid slot id {slot}"),
+            };
+        }
+        match self.ledger.clear_notices(slot) {
+            Ok(()) => {
+                self.announce();
+                Response::Ok
+            }
+            Err(e) => Response::Error {
+                message: format!("ledger: {e:#}"),
+            },
+        }
+    }
+
+    fn queue_label(self: &Arc<Self>, label: Label) {
+        let mut tx = self.labels.lock().unwrap_or_else(|e| e.into_inner());
+        let tx = tx.get_or_insert_with(|| {
+            let (tx, rx) = mpsc::unbounded_channel();
+            tokio::spawn(label_worker(Arc::downgrade(self), rx));
+            tx
+        });
+        let _ = tx.send(label);
+    }
+
+    async fn run_label(&self, l: Label) {
+        let mut cmd = vec!["bd".to_string(), "update".into(), l.id.clone()];
+        if let Some(s) = l.add {
+            cmd.extend(["--add-label".into(), format!("overseer:{}", slot_name(s))]);
+        }
+        if let Some(s) = l.remove {
+            cmd.extend([
+                "--remove-label".into(),
+                format!("overseer:{}", slot_name(s)),
+            ]);
+        }
+        let vars = self.env.get();
+        if let Err(e) = run_source(&cmd, &self.beads_dir, SOURCE_TIMEOUT, &vars).await {
+            let text = format!("could not label {} in beads: {e}", l.id);
+            tracing::warn!("{text}");
+            let Some(slot) = l.add.or(l.remove) else {
+                return;
+            };
+            if let Err(e) = self.ledger.add_notice(slot, unix_now(), &text) {
+                tracing::warn!("could not store the notice: {e:#}");
+            }
+            self.announce();
+        }
+    }
+
+    /// Polls each source on its own timer, once at start. The caller aborts
+    /// the tasks on shutdown.
+    pub fn start_polling(self: &Arc<Self>) -> Vec<JoinHandle<()>> {
+        [
+            (Source::Beads, self.beads_poll),
+            (Source::Jira, self.jira_poll),
+        ]
+        .into_iter()
+        .map(|(which, every)| {
+            let store = self.clone();
+            tokio::spawn(async move {
+                loop {
+                    store.refresh(which).await;
+                    tokio::time::sleep(every).await;
+                }
+            })
+        })
+        .collect()
+    }
+}
+
+async fn label_worker(store: Weak<WorkStore>, mut rx: mpsc::UnboundedReceiver<Label>) {
+    while let Some(l) = rx.recv().await {
+        let Some(store) = store.upgrade() else { return };
+        store.run_label(l).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn folder_matches_key_or_key_dash_prefix() {
+        let f = vec![
+            ("DEMO-1".to_string(), PathBuf::from("/b/Sprints/s1/DEMO-1")),
+            (
+                "DEMO-12-x".to_string(),
+                PathBuf::from("/b/Sprints/s1/DEMO-12-x"),
+            ),
+            (
+                "DEMO-12-y".to_string(),
+                PathBuf::from("/b/Sprints/s2/DEMO-12-y"),
+            ),
+        ];
+        assert_eq!(
+            folder_for(&f, "DEMO-1"),
+            Some(PathBuf::from("/b/Sprints/s1/DEMO-1"))
+        );
+        assert_eq!(
+            folder_for(&f, "DEMO-12"),
+            Some(PathBuf::from("/b/Sprints/s2/DEMO-12-y"))
+        );
+        assert_eq!(folder_for(&f, "DEMO-123"), None);
+    }
+
+    fn store(pattern: &str) -> Arc<WorkStore> {
+        let cfg = Config {
+            ticket_pattern: pattern.into(),
+            jira_command: vec![],
+            ..Config::default()
+        };
+        let (events, _) = broadcast::channel(4);
+        WorkStore::new(
+            &cfg,
+            Arc::new(Ledger::in_memory()),
+            events,
+            BaseEnv::ready(vec![]),
+        )
+    }
+
+    #[test]
+    fn owned_item_missing_from_the_cache_is_listed() {
+        let s = store(r"DEMO-\d+");
+        s.ledger.assign("DEMO-5", 2, 1).unwrap();
+        s.ledger.assign("ov-9", 3, 1).unwrap();
+        let v = s.view();
+        assert_eq!(v.items.len(), 2);
+        assert!(v.items.iter().all(|i| !i.in_list));
+        assert_eq!(v.items[0].kind, ItemKind::Ticket);
+        assert_eq!(v.items[0].owner, Some(2));
+        assert_eq!(v.items[1].kind, ItemKind::Bead);
+        let jira = &v.sources[1];
+        assert_eq!(
+            jira.message.as_deref(),
+            Some("jira_command is empty; Jira is off")
+        );
+    }
+
+    #[test]
+    fn bad_pattern_does_not_panic_and_groups_nothing() {
+        let s = store("[DEMO");
+        assert!(s.pattern_error.is_some());
+        assert_eq!(s.guess_kind("DEMO-1"), ItemKind::Bead);
+        assert!(s.pattern.find("DEMO-1 x").is_none());
+    }
+
+    #[test]
+    fn promotion_logs_and_tells_both_slots() {
+        let s = store(r"DEMO-\d+");
+        let bead = |title: &str| Bead {
+            id: "ov-3".into(),
+            title: title.into(),
+            status: "open".into(),
+            priority: None,
+            external_ref: None,
+            labels: vec![],
+        };
+        s.cache().beads = vec![bead("plain")];
+        s.regroup(1);
+        s.ledger.assign("ov-3", 2, 1).unwrap();
+        s.ledger.assign("DEMO-12", 5, 1).unwrap();
+        s.cache().beads = vec![bead("now DEMO-12")];
+        s.regroup(2);
+        let n = s.ledger.notices().unwrap();
+        assert_eq!(n.len(), 2, "{n:?}");
+        assert_eq!(
+            n[0].text,
+            "ov-3 (owned by S2) is now under DEMO-12, owned by S5"
+        );
+        let slots: Vec<_> = n.iter().map(|n| n.slot).collect();
+        assert_eq!(slots, [2, 5]);
+        // Seen once only.
+        s.regroup(3);
+        assert_eq!(s.ledger.notices().unwrap().len(), 2);
+    }
+}

@@ -18,11 +18,14 @@ impl Home {
     fn new(tag: &str) -> Home {
         let h = std::env::temp_dir().join(format!("ovpty-{}-{tag}", std::process::id()));
         std::fs::create_dir_all(&h).unwrap();
+        // Keep the daemon off the real beads and Jira.
+        std::fs::write(h.join("config.toml"), "beads_dir = \"/nonexistent/overseer-test-beads\"\nbrain_dir = \"/nonexistent/overseer-test-brain\"\njira_command = []\n").unwrap();
         Home(h)
     }
     fn ctl(&self, args: &[&str]) -> String {
         let out = StdCommand::new(assert_cmd::cargo::cargo_bin("overseer"))
             .env("OVERSEER_HOME", &self.0)
+            .env("OVERSEER_CONFIG", self.0.join("config.toml"))
             .env("OVERSEER_DEFAULT_COMMAND", SCRIPT)
             .arg("ctl")
             .args(args)
@@ -61,6 +64,7 @@ impl Attached {
         let mut cmd = CommandBuilder::new(assert_cmd::cargo::cargo_bin("overseer"));
         cmd.args(["attach", "1"]);
         cmd.env("OVERSEER_HOME", &home.0);
+        cmd.env("OVERSEER_CONFIG", home.0.join("config.toml"));
         let child = pair.slave.spawn_command(cmd).unwrap();
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader().unwrap();

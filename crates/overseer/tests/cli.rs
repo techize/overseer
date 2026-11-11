@@ -18,12 +18,15 @@ impl Env {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let home = std::env::temp_dir().join(format!("ovc-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&home).unwrap();
+        // Keep the daemon off the real beads and Jira.
+        std::fs::write(home.join("config.toml"), "beads_dir = \"/nonexistent/overseer-test-beads\"\nbrain_dir = \"/nonexistent/overseer-test-brain\"\njira_command = []\n").unwrap();
         Env { home }
     }
 
     fn ctl(&self, args: &[&str]) -> Command {
         let mut c = Command::cargo_bin("overseer").unwrap();
         c.env("OVERSEER_HOME", &self.home)
+            .env("OVERSEER_CONFIG", self.home.join("config.toml"))
             .env("OVERSEER_DEFAULT_COMMAND", SCRIPT)
             .arg("ctl")
             .args(args)
@@ -36,6 +39,7 @@ impl Drop for Env {
     fn drop(&mut self) {
         let _ = StdCommand::new(assert_cmd::cargo::cargo_bin("overseer"))
             .env("OVERSEER_HOME", &self.home)
+            .env("OVERSEER_CONFIG", self.home.join("config.toml"))
             .args(["ctl", "shutdown"])
             .output();
         std::thread::sleep(Duration::from_millis(200));
@@ -94,6 +98,7 @@ fn attach_empty_slot_message() {
     let mut c = Command::cargo_bin("overseer").unwrap();
     let out = c
         .env("OVERSEER_HOME", &env.home)
+        .env("OVERSEER_CONFIG", env.home.join("config.toml"))
         .env("OVERSEER_DEFAULT_COMMAND", SCRIPT)
         .args(["attach", "3"])
         .timeout(Duration::from_secs(10))
@@ -113,6 +118,7 @@ fn daemon_logs_and_exits_zero_on_shutdown() {
     let env = Env::new();
     let mut daemon = StdCommand::new(assert_cmd::cargo::cargo_bin("overseer"))
         .env("OVERSEER_HOME", &env.home)
+        .env("OVERSEER_CONFIG", env.home.join("config.toml"))
         .env("OVERSEER_DEFAULT_COMMAND", SCRIPT)
         .args(["daemon", "--foreground"])
         .spawn()
@@ -146,6 +152,7 @@ fn daemon_logs_and_exits_zero_on_shutdown() {
 fn spawn_daemon(env: &Env, vars: &[(&str, &str)]) -> std::process::Child {
     let mut cmd = StdCommand::new(assert_cmd::cargo::cargo_bin("overseer"));
     cmd.env("OVERSEER_HOME", &env.home)
+        .env("OVERSEER_CONFIG", env.home.join("config.toml"))
         .env("OVERSEER_DEFAULT_COMMAND", SCRIPT)
         .args(["daemon", "--foreground"]);
     for (k, v) in vars {
@@ -177,6 +184,7 @@ fn second_daemon_exits_zero_and_leaves_the_first_running() {
     let mut first = spawn_daemon(&env, &[]);
     let mut second = StdCommand::new(assert_cmd::cargo::cargo_bin("overseer"))
         .env("OVERSEER_HOME", &env.home)
+        .env("OVERSEER_CONFIG", env.home.join("config.toml"))
         .args(["daemon", "--foreground"])
         .stderr(std::process::Stdio::piped())
         .spawn()

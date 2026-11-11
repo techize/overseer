@@ -59,7 +59,13 @@ fn silent_and_fast_with_a_daemon() {
         env: overseer_daemon::EnvSource::Inherit,
         state_dir: home.join("state"),
         hook_program: std::path::PathBuf::from("/bin/true"),
-        settings: overseer_daemon::Config::default(),
+        // No real beads or Jira.
+        settings: overseer_daemon::Config {
+            beads_dir: "/nonexistent/overseer-test-beads".into(),
+            brain_dir: "/nonexistent/overseer-test-brain".into(),
+            jira_command: vec![],
+            ..overseer_daemon::Config::default()
+        },
     }));
     rt.block_on(async {
         let c = Client::connect_or_start(&socket, || Ok(())).await.unwrap();

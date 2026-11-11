@@ -17,6 +17,8 @@ use crate::env::{BaseEnv, EnvSource};
 use crate::ledger::Ledger;
 use crate::manager::{valid_id, Attachment, SlotManager};
 use crate::slot::CatchUp;
+use crate::work::store::unix_now;
+use crate::work::WorkStore;
 
 /// Frames queued per connection before it is considered too slow.
 const OUTBOUND_QUEUE: usize = 256;
@@ -92,11 +94,14 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
             Ledger::in_memory()
         }
     };
+    let ledger = Arc::new(ledger);
+    let store = WorkStore::new(&cfg.settings, ledger.clone(), events.clone(), env.clone());
     let mut mgr = SlotManager::new(cfg.default_command, events)
         .with_env(env.clone())
-        .with_launch(cfg.state_dir, cfg.hook_program, Arc::new(ledger));
+        .with_launch(cfg.state_dir, cfg.hook_program, ledger);
     mgr.restore();
     let manager: Manager = Arc::new(Mutex::new(mgr));
+    let polls = store.start_polling();
     let shutdown = Arc::new(Notify::new());
     let mut conns = JoinSet::new();
 
@@ -104,7 +109,13 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
         tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
-                    conns.spawn(handle_conn(stream, manager.clone(), shutdown.clone(), env.clone()));
+                    conns.spawn(handle_conn(
+                        stream,
+                        manager.clone(),
+                        store.clone(),
+                        shutdown.clone(),
+                        env.clone(),
+                    ));
                 }
                 Err(e) => tracing::warn!("accept failed: {e}"),
             },
@@ -113,6 +124,9 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
         }
     }
 
+    for p in polls {
+        p.abort();
+    }
     manager.lock().unwrap().shutdown_all();
     let _ = std::fs::remove_file(&cfg.socket);
     tokio::time::sleep(SHUTDOWN_GRACE).await;
@@ -227,6 +241,7 @@ impl Streams {
 async fn handle_conn(
     stream: UnixStream,
     manager: Manager,
+    store: Arc<WorkStore>,
     shutdown: Arc<Notify>,
     mut env: BaseEnv,
 ) {
@@ -289,7 +304,7 @@ async fn handle_conn(
                     ) {
                         env.wait().await;
                     }
-                    handle_frame(f, &manager, &outbox, &shutdown, &mut streams)
+                    handle_frame(f, &manager, &store, &outbox, &shutdown, &mut streams)
                 }
                 None => break, // client hung up
             },
@@ -314,15 +329,32 @@ async fn handle_conn(
 fn handle_frame(
     frame: Frame,
     manager: &Manager,
+    store: &Arc<WorkStore>,
     outbox: &Outbox,
     shutdown: &Notify,
     streams: &mut Streams,
 ) {
     match frame {
+        // Runs the sources, which can take up to their timeout, so it is
+        // answered from a task of its own and the connection keeps serving.
+        Frame::Request {
+            seq,
+            req: Request::RefreshWorkItems,
+        } => {
+            let store = store.clone();
+            let outbox = outbox.clone();
+            tokio::spawn(async move {
+                store.refresh_all().await;
+                outbox.send(Frame::Response {
+                    seq,
+                    resp: Response::Work(store.view()),
+                });
+            });
+        }
         Frame::Request { seq, req } => {
             let is_shutdown = matches!(req, Request::Shutdown);
             let mut pending_attach = None;
-            let resp = handle_request(req, manager, streams, &mut pending_attach);
+            let resp = handle_request(req, manager, store, streams, &mut pending_attach);
             // A re-attach ends the earlier stream before its Ok is queued.
             let gate = pending_attach.as_ref().map(|(id, _)| streams.cut(*id));
             outbox.send(Frame::Response { seq, resp });
@@ -359,6 +391,7 @@ fn handle_frame(
 fn handle_request(
     req: Request,
     manager: &Manager,
+    store: &Arc<WorkStore>,
     streams: &mut Streams,
     pending_attach: &mut Option<(SlotId, Attachment)>,
 ) -> Response {
@@ -369,12 +402,18 @@ fn handle_request(
             Response::Ok
         }
         Request::ListSlots => Response::Slots(manager.lock().unwrap().list()),
-        Request::ListWorkItems
-        | Request::RefreshWorkItems
-        | Request::Assign { .. }
-        | Request::Release { .. }
-        | Request::Kickoff { .. }
-        | Request::ClearNotices { .. } => err("not supported yet".into()),
+        // RefreshWorkItems is answered in `handle_frame` once the sources
+        // have run; this arm only keeps the match whole.
+        Request::ListWorkItems | Request::RefreshWorkItems => Response::Work(store.view()),
+        Request::Assign {
+            key,
+            slot,
+            confirm,
+            move_owner,
+        } => store.assign(&key, slot, confirm, move_owner, unix_now()),
+        Request::Release { key } => store.release(&key, unix_now()),
+        Request::ClearNotices { slot } => store.clear_notices(slot),
+        Request::Kickoff { .. } => err("not supported yet".into()),
         Request::StartSlot {
             id,
             label,

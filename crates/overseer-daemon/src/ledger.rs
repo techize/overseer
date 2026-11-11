@@ -84,6 +84,84 @@ fn migrate(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+// Connection-level forms of the work-item calls, for use inside
+// `Ledger::transaction`, whose closure already holds the ledger's lock (the
+// `&self` methods would deadlock there).
+
+/// Every work item that has a slot, as `(key, slot)`.
+pub(crate) fn assignments_on(conn: &Connection) -> Result<Vec<(String, SlotId)>> {
+    let mut stmt = conn.prepare("SELECT key, slot FROM assignments ORDER BY key")?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Gives `key` to `slot` at `at`, replacing any earlier owner.
+pub(crate) fn assign_on(conn: &Connection, key: &str, slot: SlotId, at: i64) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO assignments (key, slot, at) VALUES (?1, ?2, ?3)",
+        rusqlite::params![key, slot, at],
+    )?;
+    Ok(())
+}
+
+/// Drops the assignment for `key`, returning the slot that held it.
+pub(crate) fn release_on(conn: &Connection, key: &str) -> Result<Option<SlotId>> {
+    let slot = conn
+        .query_row(
+            "SELECT slot FROM assignments WHERE key = ?1",
+            rusqlite::params![key],
+            |r| r.get(0),
+        )
+        .map(Some)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            e => Err(e),
+        })?;
+    conn.execute(
+        "DELETE FROM assignments WHERE key = ?1",
+        rusqlite::params![key],
+    )?;
+    Ok(slot)
+}
+
+/// Appends an entry to the assignment history.
+pub(crate) fn log_on(
+    conn: &Connection,
+    at: i64,
+    key: &str,
+    slot: Option<SlotId>,
+    event: &str,
+    detail: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO history (at, key, slot, event, detail) VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![at, key, slot, event, detail],
+    )?;
+    Ok(())
+}
+
+/// Leaves a notice for a slot.
+pub(crate) fn add_notice_on(conn: &Connection, slot: SlotId, at: i64, text: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO notices (slot, at, text) VALUES (?1, ?2, ?3)",
+        rusqlite::params![slot, at, text],
+    )?;
+    Ok(())
+}
+
+/// All notices, oldest first.
+pub(crate) fn notices_on(conn: &Connection) -> Result<Vec<Notice>> {
+    let mut stmt = conn.prepare("SELECT slot, at, text FROM notices ORDER BY id")?;
+    let rows = stmt.query_map([], |r| {
+        Ok(Notice {
+            slot: r.get(0)?,
+            at: r.get::<_, Option<i64>>(1)?.unwrap_or_default(),
+            text: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 impl Ledger {
     /// Opens (creating if needed) the ledger file, making its parent
     /// directories first. A fresh database is created at the current schema
@@ -128,40 +206,17 @@ impl Ledger {
 
     /// Every work item that has a slot, as `(key, slot)`.
     pub fn assignments(&self) -> Result<Vec<(String, SlotId)>> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare("SELECT key, slot FROM assignments ORDER BY key")?;
-        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        assignments_on(&self.conn())
     }
 
     /// Gives `key` to `slot` at `at`, replacing any earlier owner.
     pub fn assign(&self, key: &str, slot: SlotId, at: i64) -> Result<()> {
-        self.conn().execute(
-            "INSERT OR REPLACE INTO assignments (key, slot, at) VALUES (?1, ?2, ?3)",
-            rusqlite::params![key, slot, at],
-        )?;
-        Ok(())
+        assign_on(&self.conn(), key, slot, at)
     }
 
     /// Drops the assignment for `key`, returning the slot that held it.
     pub fn release(&self, key: &str) -> Result<Option<SlotId>> {
-        let conn = self.conn();
-        let slot = conn
-            .query_row(
-                "SELECT slot FROM assignments WHERE key = ?1",
-                rusqlite::params![key],
-                |r| r.get(0),
-            )
-            .map(Some)
-            .or_else(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                e => Err(e),
-            })?;
-        conn.execute(
-            "DELETE FROM assignments WHERE key = ?1",
-            rusqlite::params![key],
-        )?;
-        Ok(slot)
+        release_on(&self.conn(), key)
     }
 
     /// Appends an entry to the assignment history.
@@ -173,34 +228,17 @@ impl Ledger {
         event: &str,
         detail: &str,
     ) -> Result<()> {
-        self.conn().execute(
-            "INSERT INTO history (at, key, slot, event, detail) VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![at, key, slot, event, detail],
-        )?;
-        Ok(())
+        log_on(&self.conn(), at, key, slot, event, detail)
     }
 
     /// Leaves a notice for a slot.
     pub fn add_notice(&self, slot: SlotId, at: i64, text: &str) -> Result<()> {
-        self.conn().execute(
-            "INSERT INTO notices (slot, at, text) VALUES (?1, ?2, ?3)",
-            rusqlite::params![slot, at, text],
-        )?;
-        Ok(())
+        add_notice_on(&self.conn(), slot, at, text)
     }
 
     /// All notices, oldest first.
     pub fn notices(&self) -> Result<Vec<Notice>> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare("SELECT slot, at, text FROM notices ORDER BY id")?;
-        let rows = stmt.query_map([], |r| {
-            Ok(Notice {
-                slot: r.get(0)?,
-                at: r.get::<_, Option<i64>>(1)?.unwrap_or_default(),
-                text: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
-            })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        notices_on(&self.conn())
     }
 
     /// Removes every notice for a slot.
@@ -469,6 +507,23 @@ mod tests {
         })
         .unwrap();
         assert_eq!(l.assignments().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn work_writes_inside_a_transaction_do_not_deadlock() {
+        let l = Ledger::in_memory();
+        l.transaction(|c| {
+            assign_on(c, "DEMO-1", 2, 1)?;
+            log_on(c, 1, "DEMO-1", Some(2), "assigned", "")?;
+            add_notice_on(c, 3, 1, "heads up")?;
+            assert_eq!(assignments_on(c)?, vec![("DEMO-1".to_string(), 2)]);
+            assert_eq!(release_on(c, "DEMO-1")?, Some(2));
+            assert_eq!(notices_on(c)?.len(), 1);
+            Ok(())
+        })
+        .unwrap();
+        assert!(l.assignments().unwrap().is_empty());
+        assert_eq!(l.notices().unwrap()[0].text, "heads up");
     }
 
     #[test]
