@@ -134,6 +134,45 @@ pub struct WorkView {
     pub notices: Vec<Notice>,
 }
 
+/// The Jira source's message while `jira_command` is empty. Jira is then
+/// never read, so it never holds back an item's "not read yet".
+pub const JIRA_OFF: &str = "jira_command is empty; Jira is off";
+
+impl WorkView {
+    /// An owned item missing from the list only because a source that could
+    /// list it has not answered yet since the daemon started: beads for a
+    /// bead, beads or Jira for a ticket.
+    pub fn not_read_yet(&self, item: &WorkItem) -> bool {
+        if item.in_list {
+            return false;
+        }
+        let names: &[&str] = match item.kind {
+            ItemKind::Bead => &["beads"],
+            ItemKind::Ticket => &["beads", "jira"],
+        };
+        self.sources.iter().any(|s| {
+            names.contains(&s.name.as_str())
+                && s.at.is_none()
+                && s.message.as_deref() != Some(JIRA_OFF)
+        })
+    }
+}
+
+/// The daemon's refusal when another slot owns `key`. Clients read the
+/// owner back with [`owner_in_refusal`], so the two must stay in step.
+pub fn owned_by_message(key: &str, owner: SlotId) -> String {
+    format!("{key} is owned by {}", slot_name(owner))
+}
+
+/// The owner named by an [`owned_by_message`] refusal for `key`, else `None`.
+pub fn owner_in_refusal(message: &str, key: &str) -> Option<SlotId> {
+    let n = message.strip_prefix(key)?.strip_prefix(" is owned by S")?;
+    if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    n.parse().ok()
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum Request {
@@ -304,6 +343,62 @@ mod tests {
                 text: "left the list".into(),
             }],
         }
+    }
+
+    #[test]
+    fn owned_by_refusal_text_is_pinned_and_reads_back() {
+        let m = owned_by_message("DEMO-12", 3);
+        assert_eq!(m, "DEMO-12 is owned by S3");
+        assert_eq!(owner_in_refusal(&m, "DEMO-12"), Some(3));
+        assert_eq!(
+            owner_in_refusal(&owned_by_message("ov-3", 0), "ov-3"),
+            Some(0)
+        );
+        assert_eq!(owner_in_refusal(&m, "DEMO-1"), None);
+        assert_eq!(owner_in_refusal("DEMO-12 is owned by Sx", "DEMO-12"), None);
+        assert_eq!(
+            owner_in_refusal("DEMO-12 is owned by S3 now", "DEMO-12"),
+            None
+        );
+        assert_eq!(owner_in_refusal("invalid slot id 9", "DEMO-12"), None);
+    }
+
+    fn src(name: &str, at: Option<i64>, message: Option<&str>) -> SourceStatus {
+        SourceStatus {
+            name: name.into(),
+            ok: at.is_some(),
+            count: 0,
+            at,
+            message: message.map(String::from),
+        }
+    }
+
+    #[test]
+    fn not_read_yet_until_the_items_source_answers() {
+        let mut v = view();
+        let bead = v.items[1].clone();
+        let mut ticket = v.items[0].clone();
+        ticket.in_list = false;
+        v.sources = vec![
+            src("beads", None, Some("not read yet")),
+            src("jira", Some(1), None),
+        ];
+        assert!(v.not_read_yet(&bead));
+        assert!(v.not_read_yet(&ticket), "beads can list a ticket too");
+        v.sources = vec![
+            src("beads", Some(1), None),
+            src("jira", None, Some("not read yet")),
+        ];
+        assert!(!v.not_read_yet(&bead));
+        assert!(v.not_read_yet(&ticket));
+        // Jira off is never read and does not count.
+        v.sources = vec![
+            src("beads", Some(1), None),
+            src("jira", None, Some(JIRA_OFF)),
+        ];
+        assert!(!v.not_read_yet(&ticket));
+        // An item in the list is never "not read yet".
+        assert!(!v.not_read_yet(&v.items[0].clone()));
     }
 
     #[test]

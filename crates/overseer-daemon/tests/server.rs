@@ -1319,7 +1319,10 @@ async fn work_items_load_from_stub_sources() {
     assert!(jira.ok && jira.count == 3 && jira.at.is_some(), "{jira:?}");
     // bd runs in the beads folder; the jql reaches the Jira command.
     let bd = wait_for_log(&s.bd_log, 1).await;
-    assert_eq!(bd[0], format!("{}|list --json", s.beads_dir.display()));
+    assert_eq!(
+        bd[0],
+        format!("{}|list --json --limit 0", s.beads_dir.display())
+    );
     let jira = wait_for_log(&s.jira_log, 1).await;
     assert!(jira[0].ends_with("|--jql project = DEMO"), "{}", jira[0]);
     // The list is cached: ListWorkItems answers with the same view.
@@ -1745,4 +1748,150 @@ async fn kickoff_request_returns_text() {
     assert!(text.contains("DEMO-12-widget"), "{text}");
     // The template is written for Jonathan to edit.
     assert!(d.state_dir.join("roles/assignment.md").is_file());
+}
+
+/// `bd list` stops at 50 rows unless asked for all of them.
+#[tokio::test]
+async fn bead_list_asks_for_every_row() {
+    let s = stub_sources("limit", false);
+    write_script(
+        &s.dir.join("bin/bd"),
+        &format!(
+            "if [ \"$*\" = 'list --json --limit 0' ]; then cat '{FIXTURES}/bd-list.json'; exit 0; fi\n\
+             echo \"want --limit 0, got: $*\" >&2; exit 1\n"
+        ),
+    );
+    let d = s.daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    let v = c.refresh().await;
+    let beads = source(&v, "beads");
+    assert!(beads.ok && beads.count == 4, "{beads:?}");
+}
+
+#[tokio::test]
+async fn kickoff_for_an_invalid_slot_is_refused() {
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    assert_eq!(
+        c.request(Request::Kickoff { slot: 9 }).await,
+        Response::Error {
+            message: "invalid slot id 9".into()
+        }
+    );
+}
+
+#[tokio::test]
+async fn bead_kickoff_names_its_tickets_folder() {
+    let s = stub_sources("kickoff-bead", false);
+    let d = s.daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    c.refresh().await;
+    assert_eq!(c.assign("ov-1", 4, false, false).await, Response::Ok);
+    let text = match c.request(Request::Kickoff { slot: 4 }).await {
+        Response::Text { text } => text,
+        other => panic!("unexpected {other:?}"),
+    };
+    let folder = s.dir.join("brain/Sprints/sprint-1/DEMO-12-widget");
+    assert!(
+        text.contains(&format!("Ticket folders in 2ndBrain: {}", folder.display())),
+        "{text}"
+    );
+}
+
+/// Moving a bead whose ticket a third slot owns asks first, like a fresh
+/// assign, and tells both the ticket's owner and the old owner.
+#[tokio::test]
+async fn moving_a_bead_under_an_owned_ticket_needs_confirm() {
+    let s = stub_sources("move-warn", false);
+    let d = s.daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    c.refresh().await;
+    assert_eq!(c.assign("DEMO-12", 1, false, false).await, Response::Ok);
+    assert_eq!(c.assign("ov-1", 2, true, false).await, Response::Ok);
+    assert_eq!(
+        c.assign("ov-1", 3, false, true).await,
+        Response::NeedsConfirm {
+            message: "This bead is under DEMO-12, owned by S1. Assign to S3 anyway?".into()
+        }
+    );
+    assert_eq!(item(&c.work().await, "ov-1").owner, Some(2));
+    assert_eq!(c.assign("ov-1", 3, true, true).await, Response::Ok);
+    let v = c.work().await;
+    assert_eq!(item(&v, "ov-1").owner, Some(3));
+    let texts: Vec<_> = v
+        .notices
+        .iter()
+        .map(|n| (n.slot, n.text.as_str()))
+        .collect();
+    assert!(
+        texts.contains(&(1, "S3 took ov-1, which overlaps your work")),
+        "{texts:?}"
+    );
+    assert!(texts.contains(&(2, "ov-1 was moved to S3")), "{texts:?}");
+    wait_for_line(
+        &s.bd_log,
+        "|update ov-1 --add-label overseer:S3 --remove-label overseer:S2",
+    )
+    .await;
+}
+
+/// A release right before a shutdown still reaches `bd`, even when `bd` is
+/// slow, as long as it finishes within the drain time.
+#[tokio::test]
+async fn shutdown_waits_for_queued_labels() {
+    let s = stub_sources("drain", false);
+    write_script(
+        &s.dir.join("bin/bd"),
+        &format!(
+            "if [ \"$1\" = list ]; then cat '{FIXTURES}/bd-list.json'; exit 0; fi\n\
+             sleep 1\nprintf '%s\\n' \"$*\" >> '{}'\n",
+            s.bd_log.display()
+        ),
+    );
+    let d = s.daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    c.refresh().await;
+    assert_eq!(c.assign("ov-3", 2, false, false).await, Response::Ok);
+    assert_eq!(
+        c.request(Request::Release { key: "ov-3".into() }).await,
+        Response::Ok
+    );
+    drop(c);
+    shutdown(d).await;
+    let log = std::fs::read_to_string(&s.bd_log).unwrap_or_default();
+    assert_eq!(
+        log.lines().collect::<Vec<_>>(),
+        [
+            "update ov-3 --add-label overseer:S2",
+            "update ov-3 --remove-label overseer:S2"
+        ],
+        "{log}"
+    );
+}
+
+/// A `bd` that hangs holds shutdown up for the drain time only.
+#[tokio::test]
+async fn shutdown_gives_up_on_a_hung_label() {
+    let s = stub_sources("drain-hung", false);
+    write_script(
+        &s.dir.join("bin/bd"),
+        &format!(
+            "if [ \"$1\" = list ]; then cat '{FIXTURES}/bd-list.json'; exit 0; fi\n\
+             echo $$ >> '{}'\nexec sleep 30\n",
+            s.dir.join("pids").display()
+        ),
+    );
+    let d = s.daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    c.refresh().await;
+    assert_eq!(c.assign("ov-3", 2, false, false).await, Response::Ok);
+    wait_for_log(&s.dir.join("pids"), 1).await;
+    drop(c);
+    let started = std::time::Instant::now();
+    shutdown(d).await;
+    let took = started.elapsed();
+    assert!(took < Duration::from_secs(6), "shutdown took {took:?}");
+    let pids = std::fs::read_to_string(s.dir.join("pids")).unwrap();
+    let running: Vec<_> = pids.lines().filter(|p| alive(p)).collect();
+    assert!(running.is_empty(), "still running: {running:?}");
 }

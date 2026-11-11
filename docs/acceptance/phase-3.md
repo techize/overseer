@@ -46,7 +46,7 @@ afterwards. The examples in this file (`DEMO-12`, `ov-3`) are invented.
 | C1 | `config.toml` is read, and a bad one falls back | Temp `OVERSEER_CONFIG` with `beads_dir`, `brain_dir`, `jira_command` and `ticket_pattern` set, start the daemon, `ctl items`. Then replace the file with broken TOML and restart | The values in the file are used (the stub sources were found). Broken TOML starts the daemon on the defaults and logs one warning with the parse error; a missing file starts on the defaults with no warning | Verified 2026-11-11 at d30f02c: the stub beads and Jira loaded from the configured paths with `ticket_pattern = "DEMO-[0-9]+"`. Broken TOML gave `config not loaded, using defaults: <path>: TOML parse error at line 1, column 13` in `daemon.log` and `ctl status` still answered. A missing file added no warning |
 | J1 | Jira missing on this Mac | Daemon with the default `jira_command` (`acli ...`) on a `PATH` without `acli`, `ctl refresh`, `ctl items` | The Jira source line says `acli not found`; beads still load; the daemon does not error or exit | Verified 2026-11-11: `jira  acli not found` in `ctl items` and `ok: false, count 0, message "acli not found"` in `--json`; the beads source was `ok` in the same refresh |
 | J2 | Jira output that is junk, has a warning line first, or fails (Review Focus 1) | Stub Jira command in each mode, `ctl refresh`, `ctl items` | Junk: the source says why (no JSON found). A warning line before the JSON: tickets still load. Non-zero exit: the source shows the exit code and stderr text. Beads load in all cases, nothing panics | Verified 2026-11-11: junk gave `jira  jira output: no JSON found`; the warning line before the JSON gave `jira  ok  2 items`; exit 3 gave `jira  <stub> exited with 3: auth expired`. Beads were `ok  5 items` each time and the daemon kept answering |
-| B1 | Beads load from `~/Repos/2ndBrain` | Temp daemon with `beads_dir` set to `~/Repos/2ndBrain`, no assignments, `ctl refresh`, `ctl items --json`; record counts only | The beads source is `ok` with a count; beads that name a ticket are grouped under it | Verified 2026-11-11 (read-only `bd list --json` through the daemon, no write command run): beads source `ok`, 50 beads; 13 ticket nodes (Jira was missing, so they are made from the beads); 15 beads grouped under a ticket |
+| B1 | Beads load from `~/Repos/2ndBrain` | Temp daemon with `beads_dir` set to `~/Repos/2ndBrain`, no assignments, `ctl refresh`, `ctl items --json`; record counts only | The beads source is `ok` with a count; beads that name a ticket are grouped under it | Verified 2026-11-11 (read-only `bd list --json` through the daemon, no write command run): beads source `ok`, 50 beads; 13 ticket nodes (Jira was missing, so they are made from the beads); 15 beads grouped under a ticket. The 50 was `bd list`'s default limit, not the real count (133); fixed after the run: the daemon now runs `bd list --json --limit 0`. Recount awaiting Jonathan |
 | B2 | A slow `bd` does not stall the daemon (Review Focus 2) | Stub `bd list` that sleeps 100 s. `ctl refresh` in the background, and meanwhile `ctl status`, `ctl start`, `ctl items` and an `overseer hook Stop` | Each of those answers at once (milliseconds); the refresh ends at about 30 s with `beads  timed out after 30 s`, the hung `bd` is killed, and a later refresh works once the stub is fast again | Verified 2026-11-11: `ctl status`, `ctl start 1 -- sleep 600`, `ctl items` and the hook (5.5 ms) all answered in under 20 ms while the refresh waited. `ctl refresh` returned after 30 s; no `sleep 100` process was left; after removing the delay the next refresh read 5 items. One earlier refresh queued behind another in flight took 38 s (observation, see F2) |
 
 ## Grouping
@@ -97,18 +97,22 @@ afterwards. The examples in this file (`DEMO-12`, `ov-3`) are invented.
 
 ## Findings from the 2026-11-11 run
 
-- **F1 (note): a bead's kickoff names the bead's own folder only.** `ctl kickoff
-  4` for S4, which owns `ov-3` under `DEMO-12` (whose folder exists), printed
-  `Ticket folders in 2ndBrain: none found`. Folders are looked up by the owned
-  item's key, so a bead whose ticket has a folder gets none. Decide whether the
-  kickoff should include the parent ticket's folder.
+- **F1 (fixed): a bead's kickoff named the bead's own folder only.** `ctl
+  kickoff 4` for S4, which owns `ov-3` under `DEMO-12` (whose folder exists),
+  printed `Ticket folders in 2ndBrain: none found`. Fixed after the run: the
+  kickoff now also lists the folder of an owned bead's ticket, once, whoever
+  owns the ticket (unit test `bead_kickoff_names_its_tickets_folder` and the
+  server test of the same name).
 - **F2 (note): `ctl refresh` can take longer than 30 s.** With `bd` hung, one
   refresh returned after 38 s because it queued behind a run already in flight;
   a refresh on its own returned after exactly 30 s and killed the child.
-- **F3 (note): before the first refresh an owned item shows its key as its
+- **F3 (fixed): before the first refresh an owned item showed its key as its
   title and `(left the list)`.** After a restart with `bd` hung, `ov-3`
   appeared as `ov-3  unknown  S4  ov-3  (left the list)` although it was only
-  not read yet. The owner is right, the wording is not. See L2.
+  not read yet. Fixed after the run: while the source that lists the item
+  (beads for a bead, beads or Jira for a ticket) has not been read since the
+  start, `ctl items` says `(not read yet)` and the Owns panel says `not read
+  yet`. The title is still the key until the source answers. See L2.
 - **Environment note:** the temp state dirs were under `/tmp` and not the
   session scratch directory, because the unix socket path would have been
   longer than the 104 character limit.
@@ -117,11 +121,12 @@ No scriptable check failed.
 
 ## Known limitations from the reviews
 
-- **L1: pending label writes are dropped at shutdown.** Labels are written to
-  beads by a queue after the assignment is stored in the ledger. A
-  `ctl shutdown` right after an assign can lose the `bd update`, and nothing
-  retries it, so the bead and the ledger can disagree until the item is
-  assigned again. Not checked by script (the timing is a race).
+- **L1: label writes still queued 3 s after shutdown are dropped.** Labels are
+  written to beads by a queue after the assignment is stored in the ledger.
+  Shutdown now waits up to 3 s for the queue to drain (server test
+  `shutdown_waits_for_queued_labels`), but a `bd` slower than that is killed,
+  nothing retries it, and the bead and the ledger can disagree until the item
+  is assigned again.
 - **L2: an owned item that left the list shows its key as its title.** Closed
   items leave the beads list. An owned item keeps its owner and shows as "not
   in the current list" with the key as its title until it is released.
@@ -146,8 +151,8 @@ No scriptable check failed.
   Overseer would open a newer ledger without complaint.
 - **L10: the worktree is not part of the kickoff.** It names the ticket folder;
   worktrees and targets are phase 4.
-- **L11: `ctl refresh` prints nothing,** so S0 sees no source failure from
-  it; it has to run `ctl items` afterwards.
+- **L11 (fixed): `ctl refresh` printed nothing.** It now prints the source
+  lines in the `ctl items` format, so a source failure shows straight away.
 
 ## Sign-off
 

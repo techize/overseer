@@ -6,8 +6,8 @@
 //! the ledger; every decision and its writes happen in one ledger
 //! transaction, so two clients assigning the same item cannot both win.
 //!
-//! Lock order: the ledger's lock, then the cache's. Neither is held across
-//! an await.
+//! Lock order: `change_turn`, then the ledger's lock, then the cache's.
+//! None is held across an await.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -15,11 +15,12 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use overseer_proto::{
-    slot_name, Event, ItemKind, Response, SlotId, SourceStatus, WorkItem, WorkView,
+    owned_by_message, slot_name, Event, ItemKind, Response, SlotId, SourceStatus, WorkItem,
+    WorkView, JIRA_OFF,
 };
 use regex::Regex;
 use tokio::sync::{broadcast, mpsc};
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 
 use super::ownership::{decide, promotions, Decision};
 use super::{compile_pattern, group, parse_beads, parse_jira, run_source, Bead, Ticket};
@@ -30,6 +31,12 @@ use crate::manager::valid_id;
 
 /// How long `bd` or the Jira command may run.
 pub const SOURCE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// `bd list` stops at 50 rows unless told otherwise; `--limit 0` lists all.
+pub const BD_LIST: [&str; 5] = ["bd", "list", "--json", "--limit", "0"];
+
+/// How long shutdown waits for queued bead labels to reach `bd`.
+pub const LABEL_DRAIN: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
@@ -64,6 +71,15 @@ struct Label {
     remove: Option<SlotId>,
 }
 
+/// The label queue: one worker task runs the changes in order.
+#[derive(Default)]
+struct LabelQueue {
+    tx: Option<mpsc::UnboundedSender<Label>>,
+    worker: Option<JoinHandle<()>>,
+    /// Set by `shutdown`; later changes are not queued.
+    closed: bool,
+}
+
 pub struct WorkStore {
     beads_dir: PathBuf,
     brain_dir: PathBuf,
@@ -86,7 +102,10 @@ pub struct WorkStore {
     jira_turn: tokio::sync::Mutex<()>,
     /// Bead label changes, run in order by one task (started on first use)
     /// so a quick assign and move cannot reach `bd` swapped.
-    labels: Mutex<Option<mpsc::UnboundedSender<Label>>>,
+    labels: Mutex<LabelQueue>,
+    /// Held across an assign or release and the queueing of its label, so
+    /// labels are queued in the order the ledger committed the changes.
+    change_turn: Mutex<()>,
     /// Every task the store runs (polls, requested refreshes, the label
     /// worker), so `shutdown` can stop them and the source children they own.
     tasks: Mutex<Tasks>,
@@ -177,7 +196,7 @@ impl WorkStore {
             Some(if jira_command.is_some() {
                 "not read yet".into()
             } else {
-                "jira_command is empty; Jira is off".into()
+                JIRA_OFF.into()
             }),
         );
         Arc::new(WorkStore {
@@ -202,7 +221,8 @@ impl WorkStore {
             }),
             beads_turn: tokio::sync::Mutex::new(()),
             jira_turn: tokio::sync::Mutex::new(()),
-            labels: Mutex::new(None),
+            labels: Mutex::new(LabelQueue::default()),
+            change_turn: Mutex::new(()),
             tasks: Mutex::new(Tasks {
                 set: JoinSet::new(),
                 closed: false,
@@ -214,13 +234,13 @@ impl WorkStore {
         self.cache.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The cached items with their owners and folders, owned items that have
-    /// left the cache (marked `in_list: false`), the source statuses and all
-    /// notices.
     pub fn brain_dir(&self) -> &Path {
         &self.brain_dir
     }
 
+    /// The cached items with their owners and folders, owned items that have
+    /// left the cache (marked `in_list: false`), the source statuses and all
+    /// notices.
     pub fn view(&self) -> WorkView {
         let read = self
             .ledger
@@ -296,7 +316,7 @@ impl WorkStore {
         let vars = env.get();
         match which {
             Source::Beads => {
-                let cmd = ["bd", "list", "--json"].map(String::from);
+                let cmd = BD_LIST.map(String::from);
                 let got = run_source(&cmd, &self.beads_dir, SOURCE_TIMEOUT, &vars)
                     .await
                     .and_then(|out| parse_beads(&out));
@@ -417,6 +437,7 @@ impl WorkStore {
                 message: format!("invalid slot id {slot}"),
             };
         }
+        let _turn = self.change_turn.lock().unwrap_or_else(|e| e.into_inner());
         let done = self.ledger.transaction(|conn| {
             let owners: HashMap<String, SlotId> =
                 ledger::assignments_on(conn)?.into_iter().collect();
@@ -436,26 +457,33 @@ impl WorkStore {
             Ok(match decision {
                 Decision::AlreadyYours => Outcome::Reply(Response::Ok),
                 Decision::Refuse { owner } => Outcome::Reply(Response::Error {
-                    message: format!("{key} is owned by {}", slot_name(owner)),
+                    message: owned_by_message(key, owner),
                 }),
                 Decision::Warn { message, .. } if !confirm => {
                     Outcome::Reply(Response::NeedsConfirm { message })
                 }
-                Decision::Warn { message, tell } => {
+                Decision::Warn {
+                    message,
+                    tell,
+                    from,
+                } => {
                     ledger::assign_on(conn, key, slot, now)?;
-                    ledger::log_on(
-                        conn,
-                        now,
-                        key,
-                        Some(slot),
-                        "assigned",
-                        &format!("confirmed: {message}"),
-                    )?;
+                    let (action, detail) = match from {
+                        Some(f) => (
+                            "moved",
+                            format!("from {}; confirmed: {message}", slot_name(f)),
+                        ),
+                        None => ("assigned", format!("confirmed: {message}")),
+                    };
+                    ledger::log_on(conn, now, key, Some(slot), action, &detail)?;
                     let text = format!("{} took {key}, which overlaps your work", slot_name(slot));
                     for t in tell {
                         ledger::add_notice_on(conn, t, now, &text)?;
                     }
-                    Outcome::Changed(Some(label(None)))
+                    if let Some(f) = from {
+                        ledger::add_notice_on(conn, f, now, &moved_text(key, slot))?;
+                    }
+                    Outcome::Changed(Some(label(from)))
                 }
                 Decision::Assign => {
                     ledger::assign_on(conn, key, slot, now)?;
@@ -472,12 +500,7 @@ impl WorkStore {
                         "moved",
                         &format!("from {}", slot_name(from)),
                     )?;
-                    ledger::add_notice_on(
-                        conn,
-                        from,
-                        now,
-                        &format!("{key} was moved to {}", slot_name(slot)),
-                    )?;
+                    ledger::add_notice_on(conn, from, now, &moved_text(key, slot))?;
                     Outcome::Changed(Some(label(Some(from))))
                 }
             })
@@ -487,6 +510,7 @@ impl WorkStore {
 
     /// Removes `key`'s assignment and logs it.
     pub fn release(self: &Arc<Self>, key: &str, now: i64) -> Response {
+        let _turn = self.change_turn.lock().unwrap_or_else(|e| e.into_inner());
         let done = self.ledger.transaction(|conn| {
             Ok(match ledger::release_on(conn, key)? {
                 None => Outcome::Reply(Response::Error {
@@ -506,7 +530,7 @@ impl WorkStore {
     }
 
     /// After a committed change: labels a bead in the background and tells
-    /// clients.
+    /// clients. The caller holds `change_turn`.
     fn finish(self: &Arc<Self>, done: anyhow::Result<Outcome>) -> Response {
         match done {
             Err(e) => Response::Error {
@@ -514,6 +538,10 @@ impl WorkStore {
             },
             Ok(Outcome::Reply(r)) => r,
             Ok(Outcome::Changed(label)) => {
+                #[cfg(test)]
+                if tests::WIDEN_RACE.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_micros(200));
+                }
                 // Only a directly assigned bead is labelled, never a ticket.
                 if let Some(l) = label.filter(|l| self.kind_of(&l.id) == ItemKind::Bead) {
                     self.queue_label(l);
@@ -542,12 +570,20 @@ impl WorkStore {
     }
 
     fn queue_label(self: &Arc<Self>, label: Label) {
-        let mut tx = self.labels.lock().unwrap_or_else(|e| e.into_inner());
-        let tx = tx.get_or_insert_with(|| {
-            let (tx, rx) = mpsc::unbounded_channel();
-            self.spawn(label_worker(Arc::downgrade(self), rx));
-            tx
-        });
+        let mut q = self.labels.lock().unwrap_or_else(|e| e.into_inner());
+        if q.closed {
+            tracing::warn!("stopping: label change for {} not written", label.id);
+            return;
+        }
+        let tx = match &q.tx {
+            Some(tx) => tx.clone(),
+            None => {
+                let (tx, rx) = mpsc::unbounded_channel();
+                q.worker = Some(tokio::spawn(label_worker(Arc::downgrade(self), rx)));
+                q.tx = Some(tx.clone());
+                tx
+            }
+        };
         let _ = tx.send(label);
     }
 
@@ -594,12 +630,35 @@ impl WorkStore {
         tasks.set.spawn(fut);
     }
 
-    /// Stops every task the store runs. Dropping a running source kills its
-    /// child (`kill_on_drop`).
+    /// Stops every task the store runs, except that label changes already
+    /// queued are left for `drain_labels`. Dropping a running source kills
+    /// its child (`kill_on_drop`).
     pub fn shutdown(&self) {
         let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
         tasks.closed = true;
         tasks.set.abort_all();
+        drop(tasks);
+        let mut q = self.labels.lock().unwrap_or_else(|e| e.into_inner());
+        q.closed = true;
+        // The worker ends once the queue is empty.
+        q.tx = None;
+    }
+
+    /// After `shutdown`: gives the queued label changes up to `limit` to
+    /// reach `bd`, so a release just before a restart is not lost, then
+    /// stops the worker (and any `bd` it is running).
+    pub async fn drain_labels(&self, limit: Duration) {
+        let worker = self
+            .labels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .worker
+            .take();
+        let Some(mut worker) = worker else { return };
+        if tokio::time::timeout(limit, &mut worker).await.is_err() {
+            tracing::warn!("label changes still queued after {limit:?}; dropping them");
+            worker.abort();
+        }
     }
 
     /// Polls each source on its own timer, once at start, until `shutdown`.
@@ -619,6 +678,10 @@ impl WorkStore {
     }
 }
 
+fn moved_text(key: &str, to: SlotId) -> String {
+    format!("{key} was moved to {}", slot_name(to))
+}
+
 async fn label_worker(store: Weak<WorkStore>, mut rx: mpsc::UnboundedReceiver<Label>) {
     while let Some(l) = rx.recv().await {
         let Some(store) = store.upgrade() else { return };
@@ -626,16 +689,18 @@ async fn label_worker(store: Weak<WorkStore>, mut rx: mpsc::UnboundedReceiver<La
     }
 }
 
-/// The first prompt for a slot, built from `template` and the items it
-/// owns. `None` when it owns none. A bead whose ticket is also in `items`
-/// is listed under it; any other item is a top-level line.
+/// The first prompt for a slot, built from `template` and the items in
+/// `items` (the whole view) that it owns. `None` when it owns none. A bead
+/// whose ticket it also owns is listed under it; any other item is a
+/// top-level line. The folders are those of its items and, for a bead, of
+/// the bead's ticket.
 pub fn kickoff_text(
     template: &str,
     slot: SlotId,
     items: &[WorkItem],
     brain_dir: &Path,
 ) -> Option<String> {
-    let mine: Vec<&WorkItem> = items.iter().collect();
+    let mine: Vec<&WorkItem> = items.iter().filter(|i| i.owner == Some(slot)).collect();
     if mine.is_empty() {
         return None;
     }
@@ -655,8 +720,16 @@ pub fn kickoff_text(
             lines.push(line(child, "  "));
         }
     }
+    let ticket_folder = |i: &WorkItem| {
+        let parent = i.parent.as_deref()?;
+        items.iter().find(|t| t.key == parent)?.folder.as_ref()
+    };
     let mut folders: Vec<String> = Vec::new();
-    for f in mine.iter().filter_map(|i| i.folder.as_ref()) {
+    for f in mine
+        .iter()
+        .flat_map(|i| [i.folder.as_ref(), ticket_folder(i)])
+        .flatten()
+    {
         let f = f.display().to_string();
         if !folders.contains(&f) {
             folders.push(f);
@@ -697,6 +770,11 @@ pub fn kickoff_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Makes `finish` pause between the commit and the queueing, so a
+    /// missing `change_turn` shows up as labels out of order.
+    pub(super) static WIDEN_RACE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
 
     #[test]
     fn folder_matches_key_or_key_dash_prefix() {
@@ -792,6 +870,51 @@ mod tests {
         s.regroup(3);
         assert_eq!(s.ledger.notices().unwrap().len(), 2);
     }
+
+    /// Many threads assign, move and release one bead. Each queued label
+    /// must take off the label the one before it added, or `bd` would end
+    /// up with a stale `overseer:S<n>`.
+    #[test]
+    fn labels_are_queued_in_commit_order() {
+        let s = store(r"DEMO-\d+");
+        s.cache().beads = vec![Bead {
+            id: "ov-3".into(),
+            title: "plain".into(),
+            status: "open".into(),
+            priority: None,
+            external_ref: None,
+            labels: vec![],
+        }];
+        s.regroup(1);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        s.labels.lock().unwrap().tx = Some(tx);
+        WIDEN_RACE.store(true, std::sync::atomic::Ordering::Relaxed);
+        std::thread::scope(|scope| {
+            for slot in 1..=6u8 {
+                let s = s.clone();
+                scope.spawn(move || {
+                    for round in 0..200 {
+                        if round % 7 == 0 {
+                            s.release("ov-3", 1);
+                        } else {
+                            s.assign("ov-3", slot, true, true, 1);
+                        }
+                    }
+                });
+            }
+        });
+        WIDEN_RACE.store(false, std::sync::atomic::Ordering::Relaxed);
+        let mut on_bead = None;
+        let mut n = 0;
+        while let Ok(l) = rx.try_recv() {
+            assert_eq!(l.remove, on_bead, "label {n} out of order");
+            on_bead = l.add;
+            n += 1;
+        }
+        assert!(n > 6, "only {n} labels");
+        let owner = s.ledger.assignments().unwrap().first().map(|(_, o)| *o);
+        assert_eq!(on_bead, owner);
+    }
 }
 
 #[cfg(test)]
@@ -877,6 +1000,24 @@ mod kickoff_tests {
             text,
             "- DEMO-12 (In Progress): Widget wiring\n  - ov-2 (open): Wire it\n- ov-9 (open): Loose bead"
         );
+    }
+
+    #[test]
+    fn bead_kickoff_names_its_tickets_folder() {
+        let mut ticket = it("DEMO-12", ItemKind::Ticket, "To Do", "Widget wiring", None);
+        ticket.owner = Some(5);
+        ticket.folder = Some(PathBuf::from("/b/Sprints/s1/DEMO-12-widget"));
+        let bead = it("ov-3", ItemKind::Bead, "open", "Wire it", Some("DEMO-12"));
+        let mut other = it("ov-4", ItemKind::Bead, "open", "Other", None);
+        other.owner = Some(5);
+        let items = [ticket.clone(), bead.clone(), other];
+        let text = kickoff_text("{items}|{folders}", 3, &items, Path::new("/b")).unwrap();
+        // Only S3's item is listed, with the ticket's folder.
+        assert_eq!(text, "- ov-3 (open): Wire it|/b/Sprints/s1/DEMO-12-widget");
+        // Owning the ticket too lists the folder once.
+        ticket.owner = Some(3);
+        let text = kickoff_text("{folders}", 3, &[ticket, bead], Path::new("/b")).unwrap();
+        assert_eq!(text, "/b/Sprints/s1/DEMO-12-widget");
     }
 
     #[test]

@@ -134,6 +134,9 @@ pub struct OwnsRow {
     pub status: String,
     /// The item has left the source's list but is still owned.
     pub gone: bool,
+    /// Not in the list only because its source has not answered since the
+    /// daemon started (implies `gone`).
+    pub not_read_yet: bool,
 }
 
 /// What the Owns box lists for `slot`, in `owned_by` order.
@@ -145,6 +148,7 @@ pub fn owns_rows(view: &WorkView, slot: SlotId) -> Vec<OwnsRow> {
             title: i.title.clone(),
             status: i.status.clone(),
             gone: !i.in_list,
+            not_read_yet: view.not_read_yet(i),
         })
         .collect()
 }
@@ -455,10 +459,17 @@ impl OverseerApp {
                             .flex_col()
                             .child(div().truncate().child(row.title))
                             .children(row.gone.then(|| {
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(colors::ORANGE))
-                                    .child("not in the current list")
+                                if row.not_read_yet {
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(colors::MUTED))
+                                        .child("not read yet")
+                                } else {
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(colors::ORANGE))
+                                        .child("not in the current list")
+                                }
                             })),
                     )
                     .child(
@@ -840,9 +851,38 @@ mod tests {
             [("DEMO-12", true), ("ov-3", false)]
         );
         assert_eq!(rows[0].status, "In Progress");
+        assert!(!rows[0].not_read_yet, "no source is waiting to be read");
         let notes = slot_notices(&view, 2);
         assert_eq!(notes.len(), 1);
         assert_eq!(notes[0].text, "DEMO-9 moved to S4");
+    }
+
+    #[test]
+    fn owns_rows_say_not_read_yet_before_the_first_read() {
+        use overseer_proto::{ItemKind, SourceStatus, WorkItem};
+        let view = WorkView {
+            items: vec![WorkItem {
+                key: "ov-3".into(),
+                kind: ItemKind::Bead,
+                title: "ov-3".into(),
+                status: "unknown".into(),
+                priority: None,
+                parent: None,
+                owner: Some(2),
+                in_list: false,
+                folder: None,
+            }],
+            sources: vec![SourceStatus {
+                name: "beads".into(),
+                ok: false,
+                count: 0,
+                at: None,
+                message: Some("not read yet".into()),
+            }],
+            notices: vec![],
+        };
+        let rows = owns_rows(&view, 2);
+        assert!(rows[0].gone && rows[0].not_read_yet, "{rows:?}");
     }
 
     #[test]

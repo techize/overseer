@@ -13,9 +13,11 @@ pub enum Decision {
         owner: SlotId,
     },
     /// The caller assigns when the request is confirmed and stores a notice for `tell`.
+    /// With `from` it is a move from that slot, which gets the move's notice too.
     Warn {
         message: String,
         tell: Vec<SlotId>,
+        from: Option<SlotId>,
     },
     Move {
         from: SlotId,
@@ -39,27 +41,19 @@ pub fn decide(
         };
     };
     if let Some(owner) = direct {
-        return Ok(direct_decision(owner, slot, move_owner));
+        return Ok(match direct_decision(owner, slot, move_owner) {
+            // Moving a bead under someone else's ticket still asks first.
+            Decision::Move { from } if item.kind == ItemKind::Bead => {
+                match parent_warning(item, owners, slot, Some(from)) {
+                    Some(warn) => warn,
+                    None => Decision::Move { from },
+                }
+            }
+            d => d,
+        });
     }
     match item.kind {
-        ItemKind::Bead => {
-            let parent_owner = item
-                .parent
-                .as_deref()
-                .and_then(|p| owners.get(p).map(|o| (p, *o)))
-                .filter(|(_, o)| *o != slot);
-            Ok(match parent_owner {
-                Some((parent, owner)) => Decision::Warn {
-                    message: format!(
-                        "This bead is under {parent}, owned by {}. Assign to {} anyway?",
-                        slot_name(owner),
-                        slot_name(slot)
-                    ),
-                    tell: vec![owner],
-                },
-                None => Decision::Assign,
-            })
-        }
+        ItemKind::Bead => Ok(parent_warning(item, owners, slot, None).unwrap_or(Decision::Assign)),
         ItemKind::Ticket => {
             let held: Vec<(&str, SlotId)> = items
                 .iter()
@@ -84,9 +78,30 @@ pub fn decide(
                     slot_name(slot)
                 ),
                 tell,
+                from: None,
             })
         }
     }
+}
+
+/// The warning for a bead whose ticket another slot owns, else `None`.
+fn parent_warning(
+    item: &WorkItem,
+    owners: &HashMap<String, SlotId>,
+    slot: SlotId,
+    from: Option<SlotId>,
+) -> Option<Decision> {
+    let parent = item.parent.as_deref()?;
+    let owner = *owners.get(parent)?;
+    (owner != slot).then(|| Decision::Warn {
+        message: format!(
+            "This bead is under {parent}, owned by {}. Assign to {} anyway?",
+            slot_name(owner),
+            slot_name(slot)
+        ),
+        tell: vec![owner],
+        from,
+    })
 }
 
 fn direct_decision(owner: SlotId, slot: SlotId, move_owner: bool) -> Decision {
@@ -226,12 +241,39 @@ mod tests {
         let expect = Decision::Warn {
             message: "This bead is under DEMO-12, owned by S3. Assign to S4 anyway?".into(),
             tell: vec![3],
+            from: None,
         };
         assert_eq!(
             decide(&items, &o, "ov-3", 4, false, false),
             Ok(expect.clone())
         );
         assert_eq!(decide(&items, &o, "ov-3", 4, true, false), Ok(expect));
+    }
+
+    #[test]
+    fn moving_a_bead_under_a_ticket_owned_elsewhere_warns() {
+        let items = [ticket("DEMO-12"), bead("ov-3", Some("DEMO-12"))];
+        let o = owners(&[("DEMO-12", 3), ("ov-3", 2)]);
+        let expect = Decision::Warn {
+            message: "This bead is under DEMO-12, owned by S3. Assign to S4 anyway?".into(),
+            tell: vec![3],
+            from: Some(2),
+        };
+        assert_eq!(
+            decide(&items, &o, "ov-3", 4, false, true),
+            Ok(expect.clone())
+        );
+        assert_eq!(decide(&items, &o, "ov-3", 4, true, true), Ok(expect));
+        // Without --move it is still a refusal.
+        assert_eq!(
+            decide(&items, &o, "ov-3", 4, false, false),
+            Ok(Decision::Refuse { owner: 2 })
+        );
+        // Moving it to the ticket's owner needs no question.
+        assert_eq!(
+            decide(&items, &o, "ov-3", 3, false, true),
+            Ok(Decision::Move { from: 2 })
+        );
     }
 
     #[test]
@@ -258,6 +300,7 @@ mod tests {
                       Assign to S4 anyway?"
                 .into(),
             tell: vec![3, 5],
+            from: None,
         };
         assert_eq!(
             decide(&items, &o, "DEMO-12", 4, false, false),

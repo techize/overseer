@@ -128,6 +128,8 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
 
     store.shutdown();
     manager.lock().unwrap().shutdown_all();
+    // A label change just before a restart should still reach the bead.
+    store.drain_labels(crate::work::store::LABEL_DRAIN).await;
     let _ = std::fs::remove_file(&cfg.socket);
     tokio::time::sleep(SHUTDOWN_GRACE).await;
     // Dropping `conns` aborts every connection task, closing the sockets.
@@ -416,13 +418,9 @@ fn handle_request(
         } => store.assign(&key, slot, confirm, move_owner, unix_now()),
         Request::Release { key } => store.release(&key, unix_now()),
         Request::ClearNotices { slot } => store.clear_notices(slot),
+        Request::Kickoff { slot } if !valid_id(slot) => err(format!("invalid slot id {slot}")),
         Request::Kickoff { slot } => {
-            let mine: Vec<_> = store
-                .view()
-                .items
-                .into_iter()
-                .filter(|i| i.owner == Some(slot))
-                .collect();
+            let items = store.view().items;
             let template = match crate::launch::assignment_template(state_dir) {
                 Ok(t) => t,
                 Err(e) => {
@@ -430,7 +428,7 @@ fn handle_request(
                     crate::launch::ASSIGNMENT.to_string()
                 }
             };
-            match crate::work::store::kickoff_text(&template, slot, &mine, store.brain_dir()) {
+            match crate::work::store::kickoff_text(&template, slot, &items, store.brain_dir()) {
                 Some(text) => Response::Text { text },
                 None => err(format!("{} owns no work items", slot_name(slot))),
             }

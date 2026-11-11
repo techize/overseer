@@ -17,7 +17,9 @@ use gpui::{
     div, prelude::*, px, rgb, rgba, Context, EventEmitter, FocusHandle, Focusable, FontWeight,
     KeyDownEvent, Keystroke, MouseButton, ScrollHandle, SharedString, Window,
 };
-use overseer_proto::{slot_name, Client, Request, Response, SlotId, WorkItem, WorkView};
+use overseer_proto::{
+    owner_in_refusal, slot_name, Client, Request, Response, SlotId, WorkItem, WorkView,
+};
 
 use crate::app::colors;
 
@@ -130,15 +132,6 @@ pub struct PickerState {
     pub error: Option<String>,
     /// The request on its way; Enter does nothing until it is answered.
     pub in_flight: Option<Request>,
-}
-
-/// The slot named by the daemon's refusal `<KEY> is owned by S<n>`.
-pub fn owner_in(message: &str, key: &str) -> Option<SlotId> {
-    let n = message.strip_prefix(key)?.strip_prefix(" is owned by S")?;
-    if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    n.parse().ok()
 }
 
 impl PickerState {
@@ -310,7 +303,7 @@ impl PickerState {
                     next: again(true, move_owner),
                 });
             }
-            Ok(Response::Error { message }) => match owner_in(&message, &key) {
+            Ok(Response::Error { message }) => match owner_in_refusal(&message, &key) {
                 Some(owner) if !move_owner => {
                     self.question = Some(Question {
                         prompt: Prompt::Move(owner),
@@ -993,12 +986,15 @@ mod tests {
     }
 
     #[test]
-    fn owner_parsing() {
-        assert_eq!(owner_in("DEMO-12 is owned by S3", "DEMO-12"), Some(3));
-        assert_eq!(owner_in("DEMO-12 is owned by S0", "DEMO-12"), Some(0));
-        assert_eq!(owner_in("ov-3 is owned by S3", "DEMO-12"), None);
-        assert_eq!(owner_in("DEMO-12 is owned by Sx", "DEMO-12"), None);
-        assert_eq!(owner_in("DEMO-12 is owned by S3 now", "DEMO-12"), None);
-        assert_eq!(owner_in("invalid slot id 9", "DEMO-12"), None);
+    fn the_daemons_refusal_text_offers_a_move() {
+        // The text the daemon builds, not a copy of it.
+        let all = rows(&view(), "");
+        let mut p = PickerState::new(4);
+        p.selected = 1;
+        p.accept(&all);
+        p.reply(Ok(Response::Error {
+            message: overseer_proto::owned_by_message("ov-3", 2),
+        }));
+        assert_eq!(p.question.unwrap().prompt, Prompt::Move(2));
     }
 }
