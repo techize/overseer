@@ -2,6 +2,7 @@ mod agent;
 mod attach;
 mod ctl;
 mod hook;
+mod mcp;
 mod outer;
 
 use clap::{Parser, Subcommand};
@@ -33,6 +34,8 @@ enum Cmd {
     Attach { n: overseer_proto::SlotId },
     /// Relay a Claude Code hook event to the daemon (run by Claude, not by hand).
     Hook { event: String },
+    /// Serve the lock and relay tools to a Claude session over MCP (run by Claude, not by hand).
+    Mcp,
     /// Install the LaunchAgent that keeps the daemon running.
     InstallAgent,
     /// Remove the LaunchAgent.
@@ -70,6 +73,8 @@ fn main() {
             hook::run(&event);
             return;
         }
+        // No logger: stdout carries the protocol, nothing else may use it.
+        Cmd::Mcp => mcp::run(),
         Cmd::InstallAgent => agent::install(),
         Cmd::UninstallAgent => agent::uninstall(),
         Cmd::Daemon { foreground: _ } => {

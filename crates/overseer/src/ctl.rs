@@ -152,7 +152,7 @@ fn expect_ok(resp: Response) -> anyhow::Result<()> {
 }
 
 /// Unix seconds as local HH:MM.
-fn local_hhmm(at: i64) -> String {
+pub(crate) fn local_hhmm(at: i64) -> String {
     let t = at as libc::time_t;
     // SAFETY: localtime_r writes only into the zeroed tm we pass.
     let tm = unsafe {

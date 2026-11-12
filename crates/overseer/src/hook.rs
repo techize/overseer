@@ -35,7 +35,7 @@ fn kind(name: &str) -> Option<HookKind> {
 }
 
 /// `OVERSEER_SLOT` is `S<n>`; anything else is not one of our slots.
-fn slot(env: &str) -> Option<SlotId> {
+pub(crate) fn slot(env: &str) -> Option<SlotId> {
     let n: SlotId = env.strip_prefix('S')?.parse().ok()?;
     (n < SLOT_COUNT).then_some(n)
 }
