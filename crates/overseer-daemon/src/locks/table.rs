@@ -127,7 +127,10 @@ fn claim_row(r: &Row) -> rusqlite::Result<Claim> {
     })
 }
 
-const RELAY_COLS: &str = "id, at, sender, from_slot, to_slot, text, delivered_at";
+const RELAY_COLS: &str = "id, at, sender, from_slot, to_slot, text, delivered_at, dropped_at";
+
+/// A relay still waiting to be typed in.
+const PENDING: &str = "delivered_at IS NULL AND dropped_at IS NULL";
 
 fn relay_row(r: &Row) -> rusqlite::Result<Relay> {
     let sender: String = r.get(2)?;
@@ -139,18 +142,21 @@ fn relay_row(r: &Row) -> rusqlite::Result<Relay> {
         (other, _) => return Err(bad_column(2, "relay sender", other)),
     };
     let delivered_at: Option<i64> = r.get(6)?;
+    let dropped_at: Option<i64> = r.get(7)?;
+    let state = match (delivered_at, dropped_at) {
+        (Some(_), _) => RelayState::Delivered,
+        (None, Some(_)) => RelayState::Dropped,
+        (None, None) => RelayState::Pending,
+    };
     Ok(Relay {
         id: r.get(0)?,
         at: r.get(1)?,
         from,
         to: r.get(4)?,
         text: r.get(5)?,
-        state: if delivered_at.is_some() {
-            RelayState::Delivered
-        } else {
-            RelayState::Pending
-        },
+        state,
         delivered_at,
+        dropped_at,
         held: None,
     })
 }
@@ -198,14 +204,15 @@ pub(crate) fn waits_on(conn: &Connection) -> Result<Vec<Wait>> {
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// Every pending relay plus the `recent` most recently delivered, newest
-/// first.
+/// Every pending relay plus the `recent` most recently delivered or
+/// dropped, newest first.
 pub(crate) fn relays_on(conn: &Connection, recent: usize) -> Result<Vec<Relay>> {
     let mut stmt = conn.prepare(&format!(
         "SELECT {RELAY_COLS} FROM relays
-         WHERE delivered_at IS NULL
-            OR id IN (SELECT id FROM relays WHERE delivered_at IS NOT NULL
-                      ORDER BY delivered_at DESC, id DESC LIMIT ?1)
+         WHERE ({PENDING})
+            OR id IN (SELECT id FROM relays WHERE NOT ({PENDING})
+                      ORDER BY COALESCE(delivered_at, dropped_at) DESC, id DESC
+                      LIMIT ?1)
          ORDER BY id DESC"
     ))?;
     let recent = i64::try_from(recent).unwrap_or(i64::MAX);
@@ -501,8 +508,8 @@ pub(crate) fn release_on_stop_on(
     release_all(conn, slot, targets, now)
 }
 
-/// When a slot's session ends: its command claims and every grant are
-/// released and it leaves every queue. Tool claims and pins stay.
+/// Releases a slot's command claims and every grant and takes it out of
+/// every queue. Tool claims and pins stay.
 pub(crate) fn drop_slot_on(conn: &Connection, slot: SlotId, now: i64) -> Result<Vec<Handoff>> {
     conn.execute("DELETE FROM waits WHERE slot = ?1", params![slot])?;
     let targets = targets_where(
@@ -511,6 +518,23 @@ pub(crate) fn drop_slot_on(conn: &Connection, slot: SlotId, now: i64) -> Result<
         params![slot],
     )?;
     release_all(conn, slot, targets, now)
+}
+
+/// When a slot's session ends: `drop_slot_on`, and every relay still
+/// pending for it is dropped, so a later session in the slot never gets
+/// it.
+pub(crate) fn end_session_on(conn: &Connection, slot: SlotId, now: i64) -> Result<Vec<Handoff>> {
+    let handoffs = drop_slot_on(conn, slot, now)?;
+    drop_relays_to_on(conn, slot, now)?;
+    Ok(handoffs)
+}
+
+/// Drops every relay still pending for `to`. Returns how many.
+pub(crate) fn drop_relays_to_on(conn: &Connection, to: SlotId, now: i64) -> Result<usize> {
+    Ok(conn.execute(
+        &format!("UPDATE relays SET dropped_at = ?2 WHERE to_slot = ?1 AND {PENDING}"),
+        params![to, now],
+    )?)
 }
 
 /// Releases every claim made for work item `item`, whoever holds it.
@@ -543,16 +567,18 @@ pub(crate) fn queue_relay_on(
 pub(crate) fn pending_relays_on(conn: &Connection, to: SlotId) -> Result<Vec<Relay>> {
     let mut stmt = conn.prepare(&format!(
         "SELECT {RELAY_COLS} FROM relays
-         WHERE to_slot = ?1 AND delivered_at IS NULL ORDER BY id"
+         WHERE to_slot = ?1 AND {PENDING} ORDER BY id"
     ))?;
     let rows = stmt.query_map(params![to], relay_row)?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// Marks relays delivered at `now`. Ones already delivered keep their time.
+/// Marks pending relays delivered at `now`. Ones already delivered keep
+/// their time; dropped ones stay dropped.
 pub(crate) fn mark_delivered_on(conn: &Connection, ids: &[i64], now: i64) -> Result<()> {
-    let mut stmt =
-        conn.prepare("UPDATE relays SET delivered_at = ?2 WHERE id = ?1 AND delivered_at IS NULL")?;
+    let mut stmt = conn.prepare(&format!(
+        "UPDATE relays SET delivered_at = ?2 WHERE id = ?1 AND {PENDING}"
+    ))?;
     for id in ids {
         stmt.execute(params![id, now])?;
     }
@@ -1027,6 +1053,63 @@ mod tests {
             assert_eq!(waits_on(c)?.len(), 1);
             Ok(())
         })
+    }
+
+    #[test]
+    fn session_end_retires_the_slots_pending_relays() {
+        let (l, path) = file_ledger("session-end");
+        l.transaction(|c| {
+            slot_2_with_one_of_each(c);
+            queue(c, "b", 3, Via::Hook, 17);
+            queue_relay_on(c, &Sender::You, 2, "check DEMO-12", None, 18)?;
+            let to_3 = queue_relay_on(c, &Sender::You, 3, "hello", None, 18)?;
+            let h = end_session_on(c, 2, 20)?;
+            let released: Vec<_> = h.iter().map(|h| h.target.as_str()).collect();
+            assert_eq!(released, vec!["a", "b", "c"]);
+            assert!(pending_relays_on(c, 2)?.is_empty());
+            // A relay already dropped is never marked delivered.
+            let dropped: Vec<i64> = relays_on(c, 50)?
+                .iter()
+                .filter(|r| r.state == RelayState::Dropped)
+                .map(|r| r.id)
+                .collect();
+            assert_eq!(dropped.len(), 2, "the grant relay for b and the message");
+            mark_delivered_on(c, &dropped, 21)?;
+            assert_eq!(
+                texts(c, 3),
+                vec!["hello", "S2 has released b. You now hold it."]
+            );
+            assert!(pending_relays_on(c, 3)?.iter().any(|r| r.id == to_3));
+            Ok(())
+        })
+        .unwrap();
+        drop(l);
+        let l = Ledger::open(&path).unwrap();
+        l.transaction(|c| {
+            let dropped: Vec<_> = relays_on(c, 50)?
+                .into_iter()
+                .filter(|r| r.to == 2 && r.delivered_at.is_none())
+                .map(|r| (r.text, r.state, r.dropped_at))
+                .collect();
+            assert_eq!(
+                dropped,
+                vec![
+                    (t("check DEMO-12"), RelayState::Dropped, Some(20)),
+                    (
+                        t("S1 has released b. You now hold it."),
+                        RelayState::Dropped,
+                        Some(20)
+                    ),
+                ]
+            );
+            Ok(())
+        })
+        .unwrap();
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    fn t(s: &str) -> String {
+        s.to_string()
     }
 
     #[test]

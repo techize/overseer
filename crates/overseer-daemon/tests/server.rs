@@ -2400,15 +2400,19 @@ async fn concurrent_claims_one_wins() {
 
 #[tokio::test]
 async fn locks_survive_restart() {
+    let stub = box_stub("locks-restart");
     let socket = temp_socket();
-    let d = lock_daemon_at(socket).await;
+    let start = |socket| start_daemon_full(socket, stub.env(), offline_settings(), lock_patterns());
+    let d = start(socket).await;
     let mut c = Client::connect(&d.socket).await;
-    // The shutdown kills S1's session; that exit must not drop its claim.
-    assert_eq!(c.start(1).await, Response::Ok);
+    // The shutdown kills S1's session; that exit must not drop its claim,
+    // its wait or its pending relay, since S1 can be resumed.
+    c.start_stub(1, &stub).await;
+    c.hook(hook(1, HookKind::UserPromptSubmit)).await;
     assert_eq!(c.check(1, "tu-1", "demo-deploy api").await, None);
     c.request(claim_target(2, "custom:a", Some("DEMO-12")))
         .await;
-    c.request(claim_target(3, "custom:a", None)).await;
+    c.request(claim_target(1, "custom:a", None)).await;
     c.request(claim_target(1, "custom:b", None)).await;
     c.request(claim_target(4, "custom:b", None)).await;
     c.request(Request::ReleaseTarget {
@@ -2416,15 +2420,34 @@ async fn locks_survive_restart() {
         target: t("custom:b"),
     })
     .await;
+    assert_eq!(c.relay(None, 1, "hello").await, queued_for(1));
     let before = c.locks().await;
     assert_eq!(before.claims.len(), 3);
     assert_eq!(before.waits.len(), 1);
-    assert_eq!(pending(&before).len(), 1);
+    assert_eq!(pending(&before).len(), 2);
     drop(c);
     let socket = shutdown(d).await;
-    let d = lock_daemon_at(socket).await;
+    let d = start(socket).await;
     let mut c = Client::connect(&d.socket).await;
-    assert_eq!(c.locks().await, before);
+    assert!(matches!(
+        c.list().await[1].state,
+        SlotState::Resumable { .. }
+    ));
+    let after = c.locks().await;
+    assert_eq!(after.claims, before.claims);
+    assert_eq!(after.waits, before.waits);
+    // S4 never ran, so the handoff relay to it is dropped at the restart.
+    assert_eq!(
+        relay_states(&after),
+        [
+            (1, t("hello"), RelayState::Pending),
+            (
+                4,
+                t("S1 has released custom:b. You now hold it."),
+                RelayState::Dropped
+            ),
+        ]
+    );
 }
 
 #[tokio::test]
@@ -2493,6 +2516,9 @@ fn is_error(r: &Response, text: &str) -> bool {
 async fn jonathan_and_s0_can_send_to_anyone() {
     let d = lock_daemon().await;
     let mut c = Client::connect(&d.socket).await;
+    for id in [2, 3] {
+        assert_eq!(c.start(id).await, Response::Ok);
+    }
     assert_eq!(c.relay(None, 3, "hello").await, queued_for(3));
     assert_eq!(c.relay(Some(0), 2, "status?").await, queued_for(2));
     let v = c.locks().await;
@@ -2524,6 +2550,9 @@ async fn jonathan_and_s0_can_send_to_anyone() {
 async fn worker_can_answer_s0_once() {
     let d = lock_daemon().await;
     let mut c = Client::connect(&d.socket).await;
+    for id in [0, 2] {
+        assert_eq!(c.start(id).await, Response::Ok);
+    }
     assert_eq!(c.relay(Some(0), 2, "status?").await, queued_for(2));
     // Not delivered yet, so there is nothing to answer.
     assert!(matches!(
@@ -2543,6 +2572,9 @@ async fn worker_can_answer_s0_once() {
 async fn worker_cannot_start_a_conversation() {
     let d = lock_daemon().await;
     let mut c = Client::connect(&d.socket).await;
+    for id in [0, 1, 2] {
+        assert_eq!(c.start(id).await, Response::Ok);
+    }
     assert!(is_error(
         &c.relay(Some(2), 1, "hi").await,
         "S2 can message S1 only to answer a message from S1."
@@ -2573,6 +2605,7 @@ async fn move_notice_queues_a_relay() {
     let d = s.daemon().await;
     let mut c = Client::connect(&d.socket).await;
     c.refresh().await;
+    assert_eq!(c.start(1).await, Response::Ok);
     assert_eq!(c.assign("DEMO-40", 1, false, false).await, Response::Ok);
     assert_eq!(c.assign("DEMO-40", 2, false, true).await, Response::Ok);
     let v = c.locks_until(|v| !pending(v).is_empty()).await;
@@ -2581,6 +2614,13 @@ async fn move_notice_queues_a_relay() {
         vec![(1, "DEMO-40 was moved to S2".to_string())]
     );
     assert_eq!(v.relays[0].from, Sender::Overseer);
+    // S2 has no session, so its notice is dropped, never delivered later.
+    assert_eq!(c.assign("DEMO-40", 3, false, true).await, Response::Ok);
+    let v = c.locks_until(|v| v.relays.len() == 2).await;
+    assert_eq!(
+        relay_states(&v)[0],
+        (2, t("DEMO-40 was moved to S3"), RelayState::Dropped)
+    );
 }
 
 #[tokio::test]
@@ -2907,6 +2947,7 @@ async fn two_pending_relays_go_in_one_paste() {
     let v = c.all_delivered(2).await;
     assert_eq!(v.relays.len(), 2);
     // Delivered, so S2 may now answer S0 once.
+    assert_eq!(c.start(0).await, Response::Ok);
     assert_eq!(c.relay(Some(2), 0, "on it").await, queued_for(0));
 }
 
@@ -2968,4 +3009,263 @@ async fn one_line_relay_is_typed_without_bracketed_paste() {
     let want = format!("{HELLO}\r");
     assert_eq!(stub.read_until(&want).await, want);
     c.all_delivered(2).await;
+}
+
+// Session end: a slot's waits, unused grants and pending relays belong to
+// the session in it and go when that session ends, however it ends.
+
+/// `(to, text, state)` of every relay, newest first.
+fn relay_states(v: &LockView) -> Vec<(u8, String, RelayState)> {
+    v.relays
+        .iter()
+        .map(|r| (r.to, r.text.clone(), r.state))
+        .collect()
+}
+
+impl Client {
+    /// Waits until slot `id` reads as exited.
+    async fn exited(&mut self, id: u8) {
+        for _ in 0..250 {
+            if matches!(
+                self.list().await[id as usize].state,
+                SlotState::Exited { .. }
+            ) {
+                return;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        panic!("S{id} never exited");
+    }
+}
+
+#[tokio::test]
+async fn stop_then_start_at_once_starts_clean() {
+    let stub = box_stub("stop-start");
+    let d = start_daemon_full(
+        temp_socket(),
+        stub.env(),
+        offline_settings(),
+        lock_patterns(),
+    )
+    .await;
+    let mut c = Client::connect(&d.socket).await;
+    c.start_stub(3, &stub).await;
+    c.hook(hook(3, HookKind::UserPromptSubmit)).await;
+    c.request(claim_target(1, "custom:a", None)).await;
+    assert!(matches!(
+        c.request(claim_target(3, "custom:a", None)).await,
+        Response::Queued { .. }
+    ));
+    assert_eq!(c.relay(None, 3, "hello").await, queued_for(3));
+    c.held_for(3, "session is working").await;
+
+    assert_eq!(c.request(Request::StopSlot { id: 3 }).await, Response::Ok);
+    c.exited(3).await;
+    let draws = stub.draws();
+    let start = Request::StartSlot {
+        id: 3,
+        label: "t3".into(),
+        cwd: stub.dir.join("work"),
+        command: Some(vec![stub.bin.to_string_lossy().into_owned()]),
+        prompt: None,
+    };
+    assert_eq!(c.request(start).await, Response::Ok);
+    // Settled by the start itself, whatever the old exit event does.
+    let v = c.locks().await;
+    assert!(v.waits.is_empty(), "{v:?}");
+    assert_eq!(
+        relay_states(&v),
+        [(3, t("hello"), RelayState::Dropped)],
+        "{v:?}"
+    );
+    stub.drawn(draws + 1).await;
+    c.hook(hook(3, HookKind::SessionStart)).await;
+    // The new session is idle with an empty box, and S1's release finds no
+    // one waiting: nothing is typed in.
+    assert_eq!(
+        c.request(Request::ReleaseTarget {
+            slot: 1,
+            target: t("custom:a")
+        })
+        .await,
+        Response::Text {
+            text: t("Released custom:a.")
+        }
+    );
+    stub.reads_nothing_for(2).await;
+    assert!(pending(&c.locks().await).is_empty());
+}
+
+#[tokio::test]
+async fn declining_a_resumable_slot_hands_its_grant_on() {
+    let stub = box_stub("decline");
+    let socket = temp_socket();
+    let start = |socket| start_daemon_full(socket, stub.env(), offline_settings(), lock_patterns());
+    let d = start(socket).await;
+    let mut c = Client::connect(&d.socket).await;
+    c.start_stub(2, &stub).await;
+    c.hook(hook(2, HookKind::UserPromptSubmit)).await;
+    let api = "deploy:demo/api";
+    assert_eq!(c.check(1, "tu-1", "demo-deploy api").await, None);
+    assert!(c.check(2, "tu-2", "demo-deploy api").await.is_some());
+    c.request(claim_target(4, "custom:b", None)).await;
+    c.request(claim_target(2, "custom:b", None)).await;
+    c.hook(post_tool_use(1, "tu-1")).await;
+    assert_eq!(c.relay(None, 2, "hello").await, queued_for(2));
+    let v = c.locks().await;
+    assert_eq!(
+        holds(&v),
+        [
+            (t("custom:b"), 4, ClaimKind::Claim),
+            (t(api), 2, ClaimKind::Grant)
+        ]
+    );
+    assert_eq!(queued(&v), [(t("custom:b"), 2)]);
+    drop(c);
+
+    let socket = shutdown(d).await;
+    let d = start(socket).await;
+    let mut c = Client::connect(&d.socket).await;
+    assert!(matches!(
+        c.list().await[2].state,
+        SlotState::Resumable { .. }
+    ));
+    // The resumable session keeps all of it.
+    let v = c.locks().await;
+    assert_eq!(holds(&v)[1], (t(api), 2, ClaimKind::Grant));
+    assert_eq!(queued(&v), [(t("custom:b"), 2)]);
+    assert!(matches!(
+        c.request(claim_target(5, api, None)).await,
+        Response::Queued { .. }
+    ));
+
+    assert_eq!(c.request(Request::StopSlot { id: 2 }).await, Response::Ok);
+    let v = c.locks().await;
+    assert_eq!(
+        holds(&v),
+        [
+            (t("custom:b"), 4, ClaimKind::Claim),
+            (t(api), 5, ClaimKind::Claim)
+        ]
+    );
+    assert!(v.waits.is_empty(), "{v:?}");
+    let states = relay_states(&v);
+    assert!(
+        states.contains(&(
+            5,
+            t("S2 has released deploy:demo/api. You now hold it."),
+            RelayState::Pending
+        )),
+        "{states:?}"
+    );
+    assert!(
+        states.contains(&(2, t("hello"), RelayState::Dropped)),
+        "{states:?}"
+    );
+    assert!(
+        states.contains(&(
+            2,
+            t("S1 has released deploy:demo/api. You now hold it."),
+            RelayState::Dropped
+        )),
+        "{states:?}"
+    );
+}
+
+#[tokio::test]
+async fn restart_ends_the_sessions_that_cannot_resume() {
+    let socket = temp_socket();
+    let d = lock_daemon_at(socket).await;
+    let mut c = Client::connect(&d.socket).await;
+    // S1 runs a command that is not claude, so it cannot be resumed.
+    assert_eq!(c.start(1).await, Response::Ok);
+    assert_eq!(c.check(1, "tu-1", "demo-deploy api").await, None);
+    c.request(claim_target(1, "custom:a", None)).await;
+    c.request(claim_target(2, "custom:b", None)).await;
+    c.request(claim_target(1, "custom:b", None)).await;
+    drop(c);
+    let socket = shutdown(d).await;
+    let d = lock_daemon_at(socket).await;
+    let mut c = Client::connect(&d.socket).await;
+    assert!(matches!(c.list().await[1].state, SlotState::Exited { .. }));
+    let v = c.locks().await;
+    // The command claim and the wait went with the session; tool claims
+    // stay until released.
+    assert_eq!(
+        holds(&v),
+        [
+            (t("custom:a"), 1, ClaimKind::Claim),
+            (t("custom:b"), 2, ClaimKind::Claim)
+        ]
+    );
+    assert!(v.waits.is_empty(), "{v:?}");
+}
+
+#[tokio::test]
+async fn send_to_a_slot_with_no_session_is_refused() {
+    let d = lock_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    assert!(is_error(
+        &c.relay(None, 4, "hello").await,
+        "S4 has no session to message."
+    ));
+    assert!(is_error(
+        &c.relay(Some(0), 4, "status?").await,
+        "S4 has no session to message."
+    ));
+    assert_eq!(c.start(4).await, Response::Ok);
+    assert_eq!(c.relay(None, 4, "hello").await, queued_for(4));
+    assert_eq!(c.request(Request::StopSlot { id: 4 }).await, Response::Ok);
+    c.exited(4).await;
+    let v = c
+        .locks_until(|v| v.relays.iter().all(|r| r.state == RelayState::Dropped))
+        .await;
+    assert_eq!(relay_states(&v), [(4, t("hello"), RelayState::Dropped)]);
+    assert!(is_error(
+        &c.relay(None, 4, "again").await,
+        "S4 has no session to message."
+    ));
+}
+
+#[tokio::test]
+async fn notice_for_a_holder_with_no_session_is_queued_dropped() {
+    let d = lock_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    // S3 never ran; its tool claim stays until released.
+    c.request(claim_target(3, "custom:z", None)).await;
+    assert_eq!(
+        c.request(Request::ForceRelease {
+            target: t("custom:z")
+        })
+        .await,
+        Response::Text {
+            text: t("Released custom:z.")
+        }
+    );
+    let v = c.locks().await;
+    assert_eq!(
+        relay_states(&v),
+        [(
+            3,
+            t("Jonathan released custom:z, which you held."),
+            RelayState::Dropped
+        )]
+    );
+    assert!(v.relays[0].dropped_at.is_some());
+}
+
+#[tokio::test]
+async fn relay_right_after_a_delivery_says_why_it_waits() {
+    let stub = box_stub("cooldown");
+    let d = start_daemon_with(temp_socket(), stub.env()).await;
+    let mut c = Client::connect(&d.socket).await;
+    c.start_stub(2, &stub).await;
+    c.hook(hook(2, HookKind::SessionStart)).await;
+    assert_eq!(c.relay(None, 2, "hello").await, queued_for(2));
+    stub.read_until(&pasted(HELLO)).await;
+    c.all_delivered(2).await;
+    // No hook since: the session has not reacted to the first paste yet.
+    assert_eq!(c.relay(None, 2, "and the tests").await, queued_for(2));
+    c.held_for(2, "just delivered, waiting for the session")
+        .await;
 }

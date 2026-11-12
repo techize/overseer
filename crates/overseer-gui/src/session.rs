@@ -232,9 +232,10 @@ fn sender_name(s: Sender) -> String {
 
 /// The relays to or from `slot`, newest first (by delivery time when
 /// delivered, else creation time, ties by id): `14:05 from S0: <text>`,
-/// `14:06 to S0: <text>`. A pending one ends `(pending: <reason>)`.
+/// `14:06 to S0: <text>`. A pending one ends `(pending: <reason>)`, a
+/// dropped one `(for S3, dropped: session ended)`.
 pub fn relay_rows(view: &LockView, slot: SlotId, clock: impl Fn(i64) -> String) -> Vec<String> {
-    let when = |r: &overseer_proto::Relay| r.delivered_at.unwrap_or(r.at);
+    let when = |r: &overseer_proto::Relay| r.delivered_at.or(r.dropped_at).unwrap_or(r.at);
     let mut relays: Vec<_> = view
         .relays
         .iter()
@@ -251,11 +252,14 @@ pub fn relay_rows(view: &LockView, slot: SlotId, clock: impl Fn(i64) -> String) 
                 format!("to {}", slot_name(r.to))
             };
             let mut line = format!("{time} {who}: {}", one_line(&r.text, 80));
-            if r.state == RelayState::Pending {
-                match &r.held {
-                    Some(why) => line.push_str(&format!(" (pending: {why})")),
-                    None => line.push_str(" (pending)"),
-                }
+            match (r.state, &r.held) {
+                (RelayState::Pending, Some(why)) => line.push_str(&format!(" (pending: {why})")),
+                (RelayState::Pending, None) => line.push_str(" (pending)"),
+                (RelayState::Dropped, _) => line.push_str(&format!(
+                    " (for {}, dropped: session ended)",
+                    slot_name(r.to)
+                )),
+                (RelayState::Delivered, _) => {}
             }
             line
         })
@@ -1446,6 +1450,7 @@ mod tests {
                 RelayState::Pending
             },
             delivered_at,
+            dropped_at: None,
             held: held.map(Into::into),
         }
     }
@@ -1552,6 +1557,31 @@ mod tests {
                 "T107 from you: line one line two (pending: session is working)".to_string(),
                 "T106 to S0: done with DEMO-33".to_string(),
                 "T105 from S0: argo is free".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn relay_rows_show_dropped_relays() {
+        let mut v = locks();
+        v.relays = vec![
+            overseer_proto::Relay {
+                state: RelayState::Dropped,
+                dropped_at: Some(120),
+                ..relay(1, Sender::Slot { slot: 0 }, 2, 100, None, None, "status?")
+            },
+            overseer_proto::Relay {
+                state: RelayState::Dropped,
+                dropped_at: Some(110),
+                ..relay(2, Sender::Slot { slot: 2 }, 0, 105, None, None, "on it")
+            },
+        ];
+        let clock = |t: i64| format!("T{t}");
+        assert_eq!(
+            relay_rows(&v, 2, clock),
+            vec![
+                "T120 from S0: status? (for S2, dropped: session ended)".to_string(),
+                "T110 to S0: on it (for S0, dropped: session ended)".to_string(),
             ]
         );
     }

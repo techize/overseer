@@ -371,10 +371,11 @@ pub fn pending_label(n: usize) -> Option<String> {
     }
 }
 
-/// The relay strip: the newest `max` relays, newest first, by delivery time
-/// when delivered and creation time otherwise. `clock` renders a time.
+/// The relay strip: the newest `max` relays, newest first, by delivery (or
+/// drop) time when retired and creation time otherwise. `clock` renders a
+/// time.
 pub fn strip_lines(view: &LockView, clock: impl Fn(i64) -> String, max: usize) -> Vec<String> {
-    let when = |r: &overseer_proto::Relay| r.delivered_at.unwrap_or(r.at);
+    let when = |r: &overseer_proto::Relay| r.delivered_at.or(r.dropped_at).unwrap_or(r.at);
     let mut relays: Vec<_> = view.relays.iter().collect();
     relays.sort_by_key(|r| std::cmp::Reverse((when(r), r.id)));
     relays
@@ -386,6 +387,9 @@ pub fn strip_lines(view: &LockView, clock: impl Fn(i64) -> String, max: usize) -
             match r.state {
                 RelayState::Delivered => format!("{time} told {to}: {text}"),
                 RelayState::Pending => format!("{time} for {to}, pending: {text}"),
+                RelayState::Dropped => {
+                    format!("{time} for {to}, dropped: session ended: {text}")
+                }
             }
         })
         .collect()
@@ -867,6 +871,7 @@ mod tests {
                 RelayState::Pending
             },
             delivered_at,
+            dropped_at: None,
             held: None,
         }
     }
@@ -997,6 +1002,29 @@ mod tests {
         assert_eq!(cut.chars().count(), 81);
         assert!(cut.ends_with('…'));
         assert_eq!(strip_lines(&v, clock, 10).len(), 4);
+    }
+
+    #[test]
+    fn strip_shows_a_dropped_relay_at_its_drop_time() {
+        let mut v = no_locks();
+        v.relays = vec![
+            Relay {
+                state: RelayState::Dropped,
+                dropped_at: Some(400),
+                ..relay(1, 3, 100, None, "hello")
+            },
+            relay(2, 4, 300, None, "wait for it"),
+        ];
+        let lines = strip_lines(&v, |t: i64| format!("t{t}"), 5);
+        assert_eq!(
+            lines,
+            [
+                "t400 for S3, dropped: session ended: hello",
+                "t300 for S4, pending: wait for it"
+            ]
+        );
+        // A dropped relay is not pending.
+        assert_eq!(v.pending_for(3), 0);
     }
 
     fn cm(i: &SlotInfo, now: i64, home: Option<&Path>) -> CardModel {

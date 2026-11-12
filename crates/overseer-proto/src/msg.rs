@@ -233,6 +233,8 @@ pub enum Sender {
 pub enum RelayState {
     Pending,
     Delivered,
+    /// Retired unsent: the session it was for ended first.
+    Dropped,
 }
 
 /// A message from one session (or Overseer, or you) to a slot's session.
@@ -245,13 +247,16 @@ pub struct Relay {
     pub text: String,
     pub state: RelayState,
     pub delivered_at: Option<i64>,
+    /// When a `Dropped` relay was retired.
+    #[serde(default)]
+    pub dropped_at: Option<i64>,
     /// Why a pending relay is waiting, e.g. `session is working`. Filled by
     /// the courier.
     pub held: Option<String>,
 }
 
 /// Every claim, wait and relay worth showing. `relays` holds every pending
-/// relay plus the 50 most recent delivered ones, newest first.
+/// relay plus the 50 most recent delivered or dropped ones, newest first.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LockView {
     pub claims: Vec<Claim>,
@@ -649,6 +654,7 @@ mod tests {
             text: "hello".into(),
             state,
             delivered_at: None,
+            dropped_at: None,
             held: None,
         };
         LockView {

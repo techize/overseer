@@ -10,7 +10,7 @@ pub mod targets;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -47,7 +47,11 @@ pub struct LockService {
     stopping: AtomicBool,
     /// Why each slot's pending relays wait, as the courier last found it.
     held: Mutex<[Option<&'static str>; SLOT_COUNT]>,
+    /// The slots with no session (empty or exited), from the slot manager.
+    sessionless: OnceLock<SessionlessFn>,
 }
+
+type SessionlessFn = Box<dyn Fn() -> Vec<SlotId> + Send + Sync>;
 
 /// Local `HH:MM` for unix seconds.
 pub fn local_hhmm(t: i64) -> String {
@@ -140,7 +144,45 @@ impl LockService {
             flag_after,
             stopping: AtomicBool::new(false),
             held: Mutex::new([None; SLOT_COUNT]),
+            sessionless: OnceLock::new(),
         })
+    }
+
+    /// Sets how to learn which slots have no session, so relays Overseer
+    /// queues for them are dropped at once. Set once at start-up; it must
+    /// not call back into the lock service.
+    pub fn on_sessionless(&self, f: impl Fn() -> Vec<SlotId> + Send + Sync + 'static) {
+        let _ = self.sessionless.set(Box::new(f));
+    }
+
+    /// The slots with no session now. None while the daemon stops, since
+    /// those sessions are only paused for the restart.
+    fn sessionless(&self) -> Vec<SlotId> {
+        if self.stopping.load(Ordering::SeqCst) {
+            return Vec::new();
+        }
+        self.sessionless.get().map_or_else(Vec::new, |f| f())
+    }
+
+    /// Drops the relays pending for slots with no session, such as a
+    /// notice the work store just queued for one.
+    pub fn drop_sessionless_relays(&self, now: i64) {
+        let dead = self.sessionless();
+        if dead.is_empty() {
+            return;
+        }
+        let done = self.ledger.transaction(|conn| {
+            let mut n = 0;
+            for &slot in &dead {
+                n += table::drop_relays_to_on(conn, slot, now)?;
+            }
+            Ok(n)
+        });
+        match done {
+            Ok(0) => {}
+            Ok(_) => self.announce(),
+            Err(e) => tracing::warn!("dropping relays: {e:#}"),
+        }
     }
 
     pub fn view(&self) -> LockView {
@@ -257,11 +299,17 @@ impl LockService {
         self.released(target, done)
     }
 
-    /// Jonathan's release of whatever holds `target`.
+    /// Jonathan's release of whatever holds `target`. The notice to a
+    /// holder with no session is queued already dropped.
     pub fn force_release(&self, target: &str, now: i64) -> Response {
-        let done = self
-            .ledger
-            .transaction(|conn| table::release_on(conn, target, Releaser::Force, None, now));
+        let dead = self.sessionless();
+        let done = self.ledger.transaction(|conn| {
+            let h = table::release_on(conn, target, Releaser::Force, None, now)?;
+            for &slot in &dead {
+                table::drop_relays_to_on(conn, slot, now)?;
+            }
+            Ok(h)
+        });
         self.released(target, done)
     }
 
@@ -354,28 +402,32 @@ impl LockService {
         self.after_release("hook release", done);
     }
 
-    /// A slot's session ended: its command claims and grants go and it
-    /// leaves every queue. Ignored once `shutdown` was called.
-    pub fn on_slot_exit(&self, slot: SlotId, now: i64) {
-        if self.stopping.load(Ordering::SeqCst) {
+    /// A slot's session ended (it exited, a resumable one was declined, or
+    /// a fresh start replaces it): its command claims and grants go, it
+    /// leaves every queue and its pending relays are dropped. Ignored once
+    /// `shutdown` was called, so those sessions keep all of it for a resume.
+    pub fn on_session_ended(&self, slot: SlotId, now: i64) {
+        if !valid_id(slot) || self.stopping.load(Ordering::SeqCst) {
             return;
         }
         // Leaving a queue hands nothing on, so announce either way.
-        let _ = self.change("slot exit", |conn| table::drop_slot_on(conn, slot, now));
+        let _ = self.change("session end", |conn| table::end_session_on(conn, slot, now));
     }
 
-    /// After lost exit events: each of `stopped` (slots not running now)
-    /// that still has a command claim, a grant or a wait is treated as
-    /// exited. Slots with nothing to drop are left alone.
-    pub fn reconcile_exits(&self, stopped: &[SlotId], now: i64) {
+    /// For slots whose end may not have been seen (lost exit events, or a
+    /// daemon start): each of `ended` (slots with no session now) that
+    /// still has a command claim, a grant, a wait or a pending relay is
+    /// treated as ended. Slots with nothing to drop are left alone.
+    pub fn reconcile_exits(&self, ended: &[SlotId], now: i64) {
         let v = self.view();
-        for &slot in stopped {
+        for &slot in ended {
             let stale =
                 v.claims.iter().any(|c| {
                     c.slot == slot && matches!(c.kind, ClaimKind::Command | ClaimKind::Grant)
-                }) || v.waits.iter().any(|w| w.slot == slot);
+                }) || v.waits.iter().any(|w| w.slot == slot)
+                    || v.pending_for(slot) > 0;
             if stale {
-                self.on_slot_exit(slot, now);
+                self.on_session_ended(slot, now);
             }
         }
     }
@@ -570,11 +622,11 @@ mod tests {
     #[test]
     fn exits_after_shutdown_keep_their_locks() {
         let locks = holding();
-        locks.on_slot_exit(1, 20);
+        locks.on_session_ended(1, 20);
         assert!(locks.view().claims.is_empty());
         let locks = holding();
         locks.shutdown();
-        locks.on_slot_exit(1, 20);
+        locks.on_session_ended(1, 20);
         assert_eq!(locks.view().claims.len(), 1);
     }
 

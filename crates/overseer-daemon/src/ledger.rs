@@ -103,7 +103,8 @@ CREATE TABLE IF NOT EXISTS relays (
     to_slot INTEGER NOT NULL,
     text TEXT NOT NULL,
     reply_to INTEGER,
-    delivered_at INTEGER
+    delivered_at INTEGER,
+    dropped_at INTEGER
 )";
 
 const VERSION: i64 = 3;
@@ -288,13 +289,13 @@ impl Ledger {
         Ok(())
     }
 
-    /// Every claim and wait, every pending relay and the `recent` most
-    /// recently delivered ones, read in one transaction.
     /// Marks relays delivered at `now`.
     pub fn mark_relays_delivered(&self, ids: &[i64], now: i64) -> Result<()> {
         self.transaction(|c| table::mark_delivered_on(c, ids, now))
     }
 
+    /// Every claim and wait, every pending relay and the `recent` most
+    /// recently delivered or dropped ones, read in one transaction.
     pub fn lock_view(&self, recent: usize, flag_after_secs: i64) -> Result<LockView> {
         self.transaction(|c| {
             Ok(LockView {

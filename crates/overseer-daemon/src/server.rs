@@ -117,11 +117,21 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
         .with_env(env.clone())
         .with_launch(cfg.state_dir, cfg.hook_program, ledger.clone());
     mgr.restore();
+    // A session that did not survive the restart, or whose exit was never
+    // seen, has ended: only a resumable one keeps its waits and relays.
+    let ended = sessionless(&mgr.list());
+    locks.reconcile_exits(&ended, unix_now());
     let manager: Manager = Arc::new(Mutex::new(mgr));
+    locks.on_sessionless({
+        let manager = manager.clone();
+        move || sessionless(&manager.lock().unwrap().list())
+    });
     let courier = Courier::spawn(ledger, manager.clone(), locks.clone(), courier_events);
     store.on_relays_queued({
         let (locks, courier) = (locks.clone(), courier.clone());
         move || {
+            // A notice for a slot with no session is never delivered.
+            locks.drop_sessionless_relays(unix_now());
             locks.announce();
             courier.poke();
         }
@@ -174,8 +184,18 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The slots in `infos` with no session: empty or exited. A resumable
+/// slot still has one, waiting to be resumed.
+fn sessionless(infos: &[overseer_proto::SlotInfo]) -> Vec<SlotId> {
+    infos
+        .iter()
+        .filter(|i| matches!(i.state, SlotState::Empty | SlotState::Exited { .. }))
+        .map(|i| i.id)
+        .collect()
+}
+
 /// Ends the locks of each slot whose session exits. After a lag, which
-/// may have lost exit events, every slot not running now is reconciled.
+/// may have lost exit events, every slot with no session is reconciled.
 async fn watch_exits(
     mut events: broadcast::Receiver<Event>,
     locks: Arc<LockService>,
@@ -185,22 +205,21 @@ async fn watch_exits(
     loop {
         match events.recv().await {
             Ok(Event::SlotChanged(info)) if matches!(info.state, SlotState::Exited { .. }) => {
-                locks.on_slot_exit(info.id, unix_now());
+                // A start may have replaced the session since this was
+                // sent, and the start already ended the old one.
+                let ended = sessionless(&manager.lock().unwrap().list());
+                if !ended.contains(&info.id) {
+                    continue;
+                }
+                locks.on_session_ended(info.id, unix_now());
                 // A handoff may have queued a relay.
                 courier.poke();
             }
             Ok(_) => {}
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 tracing::warn!("lock exit watcher lagged by {n} events; reconciling");
-                let stopped: Vec<SlotId> = manager
-                    .lock()
-                    .unwrap()
-                    .list()
-                    .into_iter()
-                    .filter(|i| !matches!(i.state, SlotState::Running { .. }))
-                    .map(|i| i.id)
-                    .collect();
-                locks.reconcile_exits(&stopped, unix_now());
+                let ended = sessionless(&manager.lock().unwrap().list());
+                locks.reconcile_exits(&ended, unix_now());
                 courier.poke();
             }
             Err(broadcast::error::RecvError::Closed) => return,
@@ -480,6 +499,8 @@ fn handle_frame(
                     | Request::ForceRelease { .. }
                     | Request::Release { .. }
                     | Request::Assign { .. }
+                    | Request::StartSlot { .. }
+                    | Request::StopSlot { .. }
                     | Request::Hook(_)
             );
             let mut pending_attach = None;
@@ -581,7 +602,14 @@ fn handle_request(
         Request::ReleaseTarget { slot, target } => locks.release(slot, &target, unix_now()),
         Request::ForceRelease { target } => locks.force_release(&target, unix_now()),
         Request::SendRelay { from, to, text } => {
-            crate::relay::send(locks, from, to, &text, unix_now())
+            // An empty or exited slot has no session to type into; a
+            // resumable one gets it once resumed.
+            let live = valid_id(to)
+                && !matches!(
+                    manager.lock().unwrap().list()[to as usize].state,
+                    SlotState::Empty | SlotState::Exited { .. }
+                );
+            crate::relay::send(locks, from, to, &text, live, unix_now())
         }
         // Answered in `handle_frame` from a task; this arm only keeps the
         // match whole.
@@ -607,18 +635,39 @@ fn handle_request(
             cwd,
             command,
             prompt,
-        } => match manager
-            .lock()
-            .unwrap()
-            .start(id, label, &cwd, command, prompt)
-        {
-            Ok(()) => Response::Ok,
-            Err(m) => err(m),
-        },
-        Request::StopSlot { id } => match manager.lock().unwrap().stop(id) {
-            Ok(()) => Response::Ok,
-            Err(m) => err(m),
-        },
+        } => {
+            // Held across both, so no other start or stop comes between.
+            let mut m = manager.lock().unwrap();
+            // A fresh start replaces whatever session the slot had (an
+            // exited one, perhaps not announced yet, or a resumable one):
+            // its waits, unused grants and pending relays are not the new
+            // session's. A resume keeps them.
+            let running =
+                valid_id(id) && matches!(m.list()[id as usize].state, SlotState::Running { .. });
+            if !running {
+                locks.on_session_ended(id, unix_now());
+            }
+            match m.start(id, label, &cwd, command, prompt) {
+                Ok(()) => Response::Ok,
+                Err(e) => err(e),
+            }
+        }
+        Request::StopSlot { id } => {
+            let mut m = manager.lock().unwrap();
+            // Stopping a resumable slot declines it: that session has ended
+            // and no exit event will say so.
+            let declined =
+                valid_id(id) && matches!(m.list()[id as usize].state, SlotState::Resumable { .. });
+            match m.stop(id) {
+                Ok(()) => {
+                    if declined {
+                        locks.on_session_ended(id, unix_now());
+                    }
+                    Response::Ok
+                }
+                Err(e) => err(e),
+            }
+        }
         Request::ResumeSlot { id } => match manager.lock().unwrap().resume(id) {
             Ok(()) => Response::Ok,
             Err(m) => err(m),

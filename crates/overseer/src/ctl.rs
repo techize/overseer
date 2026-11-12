@@ -213,8 +213,9 @@ fn cut(text: &str, max: usize) -> String {
 }
 
 /// One line per claim (`repo:demo-api:main  S1  command  since 08:40  for
-/// DEMO-33`, plus `  held long` when flagged) with its waiters beneath, then
-/// pending relays. Waits on a target nobody holds follow the claims.
+/// DEMO-33`, plus `  at <rev>` for a pin and `  held long` when flagged)
+/// with its waiters beneath, then pending and dropped relays. Waits on a
+/// target nobody holds follow the claims.
 pub fn format_locks(v: &LockView, now: i64) -> Vec<String> {
     let kind = |k: &ClaimKind| match k {
         ClaimKind::Command => "command",
@@ -241,6 +242,9 @@ pub fn format_locks(v: &LockView, now: i64) -> Vec<String> {
         if let Some(why) = c.item.as_deref().or(c.reason.as_deref()) {
             line.push_str(&format!("  for {why}"));
         }
+        if let Some(rev) = &c.pin_revision {
+            line.push_str(&format!("  at {rev}"));
+        }
         if v.flagged(c, now) {
             line.push_str("  held long");
         }
@@ -255,11 +259,16 @@ pub fn format_locks(v: &LockView, now: i64) -> Vec<String> {
         out.push(w.target.clone());
         out.push(waiting(w));
     }
-    for r in v.relays.iter().filter(|r| r.state == RelayState::Pending) {
-        // No reason from the courier yet: it simply has not been delivered.
-        let why = r.held.as_deref().unwrap_or("pending");
+    for r in &v.relays {
+        let state = match (r.state, r.held.as_deref()) {
+            (RelayState::Delivered, _) => continue,
+            (RelayState::Dropped, _) => "dropped: session ended".to_string(),
+            // No reason from the courier yet: it simply has not been delivered.
+            (RelayState::Pending, None) => "pending".to_string(),
+            (RelayState::Pending, Some(why)) => format!("pending ({why})"),
+        };
         out.push(format!(
-            "relay  {}  pending ({why})  {}",
+            "relay  {}  {state}  {}",
             slot_name(r.to),
             cut(&r.text, 80)
         ));
@@ -521,6 +530,58 @@ mod tests {
     struct Cli {
         #[command(subcommand)]
         cmd: CtlCmd,
+    }
+
+    #[test]
+    fn locks_lines_show_pins_and_relay_states() {
+        use overseer_proto::{Claim, Relay, Sender};
+        let relay = |id, to, state, held: Option<&str>, text: &str| Relay {
+            id,
+            at: 0,
+            from: Sender::You,
+            to,
+            text: text.into(),
+            state,
+            delivered_at: None,
+            dropped_at: (state == RelayState::Dropped).then_some(5),
+            held: held.map(Into::into),
+        };
+        let v = LockView {
+            claims: vec![Claim {
+                target: "argo:uat/demo-api".into(),
+                slot: 1,
+                kind: ClaimKind::Pin,
+                reason: None,
+                item: Some("DEMO-12".into()),
+                since: 0,
+                last_used: 0,
+                pin_revision: Some("abc123".into()),
+            }],
+            waits: vec![],
+            relays: vec![
+                relay(4, 3, RelayState::Dropped, None, "status?"),
+                relay(
+                    3,
+                    2,
+                    RelayState::Pending,
+                    Some("session is working"),
+                    "hello",
+                ),
+                relay(2, 2, RelayState::Pending, None, "again"),
+                relay(1, 2, RelayState::Delivered, None, "seen"),
+            ],
+            flag_after_secs: 3600,
+        };
+        let at = local_hhmm(0);
+        assert_eq!(
+            format_locks(&v, 0),
+            vec![
+                format!("argo:uat/demo-api  S1  pin  since {at}  for DEMO-12  at abc123"),
+                "relay  S3  dropped: session ended  status?".to_string(),
+                "relay  S2  pending (session is working)  hello".to_string(),
+                "relay  S2  pending  again".to_string(),
+            ]
+        );
     }
 
     #[test]

@@ -34,6 +34,8 @@ const COOLDOWN: Duration = Duration::from_secs(10);
 const NOT_RUNNING: &str = "slot is not running";
 const TYPED: &str = "input box has text";
 const NO_BOX: &str = "input box not found";
+/// Inside the cooldown after a delivery.
+const JUST_SENT: &str = "just delivered, waiting for the session";
 /// Without bracketed paste every newline is an Enter, and a later one could
 /// land on a prompt the first one brought up.
 const NO_BRACKETS: &str = "bracketed paste is off";
@@ -175,6 +177,7 @@ impl Courier {
             pending = true;
             if let Some(s) = &sent[id as usize] {
                 if s.activity == info.activity && s.at.elapsed() < COOLDOWN {
+                    self.locks.set_held(id, Some(JUST_SENT));
                     continue;
                 }
             }
@@ -302,6 +305,7 @@ mod tests {
             text: text.into(),
             state: RelayState::Pending,
             delivered_at: None,
+            dropped_at: None,
             held: None,
         }
     }

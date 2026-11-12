@@ -46,11 +46,15 @@ pub fn may_send(
 }
 
 /// `SendRelay`: validates, applies the reply rule and queues the relay.
+/// `live` says whether `to` has a session (running or resumable); a relay
+/// for a slot without one would only wait for the next session, which is
+/// not who it was for, so it is refused.
 pub fn send(
     locks: &LockService,
     from: Option<SlotId>,
     to: SlotId,
     text: &str,
+    live: bool,
     now: i64,
 ) -> Response {
     if !valid_id(to) {
@@ -72,6 +76,7 @@ pub fn send(
             _ => None,
         };
         match may_send(from, to, unanswered) {
+            Ok(_) if !live => Ok(Err(format!("{} has no session to message.", slot_name(to)))),
             Ok(reply_to) => queue_relay_on(conn, &sender, to, text, reply_to, now).map(|_| Ok(())),
             Err(refusal) => Ok(Err(refusal)),
         }

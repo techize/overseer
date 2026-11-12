@@ -461,12 +461,26 @@ fn release_two_args_is_a_target() {
 #[test]
 fn send_queues_a_relay() {
     let env = Env::new();
-    // Nothing runs in S3, so the relay cannot be delivered and stays pending.
+    // Nothing runs in S3: there is no session to type into.
+    let out = env
+        .ctl(&["send", "3", "check the DEMO-33 branch"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("S3 has no session to message."), "{err}");
+    assert_eq!(stdout_of(&mut env.ctl(&["locks"])), "");
+    // A session that is not Claude never reports idle, so the relay stays
+    // pending.
+    env.ctl(&["start", "3", "--cwd", "/tmp", "--", "/bin/sleep", "30"])
+        .assert()
+        .success();
     env.ctl(&["send", "3", "check the DEMO-33 branch"])
         .assert()
         .success();
     let out = stdout_of(&mut env.ctl(&["locks"]));
     let line = out.lines().find(|l| l.starts_with("relay")).expect(&out);
-    assert!(line.starts_with("relay  S3  pending ("), "{out}");
+    assert!(line.starts_with("relay  S3  pending"), "{out}");
     assert!(line.ends_with("check the DEMO-33 branch"), "{out}");
 }
