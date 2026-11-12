@@ -46,3 +46,13 @@ kube:uat-eu/demo	kubectl --context uat-eu -n demo apply -f x.yaml
 -	cat <<'EOF' > notes.md\ngit push origin main\nEOF
 kube:staging-eu/default	cat <<EOF | kubectl apply -f -\nkind: ConfigMap\nEOF
 repo:demo-api:feature-x,tf:default	make build && git push; terraform apply
+# Known limits (docs/acceptance/phase-4.md, L8 and L9). These pin what happens
+# today, not what is right. --kubeconfig is ignored, so the context is the
+# current one and two kubeconfigs share a target.
+kube:staging-eu/default	kubectl --kubeconfig other.yaml apply -f x.yaml
+kube:staging-eu/demo	kubectl --kubeconfig=other.yaml -n demo delete pod x
+# A variable is not expanded: the folder name is taken as written.
+repo:$DIR:feature-x	cd "$DIR" && git push
+# A flag before the app name hides the write (fails open).
+-	argocd app sync --grpc-web demo-api
+-	argocd --grpc-web app sync demo-api

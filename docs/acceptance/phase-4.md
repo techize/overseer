@@ -89,7 +89,10 @@ not run `make install`, which would restart the installed daemon.
    `$OV ctl start 1 --cwd $OVERSEER_HOME/work/demo-api --label demo-1` (and
    `2`, `3` likewise). The first run in the folder shows Claude's folder trust
    prompt: answer it in the terminal view. Real sessions need your normal
-   Claude login, which they find through your normal `HOME`.
+   Claude login, which they find through your normal `HOME`. Answering that
+   prompt makes Claude Code record the temp folder's trust in your real
+   `~/.claude.json`; that is Claude Code's own write, not Overseer's.
+   Overseer writes nothing under `~/.claude` or `~/.claude.json`.
 5. The notification row needs the app bundle, which step 1 made. Bring another
    app to the front before triggering it.
 6. When done: `$OV ctl shutdown`, quit the app, `rm -rf /tmp/ov-hand4`.
@@ -144,7 +147,7 @@ and empty stderr.
 | H10 | A target lookup that is slow inside the daemon (700 ms budget) | `kubectl` stub that sleeps 5 s on `config current-context`; `PreToolUse kubectl apply -f x.yaml` 3 times | Allowed after about 0.7 s, silent; no claim and no wait recorded, so a late deny can never leave a stray wait; one warning per run in `daemon.log` | Verified 2026-11-12: 711, 713 and 715 ms; no `kube:` entry in `ctl locks`; `targets not resolved within 700ms; allowing "kubectl apply -f x.yaml"` three times |
 | H11 | A command no pattern matches costs one round trip | 20 runs of `git log --oneline` and 20 of `terraform plan` against the live daemon | Same speed as a no-op hook | Verified 2026-11-12: median 7 ms, max 8 ms for both |
 | H12 | Odd input is silent | No `OVERSEER_SLOT`; non-JSON stdin; an `Edit` tool event; `OVERSEER_SLOT=S9` with empty stdin | Exit 0, no output, nothing recorded | Verified 2026-11-12: four runs, exit 0 each, `ctl locks` unchanged |
-| H13 | Hooks and MCP are wired per slot only | Start a slot with the stub `claude`; read `slots/S1/settings.json`, `slots/S1/mcp.json` and the argv | `settings.json` has a `PreToolUse` entry with matcher `Bash` and `timeout` 5, and `permissions.allow` lists the four `mcp__overseer__*` tools; `mcp.json` runs `overseer mcp` with `OVERSEER_SLOT` set; the argv has `--settings`, `--mcp-config` and `--append-system-prompt-file` pointing at the slot folder; nothing written under the temp `HOME`'s `.claude` | Verified 2026-11-12: all as described (`PreToolUse`, matcher `Bash`, timeout 5; env `OVERSEER_SLOT: S1`; the three flags); the temp `HOME` held only `.profile` and `.config/overseer`. The real `~/.claude` was never opened by anything in the run |
+| H13 | Hooks and MCP are wired per slot only | Start a slot with the stub `claude`; read `slots/S1/settings.json`, `slots/S1/mcp.json` and the argv | `settings.json` has a `PreToolUse` entry with matcher `Bash` and `timeout` 5, and `permissions.allow` lists the four `mcp__overseer__*` tools; `mcp.json` runs `overseer mcp` with `OVERSEER_SLOT` set; the argv has `--settings`, `--mcp-config` and `--append-system-prompt-file` pointing at the slot folder; nothing written under the temp `HOME`'s `.claude` | Verified 2026-11-12: all as described (`PreToolUse`, matcher `Bash`, timeout 5; env `OVERSEER_SLOT: S1`; the three flags); the temp `HOME` held only `.profile` and `.config/overseer` |
 
 ## Pins
 
@@ -261,13 +264,31 @@ Setup steps 1 to 4 with the app open. Start S1, S2 and S3 as in step 4.
 | U1 | Lock pills on cards | `$OV ctl claim 1 custom:demo-lane`; `pre S1 'argocd app set root --revision feat-x'`; wait over a minute | S1's card shows both targets as pills within a second, the pin (`argo:uat/root`) first; after `lock_idle_mins` (1) the claim pill is marked as held long | For Jonathan |
 | U2 | Blocked card | `$OV ctl claim 2 custom:demo-lane` while S2 is not Working | S2's card turns red with `blocked by lock` and `waiting on custom:demo-lane`; when S2 is Working its tone stays Working and the waiting line still shows | For Jonathan |
 | U3 | Pending count | Type `half` in S3's box without Enter, `$OV ctl send 3 hello` | S3's card says `1 relay pending`; clearing the box makes it go and the count disappear | For Jonathan |
-| U4 | Relay strip | After U3, and a few more `ctl send` calls | The strip at the bottom of the board lists the five newest relays, newest first, as `HH:MM told S3: hello` or `HH:MM for S3, pending: hello`; it is hidden when there are none | For Jonathan |
+| U4 | Relay strip | After U3, and a few more `ctl send` calls | The strip at the bottom of the board lists the five newest relays, newest first, as `HH:MM told S3: hello`, `HH:MM for S3, pending: hello` or `HH:MM for S3, dropped: session ended: hello`; it is hidden when there are none | For Jonathan |
 | U5 | Holds box | Click S1's card, open its panel | A Holds box lists each hold with its kind (`pin`, `claim`, `command`, `grant`), time, what it is for, `held long` when flagged, and how many are queued behind it; waits show beneath; `Nothing held` for a slot with none; a Release button beside each hold | For Jonathan |
-| U6 | Release, with its key | In S1's panel press Release (or Cmd+Shift+R) | An inline `Release <target>? Enter / Esc` row; Up and Down pick among the holds; Enter force-releases (S2 is granted `custom:demo-lane`, its card un-blocks); Esc cancels; plain `r` and `m` still go to the terminal | For Jonathan |
+| U6 | Release, with its key | In S1's panel press Release (or Cmd+Shift+R) | An inline `Release S1's <target>? Enter / Esc` row; Up and Down pick among the holds; Enter force-releases (S2 is granted `custom:demo-lane`, its card un-blocks), but only while S1 still holds it (E4); Esc cancels; plain `r` and `m` still go to the terminal | For Jonathan |
 | U7 | Claim entry | Press `Claim...` in S2's panel, type `custom:other lane test`, Enter; then an empty Enter and `bogus` | The claim is made with the reason `lane test`; an empty or bad entry shows its error and sends nothing | For Jonathan |
 | U8 | Relays box and message | Open S3's panel; Message... (or Cmd+Shift+M), type `hello again`, Enter | The Relays box lists S3's relays with state (pending reasons or delivered); the message goes through the delivery rules (typed in only when S3 is idle with an empty box); an empty message shows `Type a message first` | For Jonathan |
 | U9 | Denied-write notification | Bring another app to the front; with S1 holding `repo:demo-api:main` (`pre S1 'git push origin main'`), run `pre S2 'git push origin main'` | A banner `S2 blocked: repo:demo-api:main is held by S1`; one per new wait (a repeat does not post again); clicking it opens S2's session. This needs the bundle from step 1; under `cargo run` there is no bundle and no banner | For Jonathan |
 | U10 | Everything survives a daemon restart | `$OV ctl shutdown`, then reopen the window | The same pills, waits and strip show at once; slots that were running are shown as resumable | For Jonathan |
+
+## Session end and holder checks (fix wave)
+
+Run 2026-11-12 by script against a temp daemon from `target/release/overseer`
+built at 183db70, the same way as the rows above (`OVERSEER_HOME=/tmp/ov-fix4`,
+temp `config.toml`, temp `HOME` with a `.profile` putting the stub folder on
+`PATH`, `SHELL=/bin/sh`). The stub `claude` logged its argv, created an empty
+transcript under a temp `CLAUDE_CONFIG_DIR` for its `--session-id` (so a
+restart offers to resume it) and slept. The holder-checked request was sent
+over the socket by a `python3 -I` script, since `ctl force-release` sends no
+holder. The daemon was stopped with `ctl shutdown` and `/tmp/ov-fix4` removed.
+
+| ID | Check | Steps | Pass | Result |
+|----|-------|-------|------|--------|
+| E1 | A fresh start ends the old session first (F1) | `ctl start 1`; `ctl claim 2 custom:lane`; `ctl claim 1 custom:lane` (waits); `ctl send 1 "hello e1"`; `ctl stop 1 && ctl start 1` back to back | S1's wait is gone; the relay is listed as dropped and never typed into the new session | Verified 2026-11-12 at 183db70: `ctl locks` read `custom:lane  S2  claim ...` with no waiter and `relay  S1  dropped: session ended  hello e1`; S1 `running` with the new label |
+| E2 | Declining a resumable slot hands its grant on | `ctl start 1` and `3`; `ctl claim 2 tf:default`; `PreToolUse terraform apply -auto-approve` for S3 then S1 (both denied, both wait); `ctl release 2 tf:default` (S3 is granted); `ctl shutdown`, start the daemon; `ctl stop 3` | After the restart S1 and S3 are `resumable` and S3 still holds the grant with its relay pending; the decline hands `tf:default` to S1 with a relay and retires S3's relay | Verified 2026-11-12: before the decline `tf:default  S3  grant`, `waiting: S1`, `relay  S3  pending (slot is not running)`; after it `tf:default  S1  grant`, `relay  S1  pending (slot is not running)  S3 has released tf:default. You now hold it.` and `relay  S3  dropped: session ended  S2 has released tf:default. You now hold it.`; S3 `empty`. A run of the same steps with `ctl claim` waits gave S3 an explicit `claim`, which stays after the decline, as X2 says |
+| E3 | A message to a slot with no session is refused (F5) | `ctl send 5 "hi there"` with S5 empty | Exit 1 with the reason; nothing queued | Verified 2026-11-12: `overseer: S5 has no session to message.`, exit 1; `ctl locks` listed no relay for S5 |
+| E4 | A force release names the holder Jonathan was shown | S3 holds `custom:lane` (`ctl claim`); `ForceRelease` with `holder` 2, then with `holder` 3 | The first releases nothing and names the real holder; the second releases; the notice for S3, which has no session, is queued already dropped | Verified 2026-11-12: `custom:lane is now held by S3; nothing released.` (an `Error` response) with the claim unchanged; then `Released custom:lane.` and `relay  S3  dropped: session ended  Jonathan released custom:lane, which you held.` |
 
 ## Findings from the 2026-11-12 run
 
@@ -281,11 +302,19 @@ No scriptable check failed. Observations:
   (Review Focus 4, delivered on resume), but a fresh start is not a resume, and
   the texts can describe holds the new session never had. Repro: `ctl start 1`,
   queue a relay for S1, `ctl stop 1`, `ctl start 1`, send S1 a `Stop` event.
+  Fixed in a55f1a2: when a session ends (exit, stop, decline of a resumable
+  slot, a fresh start, or a restart that cannot resume it) its waits, grants
+  and command claims go and its pending relays are retired as `dropped:
+  session ended`. They are never typed. See E1 and E2.
 - **F2 (note): a relay waiting out the 10 s cooldown reads `pending
   (pending)` in `ctl locks`.** The courier has not set a reason (it skips the
   slot), so the text shows the word twice. It goes once the cooldown ends.
+  Fixed in a55f1a2: `ctl locks` prints `pending` alone when there is no reason,
+  and during the cooldown the reason reads `just delivered, waiting for the
+  session`.
 - **F3 (note): `ctl locks` does not show a pin's revision,** only `--json`
   does (`pin_revision`). The Holds box may show it; that is a GUI row to read.
+  Fixed in a55f1a2: the pin line ends `  at <revision>`.
 - **F4 (note): `claim_target` without `reason` is a protocol error
   (`-32602 missing reason`) rather than a tool error,** while `ctl claim` and
   the GUI treat the reason as optional. A session that leaves it out sees a
@@ -293,6 +322,10 @@ No scriptable check failed. Observations:
 - **F5 (note): a relay for a slot that is empty or exited stays pending
   forever** (`slot is not running`), including the replies S2 queued for S0 when
   no S0 session exists. It is shown, not lost, and is listed by `ctl locks`.
+  Fixed in a55f1a2: `ctl send` and `notify_session` to a slot with no session
+  are refused (`S5 has no session to message.`, E3), and an Overseer notice
+  for a holder with no session is queued already dropped. A relay still waits
+  while its slot is resumable.
 - **Environment note:** the temp state dir was under `/tmp`, not the session
   scratch directory, because the unix socket path would have been longer than
   the 104 character limit.
@@ -302,7 +335,9 @@ No scriptable check failed. Observations:
 - **L1: background commands release early.** A command claim is released at
   its `PostToolUse`, and a slot's command claims go at its `Stop` and exit. A
   push started with `run_in_background` releases when the tool returns, not
-  when the push finishes.
+  when the push finishes. Two Bash calls of one session on one target at the
+  same time share one claim: the first call's `PostToolUse` releases it while
+  the second call still runs.
 - **L2: a pin only ends on a revision in the pattern's `unpin` list.** The
   default list is `main`, `master`, `HEAD`. The revision in force before the
   pin cannot be learned from the command line inside the hook budget, so
@@ -326,6 +361,25 @@ No scriptable check failed. Observations:
 - **L7: the stub-based rows imitate the input box and hook events.** They show
   the daemon's rules; I1 to I5 and MR1 to MR3 are the only checks against
   Claude Code itself.
+- **L8: contexts are read from the environment, not from every flag.**
+  `kubectl --kubeconfig <file>` is ignored, so the target uses the current
+  context of the default kubeconfig. For ArgoCD, `$ARGOCD_SERVER` outranks the
+  `current-context` in the ArgoCD config. Two sessions that reach one cluster
+  by different routes can get different target names and so not block each
+  other; that fails open, never shut.
+- **L9: some command shapes are not resolved.** A shell variable is not
+  expanded (`cd "$DIR" && git push` claims `repo:$DIR:<branch>`), and a flag
+  before the app name (`argocd app sync --grpc-web demo-api`) hides the write,
+  which is allowed and not recorded. Both are pinned in
+  `crates/overseer-daemon/tests/fixtures/commands.tsv`.
+- **L10: a resumable slot's command claims outlive the command.** The command
+  died with the terminal at the restart, but its claim stays until the resumed
+  session's `Stop` or until Jonathan declines the resume, and it blocks
+  waiters until then.
+- **L11: lock ownership and the reply rule are cooperative.** They bind the
+  hook, the MCP tools and the GUI. A worker's own Bash can still run
+  `overseer ctl send --raw` or `overseer ctl force-release`; Overseer does not
+  stop a session that sets out to get round it.
 
 ## Sign-off
 
