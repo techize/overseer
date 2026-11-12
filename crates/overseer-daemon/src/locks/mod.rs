@@ -5,3 +5,10 @@
 // ledger's lock view and the tests use these functions.
 #[allow(dead_code)]
 pub(crate) mod table;
+
+// The PreToolUse hook path (the next task) is the caller; until then only
+// the tests use these.
+#[allow(dead_code)]
+pub(crate) mod context;
+#[allow(dead_code)]
+pub(crate) mod targets;
