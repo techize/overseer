@@ -3,8 +3,8 @@
 //! Type to filter, Up and Down to move, Enter to assign, Esc to close. A
 //! warning about overlapping work (`NeedsConfirm`: a bead whose ticket another
 //! slot owns, or a ticket with beads another slot owns) asks again with
-//! "Assign anyway", and an item owned by another slot offers "Move to S<n>";
-//! Enter accepts either.
+//! "Assign anyway", and an item owned by another slot offers "Move to S<n>"
+//! (the picker's own slot); Enter accepts either.
 //!
 //! The rows, the filter, the key handling and the reply handling are pure
 //! (`rows`, `PickerState`) and unit tested.
@@ -150,7 +150,8 @@ impl PickerState {
     pub fn answer_label(&self) -> Option<String> {
         self.question.as_ref().map(|q| match q.prompt {
             Prompt::Confirm => "Assign anyway".to_string(),
-            Prompt::Move(owner) => format!("Move to {}", slot_name(owner)),
+            // The button names where the item goes; the message names its owner.
+            Prompt::Move(_) => format!("Move to {}", slot_name(self.slot)),
         })
     }
 
@@ -835,7 +836,7 @@ mod tests {
         let q = p.question.clone().unwrap();
         assert_eq!(q.prompt, Prompt::Move(2));
         assert_eq!(q.message, "ov-3 is owned by S2");
-        assert_eq!(p.answer_label().as_deref(), Some("Move to S2"));
+        assert_eq!(p.answer_label().as_deref(), Some("Move to S4"));
         assert_eq!(
             p.accept(&all),
             PickerAction::Send(assign("ov-3", false, true))
