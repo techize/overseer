@@ -11,5 +11,5 @@ pub use msg::{
     owned_by_message, owner_in_refusal, slot_name, Activity, ActivityKind, BashCheck, Claim,
     ClaimKind, Event, HookEvent, HookKind, ItemKind, LockView, Notice, Relay, RelayState, Request,
     Response, Sender, SlotId, SlotInfo, SlotState, SourceStatus, Wait, WorkItem, WorkView,
-    JIRA_OFF,
+    CHECK_ENV, JIRA_OFF,
 };

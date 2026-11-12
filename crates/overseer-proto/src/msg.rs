@@ -285,6 +285,15 @@ impl LockView {
     }
 }
 
+/// The variables `BashCheck::env` may carry: the ones a target lookup reads.
+pub const CHECK_ENV: [&str; 5] = [
+    "KUBECONFIG",
+    "TF_WORKSPACE",
+    "ARGOCD_SERVER",
+    "ARGOCD_CONFIG",
+    "HOME",
+];
+
 /// A Bash command the `PreToolUse` hook asks the daemon to check.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BashCheck {

@@ -1,7 +1,7 @@
 //! Shared write targets from a Bash command: which targets it writes to,
 //! by the compiled-in patterns plus an optional `targets.toml`.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use regex::Regex;
@@ -681,16 +681,18 @@ fn render(p: &Pattern, caps: &regex::Captures, seg: &Segment, ctx: &dyn Context)
 }
 
 /// The targets a Bash command writes to: for each segment the first pattern
-/// that matches and is not skipped. One hit per target; a placeholder that
-/// cannot be filled drops that hit.
+/// that matches and is not skipped. One hit per target, the first one,
+/// except that a pin or unpin replaces a plain command hit (so a sync then
+/// a pin of one app keeps the pin); a placeholder that cannot be filled
+/// drops that hit.
 pub fn match_command(
     patterns: &[Pattern],
     command: &str,
     cwd: &Path,
     ctx: &dyn Context,
 ) -> Vec<Hit> {
-    let mut hits = Vec::new();
-    let mut seen = HashSet::new();
+    let mut hits: Vec<Hit> = Vec::new();
+    let mut seen: HashMap<String, usize> = HashMap::new();
     for seg in segments(command, cwd) {
         for p in patterns {
             let Some(caps) = p.command.captures(&seg.text) else {
@@ -711,12 +713,21 @@ pub fn match_command(
             };
             if let Some(kind) = kind {
                 for target in render(p, &caps, &seg, ctx) {
-                    if valid_target(&target) && seen.insert(target.clone()) {
-                        hits.push(Hit {
-                            target,
-                            kind: kind.clone(),
-                            pattern: p.name.clone(),
-                        });
+                    if !valid_target(&target) {
+                        continue;
+                    }
+                    let hit = Hit {
+                        target: target.clone(),
+                        kind: kind.clone(),
+                        pattern: p.name.clone(),
+                    };
+                    match seen.get(&target) {
+                        None => {
+                            seen.insert(target, hits.len());
+                            hits.push(hit);
+                        }
+                        Some(&i) if hits[i].kind == HitKind::Command => hits[i] = hit,
+                        Some(_) => {}
                     }
                 }
             }
@@ -854,6 +865,38 @@ mod tests {
         );
         assert_eq!(hits[0].target, "argo:uat/demo-api");
         assert_eq!(hits[0].pattern, "argocd pin");
+    }
+
+    #[test]
+    fn a_pin_replaces_a_command_hit_on_the_same_target() {
+        let hits = match_command(
+            &defaults(),
+            "argocd app sync demo-api && argocd app set demo-api --revision abc",
+            &cwd(),
+            &FAKE,
+        );
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].target, "argo:uat/demo-api");
+        assert_eq!(
+            hits[0].kind,
+            HitKind::Pin {
+                revision: "abc".into()
+            }
+        );
+        // The first pin is kept over a later command or pin.
+        let hits = match_command(
+            &defaults(),
+            "argocd app set demo-api --revision abc; argocd app sync demo-api; argocd app set demo-api --revision main",
+            &cwd(),
+            &FAKE,
+        );
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].kind,
+            HitKind::Pin {
+                revision: "abc".into()
+            }
+        );
     }
 
     #[test]

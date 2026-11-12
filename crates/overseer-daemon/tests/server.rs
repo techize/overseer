@@ -4,10 +4,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
+use overseer_daemon::locks::targets::{default_patterns, load_patterns, Pattern};
 use overseer_daemon::{run, DaemonConfig};
 use overseer_proto::{
-    read_frame, write_frame, Activity, ActivityKind, Event, Frame, HookEvent, HookKind, ItemKind,
-    Request, Response, SlotInfo, SlotState, SourceStatus, WorkItem, WorkView,
+    read_frame, write_frame, Activity, ActivityKind, BashCheck, ClaimKind, Event, Frame, HookEvent,
+    HookKind, ItemKind, LockView, RelayState, Request, Response, SlotInfo, SlotState, SourceStatus,
+    WorkItem, WorkView,
 };
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::UnixStream;
@@ -62,6 +64,15 @@ async fn start_daemon_cfg(
     env: overseer_daemon::EnvSource,
     settings: overseer_daemon::Config,
 ) -> Daemon {
+    start_daemon_full(socket, env, settings, default_patterns()).await
+}
+
+async fn start_daemon_full(
+    socket: PathBuf,
+    env: overseer_daemon::EnvSource,
+    settings: overseer_daemon::Config,
+    patterns: Vec<Pattern>,
+) -> Daemon {
     let state_dir = socket.parent().unwrap().join("state");
     let cfg = DaemonConfig {
         socket: socket.clone(),
@@ -70,6 +81,7 @@ async fn start_daemon_cfg(
         state_dir: state_dir.clone(),
         hook_program: PathBuf::from("/bin/true"),
         settings,
+        patterns,
     };
     let task = tokio::spawn(run(cfg));
     for _ in 0..100 {
@@ -418,6 +430,7 @@ async fn second_daemon_refused() {
         state_dir: d.state_dir.clone(),
         hook_program: PathBuf::from("/bin/true"),
         settings: offline_settings(),
+        patterns: default_patterns(),
     })
     .await
     .unwrap_err();
@@ -1071,7 +1084,7 @@ async fn restart_with_listed_command_does_not_double_the_flags() {
     let d = start_daemon().await;
     let mut c = Client::connect(&d.socket).await;
     let (line, info) = restart_with_listed_command(&mut c, &log, 2, base.clone(), &dir).await;
-    for flag in ["--session-id", "--name", "--settings"] {
+    for flag in ["--session-id", "--name", "--settings", "--mcp-config"] {
         assert_eq!(count_arg(&line, flag), 1, "{flag} in {line}");
     }
     assert_eq!(info.command, Some(base.clone()));
@@ -1094,7 +1107,7 @@ async fn s0_restart_with_listed_command_gets_one_kickoff() {
     assert!(line.ends_with(&format!(" -- {kickoff}")), "{line}");
     assert_eq!(count_arg(&line, "--"), 1, "{line}");
     assert_eq!(line.matches(kickoff.as_str()).count(), 1, "{line}");
-    for flag in ["--session-id", "--name", "--settings"] {
+    for flag in ["--session-id", "--name", "--settings", "--mcp-config"] {
         assert_eq!(count_arg(&line, flag), 1, "{flag} in {line}");
     }
     assert_eq!(info.command, Some(base.clone()));
@@ -1896,4 +1909,493 @@ async fn shutdown_gives_up_on_a_hung_label() {
     let pids = std::fs::read_to_string(s.dir.join("pids")).unwrap();
     let running: Vec<_> = pids.lines().filter(|p| alive(p)).collect();
     assert!(running.is_empty(), "still running: {running:?}");
+}
+
+// ---- Locks ----
+
+/// The test patterns (plus the defaults): writes that need no lookups.
+const LOCK_TARGETS: &str = r#"
+[[pattern]]
+name = "demo deploy"
+command = '^demo-deploy\s+(?P<app>\S+)'
+target = "deploy:demo/{app}"
+
+[[pattern]]
+name = "demo push"
+command = '^demo-push\b'
+target = "repo:demo-api:main"
+"#;
+
+fn lock_patterns() -> Vec<Pattern> {
+    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("ovs-targets-{}-{n}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("targets.toml");
+    std::fs::write(&path, LOCK_TARGETS).unwrap();
+    let (patterns, err) = load_patterns(&path);
+    assert!(err.is_none(), "{err:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+    patterns
+}
+
+async fn lock_daemon() -> Daemon {
+    lock_daemon_at(temp_socket()).await
+}
+
+async fn lock_daemon_at(socket: PathBuf) -> Daemon {
+    start_daemon_full(
+        socket,
+        overseer_daemon::EnvSource::Inherit,
+        offline_settings(),
+        lock_patterns(),
+    )
+    .await
+}
+
+fn bash(slot: u8, tool_use_id: &str, command: &str) -> Request {
+    Request::CheckBash(BashCheck {
+        slot,
+        session_id: None,
+        tool_use_id: Some(tool_use_id.into()),
+        command: command.into(),
+        cwd: Some(PathBuf::from("/tmp")),
+        env: vec![("ARGOCD_SERVER".into(), "uat".into())],
+    })
+}
+
+fn post_tool_use(slot: u8, tool_use_id: &str) -> HookEvent {
+    HookEvent {
+        tool: Some("Bash".into()),
+        tool_use_id: Some(tool_use_id.into()),
+        ..hook(slot, HookKind::PostToolUse)
+    }
+}
+
+fn claim_target(slot: u8, target: &str, item: Option<&str>) -> Request {
+    Request::ClaimTarget {
+        slot,
+        target: target.into(),
+        reason: None,
+        item: item.map(String::from),
+    }
+}
+
+/// `(target, slot, kind)` of every claim, by target.
+fn holds(v: &LockView) -> Vec<(String, u8, ClaimKind)> {
+    v.claims
+        .iter()
+        .map(|c| (c.target.clone(), c.slot, c.kind))
+        .collect()
+}
+
+/// `(target, slot)` of every wait, in queue order.
+fn queued(v: &LockView) -> Vec<(String, u8)> {
+    v.waits.iter().map(|w| (w.target.clone(), w.slot)).collect()
+}
+
+fn pending(v: &LockView) -> Vec<(u8, String)> {
+    v.relays
+        .iter()
+        .filter(|r| r.state == RelayState::Pending)
+        .map(|r| (r.to, r.text.clone()))
+        .collect()
+}
+
+fn t(s: &str) -> String {
+    s.to_string()
+}
+
+impl Client {
+    /// The deny reason, if any.
+    async fn check(&mut self, slot: u8, tool_use_id: &str, command: &str) -> Option<String> {
+        match self.request(bash(slot, tool_use_id, command)).await {
+            Response::Verdict { deny } => deny,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    async fn locks(&mut self) -> LockView {
+        match self.request(Request::ListLocks).await {
+            Response::Locks(v) => v,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// Polls the lock view until `done` holds.
+    async fn locks_until(&mut self, done: impl Fn(&LockView) -> bool) -> LockView {
+        for _ in 0..250 {
+            let v = self.locks().await;
+            if done(&v) {
+                return v;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        panic!("locks never matched: {:?}", self.locks().await);
+    }
+}
+
+#[tokio::test]
+async fn check_bash_claims_a_free_target_and_post_tool_use_releases_it() {
+    let d = lock_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    assert_eq!(c.check(1, "tu-1", "demo-deploy api").await, None);
+    let v = c.locks().await;
+    assert_eq!(holds(&v), [(t("deploy:demo/api"), 1, ClaimKind::Command)]);
+    // Clients hear about it.
+    loop {
+        if let Frame::Event(Event::LocksChanged(v)) = c.recv().await.unwrap() {
+            if !v.claims.is_empty() {
+                break;
+            }
+        }
+    }
+    // Another command's PostToolUse leaves it; its own releases it.
+    c.hook(post_tool_use(1, "tu-other")).await;
+    assert_eq!(c.locks().await.claims.len(), 1);
+    c.hook(post_tool_use(1, "tu-1")).await;
+    assert!(c.locks().await.claims.is_empty());
+}
+
+#[tokio::test]
+async fn check_bash_denies_a_held_target_and_queues() {
+    let d = lock_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    let target = "repo:demo-api:main";
+    assert_eq!(
+        c.request(claim_target(1, target, Some("DEMO-33"))).await,
+        Response::Text {
+            text: t("You hold repo:demo-api:main.")
+        }
+    );
+    assert_eq!(
+        c.request(claim_target(1, target, None)).await,
+        Response::Text {
+            text: t("You already hold repo:demo-api:main.")
+        }
+    );
+    let since = c.locks().await.claims[0].since;
+    let at = overseer_daemon::locks::local_hhmm(since);
+    let deny = c.check(2, "tu-1", "demo-push").await;
+    assert_eq!(
+        deny,
+        Some(format!("Overseer: repo:demo-api:main is held by S1 since {at} for DEMO-33. You are in its queue and Overseer will tell you here when you hold it. Do not run this again until then."))
+    );
+    let v = c.locks().await;
+    assert_eq!(queued(&v), [(t(target), 2)]);
+    assert_eq!(holds(&v), [(t(target), 1, ClaimKind::Claim)]);
+    // A claim behind it is told its place.
+    assert_eq!(
+        c.request(claim_target(3, target, None)).await,
+        Response::Queued {
+            message: format!("repo:demo-api:main is held by S1 since {at} for DEMO-33. You are number 2 in the queue; Overseer will tell you here when you hold it.")
+        }
+    );
+    // Bad requests are refused.
+    assert!(matches!(
+        c.request(claim_target(1, "nonsense", None)).await,
+        Response::Error { .. }
+    ));
+    assert!(matches!(
+        c.request(claim_target(9, target, None)).await,
+        Response::Error { .. }
+    ));
+}
+
+#[tokio::test]
+async fn compound_command_with_one_held_target_claims_nothing() {
+    let d = lock_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    assert!(matches!(
+        c.request(claim_target(1, "deploy:demo/a", None)).await,
+        Response::Text { .. }
+    ));
+    let deny = c
+        .check(2, "tu-1", "demo-deploy b && demo-deploy a")
+        .await
+        .expect("denied");
+    assert!(deny.contains("deploy:demo/a is held by S1"), "{deny}");
+    let v = c.locks().await;
+    assert_eq!(holds(&v), [(t("deploy:demo/a"), 1, ClaimKind::Claim)]);
+    assert_eq!(queued(&v), [(t("deploy:demo/a"), 2)]);
+}
+
+#[tokio::test]
+async fn unmatched_command_is_allowed_without_records() {
+    let d = lock_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    for cmd in [
+        "git status; ls -la",
+        "argocd app get demo-api",
+        "git push --dry-run",
+    ] {
+        assert_eq!(c.check(1, "tu-1", cmd).await, None, "{cmd}");
+    }
+    let v = c.locks().await;
+    assert!(v.claims.is_empty() && v.waits.is_empty() && v.relays.is_empty());
+}
+
+#[tokio::test]
+async fn release_grants_the_waiter_and_queues_a_relay() {
+    let d = lock_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    assert_eq!(c.check(1, "tu-1", "demo-deploy api").await, None);
+    assert!(c.check(2, "tu-2", "demo-deploy api").await.is_some());
+    c.hook(post_tool_use(1, "tu-1")).await;
+    let v = c.locks().await;
+    assert_eq!(holds(&v), [(t("deploy:demo/api"), 2, ClaimKind::Grant)]);
+    assert!(v.waits.is_empty());
+    assert_eq!(
+        pending(&v),
+        [(2, t("S1 has released deploy:demo/api. You now hold it."))]
+    );
+    // The grant is used by S2's next matching command, then released.
+    assert_eq!(c.check(2, "tu-3", "demo-deploy api").await, None);
+    let v = c.locks().await;
+    assert_eq!(holds(&v), [(t("deploy:demo/api"), 2, ClaimKind::Command)]);
+    c.hook(post_tool_use(2, "tu-3")).await;
+    assert!(c.locks().await.claims.is_empty());
+
+    // An explicit release hands on too.
+    c.request(claim_target(1, "custom:z", None)).await;
+    c.request(claim_target(3, "custom:z", None)).await;
+    assert_eq!(
+        c.request(Request::ReleaseTarget {
+            slot: 1,
+            target: t("custom:z")
+        })
+        .await,
+        Response::Text {
+            text: t("Released custom:z. S3 holds it now.")
+        }
+    );
+    assert_eq!(
+        holds(&c.locks().await),
+        [(t("custom:z"), 3, ClaimKind::Claim)]
+    );
+    assert_eq!(
+        c.request(Request::ForceRelease {
+            target: t("custom:z")
+        })
+        .await,
+        Response::Text {
+            text: t("Released custom:z.")
+        }
+    );
+    assert_eq!(
+        c.request(Request::ForceRelease {
+            target: t("custom:z")
+        })
+        .await,
+        Response::Error {
+            message: t("custom:z is not held")
+        }
+    );
+}
+
+#[tokio::test]
+async fn pin_survives_post_tool_use_and_unpin_releases_it() {
+    let d = lock_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    let app = "argo:uat/demo-api";
+    let pin = "argocd app set demo-api --revision abc123";
+    assert_eq!(c.check(1, "tu-1", pin).await, None);
+    c.hook(post_tool_use(1, "tu-1")).await;
+    let v = c.locks().await;
+    assert_eq!(holds(&v), [(t(app), 1, ClaimKind::Pin)]);
+    assert_eq!(v.claims[0].pin_revision.as_deref(), Some("abc123"));
+    // A sync by its holder keeps the pin.
+    assert_eq!(c.check(1, "tu-2", "argocd app sync demo-api").await, None);
+    c.hook(post_tool_use(1, "tu-2")).await;
+    assert_eq!(holds(&c.locks().await), [(t(app), 1, ClaimKind::Pin)]);
+    // Anyone else waits.
+    assert!(c
+        .check(2, "tu-3", "argocd app sync demo-api")
+        .await
+        .is_some());
+    // Setting it back to main ends the pin once that command is done.
+    let unpin = "argocd app set demo-api --revision main";
+    assert_eq!(c.check(1, "tu-4", unpin).await, None);
+    assert_eq!(holds(&c.locks().await), [(t(app), 1, ClaimKind::Command)]);
+    c.hook(post_tool_use(1, "tu-4")).await;
+    let v = c.locks().await;
+    assert_eq!(holds(&v), [(t(app), 2, ClaimKind::Grant)]);
+    assert_eq!(
+        pending(&v),
+        [(
+            2,
+            t("S1 has released argo:uat/demo-api (back on main). You now hold it.")
+        )]
+    );
+}
+
+#[tokio::test]
+async fn stop_releases_command_claims() {
+    let d = lock_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    assert_eq!(c.check(1, "tu-1", "demo-deploy api").await, None);
+    c.request(claim_target(1, "custom:kept", None)).await;
+    c.hook(hook(1, HookKind::Stop)).await;
+    assert_eq!(
+        holds(&c.locks().await),
+        [(t("custom:kept"), 1, ClaimKind::Claim)]
+    );
+}
+
+#[tokio::test]
+async fn holder_exit_hands_on_and_waiter_exit_leaves_the_queue() {
+    let d = lock_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    for id in [1, 2, 3] {
+        assert_eq!(c.start(id).await, Response::Ok);
+    }
+    let (cmd, app) = ("deploy:demo/api", "argo:uat/demo-api");
+    assert_eq!(c.check(1, "tu-1", "demo-deploy api").await, None);
+    let pin = "argocd app set demo-api --revision abc123";
+    assert_eq!(c.check(1, "tu-2", pin).await, None);
+    c.hook(post_tool_use(1, "tu-2")).await;
+    let both = "demo-deploy api && argocd app sync demo-api";
+    assert!(c.check(2, "tu-3", both).await.is_some());
+    assert!(c.check(3, "tu-4", "demo-deploy api").await.is_some());
+    assert_eq!(
+        queued(&c.locks().await),
+        [(t(cmd), 2), (t(app), 2), (t(cmd), 3)]
+    );
+
+    assert_eq!(c.request(Request::StopSlot { id: 3 }).await, Response::Ok);
+    let v = c.locks_until(|v| v.waiting_on(3).is_empty()).await;
+    assert_eq!(queued(&v), [(t(cmd), 2), (t(app), 2)]);
+    assert_eq!(
+        holds(&v),
+        [(t(app), 1, ClaimKind::Pin), (t(cmd), 1, ClaimKind::Command)]
+    );
+
+    assert_eq!(c.request(Request::StopSlot { id: 1 }).await, Response::Ok);
+    let v = c
+        .locks_until(|v| v.claims.iter().any(|c| c.slot == 2))
+        .await;
+    assert_eq!(
+        holds(&v),
+        [(t(app), 1, ClaimKind::Pin), (t(cmd), 2, ClaimKind::Grant)]
+    );
+    assert_eq!(queued(&v), [(t(app), 2)]);
+    assert!(v.waiting_on(3).is_empty());
+    assert_eq!(
+        pending(&v),
+        [(2, t("S1 has released deploy:demo/api. You now hold it."))]
+    );
+}
+
+#[tokio::test]
+async fn releasing_a_work_item_releases_its_claims() {
+    let s = stub_sources("lockitem", false);
+    let d = start_daemon_full(temp_socket(), s.env(), s.settings(), lock_patterns()).await;
+    let mut c = Client::connect(&d.socket).await;
+    c.refresh().await;
+    assert_eq!(c.assign("DEMO-12", 1, false, false).await, Response::Ok);
+    // S1 owns one item, so its claims are for it.
+    c.request(claim_target(1, "custom:x", None)).await;
+    assert_eq!(c.check(1, "tu-1", "demo-deploy api").await, None);
+    c.request(claim_target(2, "custom:x", None)).await;
+    let v = c.locks().await;
+    assert!(
+        v.claims
+            .iter()
+            .all(|c| c.item.as_deref() == Some("DEMO-12")),
+        "{v:?}"
+    );
+    assert_eq!(
+        c.request(Request::Release { key: t("DEMO-12") }).await,
+        Response::Ok
+    );
+    let v = c.locks().await;
+    assert_eq!(holds(&v), [(t("custom:x"), 2, ClaimKind::Claim)]);
+    assert_eq!(
+        pending(&v),
+        [(2, t("S1 has released custom:x. You now hold it."))]
+    );
+
+    // A move takes the item's claims away from the old owner.
+    assert_eq!(c.assign("DEMO-40", 3, false, false).await, Response::Ok);
+    c.request(claim_target(3, "custom:y", Some("DEMO-40")))
+        .await;
+    assert_eq!(c.assign("DEMO-40", 4, false, true).await, Response::Ok);
+    let v = c.locks().await;
+    assert!(v.claims.iter().all(|c| c.target != "custom:y"), "{v:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_claims_one_wins() {
+    let d = lock_daemon().await;
+    let mut a = Client::connect(&d.socket).await;
+    let mut b = Client::connect(&d.socket).await;
+    let (ra, rb) = tokio::join!(
+        a.request(claim_target(1, "custom:race", None)),
+        b.request(claim_target(2, "custom:race", None)),
+    );
+    let mut got = [ra, rb];
+    got.sort_by_key(|r| matches!(r, Response::Queued { .. }));
+    assert!(matches!(&got[0], Response::Text { text } if text == "You hold custom:race."));
+    assert!(matches!(&got[1], Response::Queued { .. }), "{got:?}");
+    let v = a.locks().await;
+    assert_eq!(v.claims.len(), 1);
+    assert_eq!(v.waits.len(), 1);
+    assert_ne!(v.claims[0].slot, v.waits[0].slot);
+}
+
+#[tokio::test]
+async fn locks_survive_restart() {
+    let socket = temp_socket();
+    let d = lock_daemon_at(socket).await;
+    let mut c = Client::connect(&d.socket).await;
+    // The shutdown kills S1's session; that exit must not drop its claim.
+    assert_eq!(c.start(1).await, Response::Ok);
+    assert_eq!(c.check(1, "tu-1", "demo-deploy api").await, None);
+    c.request(claim_target(2, "custom:a", Some("DEMO-12")))
+        .await;
+    c.request(claim_target(3, "custom:a", None)).await;
+    c.request(claim_target(1, "custom:b", None)).await;
+    c.request(claim_target(4, "custom:b", None)).await;
+    c.request(Request::ReleaseTarget {
+        slot: 1,
+        target: t("custom:b"),
+    })
+    .await;
+    let before = c.locks().await;
+    assert_eq!(before.claims.len(), 3);
+    assert_eq!(before.waits.len(), 1);
+    assert_eq!(pending(&before).len(), 1);
+    drop(c);
+    let socket = shutdown(d).await;
+    let d = lock_daemon_at(socket).await;
+    let mut c = Client::connect(&d.socket).await;
+    assert_eq!(c.locks().await, before);
+}
+
+#[tokio::test]
+async fn slow_resolution_allows_and_records_nothing() {
+    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("ovs-slowgit-{}-{n}", std::process::id()));
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let ran = dir.join("ran");
+    write_script(
+        &bin.join("git"),
+        &format!(": > '{}'\nexec sleep 5\n", ran.display()),
+    );
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let env = overseer_daemon::EnvSource::InheritWith(vec![("PATH".into(), path)]);
+    let d = start_daemon_full(temp_socket(), env, offline_settings(), lock_patterns()).await;
+    let mut c = Client::connect(&d.socket).await;
+    let start = std::time::Instant::now();
+    assert_eq!(c.check(1, "tu-1", "git push").await, None);
+    let took = start.elapsed();
+    assert!(took < Duration::from_secs(1), "took {took:?}");
+    assert!(ran.exists(), "the stub git was never asked");
+    let v = c.locks().await;
+    assert!(v.claims.is_empty() && v.waits.is_empty(), "{v:?}");
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -89,6 +89,12 @@ fn main() {
             if let Some(e) = config_err {
                 tracing::warn!("config not loaded, using defaults: {e}");
             }
+            let (patterns, targets_err) = overseer_daemon::locks::targets::load_patterns(
+                &overseer_proto::paths::targets_path(),
+            );
+            if let Some(e) = targets_err {
+                tracing::warn!("targets not loaded, using the defaults: {e}");
+            }
             let result = runtime().and_then(|rt| {
                 rt.block_on(overseer_daemon::run(DaemonConfig {
                     socket,
@@ -97,6 +103,7 @@ fn main() {
                     state_dir: overseer_proto::paths::state_dir(),
                     hook_program: std::env::current_exe()?,
                     settings,
+                    patterns,
                 }))
             });
             match &result {

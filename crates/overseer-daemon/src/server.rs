@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use anyhow::Context;
 use bytes::Bytes;
-use overseer_proto::{read_frame, slot_name, write_frame, Event, Frame, Request, Response, SlotId};
+use overseer_proto::{
+    read_frame, slot_name, write_frame, Event, Frame, Request, Response, SlotId, SlotState,
+};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc, watch, Notify};
@@ -15,6 +17,7 @@ use tokio::task::{JoinHandle, JoinSet};
 
 use crate::env::{BaseEnv, EnvSource};
 use crate::ledger::Ledger;
+use crate::locks::{owned_items, LockService};
 use crate::manager::{valid_id, Attachment, SlotManager};
 use crate::slot::CatchUp;
 use crate::work::store::unix_now;
@@ -39,6 +42,8 @@ pub struct DaemonConfig {
     pub hook_program: PathBuf,
     /// Settings from `config.toml`.
     pub settings: crate::config::Config,
+    /// Write target patterns, from `targets.toml` and the defaults.
+    pub patterns: Vec<crate::locks::targets::Pattern>,
 }
 
 /// `run` found another daemon serving the socket. Not a failure: the daemon
@@ -96,6 +101,14 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
     };
     let ledger = Arc::new(ledger);
     let store = WorkStore::new(&cfg.settings, ledger.clone(), events.clone(), env.clone());
+    let locks = LockService::new(
+        ledger.clone(),
+        cfg.patterns,
+        events.clone(),
+        env.clone(),
+        Duration::from_secs(cfg.settings.lock_idle_mins.saturating_mul(60)),
+    );
+    let exits = tokio::spawn(watch_exits(events.subscribe(), locks.clone()));
     let state_dir = cfg.state_dir.clone();
     let mut mgr = SlotManager::new(cfg.default_command, events)
         .with_env(env.clone())
@@ -114,6 +127,7 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
                         stream,
                         manager.clone(),
                         store.clone(),
+                        locks.clone(),
                         state_dir.clone(),
                         shutdown.clone(),
                         env.clone(),
@@ -127,6 +141,8 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
     }
 
     store.shutdown();
+    // The sessions are killed next; they keep their locks for the restart.
+    locks.shutdown();
     manager.lock().unwrap().shutdown_all();
     // A label change just before a restart should still reach the bead.
     store.drain_labels(crate::work::store::LABEL_DRAIN).await;
@@ -134,7 +150,24 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
     tokio::time::sleep(SHUTDOWN_GRACE).await;
     // Dropping `conns` aborts every connection task, closing the sockets.
     drop(conns);
+    exits.abort();
     Ok(())
+}
+
+/// Ends the locks of each slot whose session exits.
+async fn watch_exits(mut events: broadcast::Receiver<Event>, locks: Arc<LockService>) {
+    loop {
+        match events.recv().await {
+            Ok(Event::SlotChanged(info)) if matches!(info.state, SlotState::Exited { .. }) => {
+                locks.on_slot_exit(info.id, unix_now());
+            }
+            Ok(_) => {}
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!("lock exit watcher lagged by {n} events");
+            }
+            Err(broadcast::error::RecvError::Closed) => return,
+        }
+    }
 }
 
 /// Bounded outbound queue for one connection. Sending never waits: if the
@@ -244,6 +277,7 @@ async fn handle_conn(
     stream: UnixStream,
     manager: Manager,
     store: Arc<WorkStore>,
+    locks: Arc<LockService>,
     state_dir: PathBuf,
     shutdown: Arc<Notify>,
     mut env: BaseEnv,
@@ -307,7 +341,13 @@ async fn handle_conn(
                     ) {
                         env.wait().await;
                     }
-                    handle_frame(f, &manager, &store, &state_dir, &outbox, &shutdown, &mut streams)
+                    let ctx = Ctx {
+                        manager: &manager,
+                        store: &store,
+                        locks: &locks,
+                        state_dir: &state_dir,
+                    };
+                    handle_frame(f, &ctx, &outbox, &shutdown, &mut streams)
                 }
                 None => break, // client hung up
             },
@@ -329,15 +369,22 @@ async fn handle_conn(
     writer.abort();
 }
 
+/// What a request handler works with.
+struct Ctx<'a> {
+    manager: &'a Manager,
+    store: &'a Arc<WorkStore>,
+    locks: &'a Arc<LockService>,
+    state_dir: &'a Path,
+}
+
 fn handle_frame(
     frame: Frame,
-    manager: &Manager,
-    store: &Arc<WorkStore>,
-    state_dir: &Path,
+    ctx: &Ctx,
     outbox: &Outbox,
     shutdown: &Notify,
     streams: &mut Streams,
 ) {
+    let (manager, store) = (ctx.manager, ctx.store);
     match frame {
         // Runs the sources, which can take up to their timeout, so it is
         // answered from a task of its own and the connection keeps serving.
@@ -355,10 +402,24 @@ fn handle_frame(
                 });
             });
         }
+        // Resolving targets can run git or kubectl (bounded by
+        // `RESOLVE_WITHIN`), so it too is answered from a task.
+        Frame::Request {
+            seq,
+            req: Request::CheckBash(check),
+        } => {
+            let owned = owned_items(&store.view(), check.slot);
+            let locks = ctx.locks.clone();
+            let outbox = outbox.clone();
+            store.spawn(async move {
+                let resp = locks.check_bash(check, owned).await;
+                outbox.send(Frame::Response { seq, resp });
+            });
+        }
         Frame::Request { seq, req } => {
             let is_shutdown = matches!(req, Request::Shutdown);
             let mut pending_attach = None;
-            let resp = handle_request(req, manager, store, state_dir, streams, &mut pending_attach);
+            let resp = handle_request(req, ctx, streams, &mut pending_attach);
             // A re-attach ends the earlier stream before its Ok is queued.
             let gate = pending_attach.as_ref().map(|(id, _)| streams.cut(*id));
             outbox.send(Frame::Response { seq, resp });
@@ -394,12 +455,11 @@ fn handle_frame(
 
 fn handle_request(
     req: Request,
-    manager: &Manager,
-    store: &Arc<WorkStore>,
-    state_dir: &Path,
+    ctx: &Ctx,
     streams: &mut Streams,
     pending_attach: &mut Option<(SlotId, Attachment)>,
 ) -> Response {
+    let (manager, store, locks, state_dir) = (ctx.manager, ctx.store, ctx.locks, ctx.state_dir);
     let err = |message: String| Response::Error { message };
     match req {
         Request::Hello { client } => {
@@ -415,15 +475,48 @@ fn handle_request(
             slot,
             confirm,
             move_owner,
-        } => store.assign(&key, slot, confirm, move_owner, unix_now()),
-        Request::Release { key } => store.release(&key, unix_now()),
+        } => {
+            let owner = |v: overseer_proto::WorkView| {
+                v.items.iter().find(|i| i.key == key).and_then(|i| i.owner)
+            };
+            let before = owner(store.view());
+            let now = unix_now();
+            let resp = store.assign(&key, slot, confirm, move_owner, now);
+            // A move: the targets claimed for the item go with the old owner.
+            if resp == Response::Ok && before.is_some_and(|b| b != slot) {
+                locks.on_item_released(&key, now);
+            }
+            resp
+        }
+        Request::Release { key } => {
+            let now = unix_now();
+            let resp = store.release(&key, now);
+            if resp == Response::Ok {
+                locks.on_item_released(&key, now);
+            }
+            resp
+        }
         Request::ClearNotices { slot } => store.clear_notices(slot),
-        Request::ListLocks
-        | Request::ClaimTarget { .. }
-        | Request::ReleaseTarget { .. }
-        | Request::ForceRelease { .. }
-        | Request::SendRelay { .. }
-        | Request::CheckBash(_) => err("not supported yet".into()),
+        Request::ListLocks => Response::Locks(locks.view()),
+        Request::ClaimTarget {
+            slot,
+            target,
+            reason,
+            item,
+        } => locks.claim(
+            slot,
+            &target,
+            reason.as_deref(),
+            item.as_deref(),
+            &owned_items(&store.view(), slot),
+            unix_now(),
+        ),
+        Request::ReleaseTarget { slot, target } => locks.release(slot, &target, unix_now()),
+        Request::ForceRelease { target } => locks.force_release(&target, unix_now()),
+        Request::SendRelay { .. } => err("not supported yet".into()),
+        // Answered in `handle_frame` from a task; this arm only keeps the
+        // match whole.
+        Request::CheckBash(_) => Response::Verdict { deny: None },
         Request::Kickoff { slot } if !valid_id(slot) => err(format!("invalid slot id {slot}")),
         Request::Kickoff { slot } => {
             let items = store.view().items;
@@ -489,6 +582,7 @@ fn handle_request(
         // because of the daemon's state.
         Request::Hook(ev) => {
             manager.lock().unwrap().hook(&ev);
+            locks.on_hook(&ev, unix_now());
             Response::Ok
         }
     }
