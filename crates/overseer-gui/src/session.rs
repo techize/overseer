@@ -269,8 +269,12 @@ pub fn relay_rows(view: &LockView, slot: SlotId, clock: impl Fn(i64) -> String) 
 /// What an inline entry row in the panel is for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EntryKind {
-    /// `Release <target>? Enter / Esc`; Up and Down pick among `targets`.
-    Release { targets: Vec<String>, picked: usize },
+    /// `Release S1's <target>? Enter / Esc`; Up and Down pick among
+    /// `targets`, each with the holder Jonathan was shown.
+    Release {
+        targets: Vec<(String, SlotId)>,
+        picked: usize,
+    },
     /// One line: `<target> [reason]`.
     Claim,
     /// One line of text for the slot's session.
@@ -307,9 +311,11 @@ impl PanelEntry {
         }
     }
 
-    /// The release confirm for `targets[picked]`. None without targets.
+    /// The release confirm for `targets[picked]`, which `slot` holds. None
+    /// without targets.
     pub fn release(slot: SlotId, targets: Vec<String>, picked: usize) -> Option<Self> {
         let picked = picked.min(targets.len().checked_sub(1)?);
+        let targets = targets.into_iter().map(|t| (t, slot)).collect();
         Some(Self::new(slot, EntryKind::Release { targets, picked }))
     }
 
@@ -325,7 +331,8 @@ impl PanelEntry {
     pub fn prompt(&self) -> String {
         match &self.kind {
             EntryKind::Release { targets, picked } => {
-                format!("Release {}? Enter / Esc", targets[*picked])
+                let (target, holder) = &targets[*picked];
+                format!("Release {}'s {target}? Enter / Esc", slot_name(*holder))
             }
             EntryKind::Claim => "Claim".into(),
             EntryKind::Message => format!("Message {}", slot_name(self.slot)),
@@ -370,14 +377,19 @@ impl PanelEntry {
     }
 
     /// The request Enter sends. A release is for Jonathan acting for the
-    /// holder, so it is a force release; a claim is for this slot; a message
-    /// is from Jonathan (`from: None`).
+    /// holder, so it is a force release, and only of the holder he was
+    /// shown; a claim is for this slot; a message is from Jonathan
+    /// (`from: None`).
     pub fn request(&self) -> Result<Request, String> {
         let text = self.field.text.trim();
         match &self.kind {
-            EntryKind::Release { targets, picked } => Ok(Request::ForceRelease {
-                target: targets[*picked].clone(),
-            }),
+            EntryKind::Release { targets, picked } => {
+                let (target, holder) = &targets[*picked];
+                Ok(Request::ForceRelease {
+                    target: target.clone(),
+                    holder: Some(*holder),
+                })
+            }
             EntryKind::Claim => {
                 let (target, reason) = match text.split_once(char::is_whitespace) {
                     Some((t, r)) => (t, r.trim()),
@@ -1636,17 +1648,20 @@ mod tests {
         assert!(PanelEntry::release(2, vec![], 0).is_none());
         let targets = vec!["argo:uat/root".to_string(), "tf:default".to_string()];
         let mut e = PanelEntry::release(2, targets, 0).unwrap();
-        assert_eq!(e.prompt(), "Release argo:uat/root? Enter / Esc");
+        assert_eq!(e.prompt(), "Release S2's argo:uat/root? Enter / Esc");
         assert_eq!(e.key(&key("up")), EntryAction::Redraw);
         assert_eq!(e.key(&key("down")), EntryAction::Redraw);
         assert_eq!(e.key(&key("down")), EntryAction::Redraw);
-        assert_eq!(e.prompt(), "Release tf:default? Enter / Esc");
+        assert_eq!(e.prompt(), "Release S2's tf:default? Enter / Esc");
         assert_eq!(e.key(&key("x")), EntryAction::Ignored);
         assert_eq!(e.key(&key("enter")), EntryAction::Submit);
         assert_eq!(
             e.request(),
+            // Only while S2 still holds it, so a target handed on since
+            // the confirm opened is not taken from its new holder.
             Ok(Request::ForceRelease {
-                target: "tf:default".into()
+                target: "tf:default".into(),
+                holder: Some(2),
             })
         );
         assert_eq!(e.key(&key("escape")), EntryAction::Cancel);

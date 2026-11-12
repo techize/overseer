@@ -384,8 +384,12 @@ pub enum Request {
         slot: SlotId,
         target: String,
     },
+    /// Jonathan releases `target`. With `holder`, only while that slot
+    /// still holds it; without, from whoever does.
     ForceRelease {
         target: String,
+        #[serde(default)]
+        holder: Option<SlotId>,
     },
     /// Queues a message for a slot's session. `from` is `None` for you.
     SendRelay {
@@ -597,6 +601,24 @@ mod tests {
     }
 
     #[test]
+    fn force_release_and_relay_read_without_their_new_fields() {
+        let req: Request =
+            serde_json::from_str(r#"{"type":"ForceRelease","target":"argo:uat/root"}"#).unwrap();
+        assert_eq!(
+            req,
+            Request::ForceRelease {
+                target: "argo:uat/root".into(),
+                holder: None,
+            }
+        );
+        let relay: Relay = serde_json::from_str(
+            r#"{"id":1,"at":2,"from":{"type":"You"},"to":3,"text":"hi","state":"Pending","delivered_at":null,"held":null}"#,
+        )
+        .unwrap();
+        assert_eq!(relay.dropped_at, None);
+    }
+
+    #[test]
     fn assign_defaults_flags() {
         let req: Request =
             serde_json::from_str(r#"{"type":"Assign","key":"DEMO-1","slot":2}"#).unwrap();
@@ -704,6 +726,11 @@ mod tests {
             },
             Request::ForceRelease {
                 target: "uat/root".into(),
+                holder: None,
+            },
+            Request::ForceRelease {
+                target: "uat/root".into(),
+                holder: Some(2),
             },
             Request::SendRelay {
                 from: Some(0),

@@ -49,8 +49,9 @@ pub(crate) enum ClaimOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Releaser {
     Slot(SlotId),
-    /// Jonathan, from the GUI or `ctl force-release`.
-    Force,
+    /// Jonathan, from the GUI or `ctl force-release`. With a slot, only
+    /// while that slot still holds the target (the holder he was shown).
+    Force(Option<SlotId>),
 }
 
 /// A target leaving its holder, and the waiter it went to, if any.
@@ -365,7 +366,8 @@ fn hand_on(
 
 /// Releases `target`. Its holder (or `Releaser::Force`) hands it to the
 /// first waiter; a slot that only waits on it leaves the queue and gets
-/// `Ok(None)`. Anyone else is an error.
+/// `Ok(None)`. Anyone else, or a force release naming a holder that no
+/// longer holds it, is an error.
 pub(crate) fn release_on(
     conn: &Connection,
     target: &str,
@@ -375,8 +377,14 @@ pub(crate) fn release_on(
 ) -> Result<Option<Handoff>> {
     let holder = holder_on(conn, target)?.map(|h| h.slot);
     match (by, holder) {
-        (Releaser::Force, Some(h)) => Ok(Some(hand_on(conn, target, h, true, back_on, now)?)),
-        (Releaser::Force, None) => bail!("{target} is not held"),
+        (Releaser::Force(Some(seen)), Some(h)) if seen != h => {
+            bail!(
+                "{target} is now held by {}; nothing released.",
+                slot_name(h)
+            )
+        }
+        (Releaser::Force(_), Some(h)) => Ok(Some(hand_on(conn, target, h, true, back_on, now)?)),
+        (Releaser::Force(_), None) => bail!("{target} is not held"),
         (Releaser::Slot(s), Some(h)) if h == s => {
             Ok(Some(hand_on(conn, target, h, false, back_on, now)?))
         }
@@ -794,7 +802,7 @@ mod tests {
         with(|c| {
             take(c, T, 1, ClaimKind::Claim, 10);
             queue(c, T, 2, Via::Tool, 11);
-            let h = release_on(c, T, Releaser::Force, None, 20)?;
+            let h = release_on(c, T, Releaser::Force(None), None, 20)?;
             assert_eq!(h.map(|h| (h.from, h.to)), Some((1, Some(2))));
             assert_eq!(
                 texts(c, 2),
@@ -807,6 +815,43 @@ mod tests {
             assert_eq!(holders(c), vec![(T.into(), 2, ClaimKind::Claim)]);
             Ok(())
         })
+    }
+
+    #[test]
+    fn force_release_of_a_named_holder_refuses_another() {
+        let l = Ledger::in_memory();
+        l.transaction(|c| {
+            take(c, "repo:demo-api:main", 1, ClaimKind::Claim, 10);
+            Ok(())
+        })
+        .unwrap();
+        let mine = |c: &Connection, slot| {
+            release_on(
+                c,
+                "repo:demo-api:main",
+                Releaser::Force(Some(slot)),
+                None,
+                20,
+            )
+        };
+        // Jonathan saw S2 hold it, but it is S1's now.
+        let err = l.transaction(|c| mine(c, 2)).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "repo:demo-api:main is now held by S1; nothing released."
+        );
+        l.transaction(|c| {
+            assert_eq!(
+                holders(c),
+                vec![("repo:demo-api:main".into(), 1, ClaimKind::Claim)]
+            );
+            assert!(relays_on(c, 10)?.is_empty());
+            let h = mine(c, 1)?;
+            assert_eq!(h.map(|h| (h.from, h.to)), Some((1, None)));
+            assert!(claims_on(c)?.is_empty());
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]
@@ -841,7 +886,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.to_string(), "repo:demo-api:main is not held by S2");
         let err = l
-            .transaction(|c| release_on(c, "repo:demo-api:main", Releaser::Force, None, 20))
+            .transaction(|c| release_on(c, "repo:demo-api:main", Releaser::Force(None), None, 20))
             .unwrap_err();
         assert_eq!(err.to_string(), "repo:demo-api:main is not held");
     }

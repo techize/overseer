@@ -448,9 +448,14 @@ pub async fn run(cmd: CtlCmd) -> anyhow::Result<()> {
                 })
                 .await?,
         ),
-        CtlCmd::ForceRelease { target } => {
-            print_text_or_queued(client.request(Request::ForceRelease { target }).await?)
-        }
+        CtlCmd::ForceRelease { target } => print_text_or_queued(
+            client
+                .request(Request::ForceRelease {
+                    target,
+                    holder: None,
+                })
+                .await?,
+        ),
         CtlCmd::Items { json } => match client.request(Request::ListWorkItems).await? {
             Response::Work(v) => {
                 if json {

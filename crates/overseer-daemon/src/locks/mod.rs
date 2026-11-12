@@ -299,12 +299,13 @@ impl LockService {
         self.released(target, done)
     }
 
-    /// Jonathan's release of whatever holds `target`. The notice to a
-    /// holder with no session is queued already dropped.
-    pub fn force_release(&self, target: &str, now: i64) -> Response {
+    /// Jonathan's release of `target`: from whatever holds it when
+    /// `holder` is `None`, else only while `holder` still does. The notice
+    /// to a holder with no session is queued already dropped.
+    pub fn force_release(&self, target: &str, holder: Option<SlotId>, now: i64) -> Response {
         let dead = self.sessionless();
         let done = self.ledger.transaction(|conn| {
-            let h = table::release_on(conn, target, Releaser::Force, None, now)?;
+            let h = table::release_on(conn, target, Releaser::Force(holder), None, now)?;
             for &slot in &dead {
                 table::drop_relays_to_on(conn, slot, now)?;
             }

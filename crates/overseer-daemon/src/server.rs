@@ -600,7 +600,9 @@ fn handle_request(
             unix_now(),
         ),
         Request::ReleaseTarget { slot, target } => locks.release(slot, &target, unix_now()),
-        Request::ForceRelease { target } => locks.force_release(&target, unix_now()),
+        Request::ForceRelease { target, holder } => {
+            locks.force_release(&target, holder, unix_now())
+        }
         Request::SendRelay { from, to, text } => {
             // An empty or exited slot has no session to type into; a
             // resumable one gets it once resumed.

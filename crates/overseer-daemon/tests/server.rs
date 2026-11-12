@@ -2172,9 +2172,25 @@ async fn release_grants_the_waiter_and_queues_a_relay() {
         holds(&c.locks().await),
         [(t("custom:z"), 3, ClaimKind::Claim)]
     );
+    // Jonathan was shown S1 holding it; S3 holds it now, so nothing goes.
     assert_eq!(
         c.request(Request::ForceRelease {
-            target: t("custom:z")
+            target: t("custom:z"),
+            holder: Some(1),
+        })
+        .await,
+        Response::Error {
+            message: t("custom:z is now held by S3; nothing released.")
+        }
+    );
+    assert_eq!(
+        holds(&c.locks().await),
+        [(t("custom:z"), 3, ClaimKind::Claim)]
+    );
+    assert_eq!(
+        c.request(Request::ForceRelease {
+            target: t("custom:z"),
+            holder: Some(3),
         })
         .await,
         Response::Text {
@@ -2183,7 +2199,8 @@ async fn release_grants_the_waiter_and_queues_a_relay() {
     );
     assert_eq!(
         c.request(Request::ForceRelease {
-            target: t("custom:z")
+            target: t("custom:z"),
+            holder: None,
         })
         .await,
         Response::Error {
@@ -3235,7 +3252,8 @@ async fn notice_for_a_holder_with_no_session_is_queued_dropped() {
     c.request(claim_target(3, "custom:z", None)).await;
     assert_eq!(
         c.request(Request::ForceRelease {
-            target: t("custom:z")
+            target: t("custom:z"),
+            holder: None,
         })
         .await,
         Response::Text {
