@@ -31,8 +31,8 @@ use overseer_proto::{
 
 use crate::board::Dir;
 use crate::picker::{Picker, PickerEvent};
-use crate::session::RestartPlan;
 use crate::session::{incarnation, keep_view, restart_begin, restart_on_change, Incarnation};
+use crate::session::{reply_note, EntryAction, EntryKind, PanelEntry, RestartPlan};
 use crate::start_dialog::{DialogEvent, Prefill, StartDialog};
 use crate::{FrameHub, TerminalView, Theme};
 
@@ -79,6 +79,8 @@ actions!(
         OpenSelected,
         ResumeSelected,
         AssignSelected,
+        OpenMessage,
+        OpenRelease,
     ]
 );
 
@@ -107,7 +109,16 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-n", StartSession, nav),
         // Not from the terminal: there Esc closes the find bar or goes to
         // Claude Code.
-        KeyBinding::new("escape", GoBoard, Some("Session && !Terminal")),
+        // Nor from an open Holds or Relays entry row, which takes Esc itself.
+        KeyBinding::new(
+            "escape",
+            GoBoard,
+            Some("Session && !Terminal && !PanelEntry"),
+        ),
+        // Cmd+Shift keys never reach Claude Code, so the terminal loses
+        // nothing; plain m and r still go to it.
+        KeyBinding::new("cmd-shift-m", OpenMessage, Some("Session")),
+        KeyBinding::new("cmd-shift-r", OpenRelease, Some("Session")),
         KeyBinding::new("left", SelectLeft, Some("Board")),
         KeyBinding::new("right", SelectRight, Some("Board")),
         KeyBinding::new("up", SelectUp, Some("Board")),
@@ -270,6 +281,11 @@ pub struct OverseerApp {
     pub(crate) home: Option<PathBuf>,
     /// Last error from a request, shown until the next action.
     pub(crate) status: Option<String>,
+    /// The open Release confirm, Claim entry or Message entry of the panel.
+    pub(crate) entry: Option<PanelEntry>,
+    /// The daemon's last answer to an entry: (slot, is for Holds, text).
+    pub(crate) entry_note: Option<(SlotId, bool, String)>,
+    pub(crate) entry_focus: FocusHandle,
     terminals: HashMap<SlotId, TermEntry>,
     dialog: Option<(Entity<StartDialog>, Subscription)>,
     picker: Option<(Entity<Picker>, Subscription)>,
@@ -357,6 +373,9 @@ impl OverseerApp {
             selected: 1,
             home: std::env::var_os("HOME").map(PathBuf::from),
             status: None,
+            entry: None,
+            entry_note: None,
+            entry_focus: cx.focus_handle(),
             terminals: HashMap::new(),
             dialog: None,
             picker: None,
@@ -608,6 +627,126 @@ impl OverseerApp {
         .detach();
     }
 
+    /// Opens `entry` in the panel and takes the keyboard for it.
+    fn open_entry(&mut self, entry: PanelEntry, window: &mut Window, cx: &mut Context<Self>) {
+        self.status = None;
+        self.entry_note = None;
+        self.entry = Some(entry);
+        window.focus(&self.entry_focus);
+        cx.notify();
+    }
+
+    fn close_entry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.entry = None;
+        self.restore_focus(window, cx);
+        cx.notify();
+    }
+
+    /// The Release confirm for hold `picked` of `slot`.
+    pub(crate) fn open_release(
+        &mut self,
+        slot: SlotId,
+        picked: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let targets: Vec<String> =
+            crate::session::holds_rows(&self.locks, slot, 0, crate::board::local_hhmm)
+                .into_iter()
+                .map(|h| h.target)
+                .collect();
+        match PanelEntry::release(slot, targets, picked) {
+            Some(entry) => self.open_entry(entry, window, cx),
+            None => {
+                self.entry_note = Some((slot, true, "Nothing held".into()));
+                cx.notify();
+            }
+        }
+    }
+
+    pub(crate) fn open_claim(&mut self, slot: SlotId, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_entry(PanelEntry::claim(slot), window, cx);
+    }
+
+    pub(crate) fn open_message(
+        &mut self,
+        slot: SlotId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_entry(PanelEntry::message(slot), window, cx);
+    }
+
+    /// Cmd+Shift+R in the session view: release confirm for the first hold.
+    pub(crate) fn open_release_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Screen::Session(id) = self.screen {
+            self.open_release(id, 0, window, cx);
+        }
+    }
+
+    pub(crate) fn open_message_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Screen::Session(id) = self.screen {
+            self.open_message(id, window, cx);
+        }
+    }
+
+    pub(crate) fn on_entry_key(
+        &mut self,
+        ev: &gpui::KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(entry) = self.entry.as_mut() else {
+            return;
+        };
+        match entry.key(&ev.keystroke) {
+            EntryAction::Ignored => return,
+            EntryAction::Redraw => {}
+            EntryAction::Cancel => self.close_entry(window, cx),
+            EntryAction::Paste => {
+                if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
+                    entry.paste(&text);
+                }
+            }
+            EntryAction::Submit => self.submit_entry(window, cx),
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    /// Sends the entry's request. A request the entry cannot make stays
+    /// open with the reason; otherwise the row closes and the daemon's
+    /// answer (an error, `Queued`, a result) shows under the box.
+    fn submit_entry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(entry) = self.entry.as_mut() else {
+            return;
+        };
+        let req = match entry.request() {
+            Ok(req) => req,
+            Err(why) => {
+                entry.error = Some(why);
+                return;
+            }
+        };
+        let (slot, holds) = (entry.slot, !matches!(entry.kind, EntryKind::Message));
+        self.close_entry(window, cx);
+        self.entry_note = None;
+        let client = self.client.clone();
+        cx.spawn(async move |this, cx| {
+            let reply = client
+                .request(req)
+                .await
+                .map_err(|e| format!("{} ({e:#})", crate::terminal_view::LOST_DAEMON));
+            let _ = this.update(cx, |this, cx| {
+                if let Some(text) = reply_note(&reply) {
+                    this.entry_note = Some((slot, holds, text));
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// The modes the slot's session set on its terminal (bracketed paste
     /// and so on). Defaults when no terminal view was made for it.
     fn term_modes(&self, slot: SlotId, cx: &App) -> overseer_term::TermModes {
@@ -734,6 +873,7 @@ impl OverseerApp {
     /// a running slot becomes visible again.
     fn set_screen(&mut self, screen: Screen, cx: &mut Context<Self>) {
         self.screen = screen;
+        self.entry = None;
         self.ensure_ticker(cx);
     }
 
@@ -924,6 +1064,24 @@ mod tests {
             assert_eq!(routed(k, PICKER), None, "{k}");
         }
         assert_eq!(routed("cmd-q", PICKER), Some("overseer::Quit"));
+    }
+
+    #[test]
+    fn cmd_shift_m_and_r_open_the_entries_in_the_session_view_only() {
+        const ENTRY: &[&str] = &["Overseer", "Session", "PanelEntry"];
+        for ctx in [TERMINAL, CHROME] {
+            assert_eq!(routed("cmd-shift-m", ctx), Some("overseer::OpenMessage"));
+            assert_eq!(routed("cmd-shift-r", ctx), Some("overseer::OpenRelease"));
+        }
+        for ctx in [BOARD, DIALOG, PICKER] {
+            assert_eq!(routed("cmd-shift-m", ctx), None);
+            assert_eq!(routed("cmd-shift-r", ctx), None);
+        }
+        // Plain keys still go to the terminal, and the entry keeps Esc.
+        for k in ["m", "r", "shift-m", "cmd-m", "cmd-r"] {
+            assert_eq!(routed(k, TERMINAL), None, "{k}");
+        }
+        assert_eq!(routed("escape", ENTRY), None);
     }
 
     #[test]

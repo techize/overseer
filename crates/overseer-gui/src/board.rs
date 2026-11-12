@@ -392,7 +392,7 @@ pub fn strip_lines(view: &LockView, clock: impl Fn(i64) -> String, max: usize) -
 }
 
 /// `text` on one line, cut to `max` characters.
-fn one_line(text: &str, max: usize) -> String {
+pub(crate) fn one_line(text: &str, max: usize) -> String {
     let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
     match line.char_indices().nth(max) {
         Some((cut, _)) => format!("{}…", &line[..cut]),
