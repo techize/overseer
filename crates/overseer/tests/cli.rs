@@ -117,7 +117,7 @@ fn ctl_start_send_status() {
     env.ctl(&["start", "2", "--cwd", "/tmp", "--label", "demo"])
         .assert()
         .success();
-    env.ctl(&["send", "2", "hello"]).assert().success();
+    env.ctl(&["send", "2", "--raw", "hello"]).assert().success();
     let out = stdout_of(&mut env.ctl(&["status"]));
     let s2 = out.lines().find(|l| l.starts_with("S2")).unwrap();
     assert!(s2.starts_with("S2  running"), "{out}");
@@ -389,4 +389,84 @@ fn assign_needs_confirm_exits_2() {
     assert!(out.contains("  ov-3  open  S2  "), "{out}");
     env.ctl(&["assign", "3", "DEMO-12"]).assert().code(1);
     env.ctl(&["release", "DEMO-12"]).assert().success();
+}
+
+#[test]
+fn claim_held_exits_2() {
+    let env = Env::new();
+    let out = stdout_of(&mut env.ctl(&["claim", "1", "repo:demo-api:main", "pushing"]));
+    assert!(out.contains("repo:demo-api:main"), "{out}");
+    let held = env
+        .ctl(&["claim", "2", "repo:demo-api:main"])
+        .assert()
+        .code(2)
+        .get_output()
+        .stdout
+        .clone();
+    let held = String::from_utf8(held).unwrap();
+    assert!(held.contains("S1"), "{held}");
+}
+
+#[test]
+fn claim_error_exits_1() {
+    let env = Env::new();
+    env.ctl(&["claim", "9", "repo:demo-api:main"])
+        .assert()
+        .code(1);
+}
+
+#[test]
+fn locks_lists_holder_and_waiter() {
+    let env = Env::new();
+    env.ctl(&["claim", "1", "repo:demo-api:main", "pushing"])
+        .assert()
+        .success();
+    env.ctl(&["claim", "2", "repo:demo-api:main"])
+        .assert()
+        .code(2);
+    let out = stdout_of(&mut env.ctl(&["locks"]));
+    let lines: Vec<&str> = out.lines().collect();
+    assert!(
+        lines[0].starts_with("repo:demo-api:main  S1  claim  since "),
+        "{out}"
+    );
+    assert!(lines[0].ends_with("for pushing"), "{out}");
+    assert!(lines[1].starts_with("  waiting: S2 since "), "{out}");
+    let json = stdout_of(&mut env.ctl(&["locks", "--json"]));
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(v["claims"][0]["target"], "repo:demo-api:main");
+    assert_eq!(v["waits"][0]["slot"], 2);
+}
+
+#[test]
+fn release_two_args_is_a_target() {
+    let env = Env::new();
+    env.ctl(&["claim", "1", "repo:demo-api:main"])
+        .assert()
+        .success();
+    env.ctl(&["release", "S1", "repo:demo-api:main"])
+        .assert()
+        .success();
+    assert_eq!(stdout_of(&mut env.ctl(&["locks"])), "");
+    env.ctl(&["claim", "3", "tf:demo"]).assert().success();
+    env.ctl(&["release", "3", "tf:demo"]).assert().success();
+    assert_eq!(stdout_of(&mut env.ctl(&["locks"])), "");
+    env.ctl(&["claim", "3", "tf:demo"]).assert().success();
+    env.ctl(&["force-release", "tf:demo"]).assert().success();
+    let out = stdout_of(&mut env.ctl(&["locks"]));
+    assert!(!out.contains("tf:demo  S3"), "{out}");
+    assert!(out.contains("Jonathan released tf:demo"), "{out}");
+}
+
+#[test]
+fn send_queues_a_relay() {
+    let env = Env::new();
+    // Nothing runs in S3, so the relay cannot be delivered and stays pending.
+    env.ctl(&["send", "3", "check the DEMO-33 branch"])
+        .assert()
+        .success();
+    let out = stdout_of(&mut env.ctl(&["locks"]));
+    let line = out.lines().find(|l| l.starts_with("relay")).expect(&out);
+    assert!(line.starts_with("relay  S3  pending ("), "{out}");
+    assert!(line.ends_with("check the DEMO-33 branch"), "{out}");
 }

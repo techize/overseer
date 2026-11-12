@@ -24,8 +24,9 @@ const PREVIOUS_COORDINATOR: &[u64] = &[
     0x2053126dcf7ec248,
     0xfb1eff022d50a360,
     0x4baeb879ce73cf13,
+    0x7ddaa223f4bdd1f6,
 ];
-const PREVIOUS_WORKER: &[u64] = &[0x215de771dfd84eb4];
+const PREVIOUS_WORKER: &[u64] = &[0x215de771dfd84eb4, 0xbd3ab0020d4d25b1];
 const PREVIOUS_KICKOFF: &[u64] = &[];
 const PREVIOUS_ASSIGNMENT: &[u64] = &[];
 
@@ -790,7 +791,68 @@ mod tests {
             "{role}"
         );
         assert!(role.contains("ctl send <n> '<text>'"), "{role}");
+        assert!(role.contains("ctl send 0 --raw"), "{role}");
+        assert!(role.contains("call `notify_session`"), "{role}");
+        assert!(
+            role.contains("Never claim targets on a worker's behalf."),
+            "{role}"
+        );
         assert!(role.contains("'\\''"), "{role}");
         assert!(!role.contains("--prompt \""), "{role}");
+    }
+
+    const PHASE_3_WORKER: &str = include_str!("../tests/fixtures/roles-phase3/worker.md");
+    const PHASE_3_COORDINATOR: &str = include_str!("../tests/fixtures/roles-phase3/coordinator.md");
+
+    #[test]
+    fn phase_3_roles_upgrade() {
+        assert_eq!(text_hash(PHASE_3_WORKER), 0xbd3ab0020d4d25b1);
+        assert_eq!(text_hash(PHASE_3_COORDINATOR), 0x7ddaa223f4bdd1f6);
+        assert!(PREVIOUS_WORKER.contains(&text_hash(PHASE_3_WORKER)));
+        assert!(PREVIOUS_COORDINATOR.contains(&text_hash(PHASE_3_COORDINATOR)));
+        let dir = temp("phase3");
+        let roles = dir.join("roles");
+        std::fs::create_dir_all(&roles).unwrap();
+        std::fs::write(roles.join("worker.md"), PHASE_3_WORKER).unwrap();
+        std::fs::write(roles.join("coordinator.md"), PHASE_3_COORDINATOR).unwrap();
+        write_slot_files(&dir, 1, "lbl", Path::new("/Apps/overseer")).unwrap();
+        write_slot_files(&dir, 0, "lbl", Path::new("/Apps/overseer")).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(roles.join("worker.md")).unwrap(),
+            WORKER_ROLE
+        );
+        assert_eq!(
+            std::fs::read_to_string(roles.join("coordinator.md")).unwrap(),
+            COORDINATOR_ROLE
+        );
+        assert!(!roles.join("worker.md.new").exists());
+        assert!(!roles.join("coordinator.md.new").exists());
+    }
+
+    #[test]
+    fn worker_role_names_the_tools() {
+        let dir = temp("workertools");
+        let f = write_slot_files(&dir, 2, "lbl", Path::new("/Apps/overseer")).unwrap();
+        let role = std::fs::read_to_string(f.role).unwrap();
+        for t in [
+            "claim_target",
+            "release_target",
+            "notify_session",
+            "list_targets",
+        ] {
+            assert!(role.contains(&format!("`{t}`")), "{t}: {role}");
+        }
+        assert!(
+            role.contains("Overseer locks shared write targets"),
+            "{role}"
+        );
+        assert!(!role.contains('\u{2014}'), "no em dashes");
+    }
+
+    #[test]
+    fn coordinator_role_reads_the_journal() {
+        assert!(COORDINATOR_ROLE.contains("Before you propose work, read today's journal."));
+        assert!(COORDINATOR_ROLE.contains("date '+%Y/%m-%B/%Y-%m-%d'"));
+        assert!(COORDINATOR_ROLE.contains("06-Daily/"));
     }
 }
