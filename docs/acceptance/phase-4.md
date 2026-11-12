@@ -237,9 +237,9 @@ $OVERSEER_HOME/work/demo-api --label demo-1`.
 
 | ID | Check | Steps | Pass | Result |
 |----|-------|-------|------|--------|
-| MR1 | The tools are seen | In S1's terminal run `/mcp` | `overseer` is listed as connected, with `claim_target`, `release_target`, `notify_session` and `list_targets` | For Jonathan |
-| MR2 | `OVERSEER_SLOT` and the socket reach the server, and no permission prompt appears | Ask S1: `Use the overseer list_targets tool, then claim_target custom:demo-lane with reason "hand check", then list_targets again, then release_target custom:demo-lane.` Meanwhile in another tab `$OV ctl locks` after the claim | Claude runs all four with no permission prompt; `ctl locks` shows `custom:demo-lane  S1  claim` with `for hand check`, so the server knew it was S1 and reached the temp daemon; the last call releases it | For Jonathan |
-| MR3 | `notify_session` from a real session | `OVERSEER_SLOT=S0 $OV ctl send 1 "Reply to me with notify_session: ok"`; wait for it to be typed in | Claude calls `notify_session` for S0 with no prompt; `$OV ctl locks` shows a pending relay for S0 (`slot is not running`); a second `notify_session` for S0 is refused | For Jonathan |
+| MR1 | The tools are seen | In S1's terminal run `/mcp` | `overseer` is listed as connected, with `claim_target`, `release_target`, `notify_session` and `list_targets` | Pass, 2026-11-12 at 11a20aa: `/mcp` listed `overseer` under Built-in MCPs as connected with 4 tools; its tool list read `claim_target`, `release_target`, `notify_session`, `list_targets` |
+| MR2 | `OVERSEER_SLOT` and the socket reach the server, and no permission prompt appears | Ask S1: `Use the overseer list_targets tool, then claim_target custom:demo-lane with reason "hand check", then list_targets again, then release_target custom:demo-lane.` Meanwhile in another tab `$OV ctl locks` after the claim | Claude runs all four with no permission prompt; `ctl locks` shows `custom:demo-lane  S1  claim` with `for hand check`, so the server knew it was S1 and reached the temp daemon; the last call releases it | Pass: Claude called `list_targets` (`No targets are held.`), `claim_target` (`You hold custom:demo-lane.`), `list_targets` (`custom:demo-lane  S1  since 17:24  for hand check`) and `release_target` (`Released custom:demo-lane.`) with no prompt; `ctl locks` during the run read `custom:demo-lane  S1  claim  since 17:24  for hand check` and was empty after. The slot settings allow the four tools; Jonathan's user settings also default to auto mode |
+| MR3 | `notify_session` from a real session | `OVERSEER_SLOT=S0 $OV ctl send 1 "Reply to me with notify_session: ok"`; wait for it to be typed in | Claude calls `notify_session` for S0 with no prompt; `$OV ctl locks` shows a pending relay for S0 (`slot is not running`); a second `notify_session` for S0 is refused | Pass, with the Pass text out of date: with S0 empty Claude called `notify_session` with no prompt and got `S0 has no session to message.` (the a55f1a2 rule, see E3 and F5), so nothing was queued. With a session started in S0 the same send gave `relay  S0  pending (session is working)`, then `waiting at a prompt for Jonathan`, and S0 got `Message from S1 via Overseer: ok` once. Asked twice for a second call, Claude refused on its own and never called the tool, so the server's refusal was not exercised by hand (the reply rule rows cover it) |
 
 ## The input-box reader against Claude Code 2.1 (hand)
 
@@ -249,11 +249,11 @@ Send with `$OV ctl send 1 "reply with the word ok"`.
 
 | ID | Check | Steps | Pass | Result |
 |----|-------|-------|------|--------|
-| I1 | Empty box, placeholder showing | Fresh prompt, nothing typed | The relay is typed in as one pasted message and answered once within a few seconds; `ctl locks` ends with no pending relay | For Jonathan |
-| I2 | Text typed by you | Type `half a thought` in S1's box without pressing Enter, then send | The relay stays pending with `input box has text`, and your text is untouched. Clear the box (Ctrl-U): the relay goes within a few seconds | For Jonathan |
-| I3 | Several lines in the box | Type two lines (Shift-Enter between them) without submitting, then send | Pending with `input box has text`; goes after the box is cleared | For Jonathan |
-| I4 | A permission dialog | Ask S1 `run touch /tmp/ov-hand4/x with Bash`; while the permission dialog shows, send | Nothing is typed into the dialog; the relay is pending (`waiting at a prompt for Jonathan` or `input box not found`). Answer the dialog: the relay is typed in once the turn ends and the box is empty | For Jonathan |
-| I5 | A multi-line relay arrives as one message | `$OV ctl send 1 "$(printf 'line one\nline two')"` at an idle empty prompt | Claude shows one pasted message and answers it once (bracketed paste is on) | For Jonathan |
+| I1 | Empty box, placeholder showing | Fresh prompt, nothing typed | The relay is typed in as one pasted message and answered once within a few seconds; `ctl locks` ends with no pending relay | Pass: with the dim suggestion showing, the relay was typed in as one message within a second and answered `ok` once (transcript); `ctl locks` then showed no relay |
+| I2 | Text typed by you | Type `half a thought` in S1's box without pressing Enter, then send | The relay stays pending with `input box has text`, and your text is untouched. Clear the box (Ctrl-U): the relay goes within a few seconds | Pass: `pending (input box has text)` for 16 s with `half a thought` untouched; after Ctrl-U it was typed in within 5 s and answered once |
+| I3 | Several lines in the box | Type two lines (Shift-Enter between them) without submitting, then send | Pending with `input box has text`; goes after the box is cleared | Pass: with `one` and `two` on two lines, `pending (input box has text)`; typed in and answered once within 5 s of clearing the box |
+| I4 | A permission dialog | Ask S1 `run touch /tmp/ov-hand4/x with Bash`; while the permission dialog shows, send | Nothing is typed into the dialog; the relay is pending (`waiting at a prompt for Jonathan` or `input box not found`). Answer the dialog: the relay is typed in once the turn ends and the box is empty | Fail (part): during the permission dialog nothing was typed and the relay read `pending (waiting at a prompt for Jonathan)`. Answering No (option 4) interrupts the turn, which fires no `Stop` hook: the slot stayed `Needs you`, `Claude needs your permission` and the relay stayed pending for over a minute. It went only after the next prompt (`say hi`) ended, then was typed and answered once. See F6 |
+| I5 | A multi-line relay arrives as one message | `$OV ctl send 1 "$(printf 'line one\nline two')"` at an idle empty prompt | Claude shows one pasted message and answers it once (bracketed paste is on) | Pass: Claude showed one message `Message from Jonathan via Overseer: line one` / `line two` and answered it once (transcript) |
 
 ## Board, panel and keys (GUI, checked by hand)
 
@@ -261,16 +261,16 @@ Setup steps 1 to 4 with the app open. Start S1, S2 and S3 as in step 4.
 
 | ID | Check | Steps | Pass | Result |
 |----|-------|-------|------|--------|
-| U1 | Lock pills on cards | `$OV ctl claim 1 custom:demo-lane`; `pre S1 'argocd app set root --revision feat-x'`; wait over a minute | S1's card shows both targets as pills within a second, the pin (`argo:uat/root`) first; after `lock_idle_mins` (1) the claim pill is marked as held long | For Jonathan |
-| U2 | Blocked card | `$OV ctl claim 2 custom:demo-lane` while S2 is not Working | S2's card turns red with `blocked by lock` and `waiting on custom:demo-lane`; when S2 is Working its tone stays Working and the waiting line still shows | For Jonathan |
-| U3 | Pending count | Type `half` in S3's box without Enter, `$OV ctl send 3 hello` | S3's card says `1 relay pending`; clearing the box makes it go and the count disappear | For Jonathan |
-| U4 | Relay strip | After U3, and a few more `ctl send` calls | The strip at the bottom of the board lists the five newest relays, newest first, as `HH:MM told S3: hello`, `HH:MM for S3, pending: hello` or `HH:MM for S3, dropped: session ended: hello`; it is hidden when there are none | For Jonathan |
-| U5 | Holds box | Click S1's card, open its panel | A Holds box lists each hold with its kind (`pin`, `claim`, `command`, `grant`), time, what it is for, `held long` when flagged, and how many are queued behind it; waits show beneath; `Nothing held` for a slot with none; a Release button beside each hold | For Jonathan |
-| U6 | Release, with its key | In S1's panel press Release (or Cmd+Shift+R) | An inline `Release S1's <target>? Enter / Esc` row; Up and Down pick among the holds; Enter force-releases (S2 is granted `custom:demo-lane`, its card un-blocks), but only while S1 still holds it (E4); Esc cancels; plain `r` and `m` still go to the terminal | For Jonathan |
-| U7 | Claim entry | Press `Claim...` in S2's panel, type `custom:other lane test`, Enter; then an empty Enter and `bogus` | The claim is made with the reason `lane test`; an empty or bad entry shows its error and sends nothing | For Jonathan |
-| U8 | Relays box and message | Open S3's panel; Message... (or Cmd+Shift+M), type `hello again`, Enter | The Relays box lists S3's relays with state (pending reasons or delivered); the message goes through the delivery rules (typed in only when S3 is idle with an empty box); an empty message shows `Type a message first` | For Jonathan |
-| U9 | Denied-write notification | Bring another app to the front; with S1 holding `repo:demo-api:main` (`pre S1 'git push origin main'`), run `pre S2 'git push origin main'` | A banner `S2 blocked: repo:demo-api:main is held by S1`; one per new wait (a repeat does not post again); clicking it opens S2's session. This needs the bundle from step 1; under `cargo run` there is no bundle and no banner | For Jonathan |
-| U10 | Everything survives a daemon restart | `$OV ctl shutdown`, then reopen the window | The same pills, waits and strip show at once; slots that were running are shown as resumable | For Jonathan |
+| U1 | Lock pills on cards | `$OV ctl claim 1 custom:demo-lane`; `pre S1 'argocd app set root --revision feat-x'`; wait over a minute | S1's card shows both targets as pills within a second, the pin (`argo:uat/root`) first; after `lock_idle_mins` (1) the claim pill is marked as held long | Pass: S1's card showed `argo:uat/root` then `custom:demo-lane` within a second; after a minute both read `· held long` |
+| U2 | Blocked card | `$OV ctl claim 2 custom:demo-lane` while S2 is not Working | S2's card turns red with `blocked by lock` and `waiting on custom:demo-lane`; when S2 is Working its tone stays Working and the waiting line still shows | Pass: S2's card turned red with `blocked by lock` and `waiting on custom:demo-lane`; while S2 ran a 20 s sleep it read `Working` in green with the waiting line still shown |
+| U3 | Pending count | Type `half` in S3's box without Enter, `$OV ctl send 3 hello` | S3's card says `1 relay pending`; clearing the box makes it go and the count disappear | Pass: S3's card read `1 relay pending`; after Ctrl-U the relay went and the count disappeared |
+| U4 | Relay strip | After U3, and a few more `ctl send` calls | The strip at the bottom of the board lists the five newest relays, newest first, as `HH:MM told S3: hello`, `HH:MM for S3, pending: hello` or `HH:MM for S3, dropped: session ended: hello`; it is hidden when there are none | Pass: the strip listed five, newest first, e.g. `17:43 for S2, dropped: session ended: drop me`, `17:42 told S3: only after the sleep`, and earlier `17:32 for S3, pending: hello`; it was not shown before the first relay |
+| U5 | Holds box | Click S1's card, open its panel | A Holds box lists each hold with its kind (`pin`, `claim`, `command`, `grant`), time, what it is for, `held long` when flagged, and how many are queued behind it; waits show beneath; `Nothing held` for a slot with none; a Release button beside each hold | Pass with gaps: Holds listed `argo:uat/root  pin since 17:32  held long` and `custom:demo-lane  claim since ...  held long  waiting: S2`, each with Release; `Nothing held` for S3 before its pin. Gaps: the reason (`for lane test`) and the pin revision are not shown, and the claim's time was cut to `claim sinc` when `held long` and `waiting:` both showed. See F7 |
+| U6 | Release, with its key | In S1's panel press Release (or Cmd+Shift+R) | An inline `Release S1's <target>? Enter / Esc` row; Up and Down pick among the holds; Enter force-releases (S2 is granted `custom:demo-lane`, its card un-blocks), but only while S1 still holds it (E4); Esc cancels; plain `r` and `m` still go to the terminal | Pass: Cmd+Shift+R gave `Release S1's argo:uat/root? Enter / Esc`, Down moved it to `custom:demo-lane`, Esc cancelled, plain `r` and `m` reached the terminal. With the pin moved to S3 behind the prompt, Enter said `argo:uat/root is now held by S3; nothing released.` The Release button then Enter gave `Released custom:demo-lane. S2 holds it now.` and S2's card showed the pill, no longer blocked |
+| U7 | Claim entry | Press `Claim...` in S2's panel, type `custom:other lane test`, Enter; then an empty Enter and `bogus` | The claim is made with the reason `lane test`; an empty or bad entry shows its error and sends nothing | Pass: `custom:other lane test` gave `You hold custom:other.` and `ctl locks` `custom:other  S2  claim  since 17:35  for lane test`; an empty Enter showed `Enter a target, then an optional reason`, `bogus` showed `"bogus" is not a target: it needs a repo:, argo:, deploy:, tf:, kube: or custom: prefix and no spaces`; nothing else was claimed |
+| U8 | Relays box and message | Open S3's panel; Message... (or Cmd+Shift+M), type `hello again`, Enter | The Relays box lists S3's relays with state (pending reasons or delivered); the message goes through the delivery rules (typed in only when S3 is idle with an empty box); an empty message shows `Type a message first` | Pass: Cmd+Shift+M with nothing typed showed `Type a message first`; `hello again` was typed in at the idle empty prompt and answered; the Relays box listed `17:35 from you: hello again` and `17:33 from you: hello`. Pending reasons showed in S0's box (`from S1: ok (pending: waiting at a prompt for Jonathan)`) |
+| U9 | Denied-write notification | Bring another app to the front; with S1 holding `repo:demo-api:main` (`pre S1 'git push origin main'`), run `pre S2 'git push origin main'` | A banner `S2 blocked: repo:demo-api:main is held by S1`; one per new wait (a repeat does not post again); clicking it opens S2's session. This needs the bundle from step 1; under `cargo run` there is no bundle and no banner | For Jonathan: triggered at 17:36 with the Claude app in front; the hook denied S2 (`repo:demo-api:main is held by S1 since 17:36`) and a repeat added no second wait, but computer use cannot see banners, so whether one posted (and once) is unchecked |
+| U10 | Everything survives a daemon restart | `$OV ctl shutdown`, then reopen the window | The same pills, waits and strip show at once; slots that were running are shown as resumable | Pass: after `ctl shutdown` the window said `Lost the connection to the daemon. Quit and reopen Overseer to reconnect.`; reopened, it showed at once the same pills (S1 `repo:demo-api:main`, S2 `custom:demo-lane` and `custom:other`, S3 `argo:uat/root`, all held long), S2's `waiting on repo:demo-api:main` and the same strip, with S1 to S3 `Resumable` and a Resume button |
 
 ## Session end and holder checks (fix wave)
 
@@ -329,6 +329,41 @@ No scriptable check failed. Observations:
 - **Environment note:** the temp state dir was under `/tmp`, not the session
   scratch directory, because the unix socket path would have been longer than
   the 104 character limit.
+
+## Findings from the hand run (2026-11-12)
+
+MR1 to MR3, I1 to I5 and U1 to U10 were run by a Claude session for
+Jonathan, against `/tmp/ov-hand4/Overseer.app` bundled at 11a20aa, with
+Claude Code 2.1.259 sessions in S1 to S3 (S0 for part of MR3). Jonathan
+answered the folder trust prompt. Text was typed into sessions with `ctl send
+--raw`, and the window was driven by computer use for the U rows' clicks and
+keys. "Answered once" was read from the session transcripts. The installed
+app, its LaunchAgent and its state were not touched. Failures are listed for
+Jonathan; nothing was fixed.
+
+- **F6 (fail, I4): a relay waits forever after a permission dialog is
+  answered No.** Choosing No (or Esc) interrupts the turn, and Claude Code
+  sends no `Stop` hook for an interrupt, so the slot keeps `Needs you`,
+  `Claude needs your permission` and every relay for it stays `pending
+  (waiting at a prompt for Jonathan)` until the next prompt ends. Answering
+  Yes is not affected. Repro: I4 with No.
+- **F7 (gap, U5): the Holds box leaves out the reason and the pin revision,**
+  which `ctl locks` shows (`for lane test`, `at feat-x`), and the `since`
+  text is cut short (`claim sinc`) when `held long` and `waiting:` share the
+  row. `render_holds` in `crates/overseer-gui/src/session.rs` draws only
+  target, kind, since, held long and waiters.
+- **F8 (note): `ctl send --raw` does not submit text that wraps.** A short
+  text (`/mcp`, `say hi`) is submitted, but the MR2 request and a two-line
+  text arrived with the Enter as a newline in the box, so the prompt sat
+  unsent until Enter was pressed by hand.
+- **F9 (note): the coordinator's role file points at `~/Repos/2ndBrain` even
+  under a temp `OVERSEER_HOME`.** When S0 was started for MR3 it began a
+  start-of-day round and read the real journal and `bd ready --json` (reads
+  only; S0 was stopped afterwards). A hand run that starts S0 touches real
+  data unless the role's folder follows the temp config.
+- **Not a finding:** two relays went in while a `sleep 30` was asked for.
+  The transcripts show Claude Code refused the standalone sleep and ended the
+  turn, so the slot was idle.
 
 ## Known limitations
 
