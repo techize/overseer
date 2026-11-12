@@ -108,13 +108,15 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
         env.clone(),
         Duration::from_secs(cfg.settings.lock_idle_mins.saturating_mul(60)),
     );
-    let exits = tokio::spawn(watch_exits(events.subscribe(), locks.clone()));
+    // Subscribed before any slot can start, so no exit is missed.
+    let exit_events = events.subscribe();
     let state_dir = cfg.state_dir.clone();
     let mut mgr = SlotManager::new(cfg.default_command, events)
         .with_env(env.clone())
         .with_launch(cfg.state_dir, cfg.hook_program, ledger);
     mgr.restore();
     let manager: Manager = Arc::new(Mutex::new(mgr));
+    let exits = tokio::spawn(watch_exits(exit_events, locks.clone(), manager.clone()));
     store.start_polling();
     let shutdown = Arc::new(Notify::new());
     let mut conns = JoinSet::new();
@@ -154,8 +156,13 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Ends the locks of each slot whose session exits.
-async fn watch_exits(mut events: broadcast::Receiver<Event>, locks: Arc<LockService>) {
+/// Ends the locks of each slot whose session exits. After a lag, which
+/// may have lost exit events, every slot not running now is reconciled.
+async fn watch_exits(
+    mut events: broadcast::Receiver<Event>,
+    locks: Arc<LockService>,
+    manager: Manager,
+) {
     loop {
         match events.recv().await {
             Ok(Event::SlotChanged(info)) if matches!(info.state, SlotState::Exited { .. }) => {
@@ -163,7 +170,16 @@ async fn watch_exits(mut events: broadcast::Receiver<Event>, locks: Arc<LockServ
             }
             Ok(_) => {}
             Err(broadcast::error::RecvError::Lagged(n)) => {
-                tracing::warn!("lock exit watcher lagged by {n} events");
+                tracing::warn!("lock exit watcher lagged by {n} events; reconciling");
+                let stopped: Vec<SlotId> = manager
+                    .lock()
+                    .unwrap()
+                    .list()
+                    .into_iter()
+                    .filter(|i| !matches!(i.state, SlotState::Running { .. }))
+                    .map(|i| i.id)
+                    .collect();
+                locks.reconcile_exits(&stopped, unix_now());
             }
             Err(broadcast::error::RecvError::Closed) => return,
         }

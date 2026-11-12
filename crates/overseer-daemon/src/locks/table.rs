@@ -395,6 +395,24 @@ pub(crate) fn bind_grant_on(
     Ok(changed > 0)
 }
 
+/// Records that `slot` pinned `target` to `revision`: its `Grant` becomes
+/// a `Pin` (kept until an unpin or a release), while a `Claim` or `Pin`
+/// keeps its kind and only records the revision. True if a claim changed.
+pub(crate) fn pin_on(
+    conn: &Connection,
+    target: &str,
+    slot: SlotId,
+    revision: &str,
+) -> Result<bool> {
+    let changed = conn.execute(
+        "UPDATE claims SET pin_revision = ?3,
+                kind = CASE WHEN kind = 'grant' THEN 'pin' ELSE kind END
+         WHERE target = ?1 AND slot = ?2 AND kind IN ('grant', 'claim', 'pin')",
+        params![target, slot, revision],
+    )?;
+    Ok(changed > 0)
+}
+
 /// Releases each of `slot`'s claims on `targets`, in order. Each comes
 /// with the revision an unpin set it back to, if any.
 fn release_all(

@@ -334,6 +334,22 @@ impl LockService {
         let _ = self.change("slot exit", |conn| table::drop_slot_on(conn, slot, now));
     }
 
+    /// After lost exit events: each of `stopped` (slots not running now)
+    /// that still has a command claim, a grant or a wait is treated as
+    /// exited. Slots with nothing to drop are left alone.
+    pub fn reconcile_exits(&self, stopped: &[SlotId], now: i64) {
+        let v = self.view();
+        for &slot in stopped {
+            let stale =
+                v.claims.iter().any(|c| {
+                    c.slot == slot && matches!(c.kind, ClaimKind::Command | ClaimKind::Grant)
+                }) || v.waits.iter().any(|w| w.slot == slot);
+            if stale {
+                self.on_slot_exit(slot, now);
+            }
+        }
+    }
+
     /// A work item was released or moved: the targets claimed for it go.
     pub fn on_item_released(&self, key: &str, now: i64) {
         let done = self
@@ -415,6 +431,14 @@ fn bash_on(
             Some(mine) => {
                 let id = tool_use_id.unwrap_or("");
                 match (mine.kind, &h.kind) {
+                    // A pin keeps its lock past the command, whether the
+                    // target was granted or claimed with the tool.
+                    (
+                        ClaimKind::Grant | ClaimKind::Claim | ClaimKind::Pin,
+                        HitKind::Pin { revision },
+                    ) => {
+                        table::pin_on(conn, &h.target, slot, revision)?;
+                    }
                     (ClaimKind::Grant, _) => {
                         table::bind_grant_on(conn, &h.target, slot, id, None)?;
                     }
@@ -522,6 +546,28 @@ mod tests {
         locks.shutdown();
         locks.on_slot_exit(1, 20);
         assert_eq!(locks.view().claims.len(), 1);
+    }
+
+    #[test]
+    fn reconcile_drops_only_stopped_slots_with_something_to_drop() {
+        let locks = holding();
+        assert!(matches!(
+            locks.claim(2, "custom:a", None, None, &[], 11),
+            Response::Queued { .. }
+        ));
+        assert!(matches!(
+            locks.claim(3, "custom:b", None, None, &[], 11),
+            Response::Text { .. }
+        ));
+        // S1 is still running: untouched. S3 holds only a tool claim.
+        locks.reconcile_exits(&[2, 3], 20);
+        let v = locks.view();
+        assert!(v.waits.is_empty(), "{v:?}");
+        assert_eq!(v.claims.len(), 2);
+        locks.reconcile_exits(&[1], 21);
+        let v = locks.view();
+        assert_eq!(v.claims.len(), 1);
+        assert_eq!(v.claims[0].target, "custom:b");
     }
 
     #[test]

@@ -2229,6 +2229,62 @@ async fn pin_survives_post_tool_use_and_unpin_releases_it() {
 }
 
 #[tokio::test]
+async fn granted_pin_survives_post_tool_use_and_stop() {
+    let d = lock_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    let app = "argo:uat/demo-api";
+    let unpin = "argocd app set demo-api --revision main";
+    assert_eq!(
+        c.check(1, "tu-1", "argocd app set demo-api --revision abc123")
+            .await,
+        None
+    );
+    c.hook(post_tool_use(1, "tu-1")).await;
+    let pin = "argocd app set demo-api --revision def456";
+    assert!(c.check(2, "tu-2", pin).await.is_some());
+    assert_eq!(c.check(1, "tu-3", unpin).await, None);
+    c.hook(post_tool_use(1, "tu-3")).await;
+    assert_eq!(holds(&c.locks().await), [(t(app), 2, ClaimKind::Grant)]);
+
+    // The granted slot reruns its pin: the grant becomes that pin.
+    assert_eq!(c.check(2, "tu-4", pin).await, None);
+    c.hook(post_tool_use(2, "tu-4")).await;
+    c.hook(hook(2, HookKind::Stop)).await;
+    let v = c.locks().await;
+    assert_eq!(holds(&v), [(t(app), 2, ClaimKind::Pin)]);
+    assert_eq!(v.claims[0].pin_revision.as_deref(), Some("def456"));
+
+    // An unpin ends it and hands it on.
+    assert!(c
+        .check(3, "tu-5", "argocd app sync demo-api")
+        .await
+        .is_some());
+    assert_eq!(c.check(2, "tu-6", unpin).await, None);
+    c.hook(post_tool_use(2, "tu-6")).await;
+    let v = c.locks().await;
+    assert_eq!(holds(&v), [(t(app), 3, ClaimKind::Grant)]);
+    assert!(pending(&v).contains(&(
+        3,
+        t("S2 has released argo:uat/demo-api (back on main). You now hold it.")
+    )));
+}
+
+#[tokio::test]
+async fn held_claim_that_pins_records_the_revision_and_stays_a_claim() {
+    let d = lock_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    let app = "argo:uat/demo-api";
+    c.request(claim_target(1, app, None)).await;
+    let pin = "argocd app set demo-api --revision abc123";
+    assert_eq!(c.check(1, "tu-1", pin).await, None);
+    c.hook(post_tool_use(1, "tu-1")).await;
+    c.hook(hook(1, HookKind::Stop)).await;
+    let v = c.locks().await;
+    assert_eq!(holds(&v), [(t(app), 1, ClaimKind::Claim)]);
+    assert_eq!(v.claims[0].pin_revision.as_deref(), Some("abc123"));
+}
+
+#[tokio::test]
 async fn stop_releases_command_claims() {
     let d = lock_daemon().await;
     let mut c = Client::connect(&d.socket).await;
