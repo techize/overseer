@@ -155,13 +155,17 @@ impl LockService {
             })
     }
 
-    fn announce(&self) {
+    pub(crate) fn announce(&self) {
         let _ = self.events.send(Event::LocksChanged(self.view()));
     }
 
     /// Runs `f` in one ledger transaction and announces the result. An
     /// error is logged with `what` and returned.
-    fn change<T>(&self, what: &str, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+    pub(crate) fn change<T>(
+        &self,
+        what: &str,
+        f: impl FnOnce(&Connection) -> Result<T>,
+    ) -> Result<T> {
         let done = self.ledger.transaction(f);
         match &done {
             Ok(_) => self.announce(),

@@ -108,6 +108,10 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
         env.clone(),
         Duration::from_secs(cfg.settings.lock_idle_mins.saturating_mul(60)),
     );
+    store.on_relays_queued({
+        let locks = locks.clone();
+        move || locks.announce()
+    });
     // Subscribed before any slot can start, so no exit is missed.
     let exit_events = events.subscribe();
     let state_dir = cfg.state_dir.clone();
@@ -529,7 +533,9 @@ fn handle_request(
         ),
         Request::ReleaseTarget { slot, target } => locks.release(slot, &target, unix_now()),
         Request::ForceRelease { target } => locks.force_release(&target, unix_now()),
-        Request::SendRelay { .. } => err("not supported yet".into()),
+        Request::SendRelay { from, to, text } => {
+            crate::relay::send(locks, from, to, &text, unix_now())
+        }
         // Answered in `handle_frame` from a task; this arm only keeps the
         // match whole.
         Request::CheckBash(_) => Response::Verdict { deny: None },

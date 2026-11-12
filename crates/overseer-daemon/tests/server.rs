@@ -8,8 +8,8 @@ use overseer_daemon::locks::targets::{default_patterns, load_patterns, Pattern};
 use overseer_daemon::{run, DaemonConfig};
 use overseer_proto::{
     read_frame, write_frame, Activity, ActivityKind, BashCheck, ClaimKind, Event, Frame, HookEvent,
-    HookKind, ItemKind, LockView, RelayState, Request, Response, SlotInfo, SlotState, SourceStatus,
-    WorkItem, WorkView,
+    HookKind, ItemKind, LockView, RelayState, Request, Response, Sender, SlotInfo, SlotState,
+    SourceStatus, WorkItem, WorkView,
 };
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::UnixStream;
@@ -2454,4 +2454,155 @@ async fn slow_resolution_allows_and_records_nothing() {
     let v = c.locks().await;
     assert!(v.claims.is_empty() && v.waits.is_empty(), "{v:?}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+impl Client {
+    async fn relay(&mut self, from: Option<u8>, to: u8, text: &str) -> Response {
+        self.request(Request::SendRelay {
+            from,
+            to,
+            text: text.into(),
+        })
+        .await
+    }
+}
+
+fn queued_for(slot: u8) -> Response {
+    Response::Text {
+        text: format!("Queued for S{slot}. It will be typed in when S{slot} is idle."),
+    }
+}
+
+/// Marks every pending relay to `to` delivered, as the courier will.
+fn deliver_all(d: &Daemon, to: u8, v: &LockView) {
+    let ledger = overseer_daemon::ledger::Ledger::open(&d.state_dir.join("overseer.db")).unwrap();
+    let ids: Vec<i64> = v
+        .relays
+        .iter()
+        .filter(|r| r.to == to && r.state == RelayState::Pending)
+        .map(|r| r.id)
+        .collect();
+    ledger.mark_relays_delivered(&ids, 100).unwrap();
+}
+
+fn is_error(r: &Response, text: &str) -> bool {
+    matches!(r, Response::Error { message } if message == text)
+}
+
+#[tokio::test]
+async fn jonathan_and_s0_can_send_to_anyone() {
+    let d = lock_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    assert_eq!(c.relay(None, 3, "hello").await, queued_for(3));
+    assert_eq!(c.relay(Some(0), 2, "status?").await, queued_for(2));
+    let v = c.locks().await;
+    let mine: Vec<_> = v
+        .relays
+        .iter()
+        .map(|r| (r.from, r.to, r.text.as_str()))
+        .collect();
+    assert!(mine.contains(&(Sender::You, 3, "hello")), "{mine:?}");
+    assert!(
+        mine.contains(&(Sender::Slot { slot: 0 }, 2, "status?")),
+        "{mine:?}"
+    );
+    assert!(is_error(
+        &c.relay(None, 3, "  ").await,
+        "the message is empty"
+    ));
+    assert!(matches!(
+        c.relay(None, 3, &"x".repeat(4001)).await,
+        Response::Error { .. }
+    ));
+    assert!(matches!(
+        c.relay(None, 99, "hi").await,
+        Response::Error { .. }
+    ));
+}
+
+#[tokio::test]
+async fn worker_can_answer_s0_once() {
+    let d = lock_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    assert_eq!(c.relay(Some(0), 2, "status?").await, queued_for(2));
+    // Not delivered yet, so there is nothing to answer.
+    assert!(matches!(
+        c.relay(Some(2), 0, "early").await,
+        Response::Error { .. }
+    ));
+    let v = c.locks().await;
+    deliver_all(&d, 2, &v);
+    assert_eq!(c.relay(Some(2), 0, "on it").await, queued_for(0));
+    assert!(is_error(
+        &c.relay(Some(2), 0, "and another").await,
+        "S2 can message S0 only to answer a message from S0."
+    ));
+}
+
+#[tokio::test]
+async fn worker_cannot_start_a_conversation() {
+    let d = lock_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    assert!(is_error(
+        &c.relay(Some(2), 1, "hi").await,
+        "S2 can message S1 only to answer a message from S1."
+    ));
+    assert!(is_error(
+        &c.relay(Some(2), 2, "hi").await,
+        "you cannot message yourself"
+    ));
+    // A relay from Jonathan is not a message from S0 to answer.
+    assert_eq!(c.relay(None, 2, "hello").await, queued_for(2));
+    let v = c.locks().await;
+    deliver_all(&d, 2, &v);
+    assert!(matches!(
+        c.relay(Some(2), 0, "hi").await,
+        Response::Error { .. }
+    ));
+    assert!(c
+        .locks()
+        .await
+        .relays
+        .iter()
+        .all(|r| r.from != Sender::Slot { slot: 2 }));
+}
+
+#[tokio::test]
+async fn move_notice_queues_a_relay() {
+    let s = stub_sources("move-relay", false);
+    let d = s.daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    c.refresh().await;
+    assert_eq!(c.assign("DEMO-40", 1, false, false).await, Response::Ok);
+    assert_eq!(c.assign("DEMO-40", 2, false, true).await, Response::Ok);
+    let v = c.locks_until(|v| !pending(v).is_empty()).await;
+    assert_eq!(
+        pending(&v),
+        vec![(1, "DEMO-40 was moved to S2".to_string())]
+    );
+    assert_eq!(v.relays[0].from, Sender::Overseer);
+}
+
+#[tokio::test]
+async fn label_failure_queues_no_relay() {
+    let s = stub_sources("label-fail-relay", false);
+    write_script(
+        &s.dir.join("bin/bd"),
+        &format!(
+            "if [ \"$1\" = list ]; then cat '{FIXTURES}/bd-list.json'; exit 0; fi\n\
+             echo 'database is locked' >&2; exit 1\n"
+        ),
+    );
+    let d = s.daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    c.refresh().await;
+    assert_eq!(c.assign("ov-3", 2, false, false).await, Response::Ok);
+    for _ in 0..250 {
+        if c.work().await.notices.iter().any(|n| n.slot == 2) {
+            break;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    assert!(c.work().await.notices.iter().any(|n| n.slot == 2));
+    assert!(c.locks().await.relays.is_empty());
 }

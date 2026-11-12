@@ -11,11 +11,11 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use overseer_proto::{
-    owned_by_message, slot_name, Event, ItemKind, Response, SlotId, SourceStatus, WorkItem,
+    owned_by_message, slot_name, Event, ItemKind, Response, Sender, SlotId, SourceStatus, WorkItem,
     WorkView, JIRA_OFF,
 };
 use regex::Regex;
@@ -106,6 +106,7 @@ pub struct WorkStore {
     /// Held across an assign or release and the queueing of its label, so
     /// labels are queued in the order the ledger committed the changes.
     change_turn: Mutex<()>,
+    relay_hook: OnceLock<Box<dyn Fn() + Send + Sync>>,
     /// Every task the store runs (polls, requested refreshes, the label
     /// worker), so `shutdown` can stop them and the source children they own.
     tasks: Mutex<Tasks>,
@@ -172,7 +173,8 @@ fn folder_for(folders: &[(String, PathBuf)], key: &str) -> Option<PathBuf> {
 
 enum Outcome {
     Reply(Response),
-    Changed(Option<Label>),
+    /// The flag says a relay was queued, so lock watchers need telling.
+    Changed(Option<Label>, bool),
 }
 
 impl WorkStore {
@@ -223,6 +225,7 @@ impl WorkStore {
             jira_turn: tokio::sync::Mutex::new(()),
             labels: Mutex::new(LabelQueue::default()),
             change_turn: Mutex::new(()),
+            relay_hook: OnceLock::new(),
             tasks: Mutex::new(Tasks {
                 set: JoinSet::new(),
                 closed: false,
@@ -301,6 +304,18 @@ impl WorkStore {
 
     fn announce(&self) {
         let _ = self.events.send(Event::WorkChanged(self.view()));
+    }
+
+    /// Sets what runs after a notice also queued a relay, so lock watchers
+    /// see it. Set once at start-up.
+    pub fn on_relays_queued(&self, f: impl Fn() + Send + Sync + 'static) {
+        let _ = self.relay_hook.set(Box::new(f));
+    }
+
+    fn relays_queued(&self) {
+        if let Some(f) = self.relay_hook.get() {
+            f();
+        }
     }
 
     /// Reads one source, regroups, records promotions and tells clients.
@@ -386,6 +401,7 @@ impl WorkStore {
     fn regroup(&self, now: i64) {
         let folders = list_folders(&self.brain_dir);
         let mut folders = Some(folders);
+        let mut told = false;
         let done = self.ledger.transaction(|conn| {
             let owners: HashMap<String, SlotId> =
                 ledger::assignments_on(conn)?.into_iter().collect();
@@ -403,8 +419,9 @@ impl WorkStore {
                     slot_name(ticket_owner)
                 );
                 ledger::log_on(conn, now, &bead, Some(was), "promoted", &text)?;
-                ledger::add_notice_on(conn, was, now, &text)?;
-                ledger::add_notice_on(conn, ticket_owner, now, &text)?;
+                tell_on(conn, was, now, &text)?;
+                tell_on(conn, ticket_owner, now, &text)?;
+                told = true;
             }
             cache.items = after;
             if let Some(f) = folders.take() {
@@ -412,6 +429,9 @@ impl WorkStore {
             }
             Ok(())
         });
+        if told && done.is_ok() {
+            self.relays_queued();
+        }
         if let Err(e) = done {
             // The list still updates; only the promotion notices are lost.
             tracing::warn!("recording promotions failed: {e:#}");
@@ -478,17 +498,17 @@ impl WorkStore {
                     ledger::log_on(conn, now, key, Some(slot), action, &detail)?;
                     let text = format!("{} took {key}, which overlaps your work", slot_name(slot));
                     for t in tell {
-                        ledger::add_notice_on(conn, t, now, &text)?;
+                        tell_on(conn, t, now, &text)?;
                     }
                     if let Some(f) = from {
-                        ledger::add_notice_on(conn, f, now, &moved_text(key, slot))?;
+                        tell_on(conn, f, now, &moved_text(key, slot))?;
                     }
-                    Outcome::Changed(Some(label(from)))
+                    Outcome::Changed(Some(label(from)), true)
                 }
                 Decision::Assign => {
                     ledger::assign_on(conn, key, slot, now)?;
                     ledger::log_on(conn, now, key, Some(slot), "assigned", "")?;
-                    Outcome::Changed(Some(label(None)))
+                    Outcome::Changed(Some(label(None)), false)
                 }
                 Decision::Move { from } => {
                     ledger::assign_on(conn, key, slot, now)?;
@@ -500,8 +520,8 @@ impl WorkStore {
                         "moved",
                         &format!("from {}", slot_name(from)),
                     )?;
-                    ledger::add_notice_on(conn, from, now, &moved_text(key, slot))?;
-                    Outcome::Changed(Some(label(Some(from))))
+                    tell_on(conn, from, now, &moved_text(key, slot))?;
+                    Outcome::Changed(Some(label(Some(from))), true)
                 }
             })
         });
@@ -518,11 +538,14 @@ impl WorkStore {
                 }),
                 Some(old) => {
                     ledger::log_on(conn, now, key, Some(old), "released", "")?;
-                    Outcome::Changed(Some(Label {
-                        id: key.to_owned(),
-                        add: None,
-                        remove: Some(old),
-                    }))
+                    Outcome::Changed(
+                        Some(Label {
+                            id: key.to_owned(),
+                            add: None,
+                            remove: Some(old),
+                        }),
+                        false,
+                    )
                 }
             })
         });
@@ -537,7 +560,7 @@ impl WorkStore {
                 message: format!("ledger: {e:#}"),
             },
             Ok(Outcome::Reply(r)) => r,
-            Ok(Outcome::Changed(label)) => {
+            Ok(Outcome::Changed(label, relayed)) => {
                 #[cfg(test)]
                 if tests::WIDEN_RACE.load(std::sync::atomic::Ordering::Relaxed) {
                     std::thread::sleep(Duration::from_micros(200));
@@ -547,6 +570,9 @@ impl WorkStore {
                     self.queue_label(l);
                 }
                 self.announce();
+                if relayed {
+                    self.relays_queued();
+                }
                 Response::Ok
             }
         }
@@ -676,6 +702,14 @@ impl WorkStore {
             });
         }
     }
+}
+
+/// A notice that tells a session something: shown on the board and also
+/// queued as a relay from Overseer, in the caller's transaction.
+fn tell_on(conn: &rusqlite::Connection, slot: SlotId, now: i64, text: &str) -> anyhow::Result<()> {
+    ledger::add_notice_on(conn, slot, now, text)?;
+    crate::locks::table::queue_relay_on(conn, &Sender::Overseer, slot, text, None, now)?;
+    Ok(())
 }
 
 fn moved_text(key: &str, to: SlotId) -> String {
@@ -866,6 +900,12 @@ mod tests {
         );
         let slots: Vec<_> = n.iter().map(|n| n.slot).collect();
         assert_eq!(slots, [2, 5]);
+        // Each notice also queued a relay for the same slot.
+        let relays = s.ledger.lock_view(10, 0).unwrap().relays;
+        let mut to: Vec<_> = relays.iter().map(|r| (r.to, r.text.clone())).collect();
+        to.sort();
+        assert_eq!(to[0], (2, n[0].text.clone()));
+        assert_eq!(to[1].0, 5);
         // Seen once only.
         s.regroup(3);
         assert_eq!(s.ledger.notices().unwrap().len(), 2);

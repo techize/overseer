@@ -290,6 +290,11 @@ impl Ledger {
 
     /// Every claim and wait, every pending relay and the `recent` most
     /// recently delivered ones, read in one transaction.
+    /// Marks relays delivered at `now`.
+    pub fn mark_relays_delivered(&self, ids: &[i64], now: i64) -> Result<()> {
+        self.transaction(|c| table::mark_delivered_on(c, ids, now))
+    }
+
     pub fn lock_view(&self, recent: usize, flag_after_secs: i64) -> Result<LockView> {
         self.transaction(|c| {
             Ok(LockView {
