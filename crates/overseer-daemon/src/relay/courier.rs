@@ -34,6 +34,9 @@ const COOLDOWN: Duration = Duration::from_secs(10);
 const NOT_RUNNING: &str = "slot is not running";
 const TYPED: &str = "input box has text";
 const NO_BOX: &str = "input box not found";
+/// Without bracketed paste every newline is an Enter, and a later one could
+/// land on a prompt the first one brought up.
+const NO_BRACKETS: &str = "bracketed paste is off";
 
 /// Whether a slot in `state` doing `activity` may be typed into now, else
 /// why not.
@@ -60,6 +63,14 @@ fn speaks_for_itself(text: &str) -> bool {
     };
     let digits = rest.chars().take_while(char::is_ascii_digit).count();
     digits > 0 && rest[digits..].starts_with(" has released")
+}
+
+/// `text` without C0 control characters other than newline and tab, so a
+/// relay can never type a key such as Escape or Ctrl-C.
+pub fn strip_controls(text: &str) -> String {
+    text.chars()
+        .filter(|&c| c >= ' ' || c == '\n' || c == '\t')
+        .collect()
 }
 
 /// The text typed into slot `to` for `relays`, one paragraph each.
@@ -202,10 +213,14 @@ impl Courier {
             Ok((InputBox::NotFound, _)) | Err(_) => return Err(NO_BOX),
         };
         // A hook may have come in while the screen was read.
+        let text = strip_controls(&compose(relays, id));
+        if text.contains('\n') && !modes.bracketed_paste {
+            return Err(NO_BRACKETS);
+        }
         let latest = self.manager.lock().unwrap().list().swap_remove(id as usize);
         ready(&latest.state, latest.activity.as_ref())?;
         self.locks.set_held(id, None);
-        let paste = encode_paste(&compose(relays, id), &modes);
+        let paste = encode_paste(&text, &modes);
         let writer = slot.clone();
         let wrote = tokio::task::spawn_blocking(move || writer.write(&paste)).await;
         if let Ok(Err(e)) | Err(e) = wrote.map_err(std::io::Error::other) {
@@ -329,6 +344,15 @@ mod tests {
             compose(&[relay(Sender::Overseer, "S has released x")], 1),
             "Overseer: S has released x"
         );
+    }
+
+    #[test]
+    fn strip_controls_keeps_only_newline_and_tab() {
+        assert_eq!(
+            strip_controls("a\x1b[201~b\x03c\r\nd\te\x00\x7f"),
+            "a[201~bc\nd\te\x7f"
+        );
+        assert_eq!(strip_controls("plain text"), "plain text");
     }
 
     #[test]

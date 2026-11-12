@@ -2621,6 +2621,11 @@ struct BoxStub {
 }
 
 fn box_stub(name: &str) -> BoxStub {
+    box_stub_with(name, true)
+}
+
+/// `box_stub`, turning bracketed paste on only when `brackets` is set.
+fn box_stub_with(name: &str, brackets: bool) -> BoxStub {
     let dir = std::env::temp_dir().join(format!("ovs-courier-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("work")).unwrap();
@@ -2644,7 +2649,7 @@ reader=$!
 draw() {{
   cols=$(stty size | cut -d' ' -f2)
   rule=$(awk -v n="$cols" 'BEGIN {{ for (i = 0; i < n; i++) printf "\342\224\200" }}')
-  printf '\033[2J\033[H\033[?2004hWorking on DEMO-12 in demo-api\r\n\r\n%s\r\n' "$rule"
+  printf '\033[2J\033[H{mode}Working on DEMO-12 in demo-api\r\n\r\n%s\r\n' "$rule"
   if [ -s '{boxf}' ]; then
     printf '\342\235\257 %s\r\n' "$(cat '{boxf}')"
   else
@@ -2662,6 +2667,7 @@ kill $reader
             reads = stub.reads.display(),
             boxf = stub.box_file.display(),
             draws = stub.draws.display(),
+            mode = if brackets { "\\033[?2004h" } else { "" },
         ),
     );
     stub
@@ -2930,4 +2936,36 @@ async fn pending_relay_delivers_after_restart_and_resume() {
     c.hook(hook(3, HookKind::SessionStart)).await;
     assert_eq!(stub.read_until(&pasted(HELLO)).await, pasted(HELLO));
     c.all_delivered(3).await;
+}
+
+#[tokio::test]
+async fn multi_line_relay_waits_without_bracketed_paste() {
+    let stub = box_stub_with("no-brackets", false);
+    let d = start_daemon_with(temp_socket(), stub.env()).await;
+    let mut c = Client::connect(&d.socket).await;
+    c.start_stub(2, &stub).await;
+    c.hook(hook(2, HookKind::Stop)).await;
+    assert_eq!(
+        c.relay(None, 2, "first line\nsecond line").await,
+        queued_for(2)
+    );
+    c.held_for(2, "bracketed paste is off").await;
+    stub.reads_nothing_for(2).await;
+    let v = c.locks().await;
+    assert_eq!(v.relays[0].state, RelayState::Pending);
+    assert_eq!(v.relays[0].held.as_deref(), Some("bracketed paste is off"));
+}
+
+#[tokio::test]
+async fn one_line_relay_is_typed_without_bracketed_paste() {
+    let stub = box_stub_with("no-brackets-one", false);
+    let d = start_daemon_with(temp_socket(), stub.env()).await;
+    let mut c = Client::connect(&d.socket).await;
+    c.start_stub(2, &stub).await;
+    c.hook(hook(2, HookKind::Stop)).await;
+    // The escape is stripped, never typed as a key.
+    assert_eq!(c.relay(None, 2, "hel\x1blo").await, queued_for(2));
+    let want = format!("{HELLO}\r");
+    assert_eq!(stub.read_until(&want).await, want);
+    c.all_delivered(2).await;
 }
