@@ -371,6 +371,7 @@ impl OverseerApp {
                     self.apply_info(info, true, window, cx);
                 }
             }
+            Frame::Event(Event::LocksChanged(_)) => {}
             Frame::Event(Event::WorkChanged(view))
             | Frame::Response {
                 resp: Response::Work(view),

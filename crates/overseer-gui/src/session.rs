@@ -700,6 +700,7 @@ mod tests {
             since: 105,
             now_doing: Some("Bash".into()),
             reason: Some("Permission to run Bash".into()),
+            idle_wait: false,
         });
         let m = panel_model(&i, 165, None, false, clock);
         assert_eq!(m.rows[3], ("State", "Running".to_string()));
@@ -712,6 +713,7 @@ mod tests {
             since: 160,
             now_doing: Some("Edit".into()),
             reason: None,
+            idle_wait: false,
         });
         let m = panel_model(&i, 165, None, false, clock);
         assert_eq!(m.rows[5], ("Activity", "Working 5s".to_string()));
@@ -722,6 +724,7 @@ mod tests {
             since: 160,
             now_doing: None,
             reason: None,
+            idle_wait: false,
         });
         let m = panel_model(&i, 165, None, false, clock);
         assert_eq!(m.rows[5], ("Activity", "Idle 5s".to_string()));
@@ -900,6 +903,7 @@ mod tests {
                 since: 1,
                 now_doing: None,
                 reason: None,
+                idle_wait: false,
             });
             assert_eq!(can_kickoff(&i), ok);
         }
@@ -916,6 +920,7 @@ mod tests {
             since: 1,
             now_doing: None,
             reason: None,
+            idle_wait: false,
         });
         assert!(kickoff_enabled(&i, false));
         assert!(!kickoff_enabled(&i, true));

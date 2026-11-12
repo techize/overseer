@@ -61,6 +61,8 @@ pub fn parse_hook(event: &str, slot_env: &str, stdin: &[u8]) -> Option<HookEvent
         tool: text("tool_name"),
         detail: json.get("tool_input").and_then(detail),
         notification: text("message"),
+        tool_use_id: text("tool_use_id"),
+        notification_type: text("notification_type"),
     })
 }
 

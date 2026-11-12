@@ -63,6 +63,10 @@ pub struct Activity {
     pub now_doing: Option<String>,
     /// Why the session needs you.
     pub reason: Option<String>,
+    /// True for a `Notification` that is an idle-input wait, not a prompt
+    /// for you.
+    #[serde(default)]
+    pub idle_wait: bool,
 }
 
 /// Which Claude Code hook fired.
@@ -86,6 +90,12 @@ pub struct HookEvent {
     /// One line, at most 80 chars, summarising the tool input.
     pub detail: Option<String>,
     pub notification: Option<String>,
+    /// The tool call this event belongs to, for `PostToolUse`.
+    #[serde(default)]
+    pub tool_use_id: Option<String>,
+    /// Claude's notification type, e.g. `idle_prompt`.
+    #[serde(default)]
+    pub notification_type: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -173,6 +183,119 @@ pub fn owner_in_refusal(message: &str, key: &str) -> Option<SlotId> {
     n.parse().ok()
 }
 
+/// What a claim on a write target is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClaimKind {
+    /// Taken by a command the hook matched.
+    Command,
+    /// Handed to a waiter on release, not yet used.
+    Grant,
+    /// Taken with `claim_target`, held until released.
+    Claim,
+    /// A pinned ArgoCD revision.
+    Pin,
+}
+
+/// One slot's hold on one write target. Times are unix seconds.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Claim {
+    pub target: String,
+    pub slot: SlotId,
+    pub kind: ClaimKind,
+    pub reason: Option<String>,
+    /// The work item the claim is for.
+    pub item: Option<String>,
+    pub since: i64,
+    pub last_used: i64,
+    /// The revision a pin recorded.
+    pub pin_revision: Option<String>,
+}
+
+/// A slot queued for a target. A target's waits are listed in queue order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Wait {
+    pub target: String,
+    pub slot: SlotId,
+    pub at: i64,
+    pub reason: Option<String>,
+}
+
+/// Who a relay is from. `You` is Jonathan, through the GUI or `ctl`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum Sender {
+    Overseer,
+    You,
+    Slot { slot: SlotId },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RelayState {
+    Pending,
+    Delivered,
+}
+
+/// A message from one session (or Overseer, or you) to a slot's session.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Relay {
+    pub id: i64,
+    pub at: i64,
+    pub from: Sender,
+    pub to: SlotId,
+    pub text: String,
+    pub state: RelayState,
+    pub delivered_at: Option<i64>,
+    /// Why a pending relay is waiting, e.g. `session is working`. Filled by
+    /// the courier.
+    pub held: Option<String>,
+}
+
+/// Every claim, wait and relay worth showing. `relays` holds every pending
+/// relay plus the 50 most recent delivered ones, newest first.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LockView {
+    pub claims: Vec<Claim>,
+    pub waits: Vec<Wait>,
+    pub relays: Vec<Relay>,
+    /// Seconds without use after which a claim is flagged as long-held.
+    pub flag_after_secs: i64,
+}
+
+impl LockView {
+    /// True when `c` has gone unused for longer than `flag_after_secs`.
+    pub fn flagged(&self, c: &Claim, now: i64) -> bool {
+        now - c.last_used > self.flag_after_secs
+    }
+
+    /// The targets `slot` is queued on, in the order of `waits`.
+    pub fn waiting_on(&self, slot: SlotId) -> Vec<&str> {
+        self.waits
+            .iter()
+            .filter(|w| w.slot == slot)
+            .map(|w| w.target.as_str())
+            .collect()
+    }
+
+    /// How many pending relays are addressed to `slot`.
+    pub fn pending_for(&self, slot: SlotId) -> usize {
+        self.relays
+            .iter()
+            .filter(|r| r.to == slot && r.state == RelayState::Pending)
+            .count()
+    }
+}
+
+/// A Bash command the `PreToolUse` hook asks the daemon to check.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BashCheck {
+    pub slot: SlotId,
+    pub session_id: Option<String>,
+    pub tool_use_id: Option<String>,
+    pub command: String,
+    pub cwd: Option<PathBuf>,
+    pub env: Vec<(String, String)>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum Request {
@@ -234,6 +357,30 @@ pub enum Request {
     ClearNotices {
         slot: SlotId,
     },
+    ListLocks,
+    ClaimTarget {
+        slot: SlotId,
+        target: String,
+        #[serde(default)]
+        reason: Option<String>,
+        #[serde(default)]
+        item: Option<String>,
+    },
+    ReleaseTarget {
+        slot: SlotId,
+        target: String,
+    },
+    ForceRelease {
+        target: String,
+    },
+    /// Queues a message for a slot's session. `from` is `None` for you.
+    SendRelay {
+        #[serde(default)]
+        from: Option<SlotId>,
+        to: SlotId,
+        text: String,
+    },
+    CheckBash(BashCheck),
 }
 
 // Adjacent tagging because `Slots` is a tuple variant.
@@ -253,6 +400,15 @@ pub enum Response {
     Text {
         text: String,
     },
+    Locks(LockView),
+    /// The answer to `CheckBash`: `Some` is the deny reason.
+    Verdict {
+        deny: Option<String>,
+    },
+    /// The request was accepted and is waiting, e.g. a queued claim.
+    Queued {
+        message: String,
+    },
 }
 
 // Adjacent tagging because `SlotChanged` is a tuple variant.
@@ -261,6 +417,7 @@ pub enum Response {
 pub enum Event {
     SlotChanged(SlotInfo),
     WorkChanged(WorkView),
+    LocksChanged(LockView),
 }
 
 #[cfg(test)]
@@ -281,6 +438,8 @@ mod tests {
             tool: None,
             detail: None,
             notification: None,
+            tool_use_id: None,
+            notification_type: None,
         });
         let back: Request = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
         assert_eq!(back, req);
@@ -457,5 +616,178 @@ mod tests {
         let ev = Event::WorkChanged(view());
         let json = serde_json::to_string(&ev).unwrap();
         assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), ev);
+    }
+
+    fn claim() -> Claim {
+        Claim {
+            target: "repo:demo-api:main".into(),
+            slot: 2,
+            kind: ClaimKind::Command,
+            reason: Some("pushing".into()),
+            item: Some("DEMO-12".into()),
+            since: 100,
+            last_used: 150,
+            pin_revision: None,
+        }
+    }
+
+    fn lock_view() -> LockView {
+        let relay = |id, to, state| Relay {
+            id,
+            at: 10 + id,
+            from: Sender::Slot { slot: 1 },
+            to,
+            text: "hello".into(),
+            state,
+            delivered_at: None,
+            held: None,
+        };
+        LockView {
+            claims: vec![claim()],
+            waits: vec![
+                Wait {
+                    target: "repo:demo-api:main".into(),
+                    slot: 3,
+                    at: 120,
+                    reason: None,
+                },
+                Wait {
+                    target: "uat/root".into(),
+                    slot: 2,
+                    at: 121,
+                    reason: Some("apply".into()),
+                },
+                Wait {
+                    target: "staging-eu".into(),
+                    slot: 2,
+                    at: 122,
+                    reason: None,
+                },
+            ],
+            relays: vec![
+                relay(3, 2, RelayState::Pending),
+                relay(2, 2, RelayState::Delivered),
+                relay(1, 4, RelayState::Pending),
+            ],
+            flag_after_secs: 3600,
+        }
+    }
+
+    #[test]
+    fn lock_requests_round_trip() {
+        for req in [
+            Request::ListLocks,
+            Request::ClaimTarget {
+                slot: 2,
+                target: "repo:demo-api:main".into(),
+                reason: Some("push".into()),
+                item: Some("DEMO-12".into()),
+            },
+            Request::ReleaseTarget {
+                slot: 2,
+                target: "uat/root".into(),
+            },
+            Request::ForceRelease {
+                target: "uat/root".into(),
+            },
+            Request::SendRelay {
+                from: Some(0),
+                to: 2,
+                text: "hi".into(),
+            },
+            Request::SendRelay {
+                from: None,
+                to: 2,
+                text: "hi".into(),
+            },
+            Request::CheckBash(BashCheck {
+                slot: 2,
+                session_id: Some("abc".into()),
+                tool_use_id: Some("tu1".into()),
+                command: "git push origin main".into(),
+                cwd: Some(PathBuf::from("/tmp/demo-api")),
+                env: vec![("HOME".into(), "/tmp".into())],
+            }),
+        ] {
+            let json = serde_json::to_string(&req).unwrap();
+            assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), req);
+        }
+    }
+
+    #[test]
+    fn lock_responses_and_event_round_trip() {
+        for resp in [
+            Response::Locks(lock_view()),
+            Response::Verdict { deny: None },
+            Response::Verdict {
+                deny: Some("S2 holds it".into()),
+            },
+            Response::Queued {
+                message: "queued".into(),
+            },
+        ] {
+            let json = serde_json::to_string(&resp).unwrap();
+            assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), resp);
+        }
+        let ev = Event::LocksChanged(lock_view());
+        let json = serde_json::to_string(&ev).unwrap();
+        assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), ev);
+    }
+
+    #[test]
+    fn claim_target_defaults() {
+        let req: Request = serde_json::from_str(
+            r#"{"type":"ClaimTarget","slot":2,"target":"repo:demo-api:main"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            req,
+            Request::ClaimTarget {
+                slot: 2,
+                target: "repo:demo-api:main".into(),
+                reason: None,
+                item: None,
+            }
+        );
+    }
+
+    #[test]
+    fn old_hook_event_parses() {
+        let ev: HookEvent =
+            serde_json::from_str(r#"{"slot":1,"event":"Stop","session_id":"abc","tool":null,"detail":null,"notification":null}"#)
+                .unwrap();
+        assert_eq!(ev.tool_use_id, None);
+        assert_eq!(ev.notification_type, None);
+        let a: Activity =
+            serde_json::from_str(r#"{"kind":"Idle","since":5,"now_doing":null,"reason":null}"#)
+                .unwrap();
+        assert!(!a.idle_wait);
+    }
+
+    #[test]
+    fn sender_shapes() {
+        let v = serde_json::to_value(Sender::Slot { slot: 3 }).unwrap();
+        assert_eq!(v, serde_json::json!({"type": "Slot", "slot": 3}));
+        assert_eq!(
+            serde_json::to_value(Sender::You).unwrap(),
+            serde_json::json!({"type": "You"})
+        );
+        let back: Sender = serde_json::from_value(v).unwrap();
+        assert_eq!(back, Sender::Slot { slot: 3 });
+    }
+
+    #[test]
+    fn lock_view_helpers() {
+        let v = lock_view();
+        let c = claim();
+        // last_used is 150 and the limit 3600.
+        assert!(!v.flagged(&c, 150 + 3600));
+        assert!(v.flagged(&c, 150 + 3601));
+        assert_eq!(v.waiting_on(2), vec!["uat/root", "staging-eu"]);
+        assert_eq!(v.waiting_on(3), vec!["repo:demo-api:main"]);
+        assert!(v.waiting_on(5).is_empty());
+        assert_eq!(v.pending_for(2), 1);
+        assert_eq!(v.pending_for(4), 1);
+        assert_eq!(v.pending_for(0), 0);
     }
 }

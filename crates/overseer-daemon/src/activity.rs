@@ -29,6 +29,7 @@ pub fn apply(prev: Option<&Activity>, ev: &HookEvent, now: i64) -> Option<Activi
         since,
         now_doing,
         reason,
+        idle_wait: false,
     })
 }
 
@@ -44,6 +45,8 @@ mod tests {
             tool: None,
             detail: None,
             notification: None,
+            tool_use_id: None,
+            notification_type: None,
         }
     }
 
@@ -53,6 +56,7 @@ mod tests {
             since,
             now_doing: None,
             reason: None,
+            idle_wait: false,
         }
     }
 

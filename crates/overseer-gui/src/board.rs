@@ -877,6 +877,7 @@ mod tests {
             since: 2000,
             now_doing: now_doing.map(String::from),
             reason: reason.map(String::from),
+            idle_wait: false,
         });
         i
     }

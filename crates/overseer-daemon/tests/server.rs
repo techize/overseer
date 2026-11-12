@@ -596,6 +596,8 @@ fn hook(slot: u8, event: HookKind) -> HookEvent {
         tool: None,
         detail: None,
         notification: None,
+        tool_use_id: None,
+        notification_type: None,
     }
 }
 

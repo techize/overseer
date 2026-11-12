@@ -328,6 +328,7 @@ mod tests {
                 since: 5,
                 now_doing: None,
                 reason: reason.map(String::from),
+                idle_wait: false,
             }),
         }
     }

@@ -418,6 +418,12 @@ fn handle_request(
         } => store.assign(&key, slot, confirm, move_owner, unix_now()),
         Request::Release { key } => store.release(&key, unix_now()),
         Request::ClearNotices { slot } => store.clear_notices(slot),
+        Request::ListLocks
+        | Request::ClaimTarget { .. }
+        | Request::ReleaseTarget { .. }
+        | Request::ForceRelease { .. }
+        | Request::SendRelay { .. }
+        | Request::CheckBash(_) => err("not supported yet".into()),
         Request::Kickoff { slot } if !valid_id(slot) => err(format!("invalid slot id {slot}")),
         Request::Kickoff { slot } => {
             let items = store.view().items;
