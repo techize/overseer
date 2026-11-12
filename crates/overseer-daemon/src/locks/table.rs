@@ -215,7 +215,9 @@ pub(crate) fn relays_on(conn: &Connection, recent: usize) -> Result<Vec<Relay>> 
 
 /// Asks for `c.target`. A free target is granted; one the slot already
 /// holds is touched; one held by another slot puts the caller in its
-/// queue. Asking again while queued keeps the caller's place.
+/// queue. Asking again while queued keeps the caller's place. Asking with
+/// the tool turns the caller's grant, or its wait from a denied command,
+/// into a tool claim.
 pub(crate) fn claim_on(conn: &Connection, c: &NewClaim, now: i64) -> Result<ClaimOutcome> {
     match holder_on(conn, c.target)? {
         None => {
@@ -243,6 +245,16 @@ pub(crate) fn claim_on(conn: &Connection, c: &NewClaim, now: i64) -> Result<Clai
         }
         Some(held) if held.slot == c.slot => {
             touch_on(conn, c.target, c.slot, now)?;
+            // `claim_target` on a grant the slot has not used yet: it is
+            // told it holds the target, so it keeps it past the next Stop.
+            if c.via == Via::Tool && held.kind == ClaimKind::Grant {
+                conn.execute(
+                    "UPDATE claims SET kind = 'claim', reason = COALESCE(reason, ?3),
+                            item = COALESCE(item, ?4)
+                     WHERE target = ?1 AND slot = ?2",
+                    params![c.target, c.slot, c.reason, c.item],
+                )?;
+            }
             Ok(ClaimOutcome::AlreadyHeld)
         }
         Some(holder) => {
@@ -251,6 +263,16 @@ pub(crate) fn claim_on(conn: &Connection, c: &NewClaim, now: i64) -> Result<Clai
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![c.target, c.slot, via_str(c.via), c.reason, c.item, now],
             )?;
+            // A slot queued by a denied command that now asks with the
+            // tool keeps its place but gets a claim, not a grant.
+            if c.via == Via::Tool {
+                conn.execute(
+                    "UPDATE waits SET via = 'tool', reason = COALESCE(?3, reason),
+                            item = COALESCE(?4, item)
+                     WHERE target = ?1 AND slot = ?2",
+                    params![c.target, c.slot, c.reason, c.item],
+                )?;
+            }
             let position: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM waits WHERE target = ?1
                    AND id <= (SELECT id FROM waits WHERE target = ?1 AND slot = ?2)",
@@ -1117,6 +1139,102 @@ mod tests {
             assert_eq!(d[2].delivered_at, Some(20));
             Ok(())
         })
+    }
+
+    /// A ledger in a fresh file, so a test can reopen it.
+    fn file_ledger(name: &str) -> (Ledger, std::path::PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("overseer-table-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("ledger.db");
+        (Ledger::open(&path).unwrap(), path)
+    }
+
+    #[test]
+    fn tool_claim_while_hook_queued_makes_the_wait_a_tool_wait() {
+        let (l, path) = file_ledger("tool-wait");
+        l.transaction(|c| {
+            take(c, T, 1, ClaimKind::Claim, 10);
+            queue(c, T, 2, Via::Hook, 11);
+            let ask = NewClaim {
+                reason: Some("syncing uat"),
+                ..claim(T, 2, ClaimKind::Claim, Via::Tool)
+            };
+            assert!(matches!(
+                claim_on(c, &ask, 12)?,
+                ClaimOutcome::Queued { position: 1, .. }
+            ));
+            Ok(())
+        })
+        .unwrap();
+        drop(l);
+        let l = Ledger::open(&path).unwrap();
+        l.transaction(|c| {
+            let (via, reason, at): (String, Option<String>, i64) = c.query_row(
+                "SELECT via, reason, at FROM waits WHERE slot = 2",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+            assert_eq!(
+                (via.as_str(), reason.as_deref(), at),
+                ("tool", Some("syncing uat"), 11)
+            );
+            release_on(c, T, Releaser::Slot(1), None, 20)?;
+            assert_eq!(holders(c), vec![(T.into(), 2, ClaimKind::Claim)]);
+            assert_eq!(claims_on(c)?[0].reason.as_deref(), Some("syncing uat"));
+            // A delivered handoff relay and a Stop leave a tool claim alone.
+            let ids: Vec<i64> = pending_relays_on(c, 2)?.iter().map(|r| r.id).collect();
+            mark_delivered_on(c, &ids, 21)?;
+            assert!(release_on_stop_on(c, 2, 22)?.is_empty());
+            Ok(())
+        })
+        .unwrap();
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn tool_claim_on_a_held_grant_makes_it_a_claim() {
+        let (l, path) = file_ledger("grant-claim");
+        l.transaction(|c| {
+            take(c, T, 1, ClaimKind::Claim, 10);
+            let wait = NewClaim {
+                reason: Some("deploy"),
+                item: Some("DEMO-12"),
+                ..claim(T, 2, ClaimKind::Command, Via::Hook)
+            };
+            claim_on(c, &wait, 11)?;
+            release_on(c, T, Releaser::Slot(1), None, 12)?;
+            assert_eq!(holders(c), vec![(T.into(), 2, ClaimKind::Grant)]);
+            let again = NewClaim {
+                reason: Some("other"),
+                ..claim(T, 2, ClaimKind::Claim, Via::Tool)
+            };
+            assert_eq!(claim_on(c, &again, 13)?, ClaimOutcome::AlreadyHeld);
+            Ok(())
+        })
+        .unwrap();
+        drop(l);
+        let l = Ledger::open(&path).unwrap();
+        l.transaction(|c| {
+            let held = &claims_on(c)?[0];
+            assert_eq!(
+                (
+                    held.kind,
+                    held.reason.as_deref(),
+                    held.item.as_deref(),
+                    held.last_used
+                ),
+                (ClaimKind::Claim, Some("deploy"), Some("DEMO-12"), 13)
+            );
+            // The grant relay was delivered, but a claim outlives the Stop.
+            let ids: Vec<i64> = pending_relays_on(c, 2)?.iter().map(|r| r.id).collect();
+            mark_delivered_on(c, &ids, 14)?;
+            assert!(release_on_stop_on(c, 2, 15)?.is_empty());
+            assert_eq!(holders(c), vec![(T.into(), 2, ClaimKind::Claim)]);
+            Ok(())
+        })
+        .unwrap();
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
