@@ -3,6 +3,8 @@
 //! courier's job (a later task); this module decides who may send and
 //! queues the relay in the ledger.
 
+pub mod screen;
+
 use overseer_proto::msg::{slot_name, Sender};
 use overseer_proto::{Response, SlotId};
 
