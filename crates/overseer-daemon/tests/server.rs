@@ -2606,3 +2606,328 @@ async fn label_failure_queues_no_relay() {
     assert!(c.work().await.notices.iter().any(|n| n.slot == 2));
     assert!(c.locks().await.relays.is_empty());
 }
+
+// ---- Courier ----
+
+/// A stub `claude` for the courier: it draws Claude Code's input box (empty,
+/// or holding the text in `box_file`), redraws on SIGUSR1, and logs every
+/// byte it reads from the PTY to `reads`.
+struct BoxStub {
+    dir: PathBuf,
+    bin: PathBuf,
+    reads: PathBuf,
+    box_file: PathBuf,
+    draws: PathBuf,
+}
+
+fn box_stub(name: &str) -> BoxStub {
+    let dir = std::env::temp_dir().join(format!("ovs-courier-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("work")).unwrap();
+    let stub = BoxStub {
+        bin: dir.join("claude"),
+        reads: dir.join("reads.log"),
+        box_file: dir.join("box.txt"),
+        draws: dir.join("draws.log"),
+        dir,
+    };
+    write_script(
+        &stub.bin,
+        &format!(
+            r#"if [ "$1" = --session-id ] && [ -n "$STUB_SAVES" ]; then
+  mkdir -p "$CLAUDE_CONFIG_DIR/projects/p" && : > "$CLAUDE_CONFIG_DIR/projects/p/$2.jsonl"
+fi
+stty raw -echo
+exec 3<&0
+cat <&3 >> '{reads}' &
+reader=$!
+draw() {{
+  cols=$(stty size | cut -d' ' -f2)
+  rule=$(awk -v n="$cols" 'BEGIN {{ for (i = 0; i < n; i++) printf "\342\224\200" }}')
+  printf '\033[2J\033[H\033[?2004hWorking on DEMO-12 in demo-api\r\n\r\n%s\r\n' "$rule"
+  if [ -s '{boxf}' ]; then
+    printf '\342\235\257 %s\r\n' "$(cat '{boxf}')"
+  else
+    printf '\342\235\257 \033[7mT\033[0m\033[2mry "fix the failing test"\033[0m\r\n'
+  fi
+  printf '%s\r\n  ? for shortcuts' "$rule"
+  echo drawn >> '{draws}'
+}}
+trap draw USR1
+draw
+i=0
+while [ $i -lt 600 ]; do sleep 0.1; i=$((i + 1)); done
+kill $reader
+"#,
+            reads = stub.reads.display(),
+            boxf = stub.box_file.display(),
+            draws = stub.draws.display(),
+        ),
+    );
+    stub
+}
+
+impl BoxStub {
+    fn env(&self) -> overseer_daemon::EnvSource {
+        claude_env(&self.dir, true)
+    }
+
+    fn reads(&self) -> String {
+        String::from_utf8_lossy(&std::fs::read(&self.reads).unwrap_or_default()).into_owned()
+    }
+
+    fn draws(&self) -> usize {
+        std::fs::read_to_string(&self.draws)
+            .map(|s| s.lines().count())
+            .unwrap_or(0)
+    }
+
+    async fn drawn(&self, at_least: usize) {
+        for _ in 0..250 {
+            if self.draws() >= at_least {
+                return;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        panic!("stub never drew {at_least} times");
+    }
+
+    /// Waits for the PTY to have been sent `needle`; returns all it read.
+    async fn read_until(&self, needle: &str) -> String {
+        for _ in 0..250 {
+            let got = self.reads();
+            if got.contains(needle) {
+                return got;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        panic!("stub never read {needle:?}; read {:?}", self.reads());
+    }
+
+    /// Asserts nothing reaches the PTY for `secs`.
+    async fn reads_nothing_for(&self, secs: u64) {
+        sleep(Duration::from_secs(secs)).await;
+        assert_eq!(self.reads(), "", "typed into the session");
+    }
+
+    /// Sets the input box (`None` is empty) and has the stub redraw it.
+    async fn set_box(&self, text: Option<&str>, pid: u32) {
+        std::fs::write(&self.box_file, text.unwrap_or("")).unwrap();
+        let before = self.draws();
+        // SAFETY: a plain signal to the stub's own process.
+        assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGUSR1) }, 0);
+        self.drawn(before + 1).await;
+    }
+}
+
+impl Drop for BoxStub {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// The paste a relay of `text` arrives as, Return included.
+fn pasted(text: &str) -> String {
+    format!("\x1b[200~{}\x1b[201~\r", text.replace('\n', "\r"))
+}
+
+impl Client {
+    /// Starts `stub` in slot `id`, waits for its first screen and returns
+    /// its pid.
+    async fn start_stub(&mut self, id: u8, stub: &BoxStub) -> u32 {
+        let start = Request::StartSlot {
+            id,
+            label: format!("t{id}"),
+            cwd: stub.dir.join("work"),
+            command: Some(vec![stub.bin.to_string_lossy().into_owned()]),
+            prompt: None,
+        };
+        assert_eq!(self.request(start).await, Response::Ok);
+        stub.drawn(1).await;
+        match self.list().await[id as usize].state {
+            SlotState::Running { pid, .. } => pid,
+            ref other => panic!("not running: {other:?}"),
+        }
+    }
+
+    async fn notification(&mut self, slot: u8, kind: &str, message: &str) {
+        self.hook(HookEvent {
+            notification: Some(message.into()),
+            notification_type: Some(kind.into()),
+            ..hook(slot, HookKind::Notification)
+        })
+        .await;
+    }
+
+    /// Waits until `to` has a pending relay held for `reason`.
+    async fn held_for(&mut self, to: u8, reason: &str) {
+        self.locks_until(|v| {
+            v.relays.iter().any(|r| {
+                r.to == to && r.state == RelayState::Pending && r.held.as_deref() == Some(reason)
+            })
+        })
+        .await;
+    }
+
+    /// Waits until `to` has no pending relay left.
+    async fn all_delivered(&mut self, to: u8) -> LockView {
+        self.locks_until(|v| {
+            v.relays
+                .iter()
+                .filter(|r| r.to == to)
+                .all(|r| r.state == RelayState::Delivered && r.held.is_none())
+        })
+        .await
+    }
+}
+
+const HELLO: &str = "Message from Jonathan via Overseer: hello";
+
+#[tokio::test]
+async fn idle_slot_gets_the_relay_with_bracketed_paste_then_enter() {
+    let stub = box_stub("idle");
+    let d = start_daemon_with(temp_socket(), stub.env()).await;
+    let mut c = Client::connect(&d.socket).await;
+    c.start_stub(2, &stub).await;
+    c.hook(hook(2, HookKind::SessionStart)).await;
+    assert_eq!(c.relay(None, 2, "hello").await, queued_for(2));
+    let got = stub.read_until(&pasted(HELLO)).await;
+    assert_eq!(got, pasted(HELLO));
+    let v = c.all_delivered(2).await;
+    assert!(v.relays[0].delivered_at.is_some());
+    // Still idle, nothing more to send: nothing more is typed.
+    sleep(Duration::from_millis(1500)).await;
+    assert_eq!(stub.reads(), pasted(HELLO));
+}
+
+#[tokio::test]
+async fn working_slot_waits_until_stop() {
+    let stub = box_stub("working");
+    let d = start_daemon_with(temp_socket(), stub.env()).await;
+    let mut c = Client::connect(&d.socket).await;
+    c.start_stub(2, &stub).await;
+    // No hook yet: the courier cannot know the session is ready.
+    assert_eq!(c.relay(None, 2, "hello").await, queued_for(2));
+    c.held_for(2, "no activity reported yet").await;
+    c.hook(hook(2, HookKind::UserPromptSubmit)).await;
+    c.held_for(2, "session is working").await;
+    stub.reads_nothing_for(2).await;
+    c.hook(hook(2, HookKind::Stop)).await;
+    assert_eq!(stub.read_until(&pasted(HELLO)).await, pasted(HELLO));
+    c.all_delivered(2).await;
+}
+
+#[tokio::test]
+async fn permission_prompt_never_gets_a_relay() {
+    let stub = box_stub("permission");
+    let d = start_daemon_with(temp_socket(), stub.env()).await;
+    let mut c = Client::connect(&d.socket).await;
+    c.start_stub(2, &stub).await;
+    c.hook(hook(2, HookKind::UserPromptSubmit)).await;
+    c.notification(
+        2,
+        "permission_prompt",
+        "Claude needs your permission to use Bash",
+    )
+    .await;
+    assert_eq!(c.relay(None, 2, "hello").await, queued_for(2));
+    c.held_for(2, "waiting at a prompt for Jonathan").await;
+    stub.reads_nothing_for(3).await;
+    let v = c.locks().await;
+    assert_eq!(
+        v.relays[0].held.as_deref(),
+        Some("waiting at a prompt for Jonathan")
+    );
+    assert_eq!(v.relays[0].state, RelayState::Pending);
+    c.hook(hook(2, HookKind::Stop)).await;
+    assert_eq!(stub.read_until(&pasted(HELLO)).await, pasted(HELLO));
+    c.all_delivered(2).await;
+}
+
+#[tokio::test]
+async fn idle_input_wait_gets_the_relay() {
+    let stub = box_stub("idle-wait");
+    let d = start_daemon_with(temp_socket(), stub.env()).await;
+    let mut c = Client::connect(&d.socket).await;
+    c.start_stub(2, &stub).await;
+    c.hook(hook(2, HookKind::UserPromptSubmit)).await;
+    assert_eq!(c.relay(None, 2, "hello").await, queued_for(2));
+    c.held_for(2, "session is working").await;
+    c.notification(2, "idle_prompt", "Claude is waiting for your input")
+        .await;
+    assert_eq!(stub.read_until(&pasted(HELLO)).await, pasted(HELLO));
+    c.all_delivered(2).await;
+}
+
+#[tokio::test]
+async fn typed_input_box_waits_until_empty() {
+    let stub = box_stub("typed");
+    let d = start_daemon_with(temp_socket(), stub.env()).await;
+    let mut c = Client::connect(&d.socket).await;
+    let pid = c.start_stub(2, &stub).await;
+    stub.set_box(Some("half a draft for demo-api"), pid).await;
+    c.hook(hook(2, HookKind::Stop)).await;
+    assert_eq!(c.relay(None, 2, "hello").await, queued_for(2));
+    c.held_for(2, "input box has text").await;
+    stub.reads_nothing_for(2).await;
+    // Jonathan clears his draft; the next look finds the box empty.
+    stub.set_box(None, pid).await;
+    assert_eq!(stub.read_until(&pasted(HELLO)).await, pasted(HELLO));
+    c.all_delivered(2).await;
+}
+
+#[tokio::test]
+async fn two_pending_relays_go_in_one_paste() {
+    let stub = box_stub("two");
+    let d = start_daemon_with(temp_socket(), stub.env()).await;
+    let mut c = Client::connect(&d.socket).await;
+    c.start_stub(2, &stub).await;
+    c.hook(hook(2, HookKind::UserPromptSubmit)).await;
+    assert_eq!(c.relay(Some(0), 2, "status?").await, queued_for(2));
+    assert_eq!(c.relay(None, 2, "hello").await, queued_for(2));
+    c.locks_until(|v| {
+        v.relays
+            .iter()
+            .filter(|r| r.held.as_deref() == Some("session is working"))
+            .count()
+            == 2
+    })
+    .await;
+    c.hook(hook(2, HookKind::Stop)).await;
+    let both = format!(
+        "Message from S0 via Overseer: status?\n(You can answer once with notify_session.)\n\n{HELLO}"
+    );
+    assert_eq!(stub.read_until(&pasted(&both)).await, pasted(&both));
+    let v = c.all_delivered(2).await;
+    assert_eq!(v.relays.len(), 2);
+    // Delivered, so S2 may now answer S0 once.
+    assert_eq!(c.relay(Some(2), 0, "on it").await, queued_for(0));
+}
+
+#[tokio::test]
+async fn pending_relay_delivers_after_restart_and_resume() {
+    let stub = box_stub("restart");
+    let d = start_daemon_with(temp_socket(), stub.env()).await;
+    let mut c = Client::connect(&d.socket).await;
+    c.start_stub(3, &stub).await;
+    c.hook(hook(3, HookKind::UserPromptSubmit)).await;
+    assert_eq!(c.relay(None, 3, "hello").await, queued_for(3));
+    c.held_for(3, "session is working").await;
+    drop(c);
+
+    let socket = shutdown(d).await;
+    let draws = stub.draws();
+    let d = start_daemon_with(socket, stub.env()).await;
+    let mut c = Client::connect(&d.socket).await;
+    assert!(matches!(
+        c.list().await[3].state,
+        SlotState::Resumable { .. }
+    ));
+    c.held_for(3, "slot is not running").await;
+    assert_eq!(c.request(Request::ResumeSlot { id: 3 }).await, Response::Ok);
+    stub.drawn(draws + 1).await;
+    c.held_for(3, "no activity reported yet").await;
+    c.hook(hook(3, HookKind::SessionStart)).await;
+    assert_eq!(stub.read_until(&pasted(HELLO)).await, pasted(HELLO));
+    c.all_delivered(3).await;
+}

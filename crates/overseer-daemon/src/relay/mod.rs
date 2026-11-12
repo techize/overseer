@@ -1,8 +1,8 @@
 //! Relays: messages queued for a session, from Jonathan, S0, a worker
-//! answering one, or Overseer itself. Delivery into the terminal is the
-//! courier's job (a later task); this module decides who may send and
-//! queues the relay in the ledger.
+//! answering one, or Overseer itself. This module decides who may send and
+//! queues the relay in the ledger; the courier types it into the terminal.
 
+pub mod courier;
 pub mod screen;
 
 use overseer_proto::msg::{slot_name, Sender};

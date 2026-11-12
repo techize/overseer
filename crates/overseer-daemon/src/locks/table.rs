@@ -518,8 +518,6 @@ pub(crate) fn queue_relay_on(
 }
 
 /// The relays waiting for `to`, oldest first.
-// Also used by the relay courier and `notify_session` (later tasks).
-#[allow(dead_code)]
 pub(crate) fn pending_relays_on(conn: &Connection, to: SlotId) -> Result<Vec<Relay>> {
     let mut stmt = conn.prepare(&format!(
         "SELECT {RELAY_COLS} FROM relays
@@ -530,7 +528,6 @@ pub(crate) fn pending_relays_on(conn: &Connection, to: SlotId) -> Result<Vec<Rel
 }
 
 /// Marks relays delivered at `now`. Ones already delivered keep their time.
-// Also used by the relay courier and `notify_session` (later tasks).
 pub(crate) fn mark_delivered_on(conn: &Connection, ids: &[i64], now: i64) -> Result<()> {
     let mut stmt =
         conn.prepare("UPDATE relays SET delivered_at = ?2 WHERE id = ?1 AND delivered_at IS NULL")?;

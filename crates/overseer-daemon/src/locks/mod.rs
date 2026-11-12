@@ -10,20 +10,20 @@ pub mod targets;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use overseer_proto::msg::{
     slot_name, BashCheck, Claim, ClaimKind, Event, HookEvent, HookKind, ItemKind, LockView,
-    Response, SlotId, WorkView, CHECK_ENV,
+    RelayState, Response, SlotId, WorkView, CHECK_ENV,
 };
 use rusqlite::Connection;
 use tokio::sync::broadcast;
 
 use crate::env::BaseEnv;
 use crate::ledger::Ledger;
-use crate::manager::valid_id;
+use crate::manager::{valid_id, SLOT_COUNT};
 use crate::work::store::unix_now;
 use context::SystemContext;
 use table::{ClaimOutcome, NewClaim, Releaser, Via};
@@ -45,6 +45,8 @@ pub struct LockService {
     /// Set by `shutdown`: the daemon is killing every session, and those
     /// exits must not drop their locks.
     stopping: AtomicBool,
+    /// Why each slot's pending relays wait, as the courier last found it.
+    held: Mutex<[Option<&'static str>; SLOT_COUNT]>,
 }
 
 /// Local `HH:MM` for unix seconds.
@@ -137,12 +139,14 @@ impl LockService {
             env,
             flag_after,
             stopping: AtomicBool::new(false),
+            held: Mutex::new([None; SLOT_COUNT]),
         })
     }
 
     pub fn view(&self) -> LockView {
         let flag = i64::try_from(self.flag_after.as_secs()).unwrap_or(i64::MAX);
-        self.ledger
+        let mut view = self
+            .ledger
             .lock_view(RECENT_RELAYS, flag)
             .unwrap_or_else(|e| {
                 tracing::warn!("lock view unreadable: {e:#}");
@@ -152,7 +156,29 @@ impl LockService {
                     relays: Vec::new(),
                     flag_after_secs: flag,
                 }
-            })
+            });
+        let held = *self.held.lock().unwrap();
+        for r in &mut view.relays {
+            if r.state == RelayState::Pending {
+                r.held = held.get(r.to as usize).copied().flatten().map(String::from);
+            }
+        }
+        view
+    }
+
+    /// The courier's reason `slot`'s pending relays wait, `None` when they
+    /// are not held. A change is announced.
+    pub(crate) fn set_held(&self, slot: SlotId, reason: Option<&'static str>) {
+        let changed = {
+            let mut held = self.held.lock().unwrap();
+            let Some(entry) = held.get_mut(slot as usize) else {
+                return;
+            };
+            std::mem::replace(entry, reason) != reason
+        };
+        if changed {
+            self.announce();
+        }
     }
 
     pub(crate) fn announce(&self) {
@@ -572,6 +598,57 @@ mod tests {
         let v = locks.view();
         assert_eq!(v.claims.len(), 1);
         assert_eq!(v.claims[0].target, "custom:b");
+    }
+
+    #[test]
+    fn held_reasons_reach_only_that_slots_pending_relays() {
+        let (events, mut rx) = broadcast::channel(16);
+        let locks = LockService::new(
+            Arc::new(Ledger::in_memory()),
+            Vec::new(),
+            events,
+            BaseEnv::ready(Vec::new()),
+            Duration::from_secs(3600),
+        );
+        let queue = |to: SlotId, text: &str| {
+            locks
+                .change("test", |c| {
+                    table::queue_relay_on(c, &overseer_proto::Sender::You, to, text, None, 1)
+                })
+                .unwrap()
+        };
+        let done = queue(2, "done");
+        locks
+            .change("test", |c| table::mark_delivered_on(c, &[done], 2))
+            .unwrap();
+        queue(2, "waiting");
+        queue(3, "other");
+        while rx.try_recv().is_ok() {}
+        locks.set_held(2, Some("session is working"));
+        assert!(matches!(rx.try_recv(), Ok(Event::LocksChanged(_))));
+        // The same reason again is no change.
+        locks.set_held(2, Some("session is working"));
+        assert!(rx.try_recv().is_err());
+        let held: Vec<_> = locks
+            .view()
+            .relays
+            .iter()
+            .map(|r| (r.text.clone(), r.held.clone()))
+            .collect();
+        assert_eq!(
+            held,
+            [
+                ("other".to_string(), None),
+                (
+                    "waiting".to_string(),
+                    Some("session is working".to_string())
+                ),
+                ("done".to_string(), None),
+            ]
+        );
+        locks.set_held(2, None);
+        assert!(matches!(rx.try_recv(), Ok(Event::LocksChanged(_))));
+        assert!(locks.view().relays.iter().all(|r| r.held.is_none()));
     }
 
     #[test]

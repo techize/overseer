@@ -8,7 +8,8 @@
 //! `NotFound`, and a relay then waits.
 //!
 //! It cannot detect: a placeholder drawn without the dim attribute (reads as
-//! `Typed`, so relays wait), input that is only spaces (reads as `Empty`),
+//! `Typed`, so relays wait), input that is only spaces or one character
+//! under the cursor (reads as `Empty`),
 //! text hidden in vim normal mode or scrolled out of a box taller than the
 //! screen, and a layout change in a future Claude Code (reads as `NotFound`).
 
@@ -79,12 +80,30 @@ pub fn input_box(snap: &Snapshot) -> InputBox {
     let Some(start) = after_prompt_mark(row_cells(snap, first)) else {
         return InputBox::NotFound;
     };
-    let typed = (first..lower).any(|row| {
-        let from = if row == first { start } else { 0 };
-        row_cells(snap, row)[from..]
-            .iter()
-            .any(|c| !c.dim && !c.ch.is_whitespace() && c.ch != BORDER)
-    });
+    let in_box = || {
+        (first..lower).flat_map(move |row| {
+            let from = if row == first { start } else { 0 };
+            (from..snap.cols).map(move |col| (row, col))
+        })
+    };
+    let cell = |(row, col): (usize, usize)| &snap.cells[row * snap.cols + col];
+    // The cursor's cell never counts as text: on an empty box Claude Code
+    // can draw its cursor as an inverse, non-dim cell over the first
+    // placeholder character. That is the terminal cursor's cell, or else
+    // the box's only inverse cell; several inverse cells are text.
+    let terminal_cursor = snap
+        .cursor
+        .visible
+        .then_some((snap.cursor.row, snap.cursor.col));
+    let mut inverse = in_box().filter(|&at| cell(at).inverse);
+    let drawn_cursor = match (inverse.next(), inverse.next()) {
+        (Some(only), None) => Some(only),
+        _ => None,
+    };
+    let typed = in_box()
+        .filter(|&at| Some(at) != terminal_cursor && Some(at) != drawn_cursor)
+        .map(cell)
+        .any(|c| !c.dim && !c.ch.is_whitespace() && c.ch != BORDER);
     if typed {
         InputBox::Typed
     } else {
@@ -131,6 +150,39 @@ mod tests {
             COLS as usize,
         );
         assert_eq!(classify(&bytes, COLS), InputBox::Empty);
+    }
+
+    #[test]
+    fn empty_box_with_an_inverse_cursor_over_the_placeholder_is_empty() {
+        let bytes = box_with(
+            &["\u{276F} \x1b[7mT\x1b[0m\x1b[2mry \"fix the failing test\"\x1b[0m"],
+            COLS as usize,
+        );
+        assert_eq!(classify(&bytes, COLS), InputBox::Empty);
+    }
+
+    #[test]
+    fn typed_text_with_an_inverse_cursor_is_typed() {
+        // After the text, on a blank cell.
+        let bytes = box_with(&["\u{276F} run the tests\x1b[7m \x1b[0m"], COLS as usize);
+        assert_eq!(classify(&bytes, COLS), InputBox::Typed);
+        // Moved back over a character of the draft.
+        let bytes = box_with(&["\u{276F} run the \x1b[7mt\x1b[0mests"], COLS as usize);
+        assert_eq!(classify(&bytes, COLS), InputBox::Typed);
+    }
+
+    #[test]
+    fn the_terminal_cursor_cell_is_not_text() {
+        // The cursor is put back over a non-dim first placeholder letter.
+        let mut bytes = box_with(&["\u{276F} T\x1b[2mry something\x1b[0m"], COLS as usize);
+        bytes.extend_from_slice(b"\x1b[4;3H");
+        assert_eq!(classify(&bytes, COLS), InputBox::Empty);
+    }
+
+    #[test]
+    fn several_inverse_cells_are_text() {
+        let bytes = box_with(&["\u{276F} \x1b[7mab\x1b[0m"], COLS as usize);
+        assert_eq!(classify(&bytes, COLS), InputBox::Typed);
     }
 
     #[test]

@@ -19,6 +19,7 @@ use crate::env::{BaseEnv, EnvSource};
 use crate::ledger::Ledger;
 use crate::locks::{owned_items, LockService};
 use crate::manager::{valid_id, Attachment, SlotManager};
+use crate::relay::courier::Courier;
 use crate::slot::CatchUp;
 use crate::work::store::unix_now;
 use crate::work::WorkStore;
@@ -108,19 +109,29 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
         env.clone(),
         Duration::from_secs(cfg.settings.lock_idle_mins.saturating_mul(60)),
     );
-    store.on_relays_queued({
-        let locks = locks.clone();
-        move || locks.announce()
-    });
     // Subscribed before any slot can start, so no exit is missed.
     let exit_events = events.subscribe();
+    let courier_events = events.subscribe();
     let state_dir = cfg.state_dir.clone();
     let mut mgr = SlotManager::new(cfg.default_command, events)
         .with_env(env.clone())
-        .with_launch(cfg.state_dir, cfg.hook_program, ledger);
+        .with_launch(cfg.state_dir, cfg.hook_program, ledger.clone());
     mgr.restore();
     let manager: Manager = Arc::new(Mutex::new(mgr));
-    let exits = tokio::spawn(watch_exits(exit_events, locks.clone(), manager.clone()));
+    let courier = Courier::spawn(ledger, manager.clone(), locks.clone(), courier_events);
+    store.on_relays_queued({
+        let (locks, courier) = (locks.clone(), courier.clone());
+        move || {
+            locks.announce();
+            courier.poke();
+        }
+    });
+    let exits = tokio::spawn(watch_exits(
+        exit_events,
+        locks.clone(),
+        manager.clone(),
+        courier.clone(),
+    ));
     store.start_polling();
     let shutdown = Arc::new(Notify::new());
     let mut conns = JoinSet::new();
@@ -131,10 +142,13 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
                 Ok((stream, _)) => {
                     conns.spawn(handle_conn(
                         stream,
-                        manager.clone(),
-                        store.clone(),
-                        locks.clone(),
-                        state_dir.clone(),
+                        Services {
+                            manager: manager.clone(),
+                            store: store.clone(),
+                            locks: locks.clone(),
+                            courier: courier.clone(),
+                            state_dir: state_dir.clone(),
+                        },
                         shutdown.clone(),
                         env.clone(),
                     ));
@@ -166,11 +180,14 @@ async fn watch_exits(
     mut events: broadcast::Receiver<Event>,
     locks: Arc<LockService>,
     manager: Manager,
+    courier: Arc<Courier>,
 ) {
     loop {
         match events.recv().await {
             Ok(Event::SlotChanged(info)) if matches!(info.state, SlotState::Exited { .. }) => {
                 locks.on_slot_exit(info.id, unix_now());
+                // A handoff may have queued a relay.
+                courier.poke();
             }
             Ok(_) => {}
             Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -184,6 +201,7 @@ async fn watch_exits(
                     .map(|i| i.id)
                     .collect();
                 locks.reconcile_exits(&stopped, unix_now());
+                courier.poke();
             }
             Err(broadcast::error::RecvError::Closed) => return,
         }
@@ -293,15 +311,28 @@ impl Streams {
     }
 }
 
-async fn handle_conn(
-    stream: UnixStream,
+/// What every connection serves requests from.
+struct Services {
     manager: Manager,
     store: Arc<WorkStore>,
     locks: Arc<LockService>,
+    courier: Arc<Courier>,
     state_dir: PathBuf,
+}
+
+async fn handle_conn(
+    stream: UnixStream,
+    services: Services,
     shutdown: Arc<Notify>,
     mut env: BaseEnv,
 ) {
+    let Services {
+        manager,
+        store,
+        locks,
+        courier,
+        state_dir,
+    } = services;
     let (mut rd, mut wr) = stream.into_split();
     let (out_tx, mut out_rx) = mpsc::channel::<Frame>(OUTBOUND_QUEUE);
     let (dead_tx, mut dead_rx) = watch::channel(false);
@@ -365,6 +396,7 @@ async fn handle_conn(
                         manager: &manager,
                         store: &store,
                         locks: &locks,
+                        courier: &courier,
                         state_dir: &state_dir,
                     };
                     handle_frame(f, &ctx, &outbox, &shutdown, &mut streams)
@@ -394,6 +426,7 @@ struct Ctx<'a> {
     manager: &'a Manager,
     store: &'a Arc<WorkStore>,
     locks: &'a Arc<LockService>,
+    courier: &'a Arc<Courier>,
     state_dir: &'a Path,
 }
 
@@ -438,8 +471,22 @@ fn handle_frame(
         }
         Frame::Request { seq, req } => {
             let is_shutdown = matches!(req, Request::Shutdown);
+            // Each of these can queue a relay or make one deliverable.
+            let pokes = matches!(
+                req,
+                Request::SendRelay { .. }
+                    | Request::ClaimTarget { .. }
+                    | Request::ReleaseTarget { .. }
+                    | Request::ForceRelease { .. }
+                    | Request::Release { .. }
+                    | Request::Assign { .. }
+                    | Request::Hook(_)
+            );
             let mut pending_attach = None;
             let resp = handle_request(req, ctx, streams, &mut pending_attach);
+            if pokes {
+                ctx.courier.poke();
+            }
             // A re-attach ends the earlier stream before its Ok is queued.
             let gate = pending_attach.as_ref().map(|(id, _)| streams.cut(*id));
             outbox.send(Frame::Response { seq, resp });
