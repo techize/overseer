@@ -3,6 +3,7 @@
 pub mod app;
 pub mod board;
 pub mod notify;
+pub mod picker;
 pub mod session;
 pub mod start_dialog;
 pub mod startup_error;

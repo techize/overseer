@@ -6,8 +6,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use overseer_daemon::{run, DaemonConfig};
 use overseer_proto::{
-    read_frame, write_frame, Activity, ActivityKind, Event, Frame, HookEvent, HookKind, Request,
-    Response, SlotInfo, SlotState,
+    read_frame, write_frame, Activity, ActivityKind, Event, Frame, HookEvent, HookKind, ItemKind,
+    Request, Response, SlotInfo, SlotState, SourceStatus, WorkItem, WorkView,
 };
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::UnixStream;
@@ -43,6 +43,25 @@ async fn start_daemon_at(socket: PathBuf) -> Daemon {
 }
 
 async fn start_daemon_with(socket: PathBuf, env: overseer_daemon::EnvSource) -> Daemon {
+    start_daemon_cfg(socket, env, offline_settings()).await
+}
+
+/// Settings that read no real work sources: Jira is off and the beads
+/// folder does not exist.
+fn offline_settings() -> overseer_daemon::Config {
+    overseer_daemon::Config {
+        beads_dir: PathBuf::from("/nonexistent/overseer-test-beads"),
+        brain_dir: PathBuf::from("/nonexistent/overseer-test-brain"),
+        jira_command: vec![],
+        ..overseer_daemon::Config::default()
+    }
+}
+
+async fn start_daemon_cfg(
+    socket: PathBuf,
+    env: overseer_daemon::EnvSource,
+    settings: overseer_daemon::Config,
+) -> Daemon {
     let state_dir = socket.parent().unwrap().join("state");
     let cfg = DaemonConfig {
         socket: socket.clone(),
@@ -50,6 +69,7 @@ async fn start_daemon_with(socket: PathBuf, env: overseer_daemon::EnvSource) -> 
         env,
         state_dir: state_dir.clone(),
         hook_program: PathBuf::from("/bin/true"),
+        settings,
     };
     let task = tokio::spawn(run(cfg));
     for _ in 0..100 {
@@ -397,6 +417,7 @@ async fn second_daemon_refused() {
         env: overseer_daemon::EnvSource::Inherit,
         state_dir: d.state_dir.clone(),
         hook_program: PathBuf::from("/bin/true"),
+        settings: offline_settings(),
     })
     .await
     .unwrap_err();
@@ -1118,4 +1139,759 @@ async fn resume_without_a_saved_conversation_starts_fresh_under_the_same_id() {
     );
     assert!(matches!(c.list().await[1].state, SlotState::Running { .. }));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- Work items ----
+
+const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+
+/// Stub `bd` and Jira commands in a fresh folder, plus a beads folder and a
+/// 2ndBrain folder with one ticket folder. Each stub logs `cwd|argv`.
+struct Sources {
+    dir: PathBuf,
+    beads_dir: PathBuf,
+    bd_log: PathBuf,
+    jira_log: PathBuf,
+}
+
+fn write_script(path: &std::path::Path, body: &str) {
+    std::fs::write(path, format!("#!/bin/sh\n{body}")).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// With `hang`, both stubs sleep instead of answering.
+fn stub_sources(name: &str, hang: bool) -> Sources {
+    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("ovs-work-{name}-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let bin = dir.join("bin");
+    let beads_dir = dir.join("beads");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&beads_dir).unwrap();
+    std::fs::create_dir_all(dir.join("brain/Sprints/sprint-1/DEMO-12-widget")).unwrap();
+    std::fs::create_dir_all(dir.join("brain/Sprints/sprint-1/DEMO-400")).unwrap();
+    let beads_dir = beads_dir.canonicalize().unwrap();
+    let bd_log = dir.join("bd.log");
+    let jira_log = dir.join("jira.log");
+    let log = |l: &PathBuf| {
+        format!(
+            "printf '%s|%s\\n' \"$(pwd -P)\" \"$*\" >> '{}'\n",
+            l.display()
+        )
+    };
+    let (bd_body, jira_body) = if hang {
+        let hang = format!(
+            "echo $$ >> '{}'\nexec sleep 10\n",
+            dir.join("pids").display()
+        );
+        (hang.clone(), hang)
+    } else {
+        (
+            format!(
+                "{}if [ \"$1\" = list ]; then cat '{FIXTURES}/bd-list.json'; fi\n",
+                log(&bd_log)
+            ),
+            format!("{}cat '{FIXTURES}/acli-search.json'\n", log(&jira_log)),
+        )
+    };
+    write_script(&bin.join("bd"), &bd_body);
+    write_script(&bin.join("jira-stub"), &jira_body);
+    Sources {
+        dir,
+        beads_dir,
+        bd_log,
+        jira_log,
+    }
+}
+
+impl Sources {
+    fn settings(&self) -> overseer_daemon::Config {
+        overseer_daemon::Config {
+            beads_dir: self.beads_dir.clone(),
+            brain_dir: self.dir.join("brain"),
+            jira_command: vec![
+                self.dir
+                    .join("bin/jira-stub")
+                    .to_string_lossy()
+                    .into_owned(),
+                "--jql".into(),
+                "{jql}".into(),
+            ],
+            jql: "project = DEMO".into(),
+            ticket_pattern: r"DEMO-\d+".into(),
+            ..overseer_daemon::Config::default()
+        }
+    }
+
+    /// `bd` is found on PATH, like the real one.
+    fn env(&self) -> overseer_daemon::EnvSource {
+        let path = format!(
+            "{}:{}",
+            self.dir.join("bin").display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        overseer_daemon::EnvSource::InheritWith(vec![("PATH".into(), path)])
+    }
+
+    async fn daemon(&self) -> Daemon {
+        start_daemon_cfg(temp_socket(), self.env(), self.settings()).await
+    }
+}
+
+impl Drop for Sources {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+impl Client {
+    async fn refresh(&mut self) -> WorkView {
+        match self.request(Request::RefreshWorkItems).await {
+            Response::Work(v) => v,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    async fn work(&mut self) -> WorkView {
+        match self.request(Request::ListWorkItems).await {
+            Response::Work(v) => v,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    async fn assign(&mut self, key: &str, slot: u8, confirm: bool, move_owner: bool) -> Response {
+        self.request(Request::Assign {
+            key: key.into(),
+            slot,
+            confirm,
+            move_owner,
+        })
+        .await
+    }
+}
+
+fn item<'a>(v: &'a WorkView, key: &str) -> &'a WorkItem {
+    v.items
+        .iter()
+        .find(|i| i.key == key)
+        .unwrap_or_else(|| panic!("no {key} in {:?}", v.items))
+}
+
+fn source<'a>(v: &'a WorkView, name: &str) -> &'a SourceStatus {
+    v.sources
+        .iter()
+        .find(|s| s.name == name)
+        .unwrap_or_else(|| panic!("no {name} source in {:?}", v.sources))
+}
+
+#[tokio::test]
+async fn work_items_load_from_stub_sources() {
+    let s = stub_sources("load", false);
+    let d = s.daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    let v = c.refresh().await;
+    let keys: Vec<_> = v.items.iter().map(|i| i.key.as_str()).collect();
+    assert_eq!(
+        keys,
+        ["DEMO-12", "ov-1", "ov-2", "DEMO-40", "DEMO-7", "DEMO-30", "ov-4", "ov-3"]
+    );
+    assert_eq!(item(&v, "DEMO-12").kind, ItemKind::Ticket);
+    assert_eq!(item(&v, "DEMO-12").title, "Widget wiring");
+    assert_eq!(item(&v, "ov-2").parent.as_deref(), Some("DEMO-12"));
+    assert!(v.items.iter().all(|i| i.in_list && i.owner.is_none()));
+    // The ticket folder is found; DEMO-400 is not DEMO-40's.
+    assert_eq!(
+        item(&v, "DEMO-12").folder.as_deref(),
+        Some(
+            s.dir
+                .join("brain/Sprints/sprint-1/DEMO-12-widget")
+                .as_path()
+        )
+    );
+    assert_eq!(item(&v, "DEMO-40").folder, None);
+    let beads = source(&v, "beads");
+    assert!(
+        beads.ok && beads.count == 4 && beads.at.is_some(),
+        "{beads:?}"
+    );
+    let jira = source(&v, "jira");
+    assert!(jira.ok && jira.count == 3 && jira.at.is_some(), "{jira:?}");
+    // bd runs in the beads folder; the jql reaches the Jira command.
+    let bd = wait_for_log(&s.bd_log, 1).await;
+    assert_eq!(
+        bd[0],
+        format!("{}|list --json --limit 0", s.beads_dir.display())
+    );
+    let jira = wait_for_log(&s.jira_log, 1).await;
+    assert!(jira[0].ends_with("|--jql project = DEMO"), "{}", jira[0]);
+    // The list is cached: ListWorkItems answers with the same view.
+    assert_eq!(c.work().await.items, v.items);
+}
+
+#[tokio::test]
+async fn assign_then_second_slot_is_refused() {
+    let s = stub_sources("refuse", false);
+    let d = s.daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    c.refresh().await;
+    assert_eq!(c.assign("DEMO-12", 1, false, false).await, Response::Ok);
+    // Clients hear about it.
+    loop {
+        if let Frame::Event(Event::WorkChanged(v)) = c.recv().await.unwrap() {
+            if item(&v, "DEMO-12").owner == Some(1) {
+                break;
+            }
+        }
+    }
+    assert_eq!(
+        c.assign("DEMO-12", 2, false, false).await,
+        Response::Error {
+            message: "DEMO-12 is owned by S1".into()
+        }
+    );
+    // Asking again for the owner is fine and changes nothing.
+    assert_eq!(c.assign("DEMO-12", 1, false, false).await, Response::Ok);
+    assert_eq!(item(&c.work().await, "DEMO-12").owner, Some(1));
+    assert!(matches!(
+        c.assign("DEMO-999", 1, false, false).await,
+        Response::Error { .. }
+    ));
+    assert!(matches!(
+        c.assign("DEMO-40", 9, false, false).await,
+        Response::Error { .. }
+    ));
+}
+
+#[tokio::test]
+async fn move_releases_old_owner_and_adds_a_notice() {
+    let s = stub_sources("move", false);
+    let d = s.daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    c.refresh().await;
+    assert_eq!(c.assign("DEMO-40", 1, false, false).await, Response::Ok);
+    assert_eq!(c.assign("DEMO-40", 2, false, true).await, Response::Ok);
+    let v = c.work().await;
+    assert_eq!(item(&v, "DEMO-40").owner, Some(2));
+    let for_s1: Vec<_> = v.notices.iter().filter(|n| n.slot == 1).collect();
+    assert_eq!(for_s1.len(), 1, "{:?}", v.notices);
+    assert_eq!(for_s1[0].text, "DEMO-40 was moved to S2");
+    // Clearing the notices empties S1's list only.
+    assert_eq!(
+        c.request(Request::ClearNotices { slot: 1 }).await,
+        Response::Ok
+    );
+    assert!(c.work().await.notices.iter().all(|n| n.slot != 1));
+    // Release frees it.
+    assert_eq!(
+        c.request(Request::Release {
+            key: "DEMO-40".into()
+        })
+        .await,
+        Response::Ok
+    );
+    assert_eq!(item(&c.work().await, "DEMO-40").owner, None);
+}
+
+#[tokio::test]
+async fn warn_needs_confirm_then_assigns() {
+    let s = stub_sources("warn", false);
+    let d = s.daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    c.refresh().await;
+    assert_eq!(c.assign("DEMO-12", 1, false, false).await, Response::Ok);
+    assert_eq!(
+        c.assign("ov-1", 2, false, false).await,
+        Response::NeedsConfirm {
+            message: "This bead is under DEMO-12, owned by S1. Assign to S2 anyway?".into()
+        }
+    );
+    assert_eq!(item(&c.work().await, "ov-1").owner, None);
+    assert_eq!(c.assign("ov-1", 2, true, false).await, Response::Ok);
+    let v = c.work().await;
+    assert_eq!(item(&v, "ov-1").owner, Some(2));
+    assert_eq!(item(&v, "DEMO-12").owner, Some(1));
+    assert!(
+        v.notices
+            .iter()
+            .any(|n| n.slot == 1 && n.text.contains("ov-1")),
+        "{:?}",
+        v.notices
+    );
+}
+
+/// Waits for a line ending with `suffix` in a stub's log.
+async fn wait_for_line(log: &std::path::Path, suffix: &str) -> String {
+    for _ in 0..100 {
+        if let Ok(s) = std::fs::read_to_string(log) {
+            if let Some(l) = s.lines().find(|l| l.ends_with(suffix)) {
+                return l.to_string();
+            }
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    panic!(
+        "no line ending {suffix:?} in {:?}",
+        std::fs::read_to_string(log)
+    );
+}
+
+#[tokio::test]
+async fn bead_assign_labels_through_bd() {
+    let s = stub_sources("label", false);
+    let d = s.daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    c.refresh().await;
+    assert_eq!(c.assign("ov-3", 2, false, false).await, Response::Ok);
+    let line = wait_for_line(&s.bd_log, "|update ov-3 --add-label overseer:S2").await;
+    assert_eq!(
+        line,
+        format!(
+            "{}|update ov-3 --add-label overseer:S2",
+            s.beads_dir.display()
+        )
+    );
+    // A move swaps the label.
+    assert_eq!(c.assign("ov-3", 4, false, true).await, Response::Ok);
+    wait_for_line(
+        &s.bd_log,
+        "|update ov-3 --add-label overseer:S4 --remove-label overseer:S2",
+    )
+    .await;
+    assert_eq!(
+        c.request(Request::Release { key: "ov-3".into() }).await,
+        Response::Ok
+    );
+    wait_for_line(&s.bd_log, "|update ov-3 --remove-label overseer:S4").await;
+    // A ticket is never labelled.
+    assert_eq!(c.assign("DEMO-40", 1, false, false).await, Response::Ok);
+    sleep(Duration::from_millis(300)).await;
+    let all = std::fs::read_to_string(&s.bd_log).unwrap();
+    assert!(!all.contains("DEMO-40"), "{all}");
+}
+
+#[tokio::test]
+async fn bead_label_failure_becomes_a_notice() {
+    let s = stub_sources("label-fail", false);
+    write_script(
+        &s.dir.join("bin/bd"),
+        &format!(
+            "if [ \"$1\" = list ]; then cat '{FIXTURES}/bd-list.json'; exit 0; fi\n\
+             echo 'database is locked' >&2; exit 1\n"
+        ),
+    );
+    let d = s.daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    c.refresh().await;
+    assert_eq!(c.assign("ov-3", 2, false, false).await, Response::Ok);
+    loop {
+        if let Frame::Event(Event::WorkChanged(v)) = c.recv().await.unwrap() {
+            if let Some(n) = v.notices.iter().find(|n| n.slot == 2) {
+                assert!(
+                    n.text.starts_with("could not label ov-3 in beads: ")
+                        && n.text.contains("database is locked"),
+                    "{n:?}"
+                );
+                break;
+            }
+        }
+    }
+    // The assignment stands.
+    assert_eq!(item(&c.work().await, "ov-3").owner, Some(2));
+}
+
+#[tokio::test]
+async fn assignments_survive_restart_before_any_refresh() {
+    let s = stub_sources("restart", false);
+    let socket = temp_socket();
+    let d = start_daemon_cfg(socket, s.env(), s.settings()).await;
+    let mut c = Client::connect(&d.socket).await;
+    c.refresh().await;
+    assert_eq!(c.assign("DEMO-12", 3, false, false).await, Response::Ok);
+    drop(c);
+    let socket = shutdown(d).await;
+
+    // Now both sources hang, so nothing is read before the list is asked for.
+    let hung = stub_sources("restart-hung", true);
+    let d = start_daemon_cfg(socket, hung.env(), hung.settings()).await;
+    let mut c = Client::connect(&d.socket).await;
+    let v = timeout(Duration::from_secs(1), c.work())
+        .await
+        .expect("list answered while sources hang");
+    let it = item(&v, "DEMO-12");
+    assert_eq!(it.owner, Some(3));
+    assert!(!it.in_list);
+}
+
+#[tokio::test]
+async fn missing_jira_program_reports_status_and_beads_still_load() {
+    let s = stub_sources("nojira", false);
+    let mut settings = s.settings();
+    settings.jira_command = vec!["no-such-jira-xyz".into(), "{jql}".into()];
+    let d = start_daemon_cfg(temp_socket(), s.env(), settings).await;
+    let mut c = Client::connect(&d.socket).await;
+    let v = c.refresh().await;
+    let jira = source(&v, "jira");
+    assert!(!jira.ok, "{jira:?}");
+    assert_eq!(jira.message.as_deref(), Some("no-such-jira-xyz not found"));
+    let beads = source(&v, "beads");
+    assert!(beads.ok && beads.count == 4, "{beads:?}");
+    // Beads still group under ticket nodes made from their own keys.
+    assert_eq!(item(&v, "ov-1").parent.as_deref(), Some("DEMO-12"));
+    assert_eq!(item(&v, "DEMO-12").status, "unknown");
+}
+
+#[tokio::test]
+async fn bad_settings_are_reported_not_fatal() {
+    let s = stub_sources("badcfg", false);
+    let mut settings = s.settings();
+    settings.jira_command = vec![];
+    settings.ticket_pattern = "[DEMO".into();
+    settings.beads_dir = s.dir.join("no-such-beads");
+    let d = start_daemon_cfg(temp_socket(), s.env(), settings).await;
+    let mut c = Client::connect(&d.socket).await;
+    let v = c.refresh().await;
+    let jira = source(&v, "jira");
+    assert!(!jira.ok);
+    assert!(
+        jira.message
+            .as_deref()
+            .unwrap_or("")
+            .contains("jira_command"),
+        "{jira:?}"
+    );
+    let beads = source(&v, "beads");
+    assert!(!beads.ok);
+    let msg = beads.message.as_deref().unwrap_or("");
+    assert!(
+        msg.contains("no-such-beads") && msg.contains("not found"),
+        "{msg}"
+    );
+    assert!(msg.contains("bad ticket_pattern"), "{msg}");
+    // Still serving.
+    assert_eq!(c.list().await.len(), 7);
+
+    // A bad pattern alone: beads load, ungrouped.
+    let mut settings = s.settings();
+    settings.ticket_pattern = "[DEMO".into();
+    let d2 = start_daemon_cfg(temp_socket(), s.env(), settings).await;
+    let mut c = Client::connect(&d2.socket).await;
+    let v = c.refresh().await;
+    assert!(source(&v, "beads").ok);
+    assert!(v
+        .items
+        .iter()
+        .filter(|i| i.kind == ItemKind::Bead)
+        .all(|i| i.parent.is_none()));
+    drop(d);
+}
+
+#[tokio::test]
+async fn malformed_bead_list_lands_in_the_status() {
+    let s = stub_sources("badbd", false);
+    write_script(&s.dir.join("bin/bd"), "echo '[{\"title\":\"no id\"}]'\n");
+    let d = s.daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    let v = c.refresh().await;
+    let beads = source(&v, "beads");
+    assert!(!beads.ok);
+    assert!(
+        beads
+            .message
+            .as_deref()
+            .unwrap_or("")
+            .contains("without an id"),
+        "{beads:?}"
+    );
+    assert!(source(&v, "jira").ok);
+}
+
+#[tokio::test]
+async fn hanging_source_does_not_block_list_slots() {
+    let s = stub_sources("hang", true);
+    let d = s.daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    // A refresh is in flight (the poll at start, and this one).
+    c.seq += 1;
+    let seq = c.seq;
+    c.send(Frame::Request {
+        seq,
+        req: Request::RefreshWorkItems,
+    })
+    .await;
+    sleep(Duration::from_millis(100)).await;
+    let slots = timeout(Duration::from_secs(1), c.list())
+        .await
+        .expect("ListSlots answered within 1 s");
+    assert_eq!(slots.len(), 7);
+    timeout(Duration::from_secs(1), c.work())
+        .await
+        .expect("ListWorkItems answered within 1 s");
+    let mut other = Client::connect(&d.socket).await;
+    timeout(Duration::from_secs(1), other.list())
+        .await
+        .expect("another client is answered too");
+}
+
+/// Several clients race for the same item, round after round on a
+/// multi-thread runtime; each round exactly one may win. A decision and its
+/// write that were not under one lock would let two through now and then.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_assigns_one_wins() {
+    const CLIENTS: u8 = 4;
+    const ROUNDS: usize = 10;
+    const KEYS: [&str; 5] = ["DEMO-12", "DEMO-40", "DEMO-7", "DEMO-30", "ov-3"];
+    let s = stub_sources("race", false);
+    let d = s.daemon().await;
+    Client::connect(&d.socket).await.refresh().await;
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(CLIENTS as usize));
+    let mut tasks = Vec::new();
+    for slot in 1..=CLIENTS {
+        let mut c = Client::connect(&d.socket).await;
+        let barrier = barrier.clone();
+        // No asserts in here: a panicking client would leave the others
+        // waiting at the barrier. Everything is checked after the join.
+        tasks.push(tokio::spawn(async move {
+            let mut got = Vec::new();
+            for _ in 0..ROUNDS {
+                for key in KEYS {
+                    barrier.wait().await;
+                    let r = c.assign(key, slot, false, false).await;
+                    barrier.wait().await;
+                    // The winner frees it for the next round.
+                    if r == Response::Ok {
+                        c.request(Request::Release { key: key.into() }).await;
+                    }
+                    got.push(r);
+                }
+            }
+            got
+        }));
+    }
+    let mut results = Vec::new();
+    for t in tasks {
+        results.push(t.await.unwrap());
+    }
+    for round in 0..ROUNDS * KEYS.len() {
+        let key = KEYS[round % KEYS.len()];
+        let here: Vec<_> = results.iter().map(|r| &r[round]).collect();
+        let wins = here.iter().filter(|r| ***r == Response::Ok).count();
+        assert_eq!(wins, 1, "contest {round} ({key}): {here:?}");
+        for r in here.iter().filter(|r| ***r != Response::Ok) {
+            assert!(
+                matches!(r, Response::Error { message }
+                    if message.starts_with(&format!("{key} is owned by S"))),
+                "{key}: {r:?}"
+            );
+        }
+    }
+}
+
+/// True while `pid` runs (a zombie counts as gone).
+fn alive(pid: &str) -> bool {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", pid])
+        .output()
+        .unwrap();
+    let stat = String::from_utf8_lossy(&out.stdout);
+    let stat = stat.trim();
+    !stat.is_empty() && !stat.starts_with('Z')
+}
+
+#[tokio::test]
+async fn shutdown_stops_hung_sources_and_requested_refreshes() {
+    let s = stub_sources("hang-stop", true);
+    let pids = s.dir.join("pids");
+    let d = s.daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    // A requested refresh queues behind the hung polls.
+    c.seq += 1;
+    let seq = c.seq;
+    c.send(Frame::Request {
+        seq,
+        req: Request::RefreshWorkItems,
+    })
+    .await;
+    wait_for_log(&pids, 2).await;
+    drop(c);
+    shutdown(d).await;
+    // Had the refresh outlived the daemon it would start new stubs now.
+    sleep(Duration::from_millis(500)).await;
+    let all = std::fs::read_to_string(&pids).unwrap();
+    let running: Vec<_> = all.lines().filter(|p| alive(p)).collect();
+    assert!(running.is_empty(), "still running: {running:?} of {all:?}");
+}
+
+#[tokio::test]
+async fn kickoff_request_returns_text() {
+    let s = stub_sources("kickoff", false);
+    let d = s.daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    c.refresh().await;
+    // Nothing assigned yet.
+    assert_eq!(
+        c.request(Request::Kickoff { slot: 3 }).await,
+        Response::Error {
+            message: "S3 owns no work items".into()
+        }
+    );
+    assert_eq!(c.assign("DEMO-12", 3, false, false).await, Response::Ok);
+    let text = match c.request(Request::Kickoff { slot: 3 }).await {
+        Response::Text { text } => text,
+        other => panic!("unexpected {other:?}"),
+    };
+    assert!(text.starts_with("You are S3."), "{text}");
+    assert!(
+        text.contains("- DEMO-12 (") && text.contains("): Widget wiring"),
+        "{text}"
+    );
+    assert!(text.contains("DEMO-12-widget"), "{text}");
+    // The template is written for Jonathan to edit.
+    assert!(d.state_dir.join("roles/assignment.md").is_file());
+}
+
+/// `bd list` stops at 50 rows unless asked for all of them.
+#[tokio::test]
+async fn bead_list_asks_for_every_row() {
+    let s = stub_sources("limit", false);
+    write_script(
+        &s.dir.join("bin/bd"),
+        &format!(
+            "if [ \"$*\" = 'list --json --limit 0' ]; then cat '{FIXTURES}/bd-list.json'; exit 0; fi\n\
+             echo \"want --limit 0, got: $*\" >&2; exit 1\n"
+        ),
+    );
+    let d = s.daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    let v = c.refresh().await;
+    let beads = source(&v, "beads");
+    assert!(beads.ok && beads.count == 4, "{beads:?}");
+}
+
+#[tokio::test]
+async fn kickoff_for_an_invalid_slot_is_refused() {
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    assert_eq!(
+        c.request(Request::Kickoff { slot: 9 }).await,
+        Response::Error {
+            message: "invalid slot id 9".into()
+        }
+    );
+}
+
+#[tokio::test]
+async fn bead_kickoff_names_its_tickets_folder() {
+    let s = stub_sources("kickoff-bead", false);
+    let d = s.daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    c.refresh().await;
+    assert_eq!(c.assign("ov-1", 4, false, false).await, Response::Ok);
+    let text = match c.request(Request::Kickoff { slot: 4 }).await {
+        Response::Text { text } => text,
+        other => panic!("unexpected {other:?}"),
+    };
+    let folder = s.dir.join("brain/Sprints/sprint-1/DEMO-12-widget");
+    assert!(
+        text.contains(&format!("Ticket folders in 2ndBrain: {}", folder.display())),
+        "{text}"
+    );
+}
+
+/// Moving a bead whose ticket a third slot owns asks first, like a fresh
+/// assign, and tells both the ticket's owner and the old owner.
+#[tokio::test]
+async fn moving_a_bead_under_an_owned_ticket_needs_confirm() {
+    let s = stub_sources("move-warn", false);
+    let d = s.daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    c.refresh().await;
+    assert_eq!(c.assign("DEMO-12", 1, false, false).await, Response::Ok);
+    assert_eq!(c.assign("ov-1", 2, true, false).await, Response::Ok);
+    assert_eq!(
+        c.assign("ov-1", 3, false, true).await,
+        Response::NeedsConfirm {
+            message: "This bead is under DEMO-12, owned by S1. Assign to S3 anyway?".into()
+        }
+    );
+    assert_eq!(item(&c.work().await, "ov-1").owner, Some(2));
+    assert_eq!(c.assign("ov-1", 3, true, true).await, Response::Ok);
+    let v = c.work().await;
+    assert_eq!(item(&v, "ov-1").owner, Some(3));
+    let texts: Vec<_> = v
+        .notices
+        .iter()
+        .map(|n| (n.slot, n.text.as_str()))
+        .collect();
+    assert!(
+        texts.contains(&(1, "S3 took ov-1, which overlaps your work")),
+        "{texts:?}"
+    );
+    assert!(texts.contains(&(2, "ov-1 was moved to S3")), "{texts:?}");
+    wait_for_line(
+        &s.bd_log,
+        "|update ov-1 --add-label overseer:S3 --remove-label overseer:S2",
+    )
+    .await;
+}
+
+/// A release right before a shutdown still reaches `bd`, even when `bd` is
+/// slow, as long as it finishes within the drain time.
+#[tokio::test]
+async fn shutdown_waits_for_queued_labels() {
+    let s = stub_sources("drain", false);
+    write_script(
+        &s.dir.join("bin/bd"),
+        &format!(
+            "if [ \"$1\" = list ]; then cat '{FIXTURES}/bd-list.json'; exit 0; fi\n\
+             sleep 1\nprintf '%s\\n' \"$*\" >> '{}'\n",
+            s.bd_log.display()
+        ),
+    );
+    let d = s.daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    c.refresh().await;
+    assert_eq!(c.assign("ov-3", 2, false, false).await, Response::Ok);
+    assert_eq!(
+        c.request(Request::Release { key: "ov-3".into() }).await,
+        Response::Ok
+    );
+    drop(c);
+    shutdown(d).await;
+    let log = std::fs::read_to_string(&s.bd_log).unwrap_or_default();
+    assert_eq!(
+        log.lines().collect::<Vec<_>>(),
+        [
+            "update ov-3 --add-label overseer:S2",
+            "update ov-3 --remove-label overseer:S2"
+        ],
+        "{log}"
+    );
+}
+
+/// A `bd` that hangs holds shutdown up for the drain time only.
+#[tokio::test]
+async fn shutdown_gives_up_on_a_hung_label() {
+    let s = stub_sources("drain-hung", false);
+    write_script(
+        &s.dir.join("bin/bd"),
+        &format!(
+            "if [ \"$1\" = list ]; then cat '{FIXTURES}/bd-list.json'; exit 0; fi\n\
+             echo $$ >> '{}'\nexec sleep 30\n",
+            s.dir.join("pids").display()
+        ),
+    );
+    let d = s.daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    c.refresh().await;
+    assert_eq!(c.assign("ov-3", 2, false, false).await, Response::Ok);
+    wait_for_log(&s.dir.join("pids"), 1).await;
+    drop(c);
+    let started = std::time::Instant::now();
+    shutdown(d).await;
+    let took = started.elapsed();
+    assert!(took < Duration::from_secs(6), "shutdown took {took:?}");
+    let pids = std::fs::read_to_string(s.dir.join("pids")).unwrap();
+    let running: Vec<_> = pids.lines().filter(|p| alive(p)).collect();
+    assert!(running.is_empty(), "still running: {running:?}");
 }

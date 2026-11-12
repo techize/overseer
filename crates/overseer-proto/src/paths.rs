@@ -31,6 +31,18 @@ fn log_dir_from(over: Option<OsString>, home: Option<OsString>) -> PathBuf {
     }
 }
 
+fn config_path_from(over: Option<OsString>, home: Option<OsString>) -> PathBuf {
+    non_empty(over).unwrap_or_else(|| home_dir(home).join(".config/overseer/config.toml"))
+}
+
+/// `$OVERSEER_CONFIG`, or `$HOME/.config/overseer/config.toml`.
+pub fn config_path() -> PathBuf {
+    config_path_from(
+        std::env::var_os("OVERSEER_CONFIG"),
+        std::env::var_os("HOME"),
+    )
+}
+
 /// `$OVERSEER_HOME`, or `$HOME/Library/Application Support/Overseer`.
 pub fn state_dir() -> PathBuf {
     state_dir_from(std::env::var_os(HOME_VAR), std::env::var_os("HOME"))
@@ -72,6 +84,19 @@ mod tests {
         assert_eq!(
             log_dir_from(None, home),
             PathBuf::from("/Users/me/Library/Logs/Overseer")
+        );
+    }
+
+    #[test]
+    fn config_path_override_and_default() {
+        let home = Some(std::ffi::OsString::from("/Users/me"));
+        assert_eq!(
+            config_path_from(Some("/tmp/c.toml".into()), home.clone()),
+            PathBuf::from("/tmp/c.toml")
+        );
+        assert_eq!(
+            config_path_from(None, home),
+            PathBuf::from("/Users/me/.config/overseer/config.toml")
         );
     }
 

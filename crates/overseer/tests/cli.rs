@@ -11,6 +11,9 @@ static COUNTER: AtomicU32 = AtomicU32::new(0);
 /// Isolated OVERSEER_HOME; shuts the daemon down on drop.
 struct Env {
     home: PathBuf,
+    /// Stub `bd` folder. The daemon finds it through a login shell whose
+    /// home is `home/home`, so the real `bd` is never run.
+    bin: Option<PathBuf>,
 }
 
 impl Env {
@@ -18,16 +21,64 @@ impl Env {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let home = std::env::temp_dir().join(format!("ovc-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&home).unwrap();
-        Env { home }
+        // Keep the daemon off the real beads and Jira.
+        std::fs::write(home.join("config.toml"), "beads_dir = \"/nonexistent/overseer-test-beads\"\nbrain_dir = \"/nonexistent/overseer-test-brain\"\njira_command = []\n").unwrap();
+        Env { home, bin: None }
+    }
+
+    /// Daemon sources pointed at stub `bd` and Jira scripts.
+    fn with_stub_sources() -> Env {
+        use std::os::unix::fs::PermissionsExt;
+        let mut env = Env::new();
+        let bin = env.home.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let script = |name: &str, body: &str| {
+            let p = bin.join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        script(
+            "bd",
+            r#"if [ "$1" = list ]; then cat <<'EOF'
+[{"id":"ov-3","title":"DEMO-12 wire the widget","status":"open","priority":1}]
+EOF
+fi
+"#,
+        );
+        script(
+            "jira-stub",
+            r#"cat <<'EOF'
+{"issues":[{"key":"DEMO-12","fields":{"summary":"Widget wiring","status":{"name":"In Progress"}}}]}
+EOF
+"#,
+        );
+        let cfg = format!(
+            "beads_dir = \"{h}\"\nbrain_dir = \"{h}\"\njira_command = [\"{b}/jira-stub\"]\nticket_pattern = \"DEMO-[0-9]+\"\n",
+            h = env.home.display(),
+            b = bin.display()
+        );
+        std::fs::write(env.home.join("config.toml"), cfg).unwrap();
+        let shell_home = env.home.join("home");
+        std::fs::create_dir_all(&shell_home).unwrap();
+        std::fs::write(
+            shell_home.join(".profile"),
+            format!("export PATH=\"{}:$PATH\"\n", bin.display()),
+        )
+        .unwrap();
+        env.bin = Some(bin);
+        env
     }
 
     fn ctl(&self, args: &[&str]) -> Command {
         let mut c = Command::cargo_bin("overseer").unwrap();
         c.env("OVERSEER_HOME", &self.home)
-            .env("OVERSEER_DEFAULT_COMMAND", SCRIPT)
-            .arg("ctl")
-            .args(args)
-            .timeout(Duration::from_secs(10));
+            .env("OVERSEER_CONFIG", self.home.join("config.toml"))
+            .env("OVERSEER_DEFAULT_COMMAND", SCRIPT);
+        if self.bin.is_some() {
+            c.env("HOME", self.home.join("home"))
+                .env("SHELL", "/bin/sh");
+        }
+        c.arg("ctl").args(args).timeout(Duration::from_secs(10));
         c
     }
 }
@@ -36,6 +87,7 @@ impl Drop for Env {
     fn drop(&mut self) {
         let _ = StdCommand::new(assert_cmd::cargo::cargo_bin("overseer"))
             .env("OVERSEER_HOME", &self.home)
+            .env("OVERSEER_CONFIG", self.home.join("config.toml"))
             .args(["ctl", "shutdown"])
             .output();
         std::thread::sleep(Duration::from_millis(200));
@@ -94,6 +146,7 @@ fn attach_empty_slot_message() {
     let mut c = Command::cargo_bin("overseer").unwrap();
     let out = c
         .env("OVERSEER_HOME", &env.home)
+        .env("OVERSEER_CONFIG", env.home.join("config.toml"))
         .env("OVERSEER_DEFAULT_COMMAND", SCRIPT)
         .args(["attach", "3"])
         .timeout(Duration::from_secs(10))
@@ -113,6 +166,7 @@ fn daemon_logs_and_exits_zero_on_shutdown() {
     let env = Env::new();
     let mut daemon = StdCommand::new(assert_cmd::cargo::cargo_bin("overseer"))
         .env("OVERSEER_HOME", &env.home)
+        .env("OVERSEER_CONFIG", env.home.join("config.toml"))
         .env("OVERSEER_DEFAULT_COMMAND", SCRIPT)
         .args(["daemon", "--foreground"])
         .spawn()
@@ -146,6 +200,7 @@ fn daemon_logs_and_exits_zero_on_shutdown() {
 fn spawn_daemon(env: &Env, vars: &[(&str, &str)]) -> std::process::Child {
     let mut cmd = StdCommand::new(assert_cmd::cargo::cargo_bin("overseer"));
     cmd.env("OVERSEER_HOME", &env.home)
+        .env("OVERSEER_CONFIG", env.home.join("config.toml"))
         .env("OVERSEER_DEFAULT_COMMAND", SCRIPT)
         .args(["daemon", "--foreground"]);
     for (k, v) in vars {
@@ -177,6 +232,7 @@ fn second_daemon_exits_zero_and_leaves_the_first_running() {
     let mut first = spawn_daemon(&env, &[]);
     let mut second = StdCommand::new(assert_cmd::cargo::cargo_bin("overseer"))
         .env("OVERSEER_HOME", &env.home)
+        .env("OVERSEER_CONFIG", env.home.join("config.toml"))
         .args(["daemon", "--foreground"])
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -286,4 +342,51 @@ fn sessions_get_the_login_shell_env_without_parent_session_vars() {
         !log.contains("from-rc") && !log.contains("parent-token"),
         "{log}"
     );
+}
+
+#[test]
+fn items_prints_tickets_then_indented_beads() {
+    let env = Env::with_stub_sources();
+    env.ctl(&["refresh"]).assert().success();
+    let out = stdout_of(&mut env.ctl(&["items"]));
+    let lines: Vec<&str> = out.lines().collect();
+    // Source lines come first, tickets next, then beads under their ticket.
+    let pos = |pre: &str| lines.iter().position(|l| l.starts_with(pre)).expect(pre);
+    assert!(lines[pos("beads  ok  1 items")].contains("items"), "{out}");
+    let jira = pos("jira  ok  1 items");
+    let ticket = pos("DEMO-12  In Progress  -  Widget wiring");
+    assert!(jira < ticket, "{out}");
+    assert_eq!(
+        lines[ticket], "DEMO-12  In Progress  -  Widget wiring",
+        "{out}"
+    );
+    assert!(lines[ticket + 1].starts_with("  ov-3  "), "{out}");
+    assert!(
+        lines[ticket + 1].ends_with("DEMO-12 wire the widget"),
+        "{out}"
+    );
+    let json = stdout_of(&mut env.ctl(&["items", "--json"]));
+    assert!(json.contains("\"key\":\"DEMO-12\""), "{json}");
+}
+
+#[test]
+fn assign_needs_confirm_exits_2() {
+    let env = Env::with_stub_sources();
+    env.ctl(&["refresh"]).assert().success();
+    env.ctl(&["assign", "1", "DEMO-12"]).assert().success();
+    let out = env
+        .ctl(&["assign", "2", "ov-3"])
+        .assert()
+        .code(2)
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Assign to S2 anyway?"), "{stdout}");
+    env.ctl(&["assign", "2", "ov-3", "--yes"])
+        .assert()
+        .success();
+    let out = stdout_of(&mut env.ctl(&["items"]));
+    assert!(out.contains("  ov-3  open  S2  "), "{out}");
+    env.ctl(&["assign", "3", "DEMO-12"]).assert().code(1);
+    env.ctl(&["release", "DEMO-12"]).assert().success();
 }

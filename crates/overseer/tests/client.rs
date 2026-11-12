@@ -17,6 +17,13 @@ async fn attach_snapshot_precedes_live_output() {
         env: overseer_daemon::EnvSource::Inherit,
         state_dir: dir.join("state"),
         hook_program: std::path::PathBuf::from("/bin/true"),
+        // No real beads or Jira.
+        settings: overseer_daemon::Config {
+            beads_dir: "/nonexistent/overseer-test-beads".into(),
+            brain_dir: "/nonexistent/overseer-test-brain".into(),
+            jira_command: vec![],
+            ..overseer_daemon::Config::default()
+        },
     }));
     let client = Client::connect_or_start(&socket, || Ok(())).await.unwrap();
     let mut rx = client.subscribe();

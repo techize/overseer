@@ -3,18 +3,20 @@
 //!
 //! Navigation keys never take terminal input:
 //! - `Cmd+0` to `Cmd+6` open a session and `Cmd+Esc` goes to the board, from
-//!   anywhere except the start dialog. Cmd keys never reach the PTY anyway.
+//!   anywhere except the start dialog and the picker. Cmd keys never reach
+//!   the PTY anyway.
 //! - Plain `Esc` goes to the board only when focus is in the session view
 //!   but not in its terminal (after clicking the tab strip or the context
 //!   panel). In the terminal, Esc closes the find bar when it is open and
 //!   otherwise goes to Claude Code, which uses it to interrupt.
 //! - Plain digits always go to whatever has focus.
+//! - `a` on the board opens the work-item picker for the selected card.
 //!
 //! The routing is GPUI's keymap with the contexts `Overseer` (window),
-//! `Board`, `Session`, `Terminal` and `StartDialog`; `key_bindings` is tested
-//! against GPUI's `Keymap` directly.
+//! `Board`, `Session`, `Terminal`, `StartDialog` and `Picker`;
+//! `key_bindings` is tested against GPUI's `Keymap` directly.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -23,12 +25,15 @@ use gpui::{
     actions, div, prelude::*, rgb, App, Context, Entity, FocusHandle, Focusable, KeyBinding,
     Subscription, Task, Window,
 };
-use overseer_proto::{Client, Event, Frame, Request, Response, SlotId, SlotInfo, SlotState};
+use overseer_proto::{
+    Client, Event, Frame, Request, Response, SlotId, SlotInfo, SlotState, WorkView,
+};
 
 use crate::board::Dir;
+use crate::picker::{Picker, PickerEvent};
 use crate::session::RestartPlan;
 use crate::session::{incarnation, keep_view, restart_begin, restart_on_change, Incarnation};
-use crate::start_dialog::{DialogEvent, StartDialog};
+use crate::start_dialog::{DialogEvent, Prefill, StartDialog};
 use crate::{FrameHub, TerminalView, Theme};
 
 /// Dark palette from the approved mockups.
@@ -73,6 +78,7 @@ actions!(
         SelectDown,
         OpenSelected,
         ResumeSelected,
+        AssignSelected,
     ]
 );
 
@@ -83,8 +89,9 @@ pub enum Screen {
     Session(SlotId),
 }
 
-/// Navigation keys work anywhere in the window except the start dialog.
-const NAV: &str = "Overseer && !StartDialog";
+/// Navigation keys work anywhere in the window except the start dialog and
+/// the picker.
+const NAV: &str = "Overseer && !StartDialog && !Picker";
 
 pub fn key_bindings() -> Vec<KeyBinding> {
     let nav = Some(NAV);
@@ -107,6 +114,7 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("down", SelectDown, Some("Board")),
         KeyBinding::new("enter", OpenSelected, Some("Board")),
         KeyBinding::new("r", ResumeSelected, Some("Board")),
+        KeyBinding::new("a", AssignSelected, Some("Board")),
         KeyBinding::new("cmd-q", Quit, None),
     ]
 }
@@ -181,10 +189,41 @@ pub fn card_click(info: &SlotInfo) -> CardClick {
     }
 }
 
+/// Whether assigning to this slot goes on to start it with the kickoff
+/// ("Assign and start"): it has no session running.
+pub fn assign_starts(info: &SlotInfo) -> bool {
+    matches!(info.state, SlotState::Empty | SlotState::Exited { .. })
+}
+
+/// The keys a fresh kickoff for `slot` names, in card order: what the view
+/// says it owns, plus `assigned` when the view has not caught up yet.
+pub fn kickoff_keys(work: &WorkView, slot: SlotId, assigned: &str) -> Vec<String> {
+    let mut keys: Vec<String> = crate::board::owned_by(work, slot)
+        .into_iter()
+        .map(|i| i.key.clone())
+        .collect();
+    if !keys.iter().any(|k| k == assigned) {
+        keys.push(assigned.to_string());
+    }
+    keys
+}
+
 pub fn now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64)
+}
+
+/// How long after the kickoff paste its Return is sent.
+const KICKOFF_RETURN_DELAY: Duration = Duration::from_millis(100);
+
+/// The work view before the daemon's first answer.
+pub fn empty_work() -> WorkView {
+    WorkView {
+        items: Vec::new(),
+        sources: Vec::new(),
+        notices: Vec::new(),
+    }
 }
 
 fn empty_slots() -> Vec<SlotInfo> {
@@ -212,6 +251,8 @@ pub struct OverseerApp {
     client: Arc<Client>,
     theme: Theme,
     pub(crate) slots: Vec<SlotInfo>,
+    /// Work items, owners, source health and notices from the daemon.
+    pub(crate) work: WorkView,
     pub(crate) screen: Screen,
     pub(crate) selected: SlotId,
     pub(crate) home: Option<PathBuf>,
@@ -219,7 +260,12 @@ pub struct OverseerApp {
     pub(crate) status: Option<String>,
     terminals: HashMap<SlotId, TermEntry>,
     dialog: Option<(Entity<StartDialog>, Subscription)>,
+    picker: Option<(Entity<Picker>, Subscription)>,
+    /// Pickers closed with an assign on its way; see `PickerEvent::Late`.
+    leaving: Vec<(Entity<Picker>, Subscription)>,
     restarts: HashMap<SlotId, RestartPlan>,
+    /// Slots with a kickoff on its way; see `send_kickoff`.
+    kickoffs: HashSet<SlotId>,
     /// Focus this slot's terminal as soon as it exists.
     focus_when_ready: Option<SlotId>,
     root_focus: FocusHandle,
@@ -266,11 +312,17 @@ impl OverseerApp {
                 }
             }
         });
-        // The list comes back through the event stream (a marked reply), so
-        // it is applied in order with the events around it.
+        // The lists come back through the event stream (marked replies), so
+        // they are applied in order with the events around them.
         let lister = client.clone();
         cx.spawn(async move |this, cx| {
-            if let Err(e) = lister.request_marked(Request::ListSlots, |_| true).await {
+            let mut result = lister.request_marked(Request::ListSlots, |_| true).await;
+            if result.is_ok() {
+                result = lister
+                    .request_marked(Request::ListWorkItems, |_| true)
+                    .await;
+            }
+            if let Err(e) = result {
                 let _ = this.update(cx, |this, cx| {
                     this.status = Some(format!("{} ({e:#})", crate::terminal_view::LOST_DAEMON));
                     cx.notify();
@@ -284,13 +336,17 @@ impl OverseerApp {
             client,
             theme,
             slots: empty_slots(),
+            work: empty_work(),
             screen: Screen::Board,
             selected: 1,
             home: std::env::var_os("HOME").map(PathBuf::from),
             status: None,
             terminals: HashMap::new(),
             dialog: None,
+            picker: None,
+            leaving: Vec::new(),
             restarts: HashMap::new(),
+            kickoffs: HashSet::new(),
             focus_when_ready: None,
             root_focus: cx.focus_handle(),
             board_focus,
@@ -314,6 +370,17 @@ impl OverseerApp {
                 for info in list {
                     self.apply_info(info, true, window, cx);
                 }
+            }
+            Frame::Event(Event::WorkChanged(view))
+            | Frame::Response {
+                resp: Response::Work(view),
+                ..
+            } => {
+                if let Some((p, _)) = &self.picker {
+                    p.update(cx, |p, cx| p.set_view(view.clone(), cx));
+                }
+                self.work = view;
+                cx.notify();
             }
             _ => {}
         }
@@ -348,7 +415,7 @@ impl OverseerApp {
             }
         }
         self.slots[id as usize] = info;
-        if self.screen == Screen::Session(id) && self.dialog.is_none() {
+        if self.screen == Screen::Session(id) && !self.modal_open() {
             if let Some(view) = self.ensure_terminal(id, window, cx) {
                 // The old terminal had focus, or the user is waiting for
                 // this slot's terminal (just started or restarted).
@@ -450,6 +517,172 @@ impl OverseerApp {
         self.go_session(id, window, cx);
     }
 
+    /// Gives up the slot's hold on a work item. The new state comes back as
+    /// a `WorkChanged` event.
+    pub(crate) fn release_item(&mut self, key: String, cx: &mut Context<Self>) {
+        self.status = None;
+        self.send(Request::Release { key }, cx);
+    }
+
+    pub(crate) fn clear_notices(&mut self, slot: SlotId, cx: &mut Context<Self>) {
+        self.status = None;
+        self.send(Request::ClearNotices { slot }, cx);
+    }
+
+    pub(crate) fn kickoff_pending(&self, slot: SlotId) -> bool {
+        self.kickoffs.contains(&slot)
+    }
+
+    /// Asks the daemon for the slot's kickoff prompt and pastes it into the
+    /// session, then presses Return. Return goes a moment after the paste so
+    /// it lands once the paste has closed instead of inside it. The button
+    /// stays off until this is done.
+    pub(crate) fn send_kickoff(&mut self, slot: SlotId, cx: &mut Context<Self>) {
+        if !self.kickoffs.insert(slot) {
+            return;
+        }
+        self.status = None;
+        cx.notify();
+        let client = self.client.clone();
+        cx.spawn(async move |this, cx| {
+            let reply = client.request(Request::Kickoff { slot }).await;
+            let mut err = match reply {
+                Ok(Response::Text { text }) => {
+                    let modes = this
+                        .update(cx, |this, cx| this.term_modes(slot, cx))
+                        .unwrap_or_default();
+                    let bytes = crate::session::kickoff_bytes(&text, &modes);
+                    let mut typed = client.send_input(slot, &bytes).await;
+                    if typed.is_ok() {
+                        cx.background_executor().timer(KICKOFF_RETURN_DELAY).await;
+                        typed = client.send_input(slot, b"\r").await;
+                    }
+                    typed
+                        .err()
+                        .map(|e| format!("{} ({e})", crate::terminal_view::LOST_DAEMON))
+                }
+                Ok(Response::Error { message }) => Some(message),
+                Ok(other) => Some(format!("unexpected reply to kickoff: {other:?}")),
+                Err(e) => Some(format!("{} ({e:#})", crate::terminal_view::LOST_DAEMON)),
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.kickoffs.remove(&slot);
+                if let Some(e) = err.take() {
+                    this.status = Some(e);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The modes the slot's session set on its terminal (bracketed paste
+    /// and so on). Defaults when no terminal view was made for it.
+    fn term_modes(&self, slot: SlotId, cx: &App) -> overseer_term::TermModes {
+        self.terminals
+            .get(&slot)
+            .map(|t| t.view.read(cx).term_modes())
+            .unwrap_or_default()
+    }
+
+    /// The start dialog or the picker is up; navigation waits for it.
+    fn modal_open(&self) -> bool {
+        self.dialog.is_some() || self.picker.is_some()
+    }
+
+    /// The work-item picker for `slot`: `a` on the board, `+ assign` on an
+    /// empty card, or Assign in the session panel.
+    pub(crate) fn open_picker(
+        &mut self,
+        slot: SlotId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.modal_open() {
+            return;
+        }
+        self.status = None;
+        let client = self.client.clone();
+        let view = self.work.clone();
+        let picker = cx.new(|cx| Picker::new(slot, client, view, cx));
+        let sub = cx.subscribe_in(
+            &picker,
+            window,
+            |this, picker, ev: &PickerEvent, window, cx| {
+                match ev {
+                    PickerEvent::Assigned { slot, key } => {
+                        this.picker = None;
+                        this.restore_focus(window, cx);
+                        let start = this.slots.get(*slot as usize).is_some_and(assign_starts);
+                        if start {
+                            this.assign_and_start(*slot, key.clone(), window, cx);
+                        }
+                    }
+                    PickerEvent::Closed => {
+                        // Kept until its request is answered, for `Late`.
+                        if let Some(open) = this.picker.take() {
+                            if open.0.read(cx).busy() {
+                                this.leaving.push(open);
+                            }
+                        }
+                        this.restore_focus(window, cx);
+                    }
+                    PickerEvent::Late(line) => {
+                        this.leaving.retain(|(p, _)| p != picker);
+                        if !line.is_empty() {
+                            this.status = Some(line.clone());
+                        }
+                    }
+                }
+                cx.notify();
+            },
+        );
+        window.focus(&picker.focus_handle(cx));
+        self.picker = Some((picker, sub));
+        cx.notify();
+    }
+
+    /// After assigning to a slot with no session: fetch its kickoff and
+    /// open the start dialog with it as the first prompt.
+    fn assign_and_start(
+        &mut self,
+        slot: SlotId,
+        key: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let client = self.client.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let reply = client.request(Request::Kickoff { slot }).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                match reply {
+                    Ok(Response::Text { text }) => {
+                        let keys = kickoff_keys(&this.work, slot, &key);
+                        let prefill = Prefill {
+                            label: keys.first().cloned().unwrap_or(key),
+                            prompt: text,
+                            keys,
+                        };
+                        // Something else opened meanwhile; the item stays
+                        // assigned and Send kickoff still works later.
+                        if !this.modal_open() {
+                            this.open_dialog_with(slot, Some(prefill), window, cx);
+                        }
+                    }
+                    Ok(Response::Error { message }) => this.status = Some(message),
+                    Ok(other) => {
+                        this.status = Some(format!("unexpected reply to kickoff: {other:?}"))
+                    }
+                    Err(e) => {
+                        this.status = Some(format!("{} ({e:#})", crate::terminal_view::LOST_DAEMON))
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// Stop, wait for Exited, then start with the same label, cwd and
     /// command. The new run replaces the terminal view (see `apply_info`).
     pub(crate) fn restart_slot(&mut self, id: SlotId, cx: &mut Context<Self>) {
@@ -505,7 +738,7 @@ impl OverseerApp {
     fn notification_clicked(&mut self, id: SlotId, window: &mut Window, cx: &mut Context<Self>) {
         cx.activate(true);
         window.activate_window();
-        if self.dialog.is_none() {
+        if !self.modal_open() {
             self.go_session(id, window, cx);
         }
     }
@@ -524,6 +757,16 @@ impl OverseerApp {
     }
 
     pub(crate) fn open_dialog(&mut self, id: SlotId, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_dialog_with(id, None, window, cx);
+    }
+
+    fn open_dialog_with(
+        &mut self,
+        id: SlotId,
+        prefill: Option<Prefill>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.status = None;
         let client = self.client.clone();
         // A stopped slot reopens with its last settings, to change them.
@@ -531,7 +774,7 @@ impl OverseerApp {
             .slots
             .get(id as usize)
             .filter(|i| matches!(i.state, SlotState::Exited { .. }));
-        let dialog = cx.new(|cx| StartDialog::new(id, client, last, cx));
+        let dialog = cx.new(|cx| StartDialog::new(id, client, last, prefill, cx));
         let sub = cx.subscribe_in(&dialog, window, |this, _, ev: &DialogEvent, window, cx| {
             this.dialog = None;
             match ev {
@@ -585,6 +828,7 @@ impl Render for OverseerApp {
             .text_color(rgb(colors::TEXT))
             .child(screen)
             .children(self.dialog.as_ref().map(|(d, _)| d.clone()))
+            .children(self.picker.as_ref().map(|(p, _)| p.clone()))
     }
 }
 
@@ -621,6 +865,7 @@ mod tests {
     const CHROME: &[&str] = &["Overseer", "Session"];
     const BOARD: &[&str] = &["Overseer", "Board"];
     const DIALOG: &[&str] = &["Overseer", "StartDialog"];
+    const PICKER: &[&str] = &["Overseer", "Picker"];
 
     #[test]
     fn cmd_digits_navigate_from_everywhere_but_the_dialog() {
@@ -628,6 +873,25 @@ mod tests {
         assert_eq!(routed("cmd-0", BOARD), Some("overseer::GoS0"));
         assert_eq!(routed("cmd-6", CHROME), Some("overseer::GoS6"));
         assert_eq!(routed("cmd-1", DIALOG), None);
+        assert_eq!(routed("cmd-1", PICKER), None);
+    }
+
+    #[test]
+    fn the_picker_keeps_its_keys() {
+        // Typing, arrows, Enter and Esc go to the picker's own handler.
+        for k in [
+            "a",
+            "r",
+            "up",
+            "down",
+            "enter",
+            "escape",
+            "cmd-n",
+            "cmd-escape",
+        ] {
+            assert_eq!(routed(k, PICKER), None, "{k}");
+        }
+        assert_eq!(routed("cmd-q", PICKER), Some("overseer::Quit"));
     }
 
     #[test]
@@ -659,6 +923,9 @@ mod tests {
         assert_eq!(routed("enter", BOARD), Some("overseer::OpenSelected"));
         assert_eq!(routed("r", BOARD), Some("overseer::ResumeSelected"));
         assert_eq!(routed("r", TERMINAL), None);
+        assert_eq!(routed("a", BOARD), Some("overseer::AssignSelected"));
+        assert_eq!(routed("a", TERMINAL), None);
+        assert_eq!(routed("a", CHROME), None);
         // Arrows and Enter in a terminal are Claude Code's.
         assert_eq!(routed("left", TERMINAL), None);
         assert_eq!(routed("enter", TERMINAL), None);
@@ -717,6 +984,49 @@ mod tests {
         assert_eq!(start_target(Screen::Board, 1, &s), None);
         assert_eq!(start_target(Screen::Session(1), 5, &s), None);
         assert_eq!(start_target(Screen::Session(4), 1, &s), Some(4));
+    }
+
+    #[test]
+    fn assign_starts_only_without_a_session() {
+        let mut s = slots_with(&[1]);
+        s[2].state = SlotState::Exited { code: None, at: 0 };
+        s[3].state = SlotState::Resumable {
+            session_id: "abc".into(),
+            at: 0,
+        };
+        assert!(assign_starts(&s[5]), "empty");
+        assert!(assign_starts(&s[2]), "exited");
+        assert!(!assign_starts(&s[1]), "running");
+        assert!(!assign_starts(&s[3]), "resumable has a session to resume");
+    }
+
+    #[test]
+    fn kickoff_keys_include_the_new_item() {
+        use overseer_proto::{ItemKind, WorkItem};
+        let item = |key: &str, kind, owner| WorkItem {
+            key: key.into(),
+            kind,
+            title: String::new(),
+            status: "open".into(),
+            priority: None,
+            parent: None,
+            owner,
+            in_list: true,
+            folder: None,
+        };
+        let mut work = empty_work();
+        work.items = vec![
+            item("ov-3", ItemKind::Bead, Some(4)),
+            item("DEMO-12", ItemKind::Ticket, Some(4)),
+            item("DEMO-40", ItemKind::Ticket, Some(2)),
+        ];
+        assert_eq!(kickoff_keys(&work, 4, "DEMO-12"), ["DEMO-12", "ov-3"]);
+        assert_eq!(
+            kickoff_keys(&work, 4, "ov-9"),
+            ["DEMO-12", "ov-3", "ov-9"],
+            "not in the view yet"
+        );
+        assert_eq!(kickoff_keys(&work, 5, "ov-9"), ["ov-9"]);
     }
 
     #[test]

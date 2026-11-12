@@ -1,7 +1,7 @@
 //! Unix socket server: one reader task, one writer task and one handler per
 //! connection.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -17,6 +17,8 @@ use crate::env::{BaseEnv, EnvSource};
 use crate::ledger::Ledger;
 use crate::manager::{valid_id, Attachment, SlotManager};
 use crate::slot::CatchUp;
+use crate::work::store::unix_now;
+use crate::work::WorkStore;
 
 /// Frames queued per connection before it is considered too slow.
 const OUTBOUND_QUEUE: usize = 256;
@@ -35,6 +37,8 @@ pub struct DaemonConfig {
     pub state_dir: PathBuf,
     /// The binary the generated hooks call (`<hook_program> hook <Event>`).
     pub hook_program: PathBuf,
+    /// Settings from `config.toml`.
+    pub settings: crate::config::Config,
 }
 
 /// `run` found another daemon serving the socket. Not a failure: the daemon
@@ -90,11 +94,15 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
             Ledger::in_memory()
         }
     };
+    let ledger = Arc::new(ledger);
+    let store = WorkStore::new(&cfg.settings, ledger.clone(), events.clone(), env.clone());
+    let state_dir = cfg.state_dir.clone();
     let mut mgr = SlotManager::new(cfg.default_command, events)
         .with_env(env.clone())
-        .with_launch(cfg.state_dir, cfg.hook_program, Arc::new(ledger));
+        .with_launch(cfg.state_dir, cfg.hook_program, ledger);
     mgr.restore();
     let manager: Manager = Arc::new(Mutex::new(mgr));
+    store.start_polling();
     let shutdown = Arc::new(Notify::new());
     let mut conns = JoinSet::new();
 
@@ -102,7 +110,14 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
         tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
-                    conns.spawn(handle_conn(stream, manager.clone(), shutdown.clone(), env.clone()));
+                    conns.spawn(handle_conn(
+                        stream,
+                        manager.clone(),
+                        store.clone(),
+                        state_dir.clone(),
+                        shutdown.clone(),
+                        env.clone(),
+                    ));
                 }
                 Err(e) => tracing::warn!("accept failed: {e}"),
             },
@@ -111,7 +126,10 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
         }
     }
 
+    store.shutdown();
     manager.lock().unwrap().shutdown_all();
+    // A label change just before a restart should still reach the bead.
+    store.drain_labels(crate::work::store::LABEL_DRAIN).await;
     let _ = std::fs::remove_file(&cfg.socket);
     tokio::time::sleep(SHUTDOWN_GRACE).await;
     // Dropping `conns` aborts every connection task, closing the sockets.
@@ -225,6 +243,8 @@ impl Streams {
 async fn handle_conn(
     stream: UnixStream,
     manager: Manager,
+    store: Arc<WorkStore>,
+    state_dir: PathBuf,
     shutdown: Arc<Notify>,
     mut env: BaseEnv,
 ) {
@@ -287,7 +307,7 @@ async fn handle_conn(
                     ) {
                         env.wait().await;
                     }
-                    handle_frame(f, &manager, &outbox, &shutdown, &mut streams)
+                    handle_frame(f, &manager, &store, &state_dir, &outbox, &shutdown, &mut streams)
                 }
                 None => break, // client hung up
             },
@@ -312,15 +332,33 @@ async fn handle_conn(
 fn handle_frame(
     frame: Frame,
     manager: &Manager,
+    store: &Arc<WorkStore>,
+    state_dir: &Path,
     outbox: &Outbox,
     shutdown: &Notify,
     streams: &mut Streams,
 ) {
     match frame {
+        // Runs the sources, which can take up to their timeout, so it is
+        // answered from a task of its own and the connection keeps serving.
+        Frame::Request {
+            seq,
+            req: Request::RefreshWorkItems,
+        } => {
+            let task_store = store.clone();
+            let outbox = outbox.clone();
+            store.spawn(async move {
+                task_store.refresh_all().await;
+                outbox.send(Frame::Response {
+                    seq,
+                    resp: Response::Work(task_store.view()),
+                });
+            });
+        }
         Frame::Request { seq, req } => {
             let is_shutdown = matches!(req, Request::Shutdown);
             let mut pending_attach = None;
-            let resp = handle_request(req, manager, streams, &mut pending_attach);
+            let resp = handle_request(req, manager, store, state_dir, streams, &mut pending_attach);
             // A re-attach ends the earlier stream before its Ok is queued.
             let gate = pending_attach.as_ref().map(|(id, _)| streams.cut(*id));
             outbox.send(Frame::Response { seq, resp });
@@ -357,6 +395,8 @@ fn handle_frame(
 fn handle_request(
     req: Request,
     manager: &Manager,
+    store: &Arc<WorkStore>,
+    state_dir: &Path,
     streams: &mut Streams,
     pending_attach: &mut Option<(SlotId, Attachment)>,
 ) -> Response {
@@ -367,6 +407,32 @@ fn handle_request(
             Response::Ok
         }
         Request::ListSlots => Response::Slots(manager.lock().unwrap().list()),
+        // RefreshWorkItems is answered in `handle_frame` once the sources
+        // have run; this arm only keeps the match whole.
+        Request::ListWorkItems | Request::RefreshWorkItems => Response::Work(store.view()),
+        Request::Assign {
+            key,
+            slot,
+            confirm,
+            move_owner,
+        } => store.assign(&key, slot, confirm, move_owner, unix_now()),
+        Request::Release { key } => store.release(&key, unix_now()),
+        Request::ClearNotices { slot } => store.clear_notices(slot),
+        Request::Kickoff { slot } if !valid_id(slot) => err(format!("invalid slot id {slot}")),
+        Request::Kickoff { slot } => {
+            let items = store.view().items;
+            let template = match crate::launch::assignment_template(state_dir) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!("assignment template unreadable, using the default: {e}");
+                    crate::launch::ASSIGNMENT.to_string()
+                }
+            };
+            match crate::work::store::kickoff_text(&template, slot, &items, store.brain_dir()) {
+                Some(text) => Response::Text { text },
+                None => err(format!("{} owns no work items", slot_name(slot))),
+            }
+        }
         Request::StartSlot {
             id,
             label,

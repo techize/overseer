@@ -7,13 +7,16 @@ license.workspace = true
 [dependencies]
 overseer-proto = { path = "../overseer-proto" }
 portable-pty.workspace = true
-tokio = { workspace = true, features = ["sync", "rt", "time", "macros", "net", "io-util"] }
+tokio = { workspace = true, features = ["sync", "rt", "time", "macros", "net", "io-util", "process"] }
+regex.workspace = true
 bytes.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 libc = "0.2"
 rusqlite = { version = "0.32", features = ["bundled"] }
+serde.workspace = true
 serde_json.workspace = true
+toml = "0.8"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]

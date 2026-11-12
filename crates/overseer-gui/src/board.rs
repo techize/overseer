@@ -10,11 +10,16 @@
 //! line under the cwd says what it is doing or why it needs you. A running
 //! slot without activity (any other command) keeps the plain Running badge,
 //! with its command (`htop`) on the line under the cwd.
+//!
+//! Each card also shows the work its slot owns as pills under the title,
+//! and the header ends with the state of the work sources (`source_line`).
 
 use std::path::Path;
 
 use gpui::{div, prelude::*, px, rgb, Context, FontWeight, Window};
-use overseer_proto::{slot_name, Activity, ActivityKind, SlotId, SlotInfo, SlotState};
+use overseer_proto::{
+    slot_name, Activity, ActivityKind, ItemKind, SlotId, SlotInfo, SlotState, WorkItem, WorkView,
+};
 
 use crate::app::{colors, OverseerApp};
 
@@ -50,6 +55,87 @@ pub struct CardModel {
     pub now_doing: Option<String>,
     /// Shows a Resume button.
     pub can_resume: bool,
+    /// Keys of the work the slot owns; see `pills`.
+    pub pills: Vec<String>,
+}
+
+/// The items `slot` owns: tickets first, then beads, each in view order.
+pub fn owned_by(view: &WorkView, slot: SlotId) -> Vec<&WorkItem> {
+    let mine = |kind: ItemKind| {
+        view.items
+            .iter()
+            .filter(move |i| i.owner == Some(slot) && i.kind == kind)
+    };
+    mine(ItemKind::Ticket).chain(mine(ItemKind::Bead)).collect()
+}
+
+/// Most pills a card shows before the rest become `+N`.
+const MAX_PILLS: usize = 3;
+
+/// The pill text for `items` (from `owned_by`): each ticket and each bead
+/// whose ticket is not among them. More than three show as the first three
+/// and `+N`.
+pub fn pills(items: &[&WorkItem]) -> Vec<String> {
+    let under_owned = |i: &WorkItem| {
+        i.kind == ItemKind::Bead
+            && i.parent.as_ref().is_some_and(|p| {
+                items
+                    .iter()
+                    .any(|t| t.kind == ItemKind::Ticket && &t.key == p)
+            })
+    };
+    let mut keys: Vec<String> = items
+        .iter()
+        .filter(|i| !under_owned(i))
+        .map(|i| i.key.clone())
+        .collect();
+    if keys.len() > MAX_PILLS {
+        let rest = keys.len() - MAX_PILLS;
+        keys.truncate(MAX_PILLS);
+        keys.push(format!("+{rest}"));
+    }
+    keys
+}
+
+/// The header's source health: `jira 12 · beads 133 · 14:05`, or
+/// `jira: acli not found · beads 133 · 14:05` when a source failed. Jira
+/// leads; the time is the newest successful read, through `clock`.
+pub fn source_line(view: &WorkView, clock: impl Fn(i64) -> String) -> String {
+    let mut sources: Vec<_> = view.sources.iter().collect();
+    sources.sort_by_key(|s| s.name != "jira");
+    let mut parts: Vec<String> = sources
+        .iter()
+        .map(|s| {
+            if s.ok {
+                format!("{} {}", s.name, s.count)
+            } else {
+                let msg = s.message.as_deref().unwrap_or("failed");
+                format!("{}: {}", s.name, short_message(msg))
+            }
+        })
+        .collect();
+    if let Some(at) = sources.iter().filter(|s| s.ok).filter_map(|s| s.at).max() {
+        parts.push(clock(at));
+    }
+    parts.join(" · ")
+}
+
+/// Longest source error the header shows before cutting it.
+const MAX_SOURCE_MESSAGE: usize = 40;
+
+/// `msg` cut to 40 characters with an ellipsis, so a long source error
+/// does not crowd the header.
+pub fn short_message(msg: &str) -> String {
+    match msg.char_indices().nth(MAX_SOURCE_MESSAGE) {
+        Some((cut, _)) => format!("{}…", &msg[..cut]),
+        None => msg.to_string(),
+    }
+}
+
+/// Local `HH:MM` for unix seconds.
+pub fn local_hhmm(t: i64) -> String {
+    let full = crate::session::local_clock(t);
+    full.get(..5).unwrap_or(&full).to_string()
 }
 
 /// `45s`, `8m 05s`, `2h 03m`. Negative input (clock skew) shows `0s`.
@@ -112,7 +198,6 @@ pub fn slot_title(info: &SlotInfo) -> String {
     }
 }
 
-/// The card for `info` at unix time `now`.
 /// The detail line for a running slot without activity, such as `htop`: the
 /// program's file name and its arguments, cut to 80 characters.
 fn command_line(command: &[String]) -> Option<String> {
@@ -135,9 +220,12 @@ fn command_line(command: &[String]) -> Option<String> {
     })
 }
 
-pub fn card_model(info: &SlotInfo, now: i64, home: Option<&Path>) -> CardModel {
+/// The card for `info` at unix time `now`, with the pills of the work it
+/// owns in `work`.
+pub fn card_model(info: &SlotInfo, now: i64, home: Option<&Path>, work: &WorkView) -> CardModel {
     let cwd = info.cwd.as_deref().map(|p| tilde(p, home));
     let title = slot_title(info);
+    let pills = pills(&owned_by(work, info.id));
     match &info.state {
         SlotState::Empty => CardModel {
             title,
@@ -147,6 +235,7 @@ pub fn card_model(info: &SlotInfo, now: i64, home: Option<&Path>) -> CardModel {
             pid: None,
             now_doing: None,
             can_resume: false,
+            pills,
         },
         SlotState::Running { pid, since } => {
             let (badge, tone, now_doing) = match &info.activity {
@@ -173,6 +262,7 @@ pub fn card_model(info: &SlotInfo, now: i64, home: Option<&Path>) -> CardModel {
                 pid: Some(format!("pid {pid}")),
                 now_doing,
                 can_resume: false,
+                pills,
             }
         }
         SlotState::Exited { code, .. } => CardModel {
@@ -186,6 +276,7 @@ pub fn card_model(info: &SlotInfo, now: i64, home: Option<&Path>) -> CardModel {
             pid: None,
             now_doing: None,
             can_resume: false,
+            pills,
         },
         SlotState::Resumable { .. } => CardModel {
             title,
@@ -195,6 +286,7 @@ pub fn card_model(info: &SlotInfo, now: i64, home: Option<&Path>) -> CardModel {
             pid: None,
             now_doing: None,
             can_resume: true,
+            pills,
         },
     }
 }
@@ -282,10 +374,22 @@ fn edge_color(tone: Tone) -> u32 {
     }
 }
 
+/// One small rounded tag with a work-item key.
+fn pill(key: String) -> gpui::Div {
+    div()
+        .px_1()
+        .rounded(px(4.))
+        .text_xs()
+        .bg(rgb(colors::ACCENT_BG))
+        .text_color(rgb(colors::ACCENT))
+        .child(key)
+}
+
 impl OverseerApp {
     fn render_card(&self, id: SlotId, now: i64, cx: &mut Context<Self>) -> impl IntoElement {
         let info = &self.slots[id as usize];
-        let m = card_model(info, now, self.home.as_deref());
+        let m = card_model(info, now, self.home.as_deref(), &self.work);
+        let empty = m.tone == Tone::Empty;
         let selected = self.selected == id;
         let edge = edge_color(m.tone);
         div()
@@ -312,18 +416,60 @@ impl OverseerApp {
                     .child(
                         div()
                             .flex()
+                            .flex_1()
+                            .min_w(px(0.))
                             .gap_2()
-                            .child(div().w(px(4.)).h(px(16.)).rounded(px(2.)).bg(rgb(edge)))
-                            .child(div().font_weight(FontWeight::SEMIBOLD).child(m.title)),
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .w(px(4.))
+                                    .h(px(16.))
+                                    .rounded(px(2.))
+                                    .bg(rgb(edge)),
+                            )
+                            .child(
+                                div()
+                                    .min_w(px(0.))
+                                    .truncate()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(m.title),
+                            ),
                     )
                     .child(
                         div()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(tone_color(m.tone)))
-                            .child(m.badge),
+                            .flex()
+                            .flex_none()
+                            .gap_2()
+                            .children(empty.then(|| {
+                                div()
+                                    .id(("card-assign", id as usize))
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(colors::ACCENT))
+                                    .cursor_pointer()
+                                    .child("+ assign")
+                                    // Not also the start dialog behind it.
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        this.open_picker(id, window, cx)
+                                    }))
+                            }))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(tone_color(m.tone)))
+                                    .child(m.badge),
+                            ),
                     ),
             )
+            .children((!m.pills.is_empty()).then(|| {
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_1()
+                    .children(m.pills.into_iter().map(pill))
+            }))
             .children(
                 m.cwd
                     .map(|c| div().text_xs().text_color(rgb(colors::TEXT_DIM)).child(c)),
@@ -411,6 +557,11 @@ impl OverseerApp {
                 }),
             )
             .on_action(
+                cx.listener(|this, _: &crate::app::AssignSelected, window, cx| {
+                    this.open_picker(this.selected, window, cx)
+                }),
+            )
+            .on_action(
                 cx.listener(|this, _: &crate::app::OpenSelected, window, cx| {
                     this.open_card(this.selected, window, cx)
                 }),
@@ -433,13 +584,23 @@ impl OverseerApp {
                     )
                     .child(
                         div()
+                            .flex()
+                            .gap_3()
                             .text_sm()
-                            .text_color(rgb(if need_you > 0 {
-                                colors::ORANGE
-                            } else {
-                                colors::MUTED
-                            }))
-                            .child(header_text(running, need_you)),
+                            .child(
+                                div()
+                                    .text_color(rgb(if need_you > 0 {
+                                        colors::ORANGE
+                                    } else {
+                                        colors::MUTED
+                                    }))
+                                    .child(header_text(running, need_you)),
+                            )
+                            .child(
+                                div()
+                                    .text_color(rgb(colors::MUTED))
+                                    .child(source_line(&self.work, local_hhmm)),
+                            ),
                     ),
             )
             .child(
@@ -479,7 +640,7 @@ impl OverseerApp {
                     .mt_auto()
                     .text_xs()
                     .text_color(rgb(colors::MUTED))
-                    .child("Click a card or press Enter to open it · Cmd+0 to Cmd+6 open a session · Cmd+N starts the selected slot"),
+                    .child("Click a card or press Enter to open it · A assigns work · Cmd+0 to Cmd+6 open a session · Cmd+N starts the selected slot"),
             )
     }
 }
@@ -487,7 +648,7 @@ impl OverseerApp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use overseer_proto::{Activity, ActivityKind};
+    use overseer_proto::{Activity, ActivityKind, ItemKind, SourceStatus, WorkItem};
     use std::path::PathBuf;
 
     fn info(id: SlotId, label: &str, state: SlotState) -> SlotInfo {
@@ -505,6 +666,154 @@ mod tests {
 
     const HOME: &str = "/Users/me";
 
+    fn no_work() -> WorkView {
+        WorkView {
+            items: vec![],
+            sources: vec![],
+            notices: vec![],
+        }
+    }
+
+    fn cm(i: &SlotInfo, now: i64, home: Option<&Path>) -> CardModel {
+        card_model(i, now, home, &no_work())
+    }
+
+    fn item(key: &str, kind: ItemKind, parent: Option<&str>, owner: Option<SlotId>) -> WorkItem {
+        WorkItem {
+            key: key.into(),
+            kind,
+            title: format!("title of {key}"),
+            status: "open".into(),
+            priority: None,
+            parent: parent.map(String::from),
+            owner,
+            in_list: true,
+            folder: None,
+        }
+    }
+
+    fn work(items: Vec<WorkItem>) -> WorkView {
+        WorkView { items, ..no_work() }
+    }
+
+    #[test]
+    fn owned_by_orders_tickets_first() {
+        let v = work(vec![
+            item("ov-3", ItemKind::Bead, None, Some(2)),
+            item("DEMO-12", ItemKind::Ticket, None, Some(2)),
+            item("DEMO-7", ItemKind::Ticket, None, Some(4)),
+            item("ov-5", ItemKind::Bead, Some("DEMO-12"), Some(2)),
+            item("DEMO-14", ItemKind::Ticket, None, Some(2)),
+            item("ov-9", ItemKind::Bead, None, None),
+        ]);
+        let keys: Vec<_> = owned_by(&v, 2).iter().map(|i| i.key.as_str()).collect();
+        assert_eq!(keys, ["DEMO-12", "DEMO-14", "ov-3", "ov-5"]);
+        assert!(owned_by(&v, 1).is_empty());
+    }
+
+    #[test]
+    fn pills_skip_beads_under_owned_tickets() {
+        let v = work(vec![
+            item("DEMO-12", ItemKind::Ticket, None, Some(2)),
+            item("ov-5", ItemKind::Bead, Some("DEMO-12"), Some(2)),
+            // Its ticket belongs to someone else, so it stands alone here.
+            item("ov-6", ItemKind::Bead, Some("DEMO-7"), Some(2)),
+            item("ov-3", ItemKind::Bead, None, Some(2)),
+        ]);
+        assert_eq!(pills(&owned_by(&v, 2)), ["DEMO-12", "ov-6", "ov-3"]);
+        assert!(pills(&[]).is_empty());
+    }
+
+    #[test]
+    fn pills_collapse_after_three() {
+        let v = work(
+            ["DEMO-1", "DEMO-2", "DEMO-3", "DEMO-4", "DEMO-5"]
+                .into_iter()
+                .map(|k| item(k, ItemKind::Ticket, None, Some(1)))
+                .collect(),
+        );
+        let owned = owned_by(&v, 1);
+        assert_eq!(pills(&owned), ["DEMO-1", "DEMO-2", "DEMO-3", "+2"]);
+        assert_eq!(pills(&owned[..4]), ["DEMO-1", "DEMO-2", "DEMO-3", "+1"]);
+        assert_eq!(pills(&owned[..3]), ["DEMO-1", "DEMO-2", "DEMO-3"]);
+    }
+
+    fn source(
+        name: &str,
+        ok: bool,
+        count: usize,
+        at: Option<i64>,
+        msg: Option<&str>,
+    ) -> SourceStatus {
+        SourceStatus {
+            name: name.into(),
+            ok,
+            count,
+            at,
+            message: msg.map(String::from),
+        }
+    }
+
+    fn hhmm(t: i64) -> String {
+        format!("{:02}:{:02}", t / 60, t % 60)
+    }
+
+    #[test]
+    fn source_line_shows_missing_jira() {
+        // The daemon lists beads first; the line leads with jira.
+        let mut v = no_work();
+        v.sources = vec![
+            source("beads", true, 133, Some(14 * 60 + 5), None),
+            source("jira", true, 12, Some(14 * 60 + 2), None),
+        ];
+        assert_eq!(source_line(&v, hhmm), "jira 12 · beads 133 · 14:05");
+        v.sources[1] = source("jira", false, 0, None, Some("acli not found"));
+        assert_eq!(
+            source_line(&v, hhmm),
+            "jira: acli not found · beads 133 · 14:05"
+        );
+        // Nothing read yet: no time.
+        v.sources[0] = source("beads", false, 0, None, Some("not read yet"));
+        assert_eq!(
+            source_line(&v, hhmm),
+            "jira: acli not found · beads: not read yet"
+        );
+        assert_eq!(source_line(&no_work(), hhmm), "");
+    }
+
+    #[test]
+    fn source_line_cuts_long_errors() {
+        let long = format!("acli: {}", "x".repeat(80));
+        let mut v = no_work();
+        v.sources = vec![source("jira", false, 0, None, Some(&long))];
+        let line = source_line(&v, hhmm);
+        let msg = line.strip_prefix("jira: ").unwrap();
+        assert_eq!(msg.chars().count(), 41);
+        assert!(msg.ends_with('…'));
+        assert!(long.starts_with(msg.trim_end_matches('…')));
+        assert_eq!(short_message("acli not found"), "acli not found");
+        assert_eq!(short_message(&"y".repeat(40)), "y".repeat(40));
+    }
+
+    #[test]
+    fn card_model_has_pills() {
+        let v = work(vec![
+            item("DEMO-12", ItemKind::Ticket, None, Some(3)),
+            item("ov-5", ItemKind::Bead, Some("DEMO-12"), Some(3)),
+            item("ov-3", ItemKind::Bead, None, Some(3)),
+            item("DEMO-7", ItemKind::Ticket, None, Some(4)),
+        ]);
+        let st = SlotState::Running { pid: 1, since: 0 };
+        let m = card_model(&info(3, "eks", st), 10, None, &v);
+        assert_eq!(m.pills, ["DEMO-12", "ov-3"]);
+        // An empty slot can already own work.
+        let m = card_model(&info(4, "", SlotState::Empty), 10, None, &v);
+        assert_eq!(m.pills, ["DEMO-7"]);
+        assert!(card_model(&info(5, "", SlotState::Empty), 10, None, &v)
+            .pills
+            .is_empty());
+    }
+
     #[test]
     fn elapsed() {
         assert_eq!(format_elapsed(-5), "0s");
@@ -519,7 +828,7 @@ mod tests {
 
     #[test]
     fn empty_card() {
-        let m = card_model(&info(5, "", SlotState::Empty), 100, None);
+        let m = cm(&info(5, "", SlotState::Empty), 100, None);
         assert_eq!(
             m,
             CardModel {
@@ -530,6 +839,7 @@ mod tests {
                 pid: None,
                 now_doing: None,
                 can_resume: false,
+                pills: vec![],
             }
         );
     }
@@ -540,7 +850,7 @@ mod tests {
             pid: 4321,
             since: 1000,
         };
-        let m = card_model(
+        let m = cm(
             &info(1, "health report", st),
             1000 + 485,
             Some(Path::new(HOME)),
@@ -574,7 +884,7 @@ mod tests {
     #[test]
     fn card_model_for_each_activity() {
         let now = 2000 + 185;
-        let w = card_model(
+        let w = cm(
             &with_activity(ActivityKind::Working, Some("Bash: cargo test"), None),
             now,
             None,
@@ -585,7 +895,7 @@ mod tests {
         assert_eq!(w.now_doing.as_deref(), Some("Bash: cargo test"));
         assert_eq!(w.pid.as_deref(), Some("pid 4321"));
 
-        let n = card_model(
+        let n = cm(
             &with_activity(
                 ActivityKind::NeedsYou,
                 Some("Bash: rm -rf target"),
@@ -600,7 +910,7 @@ mod tests {
         // The reason, not the tool, says what to do.
         assert_eq!(n.now_doing.as_deref(), Some("Permission to run Bash"));
 
-        let i = card_model(
+        let i = cm(
             &with_activity(ActivityKind::Idle, Some("Edit"), None),
             2000 + 720,
             None,
@@ -611,9 +921,9 @@ mod tests {
         assert_eq!(i.now_doing, None);
 
         // Working before the first tool, or needs you without a reason.
-        let bare = card_model(&with_activity(ActivityKind::Working, None, None), now, None);
+        let bare = cm(&with_activity(ActivityKind::Working, None, None), now, None);
         assert_eq!(bare.now_doing, None);
-        let bare = card_model(
+        let bare = cm(
             &with_activity(ActivityKind::NeedsYou, None, None),
             now,
             None,
@@ -627,7 +937,7 @@ mod tests {
             pid: 4321,
             since: 1000,
         };
-        let m = card_model(&info(1, "htop", st), 1000 + 485, None);
+        let m = cm(&info(1, "htop", st), 1000 + 485, None);
         assert_eq!(m.badge, "● Running 8m 05s");
         assert_eq!(m.tone, Tone::Running);
         assert_eq!(tone_color(m.tone), colors::GREEN);
@@ -646,16 +956,13 @@ mod tests {
             "-d".into(),
             "10".into(),
         ]);
-        assert_eq!(
-            card_model(&i, 1000, None).now_doing.as_deref(),
-            Some("htop -d 10")
-        );
+        assert_eq!(cm(&i, 1000, None).now_doing.as_deref(), Some("htop -d 10"));
         i.command = Some(vec!["x".repeat(100)]);
-        let long = card_model(&i, 1000, None).now_doing.unwrap();
+        let long = cm(&i, 1000, None).now_doing.unwrap();
         assert_eq!(long.chars().count(), 81);
         assert!(long.ends_with('…'));
         i.command = Some(vec![]);
-        assert_eq!(card_model(&i, 1000, None).now_doing, None);
+        assert_eq!(cm(&i, 1000, None).now_doing, None);
     }
 
     #[test]
@@ -681,23 +988,23 @@ mod tests {
             code: Some(3),
             at: 5,
         };
-        let m = card_model(&info(3, "", st), 9, None);
+        let m = cm(&info(3, "", st), 9, None);
         assert_eq!(m.title, "S3");
         assert_eq!(m.badge, "Exited (code 3)");
         assert_eq!(m.tone, Tone::Exited);
         assert_eq!(m.cwd.as_deref(), Some("/Users/me/Repos/eks"));
         assert_eq!(m.pid, None);
         let killed = SlotState::Exited { code: None, at: 5 };
-        assert_eq!(card_model(&info(3, "", killed), 9, None).badge, "Exited");
+        assert_eq!(cm(&info(3, "", killed), 9, None).badge, "Exited");
     }
 
     #[test]
-    fn resumable_card_model() {
+    fn resumable_cm() {
         let st = SlotState::Resumable {
             session_id: "abc".into(),
             at: 5,
         };
-        let m = card_model(&info(3, "eks", st), 9, Some(Path::new(HOME)));
+        let m = cm(&info(3, "eks", st), 9, Some(Path::new(HOME)));
         assert_eq!(m.title, "S3 · eks");
         assert_eq!(m.badge, "Resumable");
         assert_eq!(m.tone, Tone::Resumable);
@@ -708,7 +1015,7 @@ mod tests {
         assert!(m.can_resume);
         // No other card offers it.
         let ex = SlotState::Exited { code: None, at: 5 };
-        assert!(!card_model(&info(3, "eks", ex), 9, None).can_resume);
+        assert!(!cm(&info(3, "eks", ex), 9, None).can_resume);
     }
 
     #[test]

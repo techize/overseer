@@ -81,6 +81,14 @@ fn main() {
                 std::process::id(),
                 socket.display()
             );
+            let home = std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from("/"));
+            let (settings, config_err) =
+                overseer_daemon::Config::load(&overseer_proto::paths::config_path(), &home);
+            if let Some(e) = config_err {
+                tracing::warn!("config not loaded, using defaults: {e}");
+            }
             let result = runtime().and_then(|rt| {
                 rt.block_on(overseer_daemon::run(DaemonConfig {
                     socket,
@@ -88,6 +96,7 @@ fn main() {
                     env: overseer_daemon::EnvSource::LoginShell,
                     state_dir: overseer_proto::paths::state_dir(),
                     hook_program: std::env::current_exe()?,
+                    settings,
                 }))
             });
             match &result {
