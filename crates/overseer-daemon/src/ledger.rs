@@ -81,6 +81,7 @@ const V3_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS claims (
     tool_use_id TEXT,
     pin_revision TEXT,
     relay_id INTEGER,
+    back_on TEXT,
     since INTEGER NOT NULL,
     last_used INTEGER NOT NULL
 );
@@ -90,6 +91,7 @@ CREATE TABLE IF NOT EXISTS waits (
     slot INTEGER NOT NULL,
     via TEXT NOT NULL,
     reason TEXT,
+    item TEXT,
     at INTEGER NOT NULL,
     UNIQUE(target, slot)
 );

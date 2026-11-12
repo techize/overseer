@@ -246,9 +246,9 @@ pub(crate) fn claim_on(conn: &Connection, c: &NewClaim, now: i64) -> Result<Clai
         }
         Some(holder) => {
             conn.execute(
-                "INSERT OR IGNORE INTO waits (target, slot, via, reason, at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![c.target, c.slot, via_str(c.via), c.reason, now],
+                "INSERT OR IGNORE INTO waits (target, slot, via, reason, item, at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![c.target, c.slot, via_str(c.via), c.reason, c.item, now],
             )?;
             let position: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM waits WHERE target = ?1
@@ -285,7 +285,8 @@ fn hand_on(
     }
     let next = conn
         .query_row(
-            "SELECT id, slot, via, reason FROM waits WHERE target = ?1 ORDER BY id LIMIT 1",
+            "SELECT id, slot, via, reason, item FROM waits
+             WHERE target = ?1 ORDER BY id LIMIT 1",
             params![target],
             |r| {
                 Ok((
@@ -293,11 +294,12 @@ fn hand_on(
                     r.get::<_, SlotId>(1)?,
                     via_from(2, &r.get::<_, String>(2)?)?,
                     r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
                 ))
             },
         )
         .optional()?;
-    let Some((wait_id, slot, via, reason)) = next else {
+    let Some((wait_id, slot, via, reason, item)) = next else {
         return Ok(Handoff {
             target: target.into(),
             from: holder,
@@ -321,8 +323,8 @@ fn hand_on(
     conn.execute(
         "INSERT INTO claims (target, slot, kind, reason, item, tool_use_id,
                              pin_revision, relay_id, since, last_used)
-         VALUES (?1, ?2, ?3, ?4, NULL, NULL, NULL, ?5, ?6, ?6)",
-        params![target, slot, kind_str(kind), reason, relay, now],
+         VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, ?7, ?7)",
+        params![target, slot, kind_str(kind), reason, item, relay, now],
     )?;
     Ok(Handoff {
         target: target.into(),
@@ -372,31 +374,37 @@ pub(crate) fn touch_on(conn: &Connection, target: &str, slot: SlotId, now: i64) 
 
 /// Turns the slot's `Grant` (or its own `Pin`, when a command unpins it) on
 /// `target` into a `Command` claim for `tool_use_id`, so that command's
-/// `PostToolUse` releases it. True if a claim changed.
+/// `PostToolUse` releases it. For a pin, `unpin_to` is the revision the
+/// command sets back, named in the handoff relay. True if a claim changed.
 pub(crate) fn bind_grant_on(
     conn: &Connection,
     target: &str,
     slot: SlotId,
     tool_use_id: &str,
+    unpin_to: Option<&str>,
 ) -> Result<bool> {
+    // The right-hand sides see the row before the update, so `kind` here is
+    // still the old kind.
     let changed = conn.execute(
-        "UPDATE claims SET kind = 'command', tool_use_id = ?3
+        "UPDATE claims SET kind = 'command', tool_use_id = ?3,
+                back_on = CASE WHEN kind = 'pin' THEN ?4 ELSE NULL END
          WHERE target = ?1 AND slot = ?2 AND kind IN ('grant', 'pin')",
-        params![target, slot, tool_use_id],
+        params![target, slot, tool_use_id, unpin_to],
     )?;
     Ok(changed > 0)
 }
 
-/// Releases each of `slot`'s claims on `targets`, in order.
+/// Releases each of `slot`'s claims on `targets`, in order. Each comes
+/// with the revision an unpin set it back to, if any.
 fn release_all(
     conn: &Connection,
     slot: SlotId,
-    targets: Vec<String>,
+    targets: Vec<(String, Option<String>)>,
     now: i64,
 ) -> Result<Vec<Handoff>> {
     targets
         .iter()
-        .map(|t| hand_on(conn, t, slot, false, None, now))
+        .map(|(t, back_on)| hand_on(conn, t, slot, false, back_on.as_deref(), now))
         .collect()
 }
 
@@ -404,11 +412,11 @@ fn targets_where(
     conn: &Connection,
     filter: &str,
     args: impl rusqlite::Params,
-) -> Result<Vec<String>> {
+) -> Result<Vec<(String, Option<String>)>> {
     let mut stmt = conn.prepare(&format!(
-        "SELECT c.target FROM claims c {filter} ORDER BY c.target"
+        "SELECT c.target, c.back_on FROM claims c {filter} ORDER BY c.target"
     ))?;
-    let rows = stmt.query_map(args, |r| r.get(0))?;
+    let rows = stmt.query_map(args, |r| Ok((r.get(0)?, r.get(1)?)))?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
@@ -807,8 +815,8 @@ mod tests {
             touch_on(c, T, 3, 30)?;
             assert_eq!(claims_on(c)?[0].last_used, 25);
 
-            assert!(!bind_grant_on(c, T, 3, "tu-9")?);
-            assert!(bind_grant_on(c, T, 2, "tu-9")?);
+            assert!(!bind_grant_on(c, T, 3, "tu-9", None)?);
+            assert!(bind_grant_on(c, T, 2, "tu-9", None)?);
             assert_eq!(holders(c), vec![(T.into(), 2, ClaimKind::Command)]);
             let id: Option<String> =
                 c.query_row("SELECT tool_use_id FROM claims", [], |r| r.get(0))?;
@@ -820,8 +828,14 @@ mod tests {
             };
             claim_on(c, &pin, 40)?;
             take(c, "repo:demo-api:main", 4, ClaimKind::Claim, 40);
-            assert!(bind_grant_on(c, "argo:uat/demo-api", 4, "tu-10")?);
-            assert!(!bind_grant_on(c, "repo:demo-api:main", 4, "tu-11")?);
+            assert!(bind_grant_on(
+                c,
+                "argo:uat/demo-api",
+                4,
+                "tu-10",
+                Some("main")
+            )?);
+            assert!(!bind_grant_on(c, "repo:demo-api:main", 4, "tu-11", None)?);
             let kinds: Vec<_> = holders(c).into_iter().filter(|h| h.1 == 4).collect();
             assert_eq!(
                 kinds,
@@ -829,6 +843,68 @@ mod tests {
                     ("argo:uat/demo-api".into(), 4, ClaimKind::Command),
                     ("repo:demo-api:main".into(), 4, ClaimKind::Claim),
                 ]
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn unpin_hands_on_back_on_the_revision() {
+        with(|c| {
+            let pin = NewClaim {
+                pin_revision: Some("feature-x"),
+                ..claim(T, 1, ClaimKind::Pin, Via::Hook)
+            };
+            claim_on(c, &pin, 10)?;
+            queue(c, T, 2, Via::Hook, 11);
+            queue(c, T, 3, Via::Hook, 12);
+            assert!(bind_grant_on(c, T, 1, "tu-1", Some("main"))?);
+            let h = release_commands_on(c, 1, Some("tu-1"), 20)?;
+            assert_eq!(h.len(), 1);
+            assert_eq!(
+                texts(c, 2),
+                vec!["S1 has released argo:uat/root (back on main). You now hold it."]
+            );
+            // A grant has no pin to go back from, so it never says so.
+            assert!(bind_grant_on(c, T, 2, "tu-2", Some("main"))?);
+            release_commands_on(c, 2, Some("tu-2"), 30)?;
+            assert_eq!(
+                texts(c, 3),
+                vec!["S2 has released argo:uat/root. You now hold it."]
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn release_item_releases_a_handed_on_claim() {
+        with(|c| {
+            take(c, T, 1, ClaimKind::Claim, 10);
+            let for_item = NewClaim {
+                item: Some("DEMO-12"),
+                ..claim(T, 2, ClaimKind::Claim, Via::Tool)
+            };
+            assert!(matches!(
+                claim_on(c, &for_item, 11)?,
+                ClaimOutcome::Queued { position: 1, .. }
+            ));
+            queue(c, T, 3, Via::Tool, 12);
+            release_on(c, T, Releaser::Slot(1), None, 20)?;
+            let held = &claims_on(c)?[0];
+            assert_eq!((held.slot, held.item.as_deref()), (2, Some("DEMO-12")));
+            let h = release_item_on(c, "DEMO-12", 30)?;
+            assert_eq!(
+                h,
+                vec![Handoff {
+                    target: T.into(),
+                    from: 2,
+                    to: Some(3)
+                }]
+            );
+            let held = &claims_on(c)?[0];
+            assert_eq!(
+                (held.slot, held.kind, held.item.as_deref()),
+                (3, ClaimKind::Claim, None)
             );
             Ok(())
         })
