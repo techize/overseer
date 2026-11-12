@@ -18,7 +18,8 @@ use std::path::Path;
 
 use gpui::{div, prelude::*, px, rgb, Context, FontWeight, Window};
 use overseer_proto::{
-    slot_name, Activity, ActivityKind, ItemKind, SlotId, SlotInfo, SlotState, WorkItem, WorkView,
+    slot_name, Activity, ActivityKind, ClaimKind, ItemKind, LockView, RelayState, SlotId, SlotInfo,
+    SlotState, WorkItem, WorkView,
 };
 
 use crate::app::{colors, OverseerApp};
@@ -35,6 +36,8 @@ pub enum Tone {
     Working,
     NeedsYou,
     Idle,
+    /// Queued behind another slot's lock and not working.
+    Blocked,
     Exited,
     /// Was running when the daemon stopped; can be resumed.
     Resumable,
@@ -57,6 +60,12 @@ pub struct CardModel {
     pub can_resume: bool,
     /// Keys of the work the slot owns; see `pills`.
     pub pills: Vec<String>,
+    /// The targets the slot holds, see `lock_pills`.
+    pub locks: Vec<String>,
+    /// `waiting on repo:demo-api:main and 1 more`.
+    pub waiting_on: Option<String>,
+    /// `2 relays pending`.
+    pub pending: Option<String>,
 }
 
 /// The items `slot` owns: tickets first, then beads, each in view order.
@@ -222,10 +231,20 @@ fn command_line(command: &[String]) -> Option<String> {
 
 /// The card for `info` at unix time `now`, with the pills of the work it
 /// owns in `work`.
-pub fn card_model(info: &SlotInfo, now: i64, home: Option<&Path>, work: &WorkView) -> CardModel {
+pub fn card_model(
+    info: &SlotInfo,
+    now: i64,
+    home: Option<&Path>,
+    work: &WorkView,
+    locks: &LockView,
+) -> CardModel {
     let cwd = info.cwd.as_deref().map(|p| tilde(p, home));
     let title = slot_title(info);
     let pills = pills(&owned_by(work, info.id));
+    let waits = locks.waiting_on(info.id);
+    let waiting_on = waiting_label(&waits);
+    let lock_pills = lock_pills(locks, info.id, now);
+    let pending = pending_label(locks.pending_for(info.id));
     match &info.state {
         SlotState::Empty => CardModel {
             title,
@@ -236,9 +255,12 @@ pub fn card_model(info: &SlotInfo, now: i64, home: Option<&Path>, work: &WorkVie
             now_doing: None,
             can_resume: false,
             pills,
+            locks: lock_pills,
+            waiting_on,
+            pending,
         },
         SlotState::Running { pid, since } => {
-            let (badge, tone, now_doing) = match &info.activity {
+            let (mut badge, mut tone, now_doing) = match &info.activity {
                 None => (
                     format!("● Running {}", format_elapsed(now - since)),
                     Tone::Running,
@@ -254,6 +276,14 @@ pub fn card_model(info: &SlotInfo, now: i64, home: Option<&Path>, work: &WorkVie
                     activity_detail(a),
                 ),
             };
+            let working = info
+                .activity
+                .as_ref()
+                .is_some_and(|a| a.kind == ActivityKind::Working);
+            if !waits.is_empty() && !working {
+                badge = "blocked by lock".into();
+                tone = Tone::Blocked;
+            }
             CardModel {
                 title,
                 badge,
@@ -263,6 +293,9 @@ pub fn card_model(info: &SlotInfo, now: i64, home: Option<&Path>, work: &WorkVie
                 now_doing,
                 can_resume: false,
                 pills,
+                locks: lock_pills,
+                waiting_on,
+                pending,
             }
         }
         SlotState::Exited { code, .. } => CardModel {
@@ -277,6 +310,9 @@ pub fn card_model(info: &SlotInfo, now: i64, home: Option<&Path>, work: &WorkVie
             now_doing: None,
             can_resume: false,
             pills,
+            locks: lock_pills,
+            waiting_on,
+            pending,
         },
         SlotState::Resumable { .. } => CardModel {
             title,
@@ -287,7 +323,80 @@ pub fn card_model(info: &SlotInfo, now: i64, home: Option<&Path>, work: &WorkVie
             now_doing: None,
             can_resume: true,
             pills,
+            locks: lock_pills,
+            waiting_on,
+            pending,
         },
+    }
+}
+
+/// The targets `slot` holds, pins first; a long-held one ends with
+/// ` · held long`. More than three show as three plus `+N`.
+pub fn lock_pills(view: &LockView, slot: SlotId, now: i64) -> Vec<String> {
+    let mut mine: Vec<_> = view.claims.iter().filter(|c| c.slot == slot).collect();
+    mine.sort_by_key(|c| c.kind != ClaimKind::Pin);
+    let mut pills: Vec<String> = mine
+        .iter()
+        .map(|c| {
+            if view.flagged(c, now) {
+                format!("{} · held long", c.target)
+            } else {
+                c.target.clone()
+            }
+        })
+        .collect();
+    if pills.len() > 3 {
+        let more = pills.len() - 3;
+        pills.truncate(3);
+        pills.push(format!("+{more}"));
+    }
+    pills
+}
+
+/// `waiting on <first>`, then `and N more` for the rest.
+fn waiting_label(waits: &[&str]) -> Option<String> {
+    let (first, rest) = waits.split_first()?;
+    Some(match rest.len() {
+        0 => format!("waiting on {first}"),
+        n => format!("waiting on {first} and {n} more"),
+    })
+}
+
+/// `1 relay pending`, `2 relays pending`, nothing for none.
+pub fn pending_label(n: usize) -> Option<String> {
+    match n {
+        0 => None,
+        1 => Some("1 relay pending".into()),
+        n => Some(format!("{n} relays pending")),
+    }
+}
+
+/// The relay strip: the newest `max` relays, newest first, by delivery time
+/// when delivered and creation time otherwise. `clock` renders a time.
+pub fn strip_lines(view: &LockView, clock: impl Fn(i64) -> String, max: usize) -> Vec<String> {
+    let when = |r: &overseer_proto::Relay| r.delivered_at.unwrap_or(r.at);
+    let mut relays: Vec<_> = view.relays.iter().collect();
+    relays.sort_by_key(|r| std::cmp::Reverse((when(r), r.id)));
+    relays
+        .into_iter()
+        .take(max)
+        .map(|r| {
+            let text = one_line(&r.text, 80);
+            let (time, to) = (clock(when(r)), slot_name(r.to));
+            match r.state {
+                RelayState::Delivered => format!("{time} told {to}: {text}"),
+                RelayState::Pending => format!("{time} for {to}, pending: {text}"),
+            }
+        })
+        .collect()
+}
+
+/// `text` on one line, cut to `max` characters.
+fn one_line(text: &str, max: usize) -> String {
+    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    match line.char_indices().nth(max) {
+        Some((cut, _)) => format!("{}…", &line[..cut]),
+        None => line,
     }
 }
 
@@ -362,6 +471,7 @@ fn tone_color(tone: Tone) -> u32 {
     match tone {
         Tone::Running | Tone::Working => colors::GREEN,
         Tone::NeedsYou => colors::ORANGE,
+        Tone::Blocked => colors::RED,
         Tone::Idle | Tone::Exited | Tone::Resumable | Tone::Empty => colors::GREY,
     }
 }
@@ -369,7 +479,9 @@ fn tone_color(tone: Tone) -> u32 {
 /// The card's left edge: the badge colour while the slot runs.
 fn edge_color(tone: Tone) -> u32 {
     match tone {
-        Tone::Running | Tone::Working | Tone::NeedsYou | Tone::Idle => tone_color(tone),
+        Tone::Running | Tone::Working | Tone::NeedsYou | Tone::Idle | Tone::Blocked => {
+            tone_color(tone)
+        }
         Tone::Exited | Tone::Resumable | Tone::Empty => colors::EDGE_IDLE,
     }
 }
@@ -385,10 +497,22 @@ fn pill(key: String) -> gpui::Div {
         .child(key)
 }
 
+/// A held lock target, outlined to tell it from a work-item pill.
+fn lock_pill(target: String) -> gpui::Div {
+    div()
+        .px_1()
+        .rounded(px(4.))
+        .text_xs()
+        .border_1()
+        .border_color(rgb(colors::BORDER_COORD))
+        .text_color(rgb(colors::TEXT))
+        .child(target)
+}
+
 impl OverseerApp {
     fn render_card(&self, id: SlotId, now: i64, cx: &mut Context<Self>) -> impl IntoElement {
         let info = &self.slots[id as usize];
-        let m = card_model(info, now, self.home.as_deref(), &self.work);
+        let m = card_model(info, now, self.home.as_deref(), &self.work, &self.locks);
         let empty = m.tone == Tone::Empty;
         let selected = self.selected == id;
         let edge = edge_color(m.tone);
@@ -470,6 +594,24 @@ impl OverseerApp {
                     .gap_1()
                     .children(m.pills.into_iter().map(pill))
             }))
+            .children((!m.locks.is_empty()).then(|| {
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_1()
+                    .children(m.locks.into_iter().map(lock_pill))
+            }))
+            .children(m.waiting_on.map(|w| {
+                div()
+                    .text_xs()
+                    .text_color(rgb(colors::RED))
+                    .truncate()
+                    .child(w)
+            }))
+            .children(
+                m.pending
+                    .map(|p| div().text_xs().text_color(rgb(colors::ORANGE)).child(p)),
+            )
             .children(
                 m.cwd
                     .map(|c| div().text_xs().text_color(rgb(colors::TEXT_DIM)).child(c)),
@@ -524,6 +666,7 @@ impl OverseerApp {
     ) -> impl IntoElement {
         let running = running_count(&self.slots);
         let need_you = needs_you_count(&self.slots);
+        let strip = strip_lines(&self.locks, local_hhmm, 5);
         let s0 = self.render_card(0, now, cx);
         let row = |ids: [SlotId; 3], this: &Self, cx: &mut Context<Self>| {
             let cards: Vec<_> = ids
@@ -635,9 +778,18 @@ impl OverseerApp {
                     .text_color(rgb(colors::ORANGE))
                     .child(s)
             }))
-            .child(
+            .children((!strip.is_empty()).then(|| {
                 div()
                     .mt_auto()
+                    .flex()
+                    .flex_col()
+                    .text_xs()
+                    .text_color(rgb(colors::TEXT_DIM))
+                    .children(strip.into_iter().map(|l| div().truncate().child(l)))
+            }))
+            .child(
+                div()
+                    .when(self.locks.relays.is_empty(), |d| d.mt_auto())
                     .text_xs()
                     .text_color(rgb(colors::MUTED))
                     .child("Click a card or press Enter to open it · A assigns work · Cmd+0 to Cmd+6 open a session · Cmd+N starts the selected slot"),
@@ -648,7 +800,9 @@ impl OverseerApp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use overseer_proto::{Activity, ActivityKind, ItemKind, SourceStatus, WorkItem};
+    use overseer_proto::{
+        Activity, ActivityKind, Claim, ItemKind, Relay, Sender, SourceStatus, Wait, WorkItem,
+    };
     use std::path::PathBuf;
 
     fn info(id: SlotId, label: &str, state: SlotState) -> SlotInfo {
@@ -674,8 +828,179 @@ mod tests {
         }
     }
 
+    fn no_locks() -> LockView {
+        crate::app::empty_locks()
+    }
+
+    fn claim(slot: SlotId, target: &str, kind: ClaimKind, last_used: i64) -> Claim {
+        Claim {
+            target: target.into(),
+            slot,
+            kind,
+            reason: None,
+            item: None,
+            since: 0,
+            last_used,
+            pin_revision: None,
+        }
+    }
+
+    fn wait(slot: SlotId, target: &str) -> Wait {
+        Wait {
+            target: target.into(),
+            slot,
+            at: 0,
+            reason: None,
+        }
+    }
+
+    fn relay(id: i64, to: SlotId, at: i64, delivered_at: Option<i64>, text: &str) -> Relay {
+        Relay {
+            id,
+            at,
+            from: Sender::Overseer,
+            to,
+            text: text.into(),
+            state: if delivered_at.is_some() {
+                RelayState::Delivered
+            } else {
+                RelayState::Pending
+            },
+            delivered_at,
+            held: None,
+        }
+    }
+
+    fn running(id: SlotId, kind: Option<ActivityKind>) -> SlotInfo {
+        let mut i = info(id, "", SlotState::Running { pid: 7, since: 0 });
+        i.activity = kind.map(|kind| Activity {
+            kind,
+            since: 0,
+            now_doing: None,
+            reason: None,
+            idle_wait: false,
+        });
+        i
+    }
+
+    #[test]
+    fn lock_pills_pins_first_and_flagged() {
+        let mut v = no_locks();
+        v.flag_after_secs = 100;
+        v.claims = vec![
+            claim(2, "repo:demo-api:main", ClaimKind::Command, 950),
+            claim(2, "argocd:demo-app", ClaimKind::Pin, 100),
+            claim(3, "tf:demo", ClaimKind::Claim, 0),
+        ];
+        assert_eq!(
+            lock_pills(&v, 2, 1000),
+            ["argocd:demo-app · held long", "repo:demo-api:main"]
+        );
+        assert!(lock_pills(&v, 5, 1000).is_empty());
+    }
+
+    #[test]
+    fn lock_pills_collapse_after_three() {
+        let mut v = no_locks();
+        v.flag_after_secs = 100;
+        v.claims = (1..=5)
+            .map(|n| claim(2, &format!("repo:demo-api:b{n}"), ClaimKind::Claim, 99))
+            .collect();
+        assert_eq!(
+            lock_pills(&v, 2, 100),
+            [
+                "repo:demo-api:b1",
+                "repo:demo-api:b2",
+                "repo:demo-api:b3",
+                "+2"
+            ]
+        );
+        v.claims.truncate(3);
+        assert_eq!(lock_pills(&v, 2, 100).len(), 3);
+    }
+
+    #[test]
+    fn waiting_slot_is_blocked_when_not_working() {
+        let mut v = no_locks();
+        v.waits = vec![wait(2, "repo:demo-api:main"), wait(2, "tf:demo")];
+        for kind in [Some(ActivityKind::Idle), Some(ActivityKind::NeedsYou), None] {
+            let m = card_model(&running(2, kind), 10, None, &no_work(), &v);
+            assert_eq!(m.tone, Tone::Blocked);
+            assert_eq!(m.badge, "blocked by lock");
+            assert_eq!(
+                m.waiting_on.as_deref(),
+                Some("waiting on repo:demo-api:main and 1 more")
+            );
+        }
+        assert_eq!(tone_color(Tone::Blocked), colors::RED);
+        assert_eq!(edge_color(Tone::Blocked), colors::RED);
+        // Only the waiting slot is blocked.
+        let m = card_model(
+            &running(3, Some(ActivityKind::Idle)),
+            10,
+            None,
+            &no_work(),
+            &v,
+        );
+        assert_eq!(m.tone, Tone::Idle);
+        assert_eq!(m.waiting_on, None);
+    }
+
+    #[test]
+    fn working_slot_keeps_its_tone_but_shows_the_wait() {
+        let mut v = no_locks();
+        v.waits = vec![wait(2, "repo:demo-api:main")];
+        let m = card_model(
+            &running(2, Some(ActivityKind::Working)),
+            10,
+            None,
+            &no_work(),
+            &v,
+        );
+        assert_eq!(m.tone, Tone::Working);
+        assert!(m.badge.starts_with("● Working"), "{}", m.badge);
+        assert_eq!(
+            m.waiting_on.as_deref(),
+            Some("waiting on repo:demo-api:main")
+        );
+    }
+
+    #[test]
+    fn pending_label_counts() {
+        assert_eq!(pending_label(0), None);
+        assert_eq!(pending_label(1).as_deref(), Some("1 relay pending"));
+        assert_eq!(pending_label(2).as_deref(), Some("2 relays pending"));
+        let mut v = no_locks();
+        v.relays = vec![relay(1, 2, 5, None, "a"), relay(2, 2, 6, Some(7), "b")];
+        let m = card_model(&running(2, None), 10, None, &no_work(), &v);
+        assert_eq!(m.pending.as_deref(), Some("1 relay pending"));
+    }
+
+    #[test]
+    fn strip_lines_newest_first_and_cut() {
+        let long = format!("line one\n{}", "x".repeat(100));
+        let mut v = no_locks();
+        v.relays = vec![
+            // Created first, delivered last: sorts by delivery time.
+            relay(1, 3, 100, Some(500), "done it"),
+            relay(2, 4, 300, None, "wait for it"),
+            relay(3, 5, 200, None, &long),
+            relay(4, 6, 50, Some(60), "old"),
+        ];
+        let clock = |t: i64| format!("t{t}");
+        let lines = strip_lines(&v, clock, 3);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "t500 told S3: done it");
+        assert_eq!(lines[1], "t300 for S4, pending: wait for it");
+        let cut = lines[2].strip_prefix("t200 for S5, pending: ").unwrap();
+        assert!(cut.starts_with("line one xxx"), "{cut}");
+        assert_eq!(cut.chars().count(), 81);
+        assert!(cut.ends_with('…'));
+        assert_eq!(strip_lines(&v, clock, 10).len(), 4);
+    }
+
     fn cm(i: &SlotInfo, now: i64, home: Option<&Path>) -> CardModel {
-        card_model(i, now, home, &no_work())
+        card_model(i, now, home, &no_work(), &no_locks())
     }
 
     fn item(key: &str, kind: ItemKind, parent: Option<&str>, owner: Option<SlotId>) -> WorkItem {
@@ -804,14 +1129,16 @@ mod tests {
             item("DEMO-7", ItemKind::Ticket, None, Some(4)),
         ]);
         let st = SlotState::Running { pid: 1, since: 0 };
-        let m = card_model(&info(3, "eks", st), 10, None, &v);
+        let m = card_model(&info(3, "eks", st), 10, None, &v, &no_locks());
         assert_eq!(m.pills, ["DEMO-12", "ov-3"]);
         // An empty slot can already own work.
-        let m = card_model(&info(4, "", SlotState::Empty), 10, None, &v);
+        let m = card_model(&info(4, "", SlotState::Empty), 10, None, &v, &no_locks());
         assert_eq!(m.pills, ["DEMO-7"]);
-        assert!(card_model(&info(5, "", SlotState::Empty), 10, None, &v)
-            .pills
-            .is_empty());
+        assert!(
+            card_model(&info(5, "", SlotState::Empty), 10, None, &v, &no_locks())
+                .pills
+                .is_empty()
+        );
     }
 
     #[test]
@@ -840,6 +1167,9 @@ mod tests {
                 now_doing: None,
                 can_resume: false,
                 pills: vec![],
+                locks: vec![],
+                waiting_on: None,
+                pending: None,
             }
         );
     }

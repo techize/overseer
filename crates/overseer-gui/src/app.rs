@@ -26,7 +26,7 @@ use gpui::{
     Subscription, Task, Window,
 };
 use overseer_proto::{
-    Client, Event, Frame, Request, Response, SlotId, SlotInfo, SlotState, WorkView,
+    Client, Event, Frame, LockView, Request, Response, SlotId, SlotInfo, SlotState, WorkView,
 };
 
 use crate::board::Dir;
@@ -226,6 +226,16 @@ pub fn empty_work() -> WorkView {
     }
 }
 
+/// The lock view before the daemon's first answer.
+pub fn empty_locks() -> LockView {
+    LockView {
+        claims: Vec::new(),
+        waits: Vec::new(),
+        relays: Vec::new(),
+        flag_after_secs: 3600,
+    }
+}
+
 fn empty_slots() -> Vec<SlotInfo> {
     (0..7)
         .map(|id| SlotInfo {
@@ -253,6 +263,8 @@ pub struct OverseerApp {
     pub(crate) slots: Vec<SlotInfo>,
     /// Work items, owners, source health and notices from the daemon.
     pub(crate) work: WorkView,
+    /// Claims, waits and relays from the daemon.
+    pub(crate) locks: LockView,
     pub(crate) screen: Screen,
     pub(crate) selected: SlotId,
     pub(crate) home: Option<PathBuf>,
@@ -322,6 +334,9 @@ impl OverseerApp {
                     .request_marked(Request::ListWorkItems, |_| true)
                     .await;
             }
+            if result.is_ok() {
+                result = lister.request_marked(Request::ListLocks, |_| true).await;
+            }
             if let Err(e) = result {
                 let _ = this.update(cx, |this, cx| {
                     this.status = Some(format!("{} ({e:#})", crate::terminal_view::LOST_DAEMON));
@@ -337,6 +352,7 @@ impl OverseerApp {
             theme,
             slots: empty_slots(),
             work: empty_work(),
+            locks: empty_locks(),
             screen: Screen::Board,
             selected: 1,
             home: std::env::var_os("HOME").map(PathBuf::from),
@@ -371,7 +387,22 @@ impl OverseerApp {
                     self.apply_info(info, true, window, cx);
                 }
             }
-            Frame::Event(Event::LocksChanged(_)) => {}
+            // The list asked for on connecting is not news, so it never
+            // notifies; a change does.
+            Frame::Response {
+                resp: Response::Locks(view),
+                ..
+            } => {
+                self.locks = view;
+                cx.notify();
+            }
+            Frame::Event(Event::LocksChanged(view)) => {
+                for note in crate::notify::new_waits(&self.locks, &view) {
+                    crate::notify::post(&note);
+                }
+                self.locks = view;
+                cx.notify();
+            }
             Frame::Event(Event::WorkChanged(view))
             | Frame::Response {
                 resp: Response::Work(view),
