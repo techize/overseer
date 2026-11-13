@@ -1087,7 +1087,12 @@ mod tests {
         ] {
             assert!(COORDINATOR_ROLE.contains(tool), "missing {tool}");
         }
-        for gone in ["ctl assign", "ctl start", "Never claim targets"] {
+        for gone in [
+            "ctl assign",
+            "ctl start",
+            "Never claim targets",
+            "To give work to a running slot",
+        ] {
             assert!(!COORDINATOR_ROLE.contains(gone), "still has {gone}");
         }
     }
