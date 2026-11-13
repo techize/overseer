@@ -311,10 +311,60 @@ fn pre_tool_use_ignores_other_tools() {
     };
     // Never joined: it waits for a connection that must not come.
     let (rx, _t) = fake_daemon_with(&home, Some(answer), Duration::ZERO);
-    let edit = br#"{"tool_name":"Edit","tool_use_id":"tu-2","tool_input":{"file_path":"/a"}}"#;
-    let (out, took) = run_pre_tool_use(&home, edit);
+    let grep = br#"{"tool_name":"Grep","tool_use_id":"tu-2","tool_input":{"pattern":"a"}}"#;
+    let (out, took) = run_pre_tool_use(&home, grep);
     assert!(out.is_empty(), "stdout: {out:?}");
     assert!(took < Duration::from_millis(200), "took {took:?}");
     assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn pre_tool_use_asks_about_file_writes_and_prints_the_deny() {
+    let home = temp_home("pedit");
+    let reason = "j.md is a shared 2ndBrain file. Use append_journal.";
+    let answer = Response::Verdict {
+        deny: Some(reason.into()),
+        rewrite: None,
+    };
+    let (rx, t) = fake_daemon_with(&home, Some(answer), Duration::ZERO);
+    let edit = br#"{"tool_name":"Edit","tool_use_id":"tu-2","cwd":"/w","tool_input":{"file_path":"/v/j.md"}}"#;
+    let (out, _) = run_pre_tool_use(&home, edit);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny");
+    assert_eq!(v["hookSpecificOutput"]["permissionDecisionReason"], reason);
+    let Frame::Request {
+        req: Request::CheckWrite(check),
+        ..
+    } = rx.recv_timeout(Duration::from_secs(2)).unwrap()
+    else {
+        panic!("not a write check");
+    };
+    assert_eq!(check.slot, 1);
+    assert_eq!(check.tool, "Edit");
+    assert_eq!(check.paths, [std::path::PathBuf::from("/v/j.md")]);
+    t.join().unwrap();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn pre_tool_use_prints_a_rewrite_as_updated_input() {
+    let home = temp_home("prewrite");
+    let answer = Response::Verdict {
+        deny: None,
+        rewrite: Some("overseer ctl bd -- close ov-3".into()),
+    };
+    let (_rx, t) = fake_daemon_with(&home, Some(answer), Duration::ZERO);
+    let (out, _) = run_pre_tool_use(&home, BASH);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        v,
+        serde_json::json!({"hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "updatedInput": {"command": "overseer ctl bd -- close ov-3"},
+        }})
+    );
+    t.join().unwrap();
     let _ = std::fs::remove_dir_all(&home);
 }

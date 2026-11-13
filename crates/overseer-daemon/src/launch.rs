@@ -163,12 +163,12 @@ const HOOK_EVENTS: [&str; 6] = [
 ];
 
 /// The tool matcher and timeout (seconds) of each hook. `PreToolUse` is the
-/// lock check, which may take up to 1 s, so it gets more room; it only runs
-/// for Bash.
+/// lock and 2ndBrain write check, which may take up to 1 s, so it gets more
+/// room; it runs for Bash and the file-writing tools.
 fn hook_shape(event: &str) -> (Option<&'static str>, u64) {
     match event {
         "PostToolUse" => (Some("*"), 2),
-        "PreToolUse" => (Some("Bash"), 5),
+        "PreToolUse" => (Some("Bash|Edit|Write|MultiEdit|NotebookEdit"), 5),
         _ => (None, 2),
     }
 }
@@ -498,7 +498,7 @@ mod tests {
                     assert_eq!(h["timeout"], 2);
                 }
                 "PreToolUse" => {
-                    assert_eq!(entry["matcher"], "Bash");
+                    assert_eq!(entry["matcher"], "Bash|Edit|Write|MultiEdit|NotebookEdit");
                     assert_eq!(h["timeout"], 5);
                 }
                 _ => {

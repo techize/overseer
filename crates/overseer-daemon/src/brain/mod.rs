@@ -5,6 +5,7 @@
 //! once the queue has drained (Ruling 8), the timed backup (Ruling 9) and
 //! `bd` writes (Ruling 10), and announces a `BrainView` after each change.
 
+pub mod bash;
 pub mod current;
 pub mod git;
 pub mod paths;
@@ -17,7 +18,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use overseer_proto::msg::{
-    BrainView, Event, QueueEntry, QueueState, Response, Sender, SlotId, WriteCheck,
+    BashCheck, BrainView, Event, QueueEntry, QueueState, Response, Sender, SlotId, WriteCheck,
 };
 use tokio::sync::{broadcast, oneshot, Notify, OwnedMutexGuard};
 use tokio::time::Instant;
@@ -48,6 +49,9 @@ const IDLE: Duration = Duration::from_secs(60);
 const REPLY_WAIT: Duration = Duration::from_secs(600);
 const BD_TIMEOUT: Duration = Duration::from_secs(120);
 const SYNC_TIMEOUT: Duration = Duration::from_secs(600);
+
+const GIT_DENY: &str = "use the commit_2ndbrain tool; Overseer commits and pushes 2ndBrain";
+const BD_COMPOUND_DENY: &str = "run bd on its own so Overseer can run it under the 2ndBrain lock";
 
 fn deny_shared(rel: &str) -> String {
     format!("{rel} is a shared 2ndBrain file. Use append_journal for the journal or edit_shared_file for an exact replacement.")
@@ -430,6 +434,43 @@ impl BrainService {
             }
         }
         None
+    }
+
+    /// The `PreToolUse` check of a Bash command (Rulings 10 to 12): a `bd`
+    /// write is rewritten to run through the daemon (or denied when joined
+    /// with other commands), git in the vault other than a read is denied,
+    /// and a redirect or writer aimed at a vault path is judged like the
+    /// file tools. `None` leaves the command to the lock check.
+    pub fn check_bash(&self, check: &BashCheck, owners: &Owners) -> Option<Response> {
+        let verdict = |deny: Option<String>, rewrite: Option<String>| {
+            Some(Response::Verdict { deny, rewrite })
+        };
+        match bash::bd_call(&check.command) {
+            bash::BdCall::Write(args) => {
+                return verdict(None, Some(bash::bd_rewrite(&check.command, &args)));
+            }
+            bash::BdCall::Compound => return verdict(Some(BD_COMPOUND_DENY.into()), None),
+            bash::BdCall::None | bash::BdCall::Read => {}
+        }
+        let cwd = check.cwd.clone().unwrap_or_else(|| PathBuf::from("/"));
+        if bash::vault_git(&check.command, &cwd, &self.cfg.brain).is_some() {
+            return verdict(Some(GIT_DENY.into()), None);
+        }
+        let paths: Vec<PathBuf> = bash::write_paths(&check.command)
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
+        if paths.is_empty() {
+            return None;
+        }
+        let write = WriteCheck {
+            slot: check.slot,
+            tool: "Bash".into(),
+            paths,
+            cwd: Some(cwd),
+        };
+        self.check_write(&write, owners)
+            .and_then(|d| verdict(Some(d), None))
     }
 
     /// Queues a pathspec commit of `paths` and waits for it to be committed

@@ -3333,3 +3333,139 @@ async fn relay_right_after_a_delivery_says_why_it_waits() {
     c.held_for(2, "just delivered, waiting for the session")
         .await;
 }
+
+/// A throwaway git vault and a daemon with the 2ndBrain writer `on` or off.
+/// Nothing under the real home is touched: the vault, `CURRENT_SESSION.md`
+/// and the state folder are all under the temp dir.
+async fn brain_daemon(on: bool) -> (Daemon, PathBuf) {
+    let socket = temp_socket();
+    let base = socket.parent().unwrap().to_path_buf();
+    let vault = base.join("vault");
+    std::fs::create_dir_all(&vault).unwrap();
+    let git = |args: &[&str]| {
+        let o = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&vault)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "git {args:?}");
+    };
+    git(&["init", "-b", "main"]);
+    let vault = vault.canonicalize().unwrap();
+    let settings = overseer_daemon::Config {
+        brain_writer: on,
+        brain_dir: vault.clone(),
+        current_session: base.join("home/.claude/CURRENT_SESSION.md"),
+        push: false,
+        backup_mins: 0,
+        sync_command: vec![],
+        ..offline_settings()
+    };
+    let d = start_daemon_cfg(socket, overseer_daemon::EnvSource::Inherit, settings).await;
+    (d, vault)
+}
+
+fn write_check(slot: u8, tool: &str, path: PathBuf) -> Request {
+    Request::CheckWrite(overseer_proto::WriteCheck {
+        slot,
+        tool: tool.into(),
+        paths: vec![path],
+        cwd: None,
+    })
+}
+
+fn verdict(resp: Response) -> (Option<String>, Option<String>) {
+    match resp {
+        Response::Verdict { deny, rewrite } => (deny, rewrite),
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+const JOURNAL: &str = "06-Daily/2026/11-November/2026-11-13-journal.md";
+const JOURNAL_DENY: &str = "06-Daily/2026/11-November/2026-11-13-journal.md is a shared 2ndBrain file. Use append_journal for the journal or edit_shared_file for an exact replacement.";
+
+#[tokio::test]
+async fn shared_file_write_is_denied_with_the_tool_name() {
+    let (d, vault) = brain_daemon(true).await;
+    let mut c = Client::connect(&d.socket).await;
+    for tool in ["Edit", "Write", "MultiEdit"] {
+        let r = c.request(write_check(1, tool, vault.join(JOURNAL))).await;
+        assert_eq!(verdict(r), (Some(JOURNAL_DENY.to_string()), None), "{tool}");
+    }
+    // A free file is allowed.
+    let r = c
+        .request(write_check(1, "Write", vault.join("free.md")))
+        .await;
+    assert_eq!(verdict(r), (None, None));
+    // A Bash redirect into the journal is the same write.
+    let cmd = format!("echo x >> {}/{JOURNAL}", vault.display());
+    let r = c.request(bash_in(1, &cmd, "/tmp")).await;
+    assert_eq!(verdict(r), (Some(JOURNAL_DENY.to_string()), None));
+    // Reading it is never blocked.
+    let cmd = format!("cat {}/{JOURNAL} | grep x", vault.display());
+    let r = c.request(bash_in(1, &cmd, "/tmp")).await;
+    assert_eq!(verdict(r), (None, None));
+    // Git in the vault, and a recursive delete over shared files.
+    let cmd = format!("git -C {} push", vault.display());
+    let (deny, _) = verdict(c.request(bash_in(1, &cmd, "/tmp")).await);
+    assert_eq!(
+        deny.as_deref(),
+        Some("use the commit_2ndbrain tool; Overseer commits and pushes 2ndBrain")
+    );
+    let cmd = format!("git -C {} log", vault.display());
+    assert_eq!(
+        verdict(c.request(bash_in(1, &cmd, "/tmp")).await),
+        (None, None)
+    );
+    std::fs::create_dir_all(vault.join("06-Daily")).unwrap();
+    let cmd = format!("rm -rf {}/06-Daily", vault.display());
+    let (deny, _) = verdict(c.request(bash_in(1, &cmd, "/tmp")).await);
+    assert!(deny.unwrap().contains("holds shared 2ndBrain files"));
+    // bd writes are rewritten, compound ones denied, reads untouched.
+    let (deny, rewrite) = verdict(c.request(bash_in(1, "bd close ov-3", "/tmp")).await);
+    assert_eq!(deny, None);
+    assert_eq!(rewrite.as_deref(), Some("overseer ctl bd -- close ov-3"));
+    let (deny, rewrite) = verdict(
+        c.request(bash_in(1, "bd close ov-3 && git push", "/tmp"))
+            .await,
+    );
+    assert_eq!(
+        deny.as_deref(),
+        Some("run bd on its own so Overseer can run it under the 2ndBrain lock")
+    );
+    assert_eq!(rewrite, None);
+    assert_eq!(
+        verdict(c.request(bash_in(1, "bd ready --json", "/tmp")).await),
+        (None, None)
+    );
+}
+
+#[tokio::test]
+async fn writer_off_allows_everything() {
+    let (d, vault) = brain_daemon(false).await;
+    let mut c = Client::connect(&d.socket).await;
+    let r = c.request(write_check(1, "Edit", vault.join(JOURNAL))).await;
+    assert_eq!(verdict(r), (None, None));
+    for cmd in [
+        format!("echo x >> {}/{JOURNAL}", vault.display()),
+        format!("git -C {} push", vault.display()),
+        format!("rm -rf {}/06-Daily", vault.display()),
+        "bd close ov-3".to_string(),
+        "bd close ov-3 && git push".to_string(),
+    ] {
+        let r = c.request(bash_in(1, &cmd, "/tmp")).await;
+        assert_eq!(verdict(r), (None, None), "{cmd}");
+    }
+}
+
+fn bash_in(slot: u8, command: &str, cwd: &str) -> Request {
+    Request::CheckBash(BashCheck {
+        slot,
+        session_id: None,
+        tool_use_id: Some("tu-w".into()),
+        command: command.into(),
+        cwd: Some(PathBuf::from(cwd)),
+        env: vec![],
+    })
+}

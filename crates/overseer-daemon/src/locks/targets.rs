@@ -202,11 +202,15 @@ pub struct Segment {
     pub text: String,
     /// The folder it runs in, after any earlier `cd`.
     pub cwd: PathBuf,
+    /// Targets of its output redirections (`>`, `>>`, `2>`, `&>`), quotes
+    /// removed. Only `write_segments` fills it.
+    pub redirects: Vec<String>,
 }
 
 /// A command as the lexer saw it: words with their source offsets.
 struct RawSegment {
     words: Vec<(String, usize)>,
+    redirects: Vec<String>,
     end: usize,
 }
 
@@ -302,23 +306,26 @@ impl Lexer<'_> {
     fn split(mut self) -> Vec<RawSegment> {
         let mut out = Vec::new();
         let mut words: Vec<(String, usize)> = Vec::new();
+        let mut redirects: Vec<String> = Vec::new();
         // End of the last word or redirection, so comments stay out of the text.
         let mut last_end = 0;
         let mut heredocs: Vec<(String, bool)> = Vec::new();
-        let mut end = |words: &mut Vec<(String, usize)>, last_end: usize| {
-            if !words.is_empty() {
-                out.push(RawSegment {
-                    words: std::mem::take(words),
-                    end: last_end,
-                });
-            }
-        };
+        let mut end =
+            |words: &mut Vec<(String, usize)>, redirects: &mut Vec<String>, last_end: usize| {
+                if !words.is_empty() || !redirects.is_empty() {
+                    out.push(RawSegment {
+                        words: std::mem::take(words),
+                        redirects: std::mem::take(redirects),
+                        end: last_end,
+                    });
+                }
+            };
         while let Some(c) = self.peek(0) {
             match c {
                 ' ' | '\t' => self.i += 1,
                 '\\' if self.peek(1) == Some('\n') => self.i += 2,
                 '\n' => {
-                    end(&mut words, last_end);
+                    end(&mut words, &mut redirects, last_end);
                     self.i += 1;
                     for (delim, strip_tabs) in heredocs.drain(..) {
                         while self.i < self.chars.len() {
@@ -335,15 +342,15 @@ impl Lexer<'_> {
                     }
                 }
                 ';' | '(' | ')' | '`' => {
-                    end(&mut words, last_end);
+                    end(&mut words, &mut redirects, last_end);
                     self.i += 1;
                 }
                 '$' if self.peek(1) == Some('(') => {
-                    end(&mut words, last_end);
+                    end(&mut words, &mut redirects, last_end);
                     self.i += 2;
                 }
                 '|' => {
-                    end(&mut words, last_end);
+                    end(&mut words, &mut redirects, last_end);
                     self.i += if matches!(self.peek(1), Some('|' | '&')) {
                         2
                     } else {
@@ -353,15 +360,20 @@ impl Lexer<'_> {
                 '&' if self.peek(1) == Some('>') => {
                     self.i += if self.peek(2) == Some('>') { 3 } else { 2 };
                     self.skip_blanks();
-                    self.word();
+                    let target = self.word();
+                    if !target.is_empty() {
+                        redirects.push(target);
+                    }
                     last_end = self.offset();
                 }
                 '&' => {
-                    end(&mut words, last_end);
+                    end(&mut words, &mut redirects, last_end);
                     self.i += if self.peek(1) == Some('&') { 2 } else { 1 };
                 }
                 '<' | '>' => {
-                    self.redirect(&mut heredocs);
+                    if let Some(target) = self.redirect(&mut heredocs) {
+                        redirects.push(target);
+                    }
                     last_end = self.offset();
                 }
                 '#' => {
@@ -383,13 +395,14 @@ impl Lexer<'_> {
                 }
             }
         }
-        end(&mut words, last_end);
+        end(&mut words, &mut redirects, last_end);
         out
     }
 
-    /// A redirection at `<` or `>`, with its target word. A heredoc is
-    /// queued so its body is skipped at the next newline.
-    fn redirect(&mut self, heredocs: &mut Vec<(String, bool)>) {
+    /// A redirection at `<` or `>`. A heredoc is queued so its body is
+    /// skipped at the next newline. Gives the target of an output
+    /// redirection to a file (not `>&2`, not an input).
+    fn redirect(&mut self, heredocs: &mut Vec<(String, bool)>) -> Option<String> {
         let c = self.peek(0);
         self.i += 1;
         if c == Some('<') && self.peek(0) == Some('<') {
@@ -406,13 +419,16 @@ impl Lexer<'_> {
                 if !delim.is_empty() {
                     heredocs.push((delim, strip_tabs));
                 }
-                return;
+                return None;
             }
         } else if matches!(self.peek(0), Some('>' | '&' | '|')) {
             self.i += 1;
         }
         self.skip_blanks();
-        self.word();
+        let target = self.word();
+        let dup =
+            target == "-" || (!target.is_empty() && target.bytes().all(|b| b.is_ascii_digit()));
+        (c == Some('>') && !target.is_empty() && !dup).then_some(target)
     }
 }
 
@@ -481,6 +497,15 @@ fn resolve(cwd: &Path, dir: &str) -> PathBuf {
 /// bodies and comments are dropped, and so are leading `VAR=value` words
 /// and an `env` prefix. A `cd <dir>` changes `cwd` for what follows.
 pub fn segments(command: &str, cwd: &Path) -> Vec<Segment> {
+    write_segments(command, cwd)
+        .into_iter()
+        .filter(|s| !s.words.is_empty())
+        .collect()
+}
+
+/// `segments` that also keeps a command with no command word but a
+/// redirection (`> file`, `: > file`) and fills `Segment::redirects`.
+pub fn write_segments(command: &str, cwd: &Path) -> Vec<Segment> {
     let lexer = Lexer {
         src: command,
         chars: command.char_indices().collect(),
@@ -490,6 +515,14 @@ pub fn segments(command: &str, cwd: &Path) -> Vec<Segment> {
     let mut out = Vec::new();
     for raw in lexer.split() {
         let Some(at) = command_word(&raw.words) else {
+            if !raw.redirects.is_empty() {
+                out.push(Segment {
+                    words: Vec::new(),
+                    text: String::new(),
+                    cwd: cwd.clone(),
+                    redirects: raw.redirects,
+                });
+            }
             continue;
         };
         let start = raw.words[at].1;
@@ -499,7 +532,7 @@ pub fn segments(command: &str, cwd: &Path) -> Vec<Segment> {
             .to_owned();
         let words: Vec<String> = raw.words[at..].iter().map(|(w, _)| w.clone()).collect();
         let here = cwd.clone();
-        if words[0] == "cd" {
+        if words[0] == "cd" && raw.redirects.is_empty() {
             let dir = words[1..]
                 .iter()
                 .find(|w| !w.starts_with('-') || w.as_str() == "-");
@@ -518,6 +551,7 @@ pub fn segments(command: &str, cwd: &Path) -> Vec<Segment> {
             words,
             text,
             cwd: here,
+            redirects: raw.redirects,
         });
     }
     out
@@ -1112,6 +1146,21 @@ mod tests {
         );
         assert_eq!(segs[0].words, ["git", "push"]);
         assert_eq!(segs[4].words, ["echo", "a;b"]);
+    }
+
+    #[test]
+    fn write_segments_keep_redirect_targets_only_for_files() {
+        let segs = write_segments(
+            "> a.md; echo x 2>> b.md >&2 | tee c.md <in.md >&d.md",
+            &cwd(),
+        );
+        let r: Vec<&[String]> = segs.iter().map(|s| s.redirects.as_slice()).collect();
+        assert_eq!(r[0], ["a.md"]);
+        assert_eq!(r[1], ["b.md"]);
+        // `<in.md` is an input; `>&d.md` is a file, `>&2` is not.
+        assert_eq!(r[2], ["d.md"]);
+        // `segments` still drops a redirect-only line.
+        assert_eq!(segments("> a.md", &cwd()).len(), 0);
     }
 
     #[test]

@@ -548,6 +548,14 @@ fn handle_frame(
             seq,
             req: Request::CheckBash(check),
         } => {
+            // The writer's own checks come first and need no lookups; a
+            // rewrite or deny answers at once.
+            if let Some(b) = ctx.brain {
+                if let Some(resp) = b.check_bash(&check, &b.context().owners) {
+                    outbox.send(Frame::Response { seq, resp });
+                    return;
+                }
+            }
             let owned = owned_items(&store.view(), check.slot);
             let locks = ctx.locks.clone();
             let outbox = outbox.clone();

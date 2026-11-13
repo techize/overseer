@@ -1148,3 +1148,68 @@ async fn daemon_serves_the_writer_requests() {
     let _ = ask(&socket, Request::Shutdown).await;
     let _ = tokio::time::timeout(WAIT, task).await;
 }
+
+const CURRENT_DENY: &str =
+    "CURRENT_SESSION.md is written by Overseer. Use update_current_session for your section.";
+
+/// Ruling R7: `~/.claude/CURRENT_SESSION.md` may be a symlink into the vault.
+/// A write to the link or to the vault path it resolves to is the same file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn current_session_symlink_is_judged_by_either_path() {
+    let v = Vault::new("cslink");
+    let target = v.vault.join("Claude/State/CURRENT_SESSION.md");
+    write(&target, "old\n");
+    let link = v.base.join("home/.claude/CURRENT_SESSION.md");
+    std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let svc = v.service(Arc::new(Ledger::in_memory()), v.options());
+    let file = |p: &Path| WriteCheck {
+        slot: 1,
+        tool: "Write".into(),
+        paths: vec![p.to_path_buf()],
+        cwd: None,
+    };
+    for p in [&link, &target] {
+        assert_eq!(
+            svc.check_write(&file(p), &owners()).as_deref(),
+            Some(CURRENT_DENY),
+            "{}",
+            p.display()
+        );
+    }
+    let bash = |command: String| overseer_proto::BashCheck {
+        slot: 1,
+        session_id: None,
+        tool_use_id: None,
+        command,
+        cwd: Some(v.base.clone()),
+        env: vec![],
+    };
+    for p in [&link, &target] {
+        for cmd in [
+            format!("echo x >> {}", p.display()),
+            format!("rm {}", p.display()),
+        ] {
+            let r = svc.check_bash(&bash(cmd.clone()), &owners());
+            assert_eq!(
+                r,
+                Some(Response::Verdict {
+                    deny: Some(CURRENT_DENY.into()),
+                    rewrite: None
+                }),
+                "{cmd}"
+            );
+        }
+    }
+    // Its folder in the vault holds it, so deleting the folder is denied too.
+    let r = svc.check_bash(
+        &bash(format!("rm -rf {}", target.parent().unwrap().display())),
+        &owners(),
+    );
+    assert!(matches!(r, Some(Response::Verdict { deny: Some(d), .. }) if d == CURRENT_DENY));
+    // A read of it is never blocked.
+    assert_eq!(
+        svc.check_bash(&bash(format!("cat {}", target.display())), &owners()),
+        None
+    );
+}
