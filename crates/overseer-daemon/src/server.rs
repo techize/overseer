@@ -859,6 +859,19 @@ fn handle_request(
                 );
             crate::relay::send(locks, from, to, &text, live, unix_now())
         }
+        Request::CheckPlan { plan } => {
+            let owned = ctx.coord.gather(ctx.plans);
+            match crate::coord::plan::validate(&plan, &owned.facts()) {
+                Ok(warnings) => Response::PlanCheck {
+                    warnings,
+                    refusal: None,
+                },
+                Err(refusal) => Response::PlanCheck {
+                    warnings: Vec::new(),
+                    refusal: Some(refusal),
+                },
+            }
+        }
         // Answered in `handle_frame` from a task; this arm only keeps the
         // match whole.
         Request::CheckBash(_) => Response::Verdict {

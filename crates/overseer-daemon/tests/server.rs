@@ -4341,3 +4341,40 @@ async fn manual_kickoff_names_the_worktree_only_under_the_root() {
         "{text}"
     );
 }
+
+/// The plan view re-checks an edited plan: dropping the slot a warning is
+/// about drops the warning, and a plan with nothing left is refused.
+#[tokio::test]
+async fn check_plan_recomputes_warnings_for_an_edited_plan() {
+    let rig = PlanRig::new("check");
+    let (_d, mut c) = rig.start().await;
+    assert_eq!(c.assign("DEMO-12", 2, false, false).await, Response::Ok);
+    let mut s4 = rig.slot4();
+    s4.items = vec!["ov-1".into()];
+    let check = |plan: Plan| Request::CheckPlan { plan };
+    assert_eq!(
+        c.request(check(plan_of(vec![s4, rig.slot5()]))).await,
+        Response::PlanCheck {
+            warnings: vec![
+                "This bead is under DEMO-12, owned by S2. Assign to S4 anyway?".to_string()
+            ],
+            refusal: None,
+        }
+    );
+    assert_eq!(
+        c.request(check(plan_of(vec![rig.slot5()]))).await,
+        Response::PlanCheck {
+            warnings: vec![],
+            refusal: None,
+        }
+    );
+    assert_eq!(
+        c.request(check(plan_of(vec![]))).await,
+        Response::PlanCheck {
+            warnings: vec![],
+            refusal: Some("the plan has no slots".into()),
+        }
+    );
+    // Checking records nothing.
+    assert!(c.coord().await.plans.is_empty());
+}

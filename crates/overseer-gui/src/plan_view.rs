@@ -126,12 +126,14 @@ pub enum PlanRow {
     Rule(String),
     Drop(SlotId),
     Warning(String),
+    /// Why approving the plan as edited would be refused.
+    Refusal(String),
 }
 
-/// The rows to draw for `rec` as edited in `draft`. Warnings come last,
-/// above the buttons.
-pub fn rows(rec: &PlanRecord, draft: &PlanDraft) -> Vec<PlanRow> {
-    let plan = &draft.current;
+/// The rows to draw for `rec` as edited in `editor`. Warnings (and a
+/// refusal) come last, above the buttons.
+pub fn rows(rec: &PlanRecord, editor: &Editor) -> Vec<PlanRow> {
+    let plan = &editor.draft.current;
     let mut out = vec![PlanRow::Title(format!("Plan {} from S0", rec.id))];
     if !plan.summary.trim().is_empty() {
         out.push(PlanRow::Summary(plan.summary.clone()));
@@ -180,8 +182,11 @@ pub fn rows(rec: &PlanRecord, draft: &PlanDraft) -> Vec<PlanRow> {
         }
         out.push(PlanRow::Drop(s.slot));
     }
-    for w in &rec.warnings {
+    for w in &editor.warnings {
         out.push(PlanRow::Warning(w.clone()));
+    }
+    if let Some(r) = &editor.refusal {
+        out.push(PlanRow::Refusal(r.clone()));
     }
     out
 }
@@ -236,6 +241,13 @@ pub struct Editor {
     pub error: Option<String>,
     /// The newest coordinator view seen while a decision was in flight.
     pub latest: Option<CoordView>,
+    /// The warnings for the plan as edited: the record's until the first
+    /// check after an edit answers.
+    pub warnings: Vec<String>,
+    /// Why the daemon would refuse the plan as edited.
+    pub refusal: Option<String>,
+    /// The number of the newest check sent; older answers are stale.
+    checks: u64,
 }
 
 impl Editor {
@@ -258,6 +270,32 @@ impl Editor {
             busy: false,
             error: None,
             latest: None,
+            warnings: rec.warnings.clone(),
+            refusal: None,
+            checks: 0,
+        }
+    }
+
+    /// A check of the plan as edited, numbered so a late answer to an older
+    /// one is dropped.
+    pub fn check_request(&mut self) -> (u64, Request) {
+        self.checks += 1;
+        (
+            self.checks,
+            Request::CheckPlan {
+                plan: self.draft.plan(),
+            },
+        )
+    }
+
+    /// The answer to check `seq`. A lost or odd answer keeps what is shown.
+    pub fn checked(&mut self, seq: u64, reply: Result<Response, String>) {
+        if seq != self.checks {
+            return;
+        }
+        if let Ok(Response::PlanCheck { warnings, refusal }) = reply {
+            self.warnings = warnings;
+            self.refusal = refusal;
         }
     }
 
@@ -516,6 +554,20 @@ impl PlanView {
         cx.notify();
     }
 
+    /// The draft changed shape: ask the daemon for its warnings now.
+    fn recheck(&mut self, cx: &mut Context<Self>) {
+        let (seq, req) = self.editor.check_request();
+        let client = self.client.clone();
+        cx.spawn(async move |this, cx| {
+            let reply = client.request(req).await.map_err(|e| format!("{e:#}"));
+            let _ = this.update(cx, |this, cx| {
+                this.editor.checked(seq, reply);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn on_key_down(&mut self, ev: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         let action = self.editor.key(&ev.keystroke);
         if action == PlanAction::Ignored {
@@ -623,7 +675,7 @@ fn pill(
 
 impl Render for PlanView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let rec_rows = rows(&self.rec, &self.editor.draft);
+        let rec_rows = rows(&self.rec, &self.editor);
         let busy = self.editor.busy;
         let can_approve = self.editor.draft.can_approve() && !busy;
         let mut body: Vec<gpui::AnyElement> = Vec::new();
@@ -656,6 +708,7 @@ impl Render for PlanView {
                         pill(("item", usize::from(slot) * 100 + i), key, move |_, cx| {
                             entity.update(cx, |this, cx| {
                                 this.editor.draft.remove_item(slot, &k);
+                                this.recheck(cx);
                                 cx.notify();
                             })
                         })
@@ -674,6 +727,7 @@ impl Render for PlanView {
                             move |_, cx| {
                                 entity.update(cx, |this, cx| {
                                     this.editor.draft.remove_target(slot, &target);
+                                    this.recheck(cx);
                                     cx.notify();
                                 })
                             },
@@ -687,6 +741,7 @@ impl Render for PlanView {
                         .child(pill(("worktree", usize::from(slot)), text, move |_, cx| {
                             entity.update(cx, |this, cx| {
                                 this.editor.draft.clear_worktree(slot);
+                                this.recheck(cx);
                                 cx.notify();
                             })
                         }))
@@ -708,6 +763,7 @@ impl Render for PlanView {
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if !this.editor.busy {
                                     this.editor.drop_slot(slot);
+                                    this.recheck(cx);
                                 }
                                 cx.notify();
                             })),
@@ -716,6 +772,10 @@ impl Render for PlanView {
                 PlanRow::Warning(t) => div()
                     .text_color(rgb(colors::ORANGE))
                     .child(t)
+                    .into_any_element(),
+                PlanRow::Refusal(t) => div()
+                    .text_color(rgb(colors::RED))
+                    .child(format!("Approving would fail: {t}"))
                     .into_any_element(),
             };
             body.push(el);
@@ -890,8 +950,8 @@ mod tests {
     #[test]
     fn rows_show_warnings_and_worktree() {
         let rec = record();
-        let mut d = PlanDraft::new(&rec.plan);
-        let rows = rows(&rec, &d);
+        let mut e = Editor::new(&rec);
+        let rows = rows(&rec, &e);
         assert_eq!(rows[0], PlanRow::Title("Plan 4 from S0".into()));
         assert_eq!(rows[1], PlanRow::Summary("Split the demo work".into()));
         assert!(rows.contains(&PlanRow::SlotHead {
@@ -914,15 +974,15 @@ mod tests {
                 "S3 is running; it will be told to work in /x but not moved".into()
             ))
         );
-        d.clear_worktree(3);
-        d.remove_slot(5);
-        let rows = rows_of(&rec, &d);
+        e.draft.clear_worktree(3);
+        e.draft.remove_slot(5);
+        let rows = rows_of(&rec, &e);
         assert!(!rows.iter().any(|r| matches!(r, PlanRow::Worktree { .. })));
         assert!(!rows.contains(&PlanRow::Drop(5)));
     }
 
-    fn rows_of(rec: &overseer_proto::PlanRecord, d: &PlanDraft) -> Vec<PlanRow> {
-        rows(rec, d)
+    fn rows_of(rec: &overseer_proto::PlanRecord, e: &Editor) -> Vec<PlanRow> {
+        rows(rec, e)
     }
 
     fn ks(s: &str) -> gpui::Keystroke {
@@ -1045,6 +1105,59 @@ mod tests {
             Reply::Failed("plan 4 is no longer pending".into())
         );
         assert!(matches!(e.reply(Err("lost".into()), true), Reply::Failed(m) if m == "lost"));
+    }
+
+    #[test]
+    fn warnings_follow_the_edited_plan() {
+        let rec = record();
+        let mut e = Editor::new(&rec);
+        // The record's warnings until a check answers.
+        assert_eq!(e.warnings, rec.warnings);
+        e.drop_slot(3);
+        let (first, req) = e.check_request();
+        assert_eq!(
+            req,
+            Request::CheckPlan {
+                plan: e.draft.plan()
+            }
+        );
+        // A newer check supersedes the first; its late answer is ignored.
+        let (second, _) = e.check_request();
+        e.checked(
+            second,
+            Ok(Response::PlanCheck {
+                warnings: vec![],
+                refusal: None,
+            }),
+        );
+        assert!(e.warnings.is_empty());
+        assert!(!rows(&rec, &e)
+            .iter()
+            .any(|r| matches!(r, PlanRow::Warning(_))));
+        e.checked(
+            first,
+            Ok(Response::PlanCheck {
+                warnings: vec!["stale".into()],
+                refusal: None,
+            }),
+        );
+        assert!(e.warnings.is_empty());
+        // A refusal is shown last; a failed check keeps what was there.
+        let (third, _) = e.check_request();
+        e.checked(
+            third,
+            Ok(Response::PlanCheck {
+                warnings: vec![],
+                refusal: Some("demo refusal".into()),
+            }),
+        );
+        assert_eq!(
+            rows(&rec, &e).last(),
+            Some(&PlanRow::Refusal("demo refusal".into()))
+        );
+        let (fourth, _) = e.check_request();
+        e.checked(fourth, Err("lost".into()));
+        assert_eq!(e.refusal.as_deref(), Some("demo refusal"));
     }
 
     #[test]

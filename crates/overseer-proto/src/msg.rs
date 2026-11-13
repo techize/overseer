@@ -459,6 +459,11 @@ pub enum Request {
         from: Option<SlotId>,
         plan: Plan,
     },
+    /// Validates `plan` against the board now without recording it:
+    /// `Response::PlanCheck`. The plan view asks after each edit.
+    CheckPlan {
+        plan: Plan,
+    },
     /// Jonathan approves (with the plan as he edited it) or rejects plan `id`.
     DecidePlan {
         id: i64,
@@ -745,6 +750,12 @@ pub enum Response {
     },
     Board(BoardView),
     Coord(CoordView),
+    /// The answer to `CheckPlan`: the warnings approval would confirm, or
+    /// the refusal approval would meet (then `warnings` is empty).
+    PlanCheck {
+        warnings: Vec<String>,
+        refusal: Option<String>,
+    },
 }
 
 // Adjacent tagging because `SlotChanged` is a tuple variant.
@@ -853,6 +864,7 @@ mod tests {
                 from: Some(0),
                 plan: plan.clone(),
             },
+            Request::CheckPlan { plan: plan.clone() },
             Request::DecidePlan {
                 id: 2,
                 from: None,
@@ -889,9 +901,17 @@ mod tests {
                 reason: String::new()
             }
         );
-        let resp = Response::Coord(coord());
-        let back: Response = serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
-        assert_eq!(back, resp);
+        for resp in [
+            Response::Coord(coord()),
+            Response::PlanCheck {
+                warnings: vec!["w".into()],
+                refusal: Some("r".into()),
+            },
+        ] {
+            let back: Response =
+                serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
+            assert_eq!(back, resp);
+        }
         let ev = Event::CoordChanged(coord());
         let back: Event = serde_json::from_str(&serde_json::to_string(&ev).unwrap()).unwrap();
         assert_eq!(back, ev);
