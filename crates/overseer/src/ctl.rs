@@ -366,11 +366,16 @@ fn text_or_stdin(text: String) -> anyhow::Result<String> {
     Ok(buf.trim_end_matches('\n').to_string())
 }
 
-/// Stdin for `ctl bd` (a heredoc the hook kept), unless it is a terminal
-/// or empty.
-fn piped_stdin() -> Option<String> {
+/// Whether a `bd` argument asks for stdin: exactly `-` or `--flag=-`.
+fn wants_stdin(args: &[String]) -> bool {
+    args.iter().any(|a| a == "-" || a.ends_with("=-"))
+}
+
+/// Stdin for `ctl bd` (a heredoc the hook kept). It is read only when an
+/// argument names it, so a stdin that never closes cannot hang a plain write.
+fn piped_stdin(args: &[String]) -> Option<String> {
     use std::io::IsTerminal;
-    if std::io::stdin().is_terminal() {
+    if !wants_stdin(args) || std::io::stdin().is_terminal() {
         return None;
     }
     let mut bytes = Vec::new();
@@ -574,7 +579,7 @@ pub async fn run(cmd: CtlCmd) -> anyhow::Result<()> {
             )
         }
         CtlCmd::Bd { args } => {
-            let stdin = piped_stdin();
+            let stdin = piped_stdin(&args);
             match client
                 .request(Request::RunBd {
                     from: env_slot(),
@@ -779,6 +784,15 @@ mod tests {
                 "relay  S2  pending  again".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn only_a_dash_argument_asks_for_stdin() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(wants_stdin(&v(&["create", "--body-file", "-"])));
+        assert!(wants_stdin(&v(&["create", "--body-file=-"])));
+        assert!(!wants_stdin(&v(&["list"])));
+        assert!(!wants_stdin(&v(&["create", "--title", "a-b", "-x"])));
     }
 
     #[test]

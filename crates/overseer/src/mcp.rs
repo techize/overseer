@@ -32,6 +32,8 @@ const SUPPORTED_VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"]
 const INVALID_PARAMS: i64 = -32602;
 const METHOD_NOT_FOUND: i64 = -32601;
 const PARSE_ERROR: i64 = -32700;
+const NEEDS_A_SLOT: &str =
+    "update_current_session needs a slot; use `overseer ctl current-session --slot S<n>`";
 const NOT_IN_A_SLOT: &str = "This session is not in an Overseer slot.";
 
 type Call<'a> = dyn FnMut(Request) -> Result<Response, String> + 'a;
@@ -286,6 +288,9 @@ fn call_tool(params: &Value, slot: Option<SlotId>, call: &mut Call) -> Result<Va
     };
     let ToolPlan::Send(req) = tool_request(name, args, slot)?;
     if slot.is_none() {
+        if name == "update_current_session" {
+            return Ok(tool_result(NEEDS_A_SLOT, true));
+        }
         return Ok(tool_result(NOT_IN_A_SLOT, true));
     }
     Ok(match call(req) {
@@ -554,12 +559,20 @@ mod tests {
 
     #[test]
     fn brain_tools_outside_a_slot_are_tool_errors() {
-        for (name, args) in [
-            ("commit_2ndbrain", json!({"paths": ["a"], "message": "m"})),
-            ("update_current_session", json!({"text": "t"})),
+        for (name, args, want) in [
+            (
+                "commit_2ndbrain",
+                json!({"paths": ["a"], "message": "m"}),
+                NOT_IN_A_SLOT,
+            ),
+            (
+                "update_current_session",
+                json!({"text": "t"}),
+                "update_current_session needs a slot; use `overseer ctl current-session --slot S<n>`",
+            ),
         ] {
             let (out, seen) = call_with(&tool(name, args), None, Ok(Response::Ok));
-            assert_eq!(text_of(&out.unwrap()), (NOT_IN_A_SLOT, true));
+            assert_eq!(text_of(&out.unwrap()), (want, true));
             assert!(seen.is_empty());
         }
     }

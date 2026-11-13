@@ -564,6 +564,32 @@ fn ctl_bd_passes_args_and_exit_code() {
 }
 
 #[test]
+fn ctl_bd_without_a_dash_never_reads_stdin() {
+    use std::process::Stdio;
+    let env = Env::with_brain();
+    // Start the daemon first so the timing below is the bd call alone.
+    env.ctl(&["brain"]).assert().success();
+    let mut child = StdCommand::new(assert_cmd::cargo::cargo_bin("overseer"))
+        .env("OVERSEER_HOME", &env.home)
+        .env("OVERSEER_CONFIG", env.home.join("config.toml"))
+        .args(["ctl", "bd", "--", "list"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // The pipe stays open and unwritten until the child is done.
+    let _held = child.stdin.take().unwrap();
+    let start = Instant::now();
+    let status = wait_exit(&mut child, Duration::from_secs(5));
+    assert!(start.elapsed() < Duration::from_secs(4));
+    assert_eq!(status.code(), Some(3));
+    let mut out = String::new();
+    std::io::Read::read_to_string(&mut child.stdout.take().unwrap(), &mut out).unwrap();
+    assert_eq!(out, "bd out\n");
+}
+
+#[test]
 fn ctl_commit_without_slot_is_jonathan() {
     let env = Env::with_brain();
     std::fs::write(env.home.join("vault/notes.md"), "one\n").unwrap();

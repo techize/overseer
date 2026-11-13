@@ -683,6 +683,36 @@ async fn bd_gets_the_stdin_it_was_sent() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bd_that_writes_before_it_reads_does_not_deadlock() {
+    let v = Vault::new("bdbig");
+    let big = v.base.join("bd-stub.sh");
+    // Over 64 KiB out before any read, then count the body.
+    script(
+        &big,
+        "#!/bin/sh\nhead -c 200000 /dev/zero | tr '\\0' x\nwc -c\n",
+    );
+    let svc = v.service(Arc::new(Ledger::in_memory()), v.options());
+    let body = "y".repeat(300_000);
+    let r = tokio::time::timeout(
+        Duration::from_secs(20),
+        svc.run_bd(vec!["create".into()], Some(body)),
+    )
+    .await
+    .expect("run_bd deadlocked");
+    match r {
+        Response::BdOutput { code, stdout, .. } => {
+            assert_eq!(code, 0);
+            assert!(
+                stdout.trim_end().ends_with("300000"),
+                "{}",
+                &stdout[stdout.len() - 20..]
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bd_runs_under_the_lock_then_syncs() {
     let v = Vault::new("bd");
     let svc = v.service(Arc::new(Ledger::in_memory()), v.options());

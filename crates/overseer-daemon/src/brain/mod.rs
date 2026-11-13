@@ -1296,10 +1296,13 @@ async fn run_program(
         let mut child = cmd.spawn()?;
         if let (Some(text), Some(mut pipe)) = (stdin, child.stdin.take()) {
             use tokio::io::AsyncWriteExt;
-            // A child that exits without reading closes the pipe early;
-            // that is its answer, not an error here. Dropping `pipe` is
-            // the EOF bd waits for.
-            let _ = pipe.write_all(text.as_bytes()).await;
+            // Written beside the output drain: a child that fills its
+            // stdout pipe before it reads would otherwise deadlock. A child
+            // that exits without reading closes the pipe early; that is its
+            // answer, not an error. Dropping `pipe` is the EOF bd waits for.
+            tokio::spawn(async move {
+                let _ = pipe.write_all(text.as_bytes()).await;
+            });
         }
         child.wait_with_output().await
     };
