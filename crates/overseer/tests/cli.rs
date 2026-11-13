@@ -129,7 +129,9 @@ EOF
         let mut c = Command::cargo_bin("overseer").unwrap();
         c.env("OVERSEER_HOME", &self.home)
             .env("OVERSEER_CONFIG", self.home.join("config.toml"))
-            .env("OVERSEER_DEFAULT_COMMAND", SCRIPT);
+            .env("OVERSEER_DEFAULT_COMMAND", SCRIPT)
+            // Run from inside a session, these would be that slot's writes.
+            .env_remove("OVERSEER_SLOT");
         if self.bin.is_some() {
             c.env("HOME", self.home.join("home"))
                 .env("SHELL", "/bin/sh");
@@ -660,6 +662,23 @@ fn ctl_journal_and_current_session_read_stdin() {
         cs.contains("<!-- overseer:S2 -->") && cs.contains("on DEMO-12"),
         "{cs}"
     );
+    // A session may not write another slot's section.
+    let err = env
+        .ctl(&["current-session", "--slot", "S3", "not mine"])
+        .env("OVERSEER_SLOT", "S6")
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let said = String::from_utf8_lossy(&err.stderr);
+    assert!(said.contains("S6") && said.contains("S3"), "{said}");
+    let cs = std::fs::read_to_string(env.home.join("CURRENT_SESSION.md")).unwrap();
+    assert!(!cs.contains("not mine"), "{cs}");
+    // Its own slot named again is fine.
+    env.ctl(&["current-session", "--slot", "6", "mine"])
+        .env("OVERSEER_SLOT", "S6")
+        .assert()
+        .success();
 }
 
 #[test]

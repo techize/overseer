@@ -356,6 +356,19 @@ fn env_slot() -> Option<SlotId> {
         .and_then(|s| crate::hook::slot(&s))
 }
 
+/// The slot whose CURRENT_SESSION.md section is written: inside a session
+/// only its own, so `--slot` must agree with `$OVERSEER_SLOT`.
+fn session_slot(named: Option<SlotId>, env: Option<SlotId>) -> anyhow::Result<SlotId> {
+    match (named, env) {
+        (Some(n), Some(e)) if n != e => {
+            bail!("this session is S{e}; it may not write S{n}'s section of CURRENT_SESSION.md")
+        }
+        (Some(n), _) => Ok(n),
+        (None, Some(e)) => Ok(e),
+        (None, None) => bail!("name the slot with --slot S<n>"),
+    }
+}
+
 /// The argument, or all of stdin when it is `-` (trailing newlines cut).
 fn text_or_stdin(text: String) -> anyhow::Result<String> {
     if text != "-" {
@@ -562,10 +575,8 @@ pub async fn run(cmd: CtlCmd) -> anyhow::Result<()> {
                 .await?,
         ),
         CtlCmd::CurrentSession { slot, text } => {
-            let slot = match slot {
-                Some(s) => parse_slot(&s)?,
-                None => env_slot().context("name the slot with --slot S<n>")?,
-            };
+            let named = slot.as_deref().map(parse_slot).transpose()?;
+            let slot = session_slot(named, env_slot())?;
             print_brain_text(
                 client
                     .request(Request::UpdateCurrentSession {
