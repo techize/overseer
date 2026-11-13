@@ -1018,9 +1018,9 @@ async fn s0_started_fresh_gets_the_kickoff_last() {
     };
     assert_eq!(c.request(start).await, Response::Ok);
     let lines = wait_for_log(&log, 1).await;
-    // Kickoff ends in "what." so check the whole tail, not one word.
+    // Check the whole tail of the kickoff, not one word.
     assert!(
-        lines[0].ends_with("propose who works on what."),
+        lines[0].ends_with("propose a plan with propose_plan."),
         "{}",
         lines[0]
     );

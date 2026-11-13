@@ -1,1 +1,1 @@
-Run the start-of-day round: check beads and Jira, check the board, and propose who works on what.
+Run the start-of-day round: call get_board, read today's journal, and propose a plan with propose_plan.
