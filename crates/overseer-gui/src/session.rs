@@ -38,7 +38,7 @@ pub fn tab_label(info: &SlotInfo) -> String {
     }
 }
 
-/// Whether tab `id` shows in orange: its session is running and needs
+/// Whether the tab of `info` shows in orange: its session is running and needs
 /// Jonathan, the same rule as the board's orange card.
 pub fn tab_needs_you(info: &SlotInfo) -> bool {
     matches!(info.state, SlotState::Running { .. })
