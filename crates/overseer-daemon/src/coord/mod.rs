@@ -4,6 +4,8 @@
 //! Plans join this service later. Every change is announced with
 //! `Event::CoordChanged`.
 
+pub mod worktree;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
