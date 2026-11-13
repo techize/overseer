@@ -269,7 +269,7 @@ Setup steps 1 to 4 with the app open. Start S1, S2 and S3 as in step 4.
 | U6 | Release, with its key | In S1's panel press Release (or Cmd+Shift+R) | An inline `Release S1's <target>? Enter / Esc` row; Up and Down pick among the holds; Enter force-releases (S2 is granted `custom:demo-lane`, its card un-blocks), but only while S1 still holds it (E4); Esc cancels; plain `r` and `m` still go to the terminal | Pass: Cmd+Shift+R gave `Release S1's argo:uat/root? Enter / Esc`, Down moved it to `custom:demo-lane`, Esc cancelled, plain `r` and `m` reached the terminal. With the pin moved to S3 behind the prompt, Enter said `argo:uat/root is now held by S3; nothing released.` The Release button then Enter gave `Released custom:demo-lane. S2 holds it now.` and S2's card showed the pill, no longer blocked |
 | U7 | Claim entry | Press `Claim...` in S2's panel, type `custom:other lane test`, Enter; then an empty Enter and `bogus` | The claim is made with the reason `lane test`; an empty or bad entry shows its error and sends nothing | Pass: `custom:other lane test` gave `You hold custom:other.` and `ctl locks` `custom:other  S2  claim  since 17:35  for lane test`; an empty Enter showed `Enter a target, then an optional reason`, `bogus` showed `"bogus" is not a target: it needs a repo:, argo:, deploy:, tf:, kube: or custom: prefix and no spaces`; nothing else was claimed |
 | U8 | Relays box and message | Open S3's panel; Message... (or Cmd+Shift+M), type `hello again`, Enter | The Relays box lists S3's relays with state (pending reasons or delivered); the message goes through the delivery rules (typed in only when S3 is idle with an empty box); an empty message shows `Type a message first` | Pass: Cmd+Shift+M with nothing typed showed `Type a message first`; `hello again` was typed in at the idle empty prompt and answered; the Relays box listed `17:35 from you: hello again` and `17:33 from you: hello`. Pending reasons showed in S0's box (`from S1: ok (pending: waiting at a prompt for Jonathan)`) |
-| U9 | Denied-write notification | Bring another app to the front; with S1 holding `repo:demo-api:main` (`pre S1 'git push origin main'`), run `pre S2 'git push origin main'` | A banner `S2 blocked: repo:demo-api:main is held by S1`; one per new wait (a repeat does not post again); clicking it opens S2's session. This needs the bundle from step 1; under `cargo run` there is no bundle and no banner | For Jonathan: triggered at 17:36 with the Claude app in front; the hook denied S2 (`repo:demo-api:main is held by S1 since 17:36`) and a repeat added no second wait, but computer use cannot see banners, so whether one posted (and once) is unchecked |
+| U9 | Denied-write notification | Bring another app to the front; with S1 holding `repo:demo-api:main` (`pre S1 'git push origin main'`), run `pre S2 'git push origin main'` | A banner `S2 blocked: repo:demo-api:main is held by S1`; one per new wait (a repeat does not post again); clicking it opens S2's session. This needs the bundle from step 1; under `cargo run` there is no bundle and no banner | Pass: triggered at 17:36 with the Claude app in front; the hook denied S2 (`repo:demo-api:main is held by S1 since 17:36`) and a repeat added no second wait. Jonathan saw the banner by eye (confirmed 2026-11-13) |
 | U10 | Everything survives a daemon restart | `$OV ctl shutdown`, then reopen the window | The same pills, waits and strip show at once; slots that were running are shown as resumable | Pass: after `ctl shutdown` the window said `Lost the connection to the daemon. Quit and reopen Overseer to reconnect.`; reopened, it showed at once the same pills (S1 `repo:demo-api:main`, S2 `custom:demo-lane` and `custom:other`, S3 `argo:uat/root`, all held long), S2's `waiting on repo:demo-api:main` and the same strip, with S1 to S3 `Resumable` and a Resume button |
 
 ## Session end and holder checks (fix wave)
@@ -421,6 +421,16 @@ Jonathan; nothing was fixed.
 Phase 4 is done when every Result above reads as passed. Record the date and
 any failures here.
 
-- Signed off by:
-- Date:
+- Signed off by: Jonathan, accepting I4 and U5 as open follow-ups
+- Date: 2026-11-13
 - Open follow-ups:
+  - F6 (I4): a relay stays pending after a permission dialog is answered No,
+    until the next prompt ends.
+  - F7 (U5): the Holds box shows no reason or pin revision, and cuts the
+    `since` text when `held long` and `waiting:` share the row.
+  - F8: `ctl send --raw` does not submit text that wraps.
+  - F9: the coordinator's role file points at `~/Repos/2ndBrain` under a temp
+    `OVERSEER_HOME`.
+  - F4: `claim_target` without `reason` is a protocol error, not a tool error.
+  - MR3's expected result predates the a55f1a2 rule and should say a session
+    must be running in S0.
