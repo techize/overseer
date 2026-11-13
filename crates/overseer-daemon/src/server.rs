@@ -8,7 +8,8 @@ use std::time::Duration;
 use anyhow::Context;
 use bytes::Bytes;
 use overseer_proto::{
-    read_frame, slot_name, write_frame, Event, Frame, Request, Response, SlotId, SlotState,
+    read_frame, slot_name, write_frame, BoardView, Event, Frame, Request, Response, SlotId,
+    SlotState,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
@@ -16,6 +17,7 @@ use tokio::sync::{broadcast, mpsc, watch, Notify};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::brain::{BrainContext, BrainOptions, BrainService, WRITER_OFF};
+use crate::coord::CoordService;
 use crate::env::{BaseEnv, EnvSource};
 use crate::launch::RoleDirs;
 use crate::ledger::Ledger;
@@ -111,6 +113,8 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
         env.clone(),
         Duration::from_secs(cfg.settings.lock_idle_mins.saturating_mul(60)),
     );
+    let coord = CoordService::new(ledger.clone(), events.clone());
+    let timeline = coord.watch(events.subscribe());
     let brain = BrainService::with_options(
         &cfg.settings,
         ledger.clone(),
@@ -198,6 +202,7 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
                             manager: manager.clone(),
                             store: store.clone(),
                             locks: locks.clone(),
+                            coord: coord.clone(),
                             courier: courier.clone(),
                             state_dir: state_dir.clone(),
                             brain: brain.clone(),
@@ -224,6 +229,7 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
     // Dropping `conns` aborts every connection task, closing the sockets.
     drop(conns);
     exits.abort();
+    timeline.abort();
     Ok(())
 }
 
@@ -424,6 +430,7 @@ struct Services {
     manager: Manager,
     store: Arc<WorkStore>,
     locks: Arc<LockService>,
+    coord: Arc<CoordService>,
     courier: Arc<Courier>,
     state_dir: PathBuf,
     brain: Option<Arc<BrainService>>,
@@ -439,6 +446,7 @@ async fn handle_conn(
         manager,
         store,
         locks,
+        coord,
         courier,
         state_dir,
         brain,
@@ -527,6 +535,7 @@ async fn handle_conn(
                         manager: &manager,
                         store: &store,
                         locks: &locks,
+                        coord: &coord,
                         courier: &courier,
                         state_dir: &state_dir,
                         brain: brain.as_ref(),
@@ -558,6 +567,7 @@ struct Ctx<'a> {
     manager: &'a Manager,
     store: &'a Arc<WorkStore>,
     locks: &'a Arc<LockService>,
+    coord: &'a Arc<CoordService>,
     courier: &'a Arc<Courier>,
     state_dir: &'a Path,
     brain: Option<&'a Arc<BrainService>>,
@@ -655,6 +665,8 @@ fn handle_frame(
                     | Request::Assign { .. }
                     | Request::StartSlot { .. }
                     | Request::StopSlot { .. }
+                    | Request::RequestStatus { .. }
+                    | Request::ReportProgress { .. }
                     | Request::Hook(_)
             );
             let mut pending_attach = None;
@@ -920,13 +932,34 @@ fn handle_request(
         },
         Request::Shutdown => Response::Ok,
         // Coordinator requests: the service arrives in a later task.
-        Request::GetBoard
-        | Request::CoordStatus
-        | Request::ProposePlan { .. }
-        | Request::DecidePlan { .. }
-        | Request::RequestStatus { .. }
-        | Request::ReportProgress { .. }
-        | Request::SetBoardSummary { .. } => err("not implemented yet".into()),
+        Request::GetBoard => Response::Board(BoardView {
+            slots: manager.lock().unwrap().list(),
+            work: store.view(),
+            locks: locks.view(),
+            coord: ctx.coord.view(),
+        }),
+        Request::CoordStatus => Response::Coord(ctx.coord.view()),
+        Request::SetBoardSummary { from, text } => ctx.coord.set_summary(from, &text, unix_now()),
+        Request::RequestStatus { from, slot } => {
+            let running = valid_id(slot)
+                && matches!(
+                    manager.lock().unwrap().list()[slot as usize].state,
+                    SlotState::Running { .. }
+                );
+            ctx.coord
+                .request_status(from, slot, running, locks, unix_now())
+        }
+        Request::ReportProgress { slot, text } => {
+            let live_s0 = matches!(
+                manager.lock().unwrap().list()[0].state,
+                SlotState::Running { .. }
+            );
+            ctx.coord.report(slot, &text, live_s0, locks, unix_now())
+        }
+        // Task 4 answers these.
+        Request::ProposePlan { .. } | Request::DecidePlan { .. } => {
+            err("not implemented yet".into())
+        }
         // Always Ok: a hook runs inside Claude and must never see a failure
         // because of the daemon's state.
         Request::Hook(ev) => {

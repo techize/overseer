@@ -7,9 +7,9 @@ use bytes::Bytes;
 use overseer_daemon::locks::targets::{default_patterns, load_patterns, Pattern};
 use overseer_daemon::{run, DaemonConfig};
 use overseer_proto::{
-    read_frame, write_frame, Activity, ActivityKind, BashCheck, ClaimKind, Event, Frame, HookEvent,
-    HookKind, ItemKind, LockView, RelayState, Request, Response, Sender, SlotInfo, SlotState,
-    SourceStatus, WorkItem, WorkView,
+    read_frame, write_frame, Activity, ActivityKind, BashCheck, BoardView, ClaimKind, CoordView,
+    Event, Frame, HookEvent, HookKind, ItemKind, LockView, RelayState, ReportKind, Request,
+    Response, Sender, SlotInfo, SlotState, SourceStatus, WorkItem, WorkView,
 };
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::UnixStream;
@@ -3561,4 +3561,189 @@ fn bash_in(slot: u8, command: &str, cwd: &str) -> Request {
         cwd: Some(PathBuf::from(cwd)),
         env: vec![],
     })
+}
+
+impl Client {
+    async fn board(&mut self) -> BoardView {
+        match self.request(Request::GetBoard).await {
+            Response::Board(b) => b,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    async fn coord(&mut self) -> CoordView {
+        match self.request(Request::CoordStatus).await {
+            Response::Coord(v) => v,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    async fn set_summary(&mut self, from: Option<u8>, text: &str) -> Response {
+        self.request(Request::SetBoardSummary {
+            from,
+            text: text.into(),
+        })
+        .await
+    }
+
+    async fn ask_status(&mut self, from: Option<u8>, slot: u8) -> Response {
+        self.request(Request::RequestStatus { from, slot }).await
+    }
+
+    async fn report(&mut self, slot: u8, text: &str) -> Response {
+        self.request(Request::ReportProgress {
+            slot,
+            text: text.into(),
+        })
+        .await
+    }
+
+    /// The next `CoordChanged` event.
+    async fn coord_event(&mut self) -> CoordView {
+        loop {
+            if let Frame::Event(Event::CoordChanged(v)) =
+                self.recv().await.expect("connection closed")
+            {
+                return v;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn summary_from_s0_shows_on_the_board() {
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    assert_eq!(c.board().await.coord.summary, None);
+    let resp = c
+        .set_summary(Some(0), "Two lanes \u{2014} both green")
+        .await;
+    assert_eq!(resp, Response::Ok);
+    let event = c.coord_event().await;
+    assert_eq!(event.summary.unwrap().text, "Two lanes - both green");
+    let board = c.board().await;
+    assert_eq!(board.coord.summary.unwrap().text, "Two lanes - both green");
+    assert_eq!(board.slots.len(), 7);
+    // Jonathan, through ctl, may set it too.
+    assert_eq!(c.set_summary(None, "  Quiet  ").await, Response::Ok);
+    assert_eq!(c.coord().await.summary.unwrap().text, "Quiet");
+}
+
+#[tokio::test]
+async fn summary_from_a_worker_is_refused() {
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    let resp = c.set_summary(Some(3), "take over").await;
+    assert!(
+        is_error(&resp, "only the coordinator (S0) can set the board summary"),
+        "{resp:?}"
+    );
+    assert_eq!(c.coord().await.summary, None);
+}
+
+#[tokio::test]
+async fn summary_limits() {
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    let resp = c.set_summary(Some(0), "  ").await;
+    assert!(is_error(&resp, "the summary is empty"), "{resp:?}");
+    let resp = c.set_summary(Some(0), &"x".repeat(2001)).await;
+    assert!(
+        is_error(&resp, "the summary is longer than 2000 characters"),
+        "{resp:?}"
+    );
+    assert_eq!(
+        c.set_summary(Some(0), &"x".repeat(2000)).await,
+        Response::Ok
+    );
+    let resp = c.report(3, "").await;
+    assert!(is_error(&resp, "the report is empty"), "{resp:?}");
+}
+
+#[tokio::test]
+async fn status_request_relays_and_the_answer_comes_back() {
+    let (s0, s3) = (box_stub("status-s0"), box_stub("status-s3"));
+    let d = start_daemon_with(temp_socket(), s0.env()).await;
+    let mut c = Client::connect(&d.socket).await;
+    c.start_stub(0, &s0).await;
+    c.start_stub(3, &s3).await;
+    c.hook(hook(0, HookKind::SessionStart)).await;
+    c.hook(hook(3, HookKind::SessionStart)).await;
+    let resp = c.ask_status(Some(0), 3).await;
+    assert!(matches!(resp, Response::Text { .. }), "{resp:?}");
+    let ask = "Overseer: S0 asks for a short status. Answer with the report_progress tool in two or three lines.";
+    assert_eq!(s3.read_until(&pasted(ask)).await, pasted(ask));
+    assert_eq!(c.coord().await.status_asked.len(), 1);
+    assert_eq!(c.report(3, "Tests pass, PR next").await, Response::Ok);
+    let reply = "Overseer: S3 reports: Tests pass, PR next";
+    assert_eq!(s0.read_until(&pasted(reply)).await, pasted(reply));
+    let coord = c.coord().await;
+    assert!(coord.status_asked.is_empty(), "{:?}", coord.status_asked);
+    let report = coord.reports_for(3).next().unwrap();
+    assert_eq!(report.kind, ReportKind::Report);
+    assert_eq!(report.text, "Tests pass, PR next");
+}
+
+#[tokio::test]
+async fn second_status_request_sends_one_relay() {
+    let (s0, s3) = (box_stub("again-s0"), box_stub("again-s3"));
+    let d = start_daemon_with(temp_socket(), s0.env()).await;
+    let mut c = Client::connect(&d.socket).await;
+    c.start_stub(3, &s3).await;
+    assert!(matches!(c.ask_status(None, 3).await, Response::Text { .. }));
+    let asked = c.coord().await.status_asked[0].1;
+    let hhmm = overseer_daemon::locks::local_hhmm(asked);
+    let resp = c.ask_status(Some(0), 3).await;
+    assert_eq!(
+        resp,
+        Response::Text {
+            text: format!("already asked S3 at {hhmm}")
+        }
+    );
+    let to_s3 = c
+        .locks()
+        .await
+        .relays
+        .into_iter()
+        .filter(|r| r.to == 3)
+        .count();
+    assert_eq!(to_s3, 1);
+    // A worker may not ask.
+    let resp = c.ask_status(Some(2), 3).await;
+    assert!(
+        is_error(&resp, "only the coordinator (S0) can ask for a status"),
+        "{resp:?}"
+    );
+    drop(s0);
+}
+
+#[tokio::test]
+async fn status_of_a_stopped_slot_is_refused() {
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    let resp = c.ask_status(Some(0), 3).await;
+    assert!(is_error(&resp, "S3 is not running"), "{resp:?}");
+    assert!(c.coord().await.status_asked.is_empty());
+}
+
+#[tokio::test]
+async fn timeline_records_state_changes() {
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    assert_eq!(c.start(3).await, Response::Ok);
+    c.hook(hook(3, HookKind::UserPromptSubmit)).await;
+    c.hook(hook(3, HookKind::Stop)).await;
+    let mut texts = Vec::new();
+    for _ in 0..250 {
+        let coord = c.coord().await;
+        let mut rows: Vec<_> = coord.reports_for(3).collect();
+        rows.reverse();
+        texts = rows.iter().map(|r| r.text.clone()).collect();
+        if texts.len() >= 3 {
+            assert!(rows.iter().all(|r| r.kind == ReportKind::State));
+            break;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(texts, ["started", "working", "idle"]);
 }
