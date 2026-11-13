@@ -37,6 +37,11 @@ the same path `brain_dir` in `config.toml`.
   first backup after step 6 commits any free change in the vault.
 - Close any Obsidian Git "commit all" you have running by hand. It is turned
   off properly in step 1.
+- `command -v overseer` prints a path, and `overseer ctl brain` runs. The
+  global hooks and skills in step 4 call `overseer ctl ...` by name from a
+  session's PATH (on the home Mac `~/.local/bin/overseer` is a symlink to the
+  app's binary). A session's rewritten `bd` writes do not depend on this:
+  the daemon names its own binary by its absolute path.
 
 ## 1. Obsidian Git: stop it committing and pushing
 
@@ -240,6 +245,18 @@ the global hooks then need switching back by hand.
   env prefix is denied; run it as a plain line. Long text goes in with
   `--body-file -` and a quoted heredoc (`<<'EOF'`). `ctl bd` reads stdin only
   when an argument is `-` or ends in `=-`.
+- A push the remote rejects runs `git pull --rebase --autostash`. While it
+  runs, your uncommitted edits in the vault (an open Obsidian note included)
+  are stashed and then put back. If they do not go back cleanly, the file is
+  left with conflict markers, the notice names the stash by its hash, and
+  Overseer holds its queued commits, leaves the conflicted files out of the
+  backup and holds the sync until you resolve them (`git status`) and drop
+  that stash. Your text is in the file and in the stash; nothing is lost.
+- A `bd` write is rewritten only when bd, run from the session's cwd, would
+  use `beads_dir`: the cwd is under it, or no other `.beads` exists from the
+  cwd up to your home folder, and `BEADS_DIR` or `--db` does not name another
+  database. In a repo with its own `.beads` (`demo-api`, say), `bd` runs as
+  written, against that repo's own tracker and outside the vault lock.
 - If a Claude Code release stops honouring `updatedInput` from a hook, the
   `bd` rewrite stops working. The acceptance row B1 checks this on the
   installed version (2.1.259 at the time of writing); re-run it after a Claude

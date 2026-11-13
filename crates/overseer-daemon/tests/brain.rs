@@ -124,6 +124,7 @@ impl Vault {
             retry: Duration::from_millis(100),
             lock_wait: Duration::from_millis(200),
             home: self.base.join("home"),
+            program: PathBuf::from("overseer"),
         }
     }
 
@@ -578,7 +579,10 @@ async fn failed_sync_and_backup_reach_the_view() {
     until("the sync record", || svc.view().last_sync.is_some()).await;
     let sync = svc.view().last_sync.unwrap();
     assert!(!sync.ok, "{sync:?}");
-    assert!(sync.detail.starts_with("held: git status failed"), "{sync:?}");
+    assert!(
+        sync.detail.starts_with("held: git status failed"),
+        "{sync:?}"
+    );
     assert!(v.log("sync.log").is_empty());
     svc.backup_now().await;
     let backup = svc.view().last_backup.unwrap();

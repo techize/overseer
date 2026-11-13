@@ -3425,7 +3425,8 @@ async fn vault_write_checks_deny_shared_files_and_git_and_rewrite_bd() {
     // bd writes are rewritten, compound ones denied, reads untouched.
     let (deny, rewrite) = verdict(c.request(bash_in(1, "bd close ov-3", "/tmp")).await);
     assert_eq!(deny, None);
-    assert_eq!(rewrite.as_deref(), Some("overseer ctl bd -- close ov-3"));
+    // The daemon names the binary by its absolute path (hook_program).
+    assert_eq!(rewrite.as_deref(), Some("/bin/true ctl bd -- close ov-3"));
     let (deny, rewrite) = verdict(
         c.request(bash_in(1, "bd close ov-3 && git push", "/tmp"))
             .await,

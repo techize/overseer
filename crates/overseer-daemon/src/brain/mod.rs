@@ -139,6 +139,8 @@ pub struct BrainOptions {
     pub lock_wait: Duration,
     /// What `~` means in a path a session names.
     pub home: PathBuf,
+    /// The overseer binary a rewritten `bd` write runs (`<program> ctl bd`).
+    pub program: PathBuf,
 }
 
 impl BrainOptions {
@@ -152,6 +154,7 @@ impl BrainOptions {
             home: std::env::var_os("HOME")
                 .map(PathBuf::from)
                 .unwrap_or_default(),
+            program: PathBuf::from("overseer"),
         }
     }
 }
@@ -461,7 +464,8 @@ impl BrainService {
             // Another repo's own beads: bd there is none of the vault's business (I1).
             bash::BdCall::Write(_) | bash::BdCall::Compound if !self.bd_uses_beads_dir(check) => {}
             bash::BdCall::Write(args) => {
-                return verdict(None, Some(bash::bd_rewrite(&check.command, &args)));
+                let line = bash::bd_rewrite(&self.opts.program, &check.command, &args);
+                return verdict(None, Some(line));
             }
             bash::BdCall::Compound => return verdict(Some(BD_COMPOUND_DENY.into()), None),
             bash::BdCall::None | bash::BdCall::Read => {}

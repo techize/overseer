@@ -15,7 +15,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc, watch, Notify};
 use tokio::task::{JoinHandle, JoinSet};
 
-use crate::brain::{BrainContext, BrainService, WRITER_OFF};
+use crate::brain::{BrainContext, BrainOptions, BrainService, WRITER_OFF};
 use crate::env::{BaseEnv, EnvSource};
 use crate::launch::RoleDirs;
 use crate::ledger::Ledger;
@@ -111,7 +111,15 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
         env.clone(),
         Duration::from_secs(cfg.settings.lock_idle_mins.saturating_mul(60)),
     );
-    let brain = BrainService::new(&cfg.settings, ledger.clone(), events.clone());
+    let brain = BrainService::with_options(
+        &cfg.settings,
+        ledger.clone(),
+        events.clone(),
+        BrainOptions {
+            program: cfg.hook_program.clone(),
+            ..BrainOptions::from_config(&cfg.settings)
+        },
+    );
     // Subscribed before any slot can start, so no exit is missed.
     let exit_events = events.subscribe();
     let courier_events = events.subscribe();

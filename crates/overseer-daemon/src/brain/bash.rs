@@ -638,19 +638,21 @@ fn quote(w: &str) -> String {
     }
 }
 
-/// The command that runs a `bd` write through the daemon: the original
-/// line with its `bd` word replaced when it starts the line (so quoting,
-/// substitutions and redirects behave as written), else the parsed
-/// arguments shell-quoted.
-pub fn bd_rewrite(command: &str, args: &[String]) -> String {
+/// The command that runs a `bd` write through the daemon with `program`
+/// (the absolute path of the overseer binary, so the session's PATH does
+/// not matter): the original line with its `bd` word replaced when it
+/// starts the line (so quoting, substitutions and redirects behave as
+/// written), else the parsed arguments shell-quoted.
+pub fn bd_rewrite(program: &Path, command: &str, args: &[String]) -> String {
+    let program = quote(&program.to_string_lossy());
     let t = command.trim_start();
     if let Some(rest) = t.strip_prefix("bd") {
         if rest.starts_with([' ', '\t']) {
-            return format!("overseer ctl bd --{rest}");
+            return format!("{program} ctl bd --{rest}");
         }
     }
     let quoted: Vec<String> = args.iter().map(|a| quote(a)).collect();
-    format!("overseer ctl bd -- {}", quoted.join(" "))
+    format!("{program} ctl bd -- {}", quoted.join(" "))
 }
 
 #[cfg(test)]
@@ -750,6 +752,23 @@ mod tests {
     }
 
     #[test]
+    fn bd_rewrite_names_the_binary_by_its_path() {
+        let p = Path::new("/Applications/Over Seer.app/Contents/MacOS/overseer");
+        assert_eq!(
+            bd_rewrite(p, "bd close DEMO-12", &["close".into(), "DEMO-12".into()]),
+            "'/Applications/Over Seer.app/Contents/MacOS/overseer' ctl bd -- close DEMO-12"
+        );
+        assert_eq!(
+            bd_rewrite(
+                Path::new("/usr/local/bin/overseer"),
+                "bd sync",
+                &["sync".into()]
+            ),
+            "/usr/local/bin/overseer ctl bd -- sync"
+        );
+    }
+
+    #[test]
     fn beads_dir_assignments_and_db_flags_are_found() {
         assert_eq!(
             assigned("BEADS_DIR=/r/demo-api/.beads bd create x", "BEADS_DIR").as_deref(),
@@ -813,11 +832,15 @@ mod tests {
     #[test]
     fn bd_rewrite_keeps_the_line_as_written() {
         assert_eq!(
-            bd_rewrite("bd create \"a $(echo b)\" -p 1", &[]),
+            bd_rewrite(Path::new("overseer"), "bd create \"a $(echo b)\" -p 1", &[]),
             "overseer ctl bd -- create \"a $(echo b)\" -p 1"
         );
         assert_eq!(
-            bd_rewrite("FOO=1 bd close ov-3", &["close".into(), "ov 3".into()]),
+            bd_rewrite(
+                Path::new("overseer"),
+                "FOO=1 bd close ov-3",
+                &["close".into(), "ov 3".into()]
+            ),
             "overseer ctl bd -- close 'ov 3'"
         );
     }
