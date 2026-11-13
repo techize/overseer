@@ -921,8 +921,10 @@ impl BrainService {
                     let paths = format!("{} paths", keep.len());
                     let (ok, detail) = match state {
                         QueueState::Committed | QueueState::NothingToCommit => (true, paths),
-                        // Retried by the queue, like any held entry.
+                        // Retried by the queue, like any held entry; the
+                        // worker is told so it waits only for the retry.
                         QueueState::Queued => {
+                            self.wake.notify_one();
                             (true, format!("{paths}, queued: {}", self.entry_error(id)))
                         }
                         QueueState::Failed => (false, self.entry_error(id)),

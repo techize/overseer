@@ -1210,6 +1210,41 @@ async fn backup_leaves_a_queued_entrys_paths_alone() {
     assert_eq!(files.trim(), rel);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retried_backup_checks_its_paths_again() {
+    let v = Vault::new("backupretry");
+    let opts = BrainOptions {
+        retry: Duration::from_millis(1500),
+        ..v.options()
+    };
+    let svc = v.service(Arc::new(Ledger::in_memory()), opts);
+    let ctx = shared_context(
+        &svc,
+        BrainContext {
+            owners: owners(),
+            running: vec![1],
+            busy: vec![],
+        },
+    );
+    write(&v.vault.join("free.md"), "free\n");
+    write(&v.vault.join(S1_NOTE), "idle\n");
+    let lock = v.vault.join(".git/index.lock");
+    std::fs::write(&lock, "").unwrap();
+    svc.backup_now().await;
+    let backup = svc.view().last_backup.expect("a backup record");
+    assert!(backup.detail.contains("queued"), "{}", backup.detail);
+    // S1 starts working before the retry: its note is no longer backed up.
+    ctx.lock().unwrap().busy = vec![1];
+    std::fs::remove_file(&lock).unwrap();
+    until("the backup commit", || {
+        sh(&v.vault, &["log", "-1", "--format=%s"]).starts_with("vault backup: ")
+    })
+    .await;
+    let files = sh(&v.vault, &["show", "--name-only", "--format=", "HEAD"]);
+    assert_eq!(files.trim(), "free.md");
+    assert!(v.status().contains("s1-demo.md"));
+}
+
 // The daemon over its socket, with the writer off and on.
 
 async fn ask(socket: &Path, req: Request) -> Response {
