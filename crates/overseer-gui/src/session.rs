@@ -38,6 +38,16 @@ pub fn tab_label(info: &SlotInfo) -> String {
     }
 }
 
+/// Whether tab `id` shows in orange: its session is running and needs
+/// Jonathan, the same rule as the board's orange card.
+pub fn tab_needs_you(info: &SlotInfo) -> bool {
+    matches!(info.state, SlotState::Running { .. })
+        && info
+            .activity
+            .as_ref()
+            .is_some_and(|a| a.kind == ActivityKind::NeedsYou)
+}
+
 /// What the context panel shows for a slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PanelModel {
@@ -654,8 +664,12 @@ impl OverseerApp {
                     .rounded(px(5.))
                     .bg(rgb(colors::CARD))
                     .border_1()
-                    .border_color(rgb(if on { colors::ORANGE } else { colors::BORDER }))
-                    .text_color(rgb(if on { colors::ORANGE } else { colors::TEXT }))
+                    .border_color(rgb(if on { colors::ACCENT } else { colors::BORDER }))
+                    .text_color(rgb(if tab_needs_you(info) {
+                        colors::ORANGE
+                    } else {
+                        colors::TEXT
+                    }))
                     .cursor_pointer()
                     .child(tab_label(info))
                     .on_click(
@@ -1261,6 +1275,30 @@ mod tests {
     fn tabs() {
         assert_eq!(tab_label(&info(RUN)), "2 S2 ●");
         assert_eq!(tab_label(&info(SlotState::Empty)), "2 S2");
+    }
+
+    #[test]
+    fn tab_is_orange_only_while_running_and_needing_you() {
+        use overseer_proto::Activity;
+        let with = |state, kind| SlotInfo {
+            activity: Some(Activity {
+                kind,
+                since: 100,
+                now_doing: None,
+                reason: None,
+                idle_wait: false,
+            }),
+            ..info(state)
+        };
+        assert!(tab_needs_you(&with(RUN, ActivityKind::NeedsYou)));
+        assert!(!tab_needs_you(&with(RUN, ActivityKind::Working)));
+        assert!(!tab_needs_you(&with(RUN, ActivityKind::Idle)));
+        assert!(!tab_needs_you(&info(RUN)));
+        let exited = SlotState::Exited {
+            code: Some(0),
+            at: 200,
+        };
+        assert!(!tab_needs_you(&with(exited, ActivityKind::NeedsYou)));
     }
 
     #[test]
