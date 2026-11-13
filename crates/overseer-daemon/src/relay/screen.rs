@@ -111,15 +111,23 @@ pub fn input_box(snap: &Snapshot) -> InputBox {
     }
 }
 
-/// Claude Code's working line ends with this while a turn runs.
+/// Older Claude Code ends its working line with this.
 const WORKING_HINT: &str = "esc to interrupt";
 
 /// Whether `snap` shows Claude Code's working line anywhere, so a turn is
-/// running even if no hook has said so yet.
+/// running even if no hook has said so yet. The line is a word ending in an
+/// ellipsis and a running time, `✻ Churning… (4s · ↓ 323 tokens)`; a
+/// finished turn reads `✻ Brewed for 6s · done`, with no ellipsis.
 pub fn shows_working(snap: &Snapshot) -> bool {
     (0..snap.rows).any(|row| {
         let line: String = row_cells(snap, row).iter().map(|c| c.ch).collect();
         line.contains(WORKING_HINT)
+            || line.match_indices("\u{2026} (").any(|(at, m)| {
+                line[at + m.len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_digit())
+            })
     })
 }
 
@@ -229,6 +237,15 @@ mod tests {
         lines.push(rule(COLS as usize));
         let (snap, _) = screen_of(&draw(&lines), COLS, ROWS);
         assert!(shows_working(&snap));
+        // Claude Code 2.1.259 has no `esc to interrupt`.
+        lines[0] = "\u{273B} Churning\u{2026} (4s \u{00B7} \u{2193} 323 tokens)".to_string();
+        let (snap, _) = screen_of(&draw(&lines), COLS, ROWS);
+        assert!(shows_working(&snap));
+        // A finished turn, or an ellipsis in prose, is not working.
+        lines[0] = "\u{273B} Brewed for 6s \u{00B7} done 9:21 AM".to_string();
+        lines[1] = "Creating the file\u{2026} (then pushing)".to_string();
+        let (snap, _) = screen_of(&draw(&lines), COLS, ROWS);
+        assert!(!shows_working(&snap));
         let (snap, _) = screen_of(&box_with(&["\u{276F} "], COLS as usize), COLS, ROWS);
         assert!(!shows_working(&snap));
     }

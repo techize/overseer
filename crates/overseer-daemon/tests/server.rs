@@ -2715,7 +2715,7 @@ draw() {{
     return
   fi
   if [ "$b" = @working ]; then
-    printf '\033[2J\033[H{mode}\342\234\273 Running\342\200\246 (3s \302\267 esc to interrupt)\r\n\r\n%s\r\n' "$rule"
+    printf '\033[2J\033[H{mode}\342\234\273 Churning\342\200\246 (4s \302\267 \342\206\223 323 tokens)\r\n\r\n%s\r\n' "$rule"
     printf '\342\235\257 \033[7mT\033[0m\033[2mry "fix the failing test"\033[0m\r\n'
     printf '%s\r\n  ? for shortcuts' "$rule"
     echo drawn >> '{draws}'
