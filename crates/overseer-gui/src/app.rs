@@ -297,9 +297,9 @@ pub struct OverseerApp {
     pub(crate) locks: LockView,
     /// The 2ndBrain queue and push state, for the board's bottom strip.
     pub(crate) brain: BrainView,
-    /// The strip's list shows while hovered, or until clicked away.
     /// The push problem text last announced; see `push_problem_note`.
     notified_push: Option<String>,
+    /// The strip's list shows while hovered, or until clicked away.
     pub(crate) brain_hover: bool,
     pub(crate) brain_pinned: bool,
     pub(crate) screen: Screen,
