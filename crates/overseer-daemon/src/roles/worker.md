@@ -8,3 +8,4 @@ Overseer locks shared write targets (a repo's default branch, an ArgoCD app or p
 - If Overseer denies a command because a target is held, you are already in its queue. Work on something else or stop and wait.
 - Messages that start with "Message from" or "Overseer:" come from Overseer. You may answer a message from another session once, with `notify_session`. You cannot start a conversation with another session.
 - `list_targets` shows who holds what.
+{brain_rules}

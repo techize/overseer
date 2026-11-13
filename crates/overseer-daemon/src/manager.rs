@@ -48,6 +48,8 @@ struct Entry {
     /// what clients see and send back on a restart: reporting the flagged
     /// argv would make every restart add a second set of flags.
     command: Vec<String>,
+    /// The ledger's session note for the slot, relative to the vault.
+    session_note: Option<String>,
 }
 
 impl Entry {
@@ -57,6 +59,7 @@ impl Entry {
             activity: None,
             session_id,
             command,
+            session_note: None,
         }
     }
 
@@ -64,6 +67,7 @@ impl Entry {
         SlotInfo {
             activity: self.activity.clone(),
             command: Some(self.command.clone()),
+            session_note: self.session_note.clone(),
             ..self.slot.info()
         }
     }
@@ -89,6 +93,9 @@ pub struct SlotManager {
     /// process. Only ever set for a slot with no entry in `slots`; a start
     /// or resume replaces it.
     restored: [Option<Restored>; SLOT_COUNT],
+    /// `session_note` from the config: a fresh start fixes the slot's note
+    /// from it in the ledger; a resume keeps the one it had.
+    session_note: Option<String>,
 }
 
 /// A slot as the ledger left it: no process, but remembered.
@@ -134,6 +141,7 @@ impl SlotManager {
             launch: None,
             shutting_down: Default::default(),
             restored: Default::default(),
+            session_note: None,
         }
     }
 
@@ -178,6 +186,7 @@ impl SlotManager {
                 cols: DEFAULT_COLS,
                 rows: DEFAULT_ROWS,
                 activity: None,
+                session_note: launch.ledger.session_note(row.slot).ok().flatten(),
             };
             let session_id = if resumable {
                 row.session_id
@@ -203,6 +212,13 @@ impl SlotManager {
             ledger,
             dirs,
         });
+        self
+    }
+
+    /// Fixes each fresh session's note path from `template` (vault-relative,
+    /// see `brain::paths::fill_template`).
+    pub fn with_session_note(mut self, template: String) -> Self {
+        self.session_note = Some(template);
         self
     }
 
@@ -277,6 +293,18 @@ impl SlotManager {
             }
         }
         let command = command.unwrap_or_else(|| self.default_command.clone());
+        // One clock reading and one note for the role, the row and the
+        // ledger: a fresh start fixes the note from `start_time`, a resume keeps
+        // the stored one (it may be from another day).
+        let start_time = unix_now();
+        let note = match (&resume, &self.launch) {
+            (Some(_), Some(l)) => l.ledger.session_note(id).ok().flatten(),
+            (None, _) => self
+                .session_note
+                .as_ref()
+                .map(|t| crate::brain::paths::fill_template(t, start_time, id, &label)),
+            _ => None,
+        };
         // Claude gets Overseer's hooks, role prompt and a session id of our
         // choosing; anything else runs as given and has no session id.
         let mut session_id = String::new();
@@ -289,6 +317,7 @@ impl SlotManager {
                 &label,
                 &launch.hook_program,
                 &launch.dirs,
+                note.as_deref(),
             )
             .map_err(|e| format!("cannot write {} launch files: {e}", slot_name(id)))?;
             let how = match &resume {
@@ -334,7 +363,8 @@ impl SlotManager {
         }
         // N4: tear down whatever occupied the slot before (an exited child;
         // kill is a no-op then, but keeps the invariant in one place).
-        let entry = Entry::new(slot.clone(), entry_session_id, command.clone());
+        let mut entry = Entry::new(slot.clone(), entry_session_id, command.clone());
+        entry.session_note = note.clone().filter(|_| self.launch.is_some());
         let started = entry.info();
         if let Some(old) = slots[id as usize].replace(entry) {
             old.slot.kill();
@@ -356,10 +386,14 @@ impl SlotManager {
                 label: row_label,
                 cwd: cwd.to_path_buf(),
                 command: command.clone(),
-                started: unix_now(),
+                started: start_time,
             };
             if let Err(e) = launch.ledger.record_start(&row) {
                 tracing::warn!("{} ledger start not recorded: {e:#}", slot_name(id));
+            } else if let Some(note) = &note {
+                if let Err(e) = launch.ledger.set_session_note(id, note) {
+                    tracing::warn!("{} session note not recorded: {e:#}", slot_name(id));
+                }
             }
         }
         let _ = self.events.send(Event::SlotChanged(started));
@@ -460,6 +494,7 @@ impl SlotManager {
             cols: DEFAULT_COLS,
             rows: DEFAULT_ROWS,
             activity: None,
+            session_note: None,
         }
     }
 
@@ -656,23 +691,154 @@ mod restore_tests {
         }
     }
 
-    fn manager(ledger: Arc<Ledger>) -> SlotManager {
+    /// A state folder of the test's own, removed when it ends.
+    struct StateDir(PathBuf);
+
+    impl StateDir {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!("ovm-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for StateDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn manager(ledger: Arc<Ledger>, state: &StateDir) -> SlotManager {
         let (events, _) = broadcast::channel(16);
         SlotManager::new(vec!["claude".into()], events).with_launch(
-            std::env::temp_dir(),
+            state.0.clone(),
             PathBuf::from("/bin/true"),
             ledger,
             RoleDirs::default(),
         )
     }
 
+    fn role_note(state: &StateDir, slot: SlotId) -> String {
+        let role =
+            std::fs::read_to_string(state.0.join("slots").join(slot_name(slot)).join("role.md"))
+                .unwrap();
+        role.lines()
+            .find_map(|l| l.split("session note is ").nth(1))
+            .unwrap_or("")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn the_role_names_the_ledgers_note_fresh_and_resumed() {
+        let ledger = Arc::new(Ledger::in_memory());
+        let state = StateDir::new();
+        let mut m =
+            manager(ledger.clone(), &state).with_session_note("Sessions/{slot}-{label}.md".into());
+        // The role needs the writer on to name a note.
+        m.launch.as_mut().unwrap().dirs.brain_writer = true;
+        m.launch.as_mut().unwrap().dirs.brain = PathBuf::from("/tmp/demo-brain");
+        // Only a claude command gets a role file: a stand-in named claude.
+        let bin = state.0.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let fake = bin.join("claude");
+        std::fs::write(&fake, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let sleep = Some(vec![fake.to_string_lossy().to_string()]);
+        m.start(
+            6,
+            "Demo Lane".into(),
+            Path::new("/tmp"),
+            sleep.clone(),
+            None,
+        )
+        .unwrap();
+        let fresh = ledger.session_note(6).unwrap().unwrap();
+        assert_eq!(role_note(&state, 6), format!("/tmp/demo-brain/{fresh}. Write it, and any ticket folder you own (for example Sprints/sprint-26-01/DEMO-12-demo-lane/), directly with your file tools."));
+        m.stop(6).unwrap();
+        for _ in 0..100 {
+            if !matches!(m.list()[6].state, SlotState::Running { .. }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // A resume the next day keeps the stored note, not today's.
+        ledger
+            .set_session_note(6, "Sessions/2020/01-January/2020-01-02-s6-old.md")
+            .unwrap();
+        m.launch_slot(
+            6,
+            "Demo Lane".into(),
+            Path::new("/tmp"),
+            sleep,
+            Some("sid-6".into()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            m.list()[6].session_note.as_deref(),
+            Some("Sessions/2020/01-January/2020-01-02-s6-old.md")
+        );
+        assert!(
+            role_note(&state, 6)
+                .starts_with("/tmp/demo-brain/Sessions/2020/01-January/2020-01-02-s6-old.md."),
+            "{}",
+            role_note(&state, 6)
+        );
+        m.shutdown_all();
+    }
+
+    #[tokio::test]
+    async fn a_fresh_start_fixes_the_session_note() {
+        let ledger = Arc::new(Ledger::in_memory());
+        let state = StateDir::new();
+        let mut m =
+            manager(ledger.clone(), &state).with_session_note("Sessions/{slot}-{label}.md".into());
+        let sleep = Some(vec!["/bin/sleep".to_string(), "30".to_string()]);
+        m.start(
+            3,
+            "Demo Lane".into(),
+            Path::new("/tmp"),
+            sleep.clone(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            ledger.session_note(3).unwrap().as_deref(),
+            Some("Sessions/s3-demo-lane.md")
+        );
+        // The slot's info carries the note for the board.
+        assert_eq!(
+            m.list()[3].session_note.as_deref(),
+            Some("Sessions/s3-demo-lane.md")
+        );
+        // A resume keeps the row, note included.
+        ledger.mark_resumed(3).unwrap();
+        assert!(ledger.session_note(3).unwrap().is_some());
+        m.stop(3).unwrap();
+        for _ in 0..100 {
+            if !matches!(m.list()[3].state, SlotState::Running { .. }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        m.start(3, "other".into(), Path::new("/tmp"), sleep, None)
+            .unwrap();
+        assert_eq!(
+            ledger.session_note(3).unwrap().as_deref(),
+            Some("Sessions/s3-other.md")
+        );
+        m.shutdown_all();
+    }
+
     #[test]
     fn corrupt_row_is_not_resumable() {
         let ledger = Arc::new(Ledger::in_memory());
+        let state = StateDir::new();
         // A command that reads back as empty, as a corrupt row does.
         ledger.record_start(&row(1, "abc", &[])).unwrap();
         ledger.record_start(&row(2, "def", &["claude"])).unwrap();
-        let mut m = manager(ledger.clone());
+        let mut m = manager(ledger.clone(), &state);
         m.restore();
         let slots = m.list();
         assert_eq!(slots[1].state, SlotState::Exited { code: None, at: 77 });

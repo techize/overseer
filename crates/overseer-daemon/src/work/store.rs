@@ -33,7 +33,19 @@ use crate::manager::valid_id;
 pub const SOURCE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `bd list` stops at 50 rows unless told otherwise; `--limit 0` lists all.
-pub const BD_LIST: [&str; 5] = ["bd", "list", "--json", "--limit", "0"];
+/// Run after the configured `bd_command`.
+pub const BD_LIST: [&str; 4] = ["list", "--json", "--limit", "0"];
+
+/// Runs one `bd` write (the arguments after `bd`) somewhere else: the
+/// 2ndBrain writer, which holds the vault lock while bd runs.
+pub type LabelWriter = Box<
+    dyn Fn(
+            Vec<String>,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// How long shutdown waits for queued bead labels to reach `bd`.
 pub const LABEL_DRAIN: Duration = Duration::from_secs(3);
@@ -82,6 +94,10 @@ struct LabelQueue {
 
 pub struct WorkStore {
     beads_dir: PathBuf,
+    /// The configured `bd` program and its leading arguments.
+    bd_command: Vec<String>,
+    /// Set when the 2ndBrain writer is on: label writes go through it.
+    label_writer: OnceLock<LabelWriter>,
     brain_dir: PathBuf,
     /// `None` when the configured command is empty: Jira is off.
     jira_command: Option<Vec<String>>,
@@ -203,6 +219,8 @@ impl WorkStore {
         );
         Arc::new(WorkStore {
             beads_dir: cfg.beads_dir.clone(),
+            bd_command: cfg.bd_command.clone(),
+            label_writer: OnceLock::new(),
             brain_dir: cfg.brain_dir.clone(),
             jira_command,
             jql: cfg.jql.clone(),
@@ -239,6 +257,19 @@ impl WorkStore {
 
     pub fn brain_dir(&self) -> &Path {
         &self.brain_dir
+    }
+
+    /// Sends the label writes to `f` instead of running `bd` here. Set once
+    /// at start-up, when the 2ndBrain writer is on.
+    pub fn route_label_writes(&self, f: LabelWriter) {
+        let _ = self.label_writer.set(f);
+    }
+
+    /// `bd_command` followed by `args`.
+    fn bd(&self, args: &[String]) -> Vec<String> {
+        let mut cmd = self.bd_command.clone();
+        cmd.extend(args.iter().cloned());
+        cmd
     }
 
     /// The cached items with their owners and folders, owned items that have
@@ -331,7 +362,7 @@ impl WorkStore {
         let vars = env.get();
         match which {
             Source::Beads => {
-                let cmd = BD_LIST.map(String::from);
+                let cmd = self.bd(&BD_LIST.map(String::from));
                 let got = run_source(&cmd, &self.beads_dir, SOURCE_TIMEOUT, &vars)
                     .await
                     .and_then(|out| parse_beads(&out));
@@ -614,7 +645,7 @@ impl WorkStore {
     }
 
     async fn run_label(&self, l: Label) {
-        let mut cmd = vec!["bd".to_string(), "update".into(), l.id.clone()];
+        let mut cmd = vec!["update".to_string(), l.id.clone()];
         if let Some(s) = l.add {
             cmd.extend(["--add-label".into(), format!("overseer:{}", slot_name(s))]);
         }
@@ -624,11 +655,19 @@ impl WorkStore {
                 format!("overseer:{}", slot_name(s)),
             ]);
         }
-        // Right after start the login shell's PATH may not be in yet.
-        let mut env = self.env.clone();
-        env.wait().await;
-        let vars = env.get();
-        if let Err(e) = run_source(&cmd, &self.beads_dir, SOURCE_TIMEOUT, &vars).await {
+        let result = match self.label_writer.get() {
+            Some(write) => write(cmd).await,
+            None => {
+                // Right after start the login shell's PATH may not be in yet.
+                let mut env = self.env.clone();
+                env.wait().await;
+                let vars = env.get();
+                run_source(&self.bd(&cmd), &self.beads_dir, SOURCE_TIMEOUT, &vars)
+                    .await
+                    .map(|_| ())
+            }
+        };
+        if let Err(e) = result {
             let text = format!("could not label {} in beads: {e}", l.id);
             tracing::warn!("{text}");
             let Some(slot) = l.add.or(l.remove) else {

@@ -21,6 +21,7 @@ fn info(id: SlotId) -> Event {
         cols: 80,
         rows: 24,
         activity: None,
+        session_note: None,
     })
 }
 

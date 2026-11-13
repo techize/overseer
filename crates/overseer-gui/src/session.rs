@@ -18,7 +18,7 @@ use overseer_proto::{
     SlotId, SlotInfo, SlotState, WorkView,
 };
 
-use crate::app::{colors, OpenMessage, OpenRelease, OverseerApp};
+use crate::app::{colors, OpenMessage, OpenNote, OpenRelease, OverseerApp};
 use crate::board::{
     activity_detail, activity_state, format_elapsed, local_hhmm, one_line, owned_by, slot_title,
     tilde,
@@ -51,6 +51,38 @@ pub struct PanelModel {
     pub can_start_new: bool,
     /// Resumable: Resume takes the place of Restart and Start.
     pub can_resume: bool,
+}
+
+/// The obsidian link that opens `note` (relative to `brain_dir`).
+pub fn obsidian_url(brain_dir: &Path, note: &str) -> String {
+    let abs = brain_dir.join(note);
+    let mut url = String::from("obsidian://open?path=");
+    for b in abs.to_string_lossy().bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                url.push(b as char)
+            }
+            _ => url.push_str(&format!("%{b:02X}")),
+        }
+    }
+    url
+}
+
+/// What the panel says about the slot's session note, `None` for an empty
+/// slot.
+pub fn note_line(info: &SlotInfo, brain_dir: Option<&Path>) -> Option<String> {
+    match (&info.session_note, &info.state) {
+        (Some(note), _) if brain_dir.is_some() => Some(format!("{note} (press n to open)")),
+        (Some(note), _) => Some(note.clone()),
+        (None, SlotState::Empty) => None,
+        (None, _) => Some("No session note yet".into()),
+    }
+}
+
+/// The link `n` opens, or `None` while the slot has no note yet or the
+/// board does not know the vault.
+pub fn note_target(info: &SlotInfo, brain_dir: Option<&Path>) -> Option<String> {
+    Some(obsidian_url(brain_dir?, info.session_note.as_deref()?))
 }
 
 /// `14:05:12 (8m 05s ago)`. `clock` turns unix seconds into local time.
@@ -709,6 +741,29 @@ impl OverseerApp {
                 panel_box("Session")
                     .child(div().font_weight(FontWeight::SEMIBOLD).child(m.title))
                     .children(rows)
+                    .children(
+                        note_line(info, self.brain.brain_dir.as_deref()).map(|text| {
+                            let missing = info.session_note.is_none();
+                            div()
+                                .flex()
+                                .gap_2()
+                                .text_sm()
+                                .child(
+                                    div()
+                                        .w(px(64.))
+                                        .text_color(rgb(colors::MUTED))
+                                        .child("Note"),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .truncate()
+                                        .when(missing, |d| d.text_color(rgb(colors::TEXT_DIM)))
+                                        .child(text),
+                                )
+                        }),
+                    )
                     .child(buttons),
             )
             .child(self.render_owns(id, cx))
@@ -1102,6 +1157,7 @@ impl OverseerApp {
             .on_action(
                 cx.listener(|this, _: &OpenRelease, window, cx| this.open_release_key(window, cx)),
             )
+            .on_action(cx.listener(|this, _: &OpenNote, _, _| this.open_note_key()))
             .size_full()
             .flex()
             .flex_col()
@@ -1146,7 +1202,50 @@ mod tests {
             cols: 80,
             rows: 24,
             activity: None,
+            session_note: None,
         }
+    }
+
+    #[test]
+    fn obsidian_url_encodes_spaces_and_unicode() {
+        let url = obsidian_url(
+            Path::new("/Users/me/My Brain"),
+            "Sessions/2026/11-November/2026-11-13-s1-caf\u{e9} & co.md",
+        );
+        assert_eq!(
+            url,
+            "obsidian://open?path=/Users/me/My%20Brain/Sessions/2026/11-November/2026-11-13-s1-caf%C3%A9%20%26%20co.md"
+        );
+        // Unreserved characters stay as they are.
+        assert_eq!(
+            obsidian_url(Path::new("/b"), "a-b_c.d~e/f.md"),
+            "obsidian://open?path=/b/a-b_c.d~e/f.md"
+        );
+    }
+
+    #[test]
+    fn the_note_key_needs_a_note_and_a_vault() {
+        let mut i = info(RUN);
+        assert_eq!(
+            note_line(&i, Some(Path::new("/b"))).as_deref(),
+            Some("No session note yet")
+        );
+        assert_eq!(note_target(&i, Some(Path::new("/b"))), None);
+        i.session_note = Some("Sessions/s2.md".into());
+        assert_eq!(
+            note_line(&i, Some(Path::new("/b"))).as_deref(),
+            Some("Sessions/s2.md (press n to open)")
+        );
+        assert_eq!(note_target(&i, None), None);
+        // No vault known: the path alone, with no key to press.
+        assert_eq!(note_line(&i, None).as_deref(), Some("Sessions/s2.md"));
+        assert_eq!(
+            note_target(&i, Some(Path::new("/b"))).as_deref(),
+            Some("obsidian://open?path=/b/Sessions/s2.md")
+        );
+        i.state = SlotState::Empty;
+        i.session_note = None;
+        assert_eq!(note_line(&i, Some(Path::new("/b"))), None);
     }
 
     fn clock(t: i64) -> String {

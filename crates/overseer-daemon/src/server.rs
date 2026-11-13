@@ -15,6 +15,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc, watch, Notify};
 use tokio::task::{JoinHandle, JoinSet};
 
+use crate::brain::{BrainContext, BrainOptions, BrainService, WRITER_OFF};
 use crate::env::{BaseEnv, EnvSource};
 use crate::launch::RoleDirs;
 use crate::ledger::Ledger;
@@ -110,12 +111,22 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
         env.clone(),
         Duration::from_secs(cfg.settings.lock_idle_mins.saturating_mul(60)),
     );
+    let brain = BrainService::with_options(
+        &cfg.settings,
+        ledger.clone(),
+        events.clone(),
+        BrainOptions {
+            program: cfg.hook_program.clone(),
+            ..BrainOptions::from_config(&cfg.settings)
+        },
+    );
     // Subscribed before any slot can start, so no exit is missed.
     let exit_events = events.subscribe();
     let courier_events = events.subscribe();
     let state_dir = cfg.state_dir.clone();
     let mut mgr = SlotManager::new(cfg.default_command, events)
         .with_env(env.clone())
+        .with_session_note(cfg.settings.session_note.clone())
         .with_launch(
             cfg.state_dir,
             cfg.hook_program,
@@ -123,6 +134,8 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
             RoleDirs {
                 brain: cfg.settings.brain_dir.clone(),
                 beads: cfg.settings.beads_dir.clone(),
+                brain_writer: cfg.settings.brain_writer,
+                current_session: cfg.settings.current_session.clone(),
             },
         );
     mgr.restore();
@@ -131,6 +144,26 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
     let ended = sessionless(&mgr.list());
     locks.reconcile_exits(&ended, unix_now());
     let manager: Manager = Arc::new(Mutex::new(mgr));
+    if let Some(b) = &brain {
+        {
+            let (manager, store, ledger) = (manager.clone(), store.clone(), ledger.clone());
+            let dir = cfg.settings.brain_dir.clone();
+            b.set_context(move || brain_context(&manager, &store, &ledger, &dir));
+        }
+        b.set_env(env.clone());
+        // Label writes take the vault lock like a session's bd write. Weak:
+        // the brain's context already holds the store.
+        let weak = Arc::downgrade(b);
+        store.route_label_writes(Box::new(move |args| {
+            let weak = weak.clone();
+            Box::pin(async move {
+                match weak.upgrade() {
+                    Some(b) => b.write_label(args).await,
+                    None => Err("the 2ndBrain writer has stopped".into()),
+                }
+            })
+        }));
+    }
     locks.on_sessionless({
         let manager = manager.clone();
         move || sessionless(&manager.lock().unwrap().list())
@@ -167,6 +200,7 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
                             locks: locks.clone(),
                             courier: courier.clone(),
                             state_dir: state_dir.clone(),
+                            brain: brain.clone(),
                         },
                         shutdown.clone(),
                         env.clone(),
@@ -201,6 +235,52 @@ fn sessionless(infos: &[overseer_proto::SlotInfo]) -> Vec<SlotId> {
         .filter(|i| matches!(i.state, SlotState::Empty | SlotState::Exited { .. }))
         .map(|i| i.id)
         .collect()
+}
+
+/// Who owns what in the vault and which slots are running or busy, from
+/// the slots, the work store and the session notes in the ledger.
+fn brain_context(
+    manager: &Manager,
+    store: &WorkStore,
+    ledger: &Ledger,
+    brain: &Path,
+) -> BrainContext {
+    let infos = manager.lock().unwrap().list();
+    let running: Vec<SlotId> = infos
+        .iter()
+        .filter(|i| matches!(i.state, SlotState::Running { .. }))
+        .map(|i| i.id)
+        .collect();
+    let live: Vec<SlotId> = infos
+        .iter()
+        .filter(|i| {
+            matches!(
+                i.state,
+                SlotState::Running { .. } | SlotState::Resumable { .. }
+            )
+        })
+        .map(|i| i.id)
+        .collect();
+    // A running slot is quiet only once it says it is idle.
+    let busy = infos
+        .iter()
+        .filter(|i| running.contains(&i.id))
+        .filter(|i| {
+            i.activity
+                .as_ref()
+                .is_none_or(|a| a.kind != overseer_proto::ActivityKind::Idle)
+        })
+        .map(|i| i.id)
+        .collect();
+    let notes: Vec<(SlotId, String)> = live
+        .iter()
+        .filter_map(|&s| ledger.session_note(s).ok().flatten().map(|n| (s, n)))
+        .collect();
+    BrainContext {
+        owners: crate::brain::paths::owners(&store.view(), &notes, &live, brain),
+        running,
+        busy,
+    }
 }
 
 /// Ends the locks of each slot whose session exits. After a lag, which
@@ -346,6 +426,7 @@ struct Services {
     locks: Arc<LockService>,
     courier: Arc<Courier>,
     state_dir: PathBuf,
+    brain: Option<Arc<BrainService>>,
 }
 
 async fn handle_conn(
@@ -360,6 +441,7 @@ async fn handle_conn(
         locks,
         courier,
         state_dir,
+        brain,
     } = services;
     let (mut rd, mut wr) = stream.into_split();
     let (out_tx, mut out_rx) = mpsc::channel::<Frame>(OUTBOUND_QUEUE);
@@ -420,12 +502,34 @@ async fn handle_conn(
                     ) {
                         env.wait().await;
                     }
+                    // A fresh session starts with no section of its own.
+                    // Cleared before the start, so its first update cannot
+                    // be lost to the clear.
+                    if let (
+                        Frame::Request {
+                            req: Request::StartSlot { id, .. },
+                            ..
+                        },
+                        Some(b),
+                    ) = (&f, &brain)
+                    {
+                        let id = *id;
+                        let running = valid_id(id)
+                            && matches!(
+                                manager.lock().unwrap().list()[id as usize].state,
+                                SlotState::Running { .. }
+                            );
+                        if valid_id(id) && !running {
+                            b.clear_current_session(id).await;
+                        }
+                    }
                     let ctx = Ctx {
                         manager: &manager,
                         store: &store,
                         locks: &locks,
                         courier: &courier,
                         state_dir: &state_dir,
+                        brain: brain.as_ref(),
                     };
                     handle_frame(f, &ctx, &outbox, &shutdown, &mut streams)
                 }
@@ -456,6 +560,7 @@ struct Ctx<'a> {
     locks: &'a Arc<LockService>,
     courier: &'a Arc<Courier>,
     state_dir: &'a Path,
+    brain: Option<&'a Arc<BrainService>>,
 }
 
 fn handle_frame(
@@ -489,11 +594,51 @@ fn handle_frame(
             seq,
             req: Request::CheckBash(check),
         } => {
+            // The writer's own checks come first and need no lookups; a
+            // rewrite or deny answers at once.
+            if let Some(b) = ctx.brain {
+                if let Some(resp) = b.check_bash(&check, &b.context().owners) {
+                    outbox.send(Frame::Response { seq, resp });
+                    return;
+                }
+            }
             let owned = owned_items(&store.view(), check.slot);
             let locks = ctx.locks.clone();
             let outbox = outbox.clone();
             store.spawn(async move {
                 let resp = locks.check_bash(check, owned).await;
+                outbox.send(Frame::Response { seq, resp });
+            });
+        }
+        // A commit waits for its turn in the queue and `bd` for the vault
+        // lock, so the writer's requests are answered from a task.
+        Frame::Request {
+            seq,
+            req:
+                req @ (Request::Commit { .. }
+                | Request::AppendJournal { .. }
+                | Request::EditShared { .. }
+                | Request::UpdateCurrentSession { .. }
+                | Request::RunBd { .. }),
+        } => {
+            let Some(brain) = ctx.brain.cloned() else {
+                outbox.send(Frame::Response {
+                    seq,
+                    resp: Response::Error {
+                        message: WRITER_OFF.into(),
+                    },
+                });
+                return;
+            };
+            let label = match &req {
+                Request::UpdateCurrentSession { slot, .. } if valid_id(*slot) => {
+                    manager.lock().unwrap().list()[*slot as usize].label.clone()
+                }
+                _ => String::new(),
+            };
+            let outbox = outbox.clone();
+            store.spawn(async move {
+                let resp = brain_request(&brain, req, &label).await;
                 outbox.send(Frame::Response { seq, resp });
             });
         }
@@ -547,6 +692,52 @@ fn handle_frame(
             }
         }
         other => tracing::debug!("ignoring unexpected frame from client: {other:?}"),
+    }
+}
+
+/// The writer's requests that wait (see `handle_frame`).
+async fn brain_request(brain: &BrainService, req: Request, label: &str) -> Response {
+    let sender = |from: Option<SlotId>| -> Result<overseer_proto::Sender, String> {
+        match from {
+            None => Ok(overseer_proto::Sender::You),
+            Some(slot) if valid_id(slot) => Ok(overseer_proto::Sender::Slot { slot }),
+            Some(slot) => Err(format!("invalid slot id {slot}")),
+        }
+    };
+    let from = match &req {
+        Request::Commit { from, .. }
+        | Request::AppendJournal { from, .. }
+        | Request::EditShared { from, .. }
+        | Request::RunBd { from, .. } => match sender(*from) {
+            Ok(s) => s,
+            Err(message) => return Response::Error { message },
+        },
+        _ => overseer_proto::Sender::You,
+    };
+    match req {
+        Request::Commit { paths, message, .. } => {
+            let owners = brain.context().owners;
+            brain.commit(from, paths, message, &owners).await
+        }
+        Request::AppendJournal { section, text, .. } => {
+            brain.append_journal(from, &section, &text).await
+        }
+        Request::EditShared {
+            path,
+            old_text,
+            new_text,
+            ..
+        } => brain.edit_shared(from, &path, &old_text, &new_text).await,
+        Request::UpdateCurrentSession { slot, .. } if !valid_id(slot) => Response::Error {
+            message: format!("invalid slot id {slot}"),
+        },
+        Request::UpdateCurrentSession { slot, text } => {
+            brain.update_current_session(slot, label, &text).await
+        }
+        Request::RunBd { args, stdin, .. } => brain.run_bd(args, stdin).await,
+        other => Response::Error {
+            message: format!("not a 2ndBrain writer request: {other:?}"),
+        },
     }
 }
 
@@ -624,7 +815,27 @@ fn handle_request(
         }
         // Answered in `handle_frame` from a task; this arm only keeps the
         // match whole.
-        Request::CheckBash(_) => Response::Verdict { deny: None },
+        Request::CheckBash(_) => Response::Verdict {
+            deny: None,
+            rewrite: None,
+        },
+        // Answered in `handle_frame` from a task; this arm only keeps the
+        // match whole.
+        Request::Commit { .. }
+        | Request::AppendJournal { .. }
+        | Request::EditShared { .. }
+        | Request::UpdateCurrentSession { .. }
+        | Request::RunBd { .. } => err(WRITER_OFF.to_string()),
+        Request::BrainStatus => {
+            Response::Brain(ctx.brain.map_or_else(BrainService::off_view, |b| b.view()))
+        }
+        // While the writer is off the hook applies none of its checks.
+        Request::CheckWrite(check) => Response::Verdict {
+            deny: ctx
+                .brain
+                .and_then(|b| b.check_write(&check, &b.context().owners)),
+            rewrite: None,
+        },
         Request::Kickoff { slot } if !valid_id(slot) => err(format!("invalid slot id {slot}")),
         Request::Kickoff { slot } => {
             let items = store.view().items;
@@ -659,6 +870,7 @@ fn handle_request(
                 locks.on_session_ended(id, unix_now());
             }
             match m.start(id, label, &cwd, command, prompt) {
+                // CURRENT_SESSION.md was cleared before this (`handle_conn`).
                 Ok(()) => Response::Ok,
                 Err(e) => err(e),
             }

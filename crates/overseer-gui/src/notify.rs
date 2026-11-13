@@ -31,6 +31,9 @@ pub fn should_notify(prev: Option<&SlotInfo>, next: &SlotInfo, first_sync: bool)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Note {
     pub slot: SlotId,
+    /// The 2ndBrain push notice: it has its own identifier and a click
+    /// opens the board, not a session.
+    pub push: bool,
     /// `S3 needs you`.
     pub title: String,
     /// `label: reason`, or whichever of the two there is.
@@ -54,6 +57,7 @@ pub fn note_for(info: &SlotInfo) -> Note {
     };
     Note {
         slot: info.id,
+        push: false,
         title: format!("{name} needs you"),
         body,
     }
@@ -75,6 +79,7 @@ pub fn new_waits(prev: &LockView, next: &LockView) -> Vec<Note> {
             let holder = next.claims.iter().find(|c| c.target == w.target)?;
             Some(Note {
                 slot: w.slot,
+                push: false,
                 title: format!(
                     "{} blocked: {} is held by {}",
                     slot_name(w.slot),
@@ -85,6 +90,51 @@ pub fn new_waits(prev: &LockView, next: &LockView) -> Vec<Note> {
             })
         })
         .collect()
+}
+
+/// The notification for the push problem `next`, if it has not been
+/// announced yet. `notified` is the text last announced: it is set when a
+/// note is returned and cleared when the problem is gone, so a recurrence
+/// notifies again. The daemon's text already starts `2ndBrain push needs
+/// you:`, so the title is just `2ndBrain` and the body is the text in full.
+pub fn push_problem_note(notified: &mut Option<String>, next: Option<&str>) -> Option<Note> {
+    let Some(next) = next else {
+        *notified = None;
+        return None;
+    };
+    if notified.as_deref() == Some(next) {
+        return None;
+    }
+    *notified = Some(next.to_string());
+    Some(Note {
+        slot: 0,
+        push: true,
+        title: "2ndBrain".into(),
+        body: next.to_string(),
+    })
+}
+
+/// What a clicked notification opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Click {
+    Slot(SlotId),
+    Board,
+}
+
+const PUSH_PREFIX: &str = "overseer-push-";
+
+/// The request identifier for the `seq`th push notice; never one of a
+/// slot's.
+pub fn push_identifier(seq: u64) -> String {
+    format!("{PUSH_PREFIX}{seq}")
+}
+
+/// What a clicked notification's identifier stands for.
+pub fn click_from_identifier(id: &str) -> Option<Click> {
+    if id.starts_with(PUSH_PREFIX) {
+        return Some(Click::Board);
+    }
+    slot_from_identifier(id).map(Click::Slot)
 }
 
 const ID_PREFIX: &str = "overseer-slot-";
@@ -108,19 +158,19 @@ pub fn slot_from_identifier(id: &str) -> Option<SlotId> {
 }
 
 /// Where the delegate sends clicked slots.
-static CLICKS: Mutex<Option<mpsc::UnboundedSender<SlotId>>> = Mutex::new(None);
+static CLICKS: Mutex<Option<mpsc::UnboundedSender<Click>>> = Mutex::new(None);
 
 /// The stream of clicked notifications' slots. Call once; a later call
 /// takes the stream over.
-pub fn clicks() -> mpsc::UnboundedReceiver<SlotId> {
+pub fn clicks() -> mpsc::UnboundedReceiver<Click> {
     let (tx, rx) = mpsc::unbounded_channel();
     *CLICKS.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
     rx
 }
 
-fn clicked(slot: SlotId) {
+fn clicked(click: Click) {
     if let Some(tx) = CLICKS.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-        let _ = tx.send(slot);
+        let _ = tx.send(click);
     }
 }
 
@@ -227,8 +277,8 @@ mod platform {
             let note: Id = msg_send![response, notification];
             let request: Id = msg_send![note, request];
             let ident = rust_string(msg_send![request, identifier]);
-            if let Some(slot) = super::slot_from_identifier(&ident) {
-                super::clicked(slot);
+            if let Some(click) = super::click_from_identifier(&ident) {
+                super::clicked(click);
             }
             let handler = &*(handler as *const Block<(), ()>);
             handler.call(());
@@ -281,15 +331,19 @@ mod platform {
         }
     }
 
-    /// A fresh identifier for `slot`, and the one it replaces, if any.
-    fn next_identifier(slot: super::SlotId) -> (String, Option<String>) {
+    /// A fresh identifier for `note`, and the one it replaces, if any. The
+    /// push notice replaces only an earlier push notice (entry 7).
+    fn next_identifier(note: &Note) -> (String, Option<String>) {
         static SEQ: AtomicU64 = AtomicU64::new(0);
-        static LAST: Mutex<[Option<String>; 7]> = Mutex::new([const { None }; 7]);
-        let ident = super::identifier(slot, SEQ.fetch_add(1, Ordering::Relaxed));
+        static LAST: Mutex<[Option<String>; 8]> = Mutex::new([const { None }; 8]);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let (ident, key) = if note.push {
+            (super::push_identifier(seq), 7)
+        } else {
+            (super::identifier(note.slot, seq), note.slot as usize)
+        };
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-        let previous = last
-            .get_mut(slot as usize)
-            .and_then(|l| l.replace(ident.clone()));
+        let previous = last.get_mut(key).and_then(|l| l.replace(ident.clone()));
         (ident, previous)
     }
 
@@ -303,7 +357,7 @@ mod platform {
             return;
         };
         let slot = note.slot;
-        let (ident, previous) = next_identifier(slot);
+        let (ident, previous) = next_identifier(note);
         let done = ConcreteBlock::new(move |err: Id| {
             if !err.is_null() {
                 // SAFETY: an NSError from the framework.
@@ -358,6 +412,7 @@ mod tests {
                 reason: reason.map(String::from),
                 idle_wait: false,
             }),
+            session_note: None,
         }
     }
 
@@ -441,6 +496,45 @@ mod tests {
         assert_eq!(slot_from_identifier("overseer-slot-x-1"), None);
         assert_eq!(slot_from_identifier("overseer-slot-9"), None);
         assert_eq!(slot_from_identifier("something-else"), None);
+    }
+
+    #[test]
+    fn push_problem_notifies_once_per_occurrence() {
+        let mut seen = None;
+        // Already there at connect: notifies.
+        let n = push_problem_note(&mut seen, Some("2ndBrain push needs you: rejected")).unwrap();
+        assert_eq!(n.title, "2ndBrain");
+        assert_eq!(n.body, "2ndBrain push needs you: rejected");
+        assert!(n.push);
+        // The same text on a later event does not.
+        assert_eq!(
+            push_problem_note(&mut seen, Some("2ndBrain push needs you: rejected")),
+            None
+        );
+        // Different text (the autostash notice, in full) is news.
+        let full =
+            "2ndBrain push needs you: x. Resolve the conflicted files, then drop that stash.";
+        assert_eq!(push_problem_note(&mut seen, Some(full)).unwrap().body, full);
+        // Cleared, then recurring, notifies again.
+        assert_eq!(push_problem_note(&mut seen, None), None);
+        assert_eq!(seen, None);
+        assert!(push_problem_note(&mut seen, Some(full)).is_some());
+    }
+
+    #[test]
+    fn the_push_notice_has_its_own_identifier_and_opens_the_board() {
+        for slot in 0..=6 {
+            assert_ne!(push_identifier(5), identifier(slot, 5));
+            assert_eq!(
+                click_from_identifier(&identifier(slot, 5)),
+                Some(Click::Slot(slot))
+            );
+        }
+        assert_eq!(slot_from_identifier(&push_identifier(5)), None);
+        assert_eq!(
+            click_from_identifier(&push_identifier(5)),
+            Some(Click::Board)
+        );
     }
 
     #[test]

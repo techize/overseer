@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::Result;
-use overseer_proto::msg::{LockView, Notice, SlotId};
+use overseer_proto::msg::{LockView, Notice, QueueEntry, QueueState, Sender, SlotId};
 use rusqlite::Connection;
 
 use crate::locks::table;
@@ -107,7 +107,30 @@ CREATE TABLE IF NOT EXISTS relays (
     dropped_at INTEGER
 )";
 
-const VERSION: i64 = 3;
+/// What version 4 adds: the 2ndBrain commit queue, the record of the last
+/// backup and sync, and each session's note path. The `ALTER` is not
+/// idempotent, so it runs only for files older than version 4.
+const V4_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS brain_queue (
+    id INTEGER PRIMARY KEY,
+    at INTEGER NOT NULL,
+    sender TEXT NOT NULL,
+    paths TEXT NOT NULL,
+    message TEXT NOT NULL,
+    state TEXT NOT NULL,
+    commit_sha TEXT,
+    pushed INTEGER,
+    error TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS brain_runs (
+    kind TEXT PRIMARY KEY,
+    at INTEGER NOT NULL,
+    ok INTEGER NOT NULL,
+    detail TEXT
+);
+ALTER TABLE sessions ADD COLUMN session_note TEXT";
+
+const VERSION: i64 = 4;
 
 /// Creates any missing tables and brings the file up to [`VERSION`]. An
 /// older file keeps its rows; the new tables are added beside them. The
@@ -118,9 +141,170 @@ fn migrate(conn: &Connection) -> Result<()> {
         return Ok(());
     }
     conn.execute_batch(&format!(
-        "BEGIN;\n{SESSIONS_SCHEMA};\n{V2_SCHEMA};\n{V3_SCHEMA};\nPRAGMA user_version = {VERSION};\nCOMMIT;"
+        "BEGIN;\n{SESSIONS_SCHEMA};\n{V2_SCHEMA};\n{V3_SCHEMA};\n{V4_SCHEMA};\nPRAGMA user_version = {VERSION};\nCOMMIT;"
     ))?;
     Ok(())
+}
+
+/// A queue row, or `None` (logged) when its sender or state cannot be read:
+/// a row nobody can attribute is left out rather than shown as Jonathan's.
+fn queue_entry(r: &rusqlite::Row) -> rusqlite::Result<Option<QueueEntry>> {
+    let id: i64 = r.get(0)?;
+    let sender: String = r.get(2)?;
+    let paths: String = r.get(3)?;
+    let state: String = r.get(5)?;
+    let Ok(from) = serde_json::from_str::<Sender>(&sender) else {
+        tracing::warn!("2ndBrain queue entry {id}: unreadable sender {sender:?}, skipped");
+        return Ok(None);
+    };
+    let Some(state) = state_from_name(&state) else {
+        tracing::warn!("2ndBrain queue entry {id}: unknown state {state:?}, skipped");
+        return Ok(None);
+    };
+    let Ok(paths) = serde_json::from_str::<Vec<String>>(&paths) else {
+        tracing::warn!("2ndBrain queue entry {id}: unreadable paths, skipped");
+        return Ok(None);
+    };
+    Ok(Some(QueueEntry {
+        id,
+        at: r.get(1)?,
+        from,
+        paths,
+        message: r.get(4)?,
+        state,
+        commit: r.get(6)?,
+        pushed: r.get::<_, Option<i64>>(7)?.map(|p| p != 0),
+        error: r.get(8)?,
+    }))
+}
+
+const QUEUE_COLS: &str = "id, at, sender, paths, message, state, commit_sha, pushed, error";
+
+/// The name a state is stored under; every query binds it rather than
+/// spelling the literal.
+fn state_name(state: QueueState) -> String {
+    serde_json::to_string(&state)
+        .unwrap_or_default()
+        .trim_matches('"')
+        .to_string()
+}
+
+fn state_from_name(name: &str) -> Option<QueueState> {
+    serde_json::from_str(&format!("\"{name}\"")).ok()
+}
+
+fn queue_rows(
+    conn: &Connection,
+    sql: &str,
+    params: impl rusqlite::Params,
+) -> Result<Vec<QueueEntry>> {
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(params, queue_entry)?;
+    let mut out = Vec::new();
+    for r in rows {
+        if let Some(e) = r? {
+            out.push(e);
+        }
+    }
+    Ok(out)
+}
+
+/// Adds a queued commit, returning its id.
+pub(crate) fn queue_push_on(
+    conn: &Connection,
+    at: i64,
+    from: &Sender,
+    paths: &[String],
+    message: &str,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO brain_queue (at, sender, paths, message, state) VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![
+            at,
+            serde_json::to_string(from)?,
+            serde_json::to_string(paths)?,
+            message,
+            state_name(QueueState::Queued)
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// The oldest readable entry still queued.
+pub(crate) fn queue_next_on(conn: &Connection) -> Result<Option<QueueEntry>> {
+    Ok(queue_rows(
+        conn,
+        &format!("SELECT {QUEUE_COLS} FROM brain_queue WHERE state = ?1 ORDER BY id"),
+        rusqlite::params![state_name(QueueState::Queued)],
+    )?
+    .into_iter()
+    .next())
+}
+
+/// Records where an entry got to. Does not count as an attempt.
+pub(crate) fn queue_set_on(
+    conn: &Connection,
+    id: i64,
+    state: QueueState,
+    sha: Option<&str>,
+    pushed: Option<bool>,
+    error: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE brain_queue SET state = ?2, commit_sha = ?3, pushed = ?4, error = ?5 WHERE id = ?1",
+        rusqlite::params![id, state_name(state), sha, pushed, error],
+    )?;
+    Ok(())
+}
+
+/// Counts a real commit attempt for an entry and returns how many it has had.
+pub(crate) fn queue_begin_on(conn: &Connection, id: i64) -> Result<i64> {
+    conn.execute(
+        "UPDATE brain_queue SET attempts = attempts + 1 WHERE id = ?1",
+        rusqlite::params![id],
+    )?;
+    Ok(conn.query_row(
+        "SELECT attempts FROM brain_queue WHERE id = ?1",
+        rusqlite::params![id],
+        |r| r.get(0),
+    )?)
+}
+
+/// How many commit attempts an entry has had.
+pub(crate) fn queue_attempts_on(conn: &Connection, id: i64) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT attempts FROM brain_queue WHERE id = ?1",
+        rusqlite::params![id],
+        |r| r.get(0),
+    )?)
+}
+
+/// Committed entries whose push has not succeeded, oldest first.
+pub(crate) fn queue_unpushed_on(conn: &Connection) -> Result<Vec<QueueEntry>> {
+    queue_rows(
+        conn,
+        &format!(
+            "SELECT {QUEUE_COLS} FROM brain_queue
+             WHERE state = ?1 AND (pushed = 0 OR pushed IS NULL) AND commit_sha IS NOT NULL
+             ORDER BY id"
+        ),
+        rusqlite::params![state_name(QueueState::Committed)],
+    )
+}
+
+/// Every queued entry plus the `n` most recent others, newest first.
+pub(crate) fn queue_recent_on(conn: &Connection, n: usize) -> Result<Vec<QueueEntry>> {
+    queue_rows(
+        conn,
+        &format!(
+            "SELECT {QUEUE_COLS} FROM brain_queue WHERE state = ?2
+             UNION ALL
+             SELECT {QUEUE_COLS} FROM (SELECT * FROM brain_queue WHERE state <> ?2
+                                       ORDER BY id DESC LIMIT ?1)
+             ORDER BY id DESC"
+        ),
+        rusqlite::params![n as i64, state_name(QueueState::Queued)],
+    )
 }
 
 // Connection-level forms of the work-item calls, for use inside
@@ -307,6 +491,92 @@ impl Ledger {
         })
     }
 
+    /// Adds a commit to the 2ndBrain queue, returning its id.
+    pub fn queue_push(
+        &self,
+        at: i64,
+        from: &Sender,
+        paths: &[String],
+        message: &str,
+    ) -> Result<i64> {
+        queue_push_on(&self.conn(), at, from, paths, message)
+    }
+
+    /// The oldest entry still queued.
+    pub fn queue_next(&self) -> Result<Option<QueueEntry>> {
+        queue_next_on(&self.conn())
+    }
+
+    /// Counts a real commit attempt for an entry; returns its attempts so far.
+    pub fn queue_begin(&self, id: i64) -> Result<i64> {
+        queue_begin_on(&self.conn(), id)
+    }
+
+    pub fn queue_attempts(&self, id: i64) -> Result<i64> {
+        queue_attempts_on(&self.conn(), id)
+    }
+
+    /// Records where a queue entry got to. Not an attempt: see `queue_begin`.
+    pub fn queue_set(
+        &self,
+        id: i64,
+        state: QueueState,
+        sha: Option<&str>,
+        pushed: Option<bool>,
+        error: Option<&str>,
+    ) -> Result<()> {
+        queue_set_on(&self.conn(), id, state, sha, pushed, error)
+    }
+
+    /// Committed entries still waiting for a push, oldest first.
+    pub fn queue_unpushed(&self) -> Result<Vec<QueueEntry>> {
+        queue_unpushed_on(&self.conn())
+    }
+
+    /// Every queued entry plus the `n` most recent others, newest first.
+    pub fn queue_recent(&self, n: usize) -> Result<Vec<QueueEntry>> {
+        queue_recent_on(&self.conn(), n)
+    }
+
+    /// Records the last `backup` or `sync` run as `(at, ok, detail)`.
+    pub fn set_brain_run(&self, kind: &str, at: i64, ok: bool, detail: &str) -> Result<()> {
+        self.conn().execute(
+            "INSERT OR REPLACE INTO brain_runs (kind, at, ok, detail) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![kind, at, ok, detail],
+        )?;
+        Ok(())
+    }
+
+    pub fn brain_run(&self, kind: &str) -> Result<Option<(i64, bool, String)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT at, ok, detail FROM brain_runs WHERE kind = ?1")?;
+        let mut rows = stmt.query_map(rusqlite::params![kind], |r| {
+            Ok((
+                r.get(0)?,
+                r.get::<_, i64>(1)? != 0,
+                r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            ))
+        })?;
+        Ok(rows.next().transpose()?)
+    }
+
+    /// Fixes the slot's session note path (relative to the vault).
+    pub fn set_session_note(&self, slot: SlotId, rel: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE sessions SET session_note = ?2 WHERE slot = ?1",
+            rusqlite::params![slot, rel],
+        )?;
+        Ok(())
+    }
+
+    pub fn session_note(&self, slot: SlotId) -> Result<Option<String>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT session_note FROM sessions WHERE slot = ?1")?;
+        let mut rows =
+            stmt.query_map(rusqlite::params![slot], |r| r.get::<_, Option<String>>(0))?;
+        Ok(rows.next().transpose()?.flatten())
+    }
+
     /// Records a session starting in a slot, replacing whatever row the slot
     /// had (so `exited` and `exit_code` are cleared).
     pub fn record_start(&self, s: &SessionRow) -> Result<()> {
@@ -481,7 +751,7 @@ mod tests {
     }
 
     #[test]
-    fn version_1_file_migrates_to_3() {
+    fn version_1_file_migrates_to_4() {
         let path = temp_db("migrate");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         {
@@ -503,12 +773,12 @@ mod tests {
         assert!(l.notices().unwrap().is_empty());
         l.log(1, "k", None, "e", "d").unwrap();
         lock_tables_are_empty(&l);
-        assert_eq!(user_version(&l), 3);
+        assert_eq!(user_version(&l), 4);
         let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
     }
 
     #[test]
-    fn version_2_file_migrates_to_3_keeping_assignments() {
+    fn version_2_file_migrates_to_4_keeping_assignments() {
         let path = temp_db("migrate-v2");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         {
@@ -528,25 +798,219 @@ mod tests {
             .unwrap();
         }
         let l = Ledger::open(&path).unwrap();
-        assert_eq!(user_version(&l), 3);
+        assert_eq!(user_version(&l), 4);
         assert_eq!(l.assignments().unwrap(), vec![("DEMO-12".to_string(), 3)]);
         assert_eq!(l.notices().unwrap()[0].text, "moved");
         lock_tables_are_empty(&l);
         drop(l);
-        // Opening a v3 file again changes nothing.
+        // Opening a v4 file again changes nothing.
         let l = Ledger::open(&path).unwrap();
-        assert_eq!(user_version(&l), 3);
+        assert_eq!(user_version(&l), 4);
         assert_eq!(l.assignments().unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
     }
 
     #[test]
-    fn fresh_file_is_created_at_3() {
+    fn fresh_file_is_created_at_4() {
         let path = temp_db("fresh");
         let l = Ledger::open(&path).unwrap();
-        assert_eq!(user_version(&l), 3);
+        assert_eq!(user_version(&l), 4);
         lock_tables_are_empty(&l);
         let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn version_3_file_migrates_to_4() {
+        let path = temp_db("migrate-v3");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SESSIONS_SCHEMA).unwrap();
+            conn.execute_batch(V2_SCHEMA).unwrap();
+            conn.execute_batch(V3_SCHEMA).unwrap();
+            conn.execute_batch("PRAGMA user_version = 3").unwrap();
+            conn.execute(
+                "INSERT INTO sessions (slot, session_id, label, cwd, command, started)
+                 VALUES (2, 'old-id', 'lane', '/tmp/work', '[\"claude\"]', 1700000000)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO claims (target, slot, kind, since, last_used)
+                 VALUES ('uat/root', 2, 'claim', 10, 11)",
+                [],
+            )
+            .unwrap();
+        }
+        let l = Ledger::open(&path).unwrap();
+        assert_eq!(user_version(&l), 4);
+        let live = l.live_at_shutdown().unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].session_id, "old-id");
+        assert_eq!(l.lock_view(50, 3600).unwrap().claims.len(), 1);
+        assert!(l.queue_next().unwrap().is_none());
+        assert!(l.queue_recent(10).unwrap().is_empty());
+        assert_eq!(l.session_note(2).unwrap(), None);
+        drop(l);
+        // Opening a v4 file again changes nothing.
+        let l = Ledger::open(&path).unwrap();
+        assert_eq!(user_version(&l), 4);
+        assert_eq!(l.live_at_shutdown().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn session_note_is_per_slot_and_kept() {
+        let l = Ledger::in_memory();
+        l.record_start(&row(3, "id3")).unwrap();
+        assert_eq!(l.session_note(3).unwrap(), None);
+        l.set_session_note(3, "Sessions/2026/11-November/2026-11-13-s3-lane.md")
+            .unwrap();
+        assert_eq!(
+            l.session_note(3).unwrap().as_deref(),
+            Some("Sessions/2026/11-November/2026-11-13-s3-lane.md")
+        );
+        assert_eq!(l.session_note(4).unwrap(), None);
+        // Marking the slot resumed keeps its note.
+        l.mark_resumed(3).unwrap();
+        assert!(l.session_note(3).unwrap().is_some());
+    }
+
+    #[test]
+    fn queue_is_fifo_and_survives_reopen() {
+        use overseer_proto::msg::{QueueState, Sender};
+        let path = temp_db("queue");
+        let (a, b);
+        {
+            let l = Ledger::open(&path).unwrap();
+            a = l
+                .queue_push(
+                    10,
+                    &Sender::Slot { slot: 3 },
+                    &["a.md".to_string()],
+                    "first",
+                )
+                .unwrap();
+            b = l
+                .queue_push(
+                    11,
+                    &Sender::You,
+                    &["b.md".to_string(), "c.md".to_string()],
+                    "second",
+                )
+                .unwrap();
+            assert!(b > a);
+            let next = l.queue_next().unwrap().unwrap();
+            assert_eq!(next.id, a);
+            assert_eq!(next.from, Sender::Slot { slot: 3 });
+            assert_eq!(next.state, QueueState::Queued);
+            l.queue_set(a, QueueState::Committed, Some("abc1234"), Some(true), None)
+                .unwrap();
+        }
+        let l = Ledger::open(&path).unwrap();
+        let next = l.queue_next().unwrap().unwrap();
+        assert_eq!(next.id, b);
+        assert_eq!(next.paths, vec!["b.md", "c.md"]);
+        assert_eq!(next.message, "second");
+        l.queue_set(b, QueueState::Failed, None, None, Some("boom"))
+            .unwrap();
+        assert!(l.queue_next().unwrap().is_none());
+        let recent = l.queue_recent(10).unwrap();
+        assert_eq!(recent.iter().map(|e| e.id).collect::<Vec<_>>(), vec![b, a]);
+        assert_eq!(recent[0].error.as_deref(), Some("boom"));
+        assert_eq!(recent[1].commit.as_deref(), Some("abc1234"));
+        assert_eq!(recent[1].pushed, Some(true));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn unpushed_lists_committed_entries_not_pushed() {
+        use overseer_proto::msg::{QueueState, Sender};
+        let l = Ledger::in_memory();
+        let a = l.queue_push(1, &Sender::You, &[], "a").unwrap();
+        let b = l.queue_push(2, &Sender::You, &[], "b").unwrap();
+        let c = l.queue_push(3, &Sender::You, &[], "c").unwrap();
+        l.queue_set(a, QueueState::Committed, Some("1"), Some(true), None)
+            .unwrap();
+        l.queue_set(
+            b,
+            QueueState::Committed,
+            Some("2"),
+            Some(false),
+            Some("conflict"),
+        )
+        .unwrap();
+        l.queue_set(c, QueueState::NothingToCommit, None, None, None)
+            .unwrap();
+        let un = l.queue_unpushed().unwrap();
+        assert_eq!(un.iter().map(|e| e.id).collect::<Vec<_>>(), vec![b]);
+    }
+
+    #[test]
+    fn attempts_count_only_real_attempts() {
+        use overseer_proto::msg::{QueueState, Sender};
+        let l = Ledger::in_memory();
+        let a = l.queue_push(1, &Sender::You, &[], "a").unwrap();
+        assert_eq!(l.queue_attempts(a).unwrap(), 0);
+        l.queue_set(a, QueueState::Queued, None, None, Some("index.lock held"))
+            .unwrap();
+        l.queue_set(a, QueueState::Queued, None, None, None)
+            .unwrap();
+        assert_eq!(l.queue_attempts(a).unwrap(), 0);
+        assert_eq!(l.queue_begin(a).unwrap(), 1);
+        assert_eq!(l.queue_begin(a).unwrap(), 2);
+        l.queue_set(a, QueueState::Committed, Some("1"), Some(true), None)
+            .unwrap();
+        assert_eq!(l.queue_attempts(a).unwrap(), 2);
+    }
+
+    #[test]
+    fn unreadable_sender_is_skipped_not_jonathan() {
+        use overseer_proto::msg::Sender;
+        let l = Ledger::in_memory();
+        let bad = l.queue_push(1, &Sender::You, &[], "bad").unwrap();
+        let good = l
+            .queue_push(2, &Sender::Slot { slot: 2 }, &[], "good")
+            .unwrap();
+        l.conn()
+            .execute(
+                "UPDATE brain_queue SET sender = 'garbage' WHERE id = ?1",
+                rusqlite::params![bad],
+            )
+            .unwrap();
+        let next = l.queue_next().unwrap().unwrap();
+        assert_eq!(next.id, good);
+        let ids: Vec<i64> = l.queue_recent(10).unwrap().iter().map(|e| e.id).collect();
+        assert_eq!(ids, vec![good]);
+    }
+
+    #[test]
+    fn recent_view_is_every_queued_plus_20_others() {
+        use overseer_proto::msg::{QueueState, Sender};
+        let l = Ledger::in_memory();
+        let first = l.queue_push(1, &Sender::You, &[], "old queued").unwrap();
+        for i in 0..25 {
+            let id = l.queue_push(10 + i, &Sender::You, &[], "done").unwrap();
+            l.queue_set(id, QueueState::NothingToCommit, None, None, None)
+                .unwrap();
+        }
+        let v = l.queue_recent(20).unwrap();
+        assert_eq!(v.len(), 21);
+        assert_eq!(v.last().unwrap().id, first);
+        assert!(v.windows(2).all(|w| w[0].id > w[1].id));
+    }
+
+    #[test]
+    fn brain_runs_record_backup_and_sync() {
+        let l = Ledger::in_memory();
+        assert_eq!(l.brain_run("backup").unwrap(), None);
+        l.set_brain_run("backup", 100, true, "").unwrap();
+        l.set_brain_run("backup", 200, false, "no remote").unwrap();
+        assert_eq!(
+            l.brain_run("backup").unwrap(),
+            Some((200, false, "no remote".to_string()))
+        );
+        assert_eq!(l.brain_run("sync").unwrap(), None);
     }
 
     #[test]

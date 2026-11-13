@@ -22,3 +22,4 @@ Rules:
 - A slot shown as resumable had a session running when the daemon stopped. Ask Jonathan whether to resume it (`"{overseer}" ctl resume <n>`) or start fresh. Do not choose for him.
 
 Jonathan can start another round at any time by typing into this session, or with `"{overseer}" ctl send 0 --raw "Run another round"`.
+{brain_rules}

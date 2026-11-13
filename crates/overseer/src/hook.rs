@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use overseer_proto::{
-    paths, BashCheck, Client, HookEvent, HookKind, Request, Response, SlotId, CHECK_ENV,
+    paths, BashCheck, Client, HookEvent, HookKind, Request, Response, SlotId, WriteCheck, CHECK_ENV,
 };
 
 /// Total budget for connect plus the round trip. A hook that waits longer
@@ -73,32 +73,46 @@ pub fn parse_hook(event: &str, slot_env: &str, stdin: &[u8]) -> Option<HookEvent
     })
 }
 
-/// The lock check for a `PreToolUse` event, or `None` when the daemon need
-/// not be asked. Only Bash is checked; this is the one place that decides
-/// which tools are.
+/// The check for a `PreToolUse` event, or `None` when the daemon need not
+/// be asked: a Bash command is a `CheckBash`; the file tools are a
+/// `CheckWrite` of their `file_path` (`notebook_path` for `NotebookEdit`).
+/// This is the one place that decides which tools are checked.
 pub fn parse_pre_tool_use(
     slot_env: &str,
     stdin: &[u8],
     env: impl Fn(&str) -> Option<String>,
-) -> Option<BashCheck> {
+) -> Option<Request> {
     let slot = slot(slot_env)?;
     let json: serde_json::Value = serde_json::from_slice(stdin).ok()?;
     let text = |k: &str| json.get(k)?.as_str().map(String::from);
-    if text("tool_name").as_deref() != Some("Bash") {
-        return None;
-    }
-    let command = json.get("tool_input")?.get("command")?.as_str()?.to_owned();
-    Some(BashCheck {
+    let tool = text("tool_name")?;
+    let input = json.get("tool_input")?;
+    let path_key = match tool.as_str() {
+        "Bash" => {
+            let command = input.get("command")?.as_str()?.to_owned();
+            return Some(Request::CheckBash(BashCheck {
+                slot,
+                session_id: text("session_id"),
+                tool_use_id: text("tool_use_id"),
+                command,
+                cwd: text("cwd").map(PathBuf::from),
+                env: CHECK_ENV
+                    .iter()
+                    .filter_map(|k| Some((k.to_string(), env(k)?)))
+                    .collect(),
+            }));
+        }
+        "Edit" | "Write" | "MultiEdit" => "file_path",
+        "NotebookEdit" => "notebook_path",
+        _ => return None,
+    };
+    let path = input.get(path_key)?.as_str().filter(|p| !p.is_empty())?;
+    Some(Request::CheckWrite(WriteCheck {
         slot,
-        session_id: text("session_id"),
-        tool_use_id: text("tool_use_id"),
-        command,
+        tool,
+        paths: vec![PathBuf::from(path)],
         cwd: text("cwd").map(PathBuf::from),
-        env: CHECK_ENV
-            .iter()
-            .filter_map(|k| Some((k.to_string(), env(k)?)))
-            .collect(),
-    })
+    }))
 }
 
 /// Claude Code's decision JSON denying a tool call, with `reason` shown to
@@ -112,6 +126,41 @@ pub fn deny_json(reason: &str) -> String {
         }
     })
     .to_string()
+}
+
+/// Claude Code's decision JSON allowing a tool call with its Bash command
+/// replaced by `command`. `input` is the original `tool_input`: it is
+/// copied and only `command` replaced, so `timeout`, `description` and
+/// `run_in_background` survive whether Claude Code merges or replaces it.
+pub fn rewrite_json(command: &str, input: Option<&serde_json::Value>) -> String {
+    let mut updated = match input {
+        Some(serde_json::Value::Object(o)) => o.clone(),
+        _ => serde_json::Map::new(),
+    };
+    updated.insert("command".into(), command.into());
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "updatedInput": updated,
+        }
+    })
+    .to_string()
+}
+
+/// What the hook prints for the daemon's answer: a deny wins over a
+/// rewrite; an allow prints nothing.
+pub fn decision_json(answer: &Response, input: Option<&serde_json::Value>) -> Option<String> {
+    match answer {
+        Response::Verdict {
+            deny: Some(reason), ..
+        } => Some(deny_json(reason)),
+        Response::Verdict {
+            rewrite: Some(command),
+            ..
+        } => Some(rewrite_json(command, input)),
+        _ => None,
+    }
 }
 
 fn read_stdin() -> Vec<u8> {
@@ -130,27 +179,33 @@ fn runtime() -> Option<tokio::runtime::Runtime> {
         .ok()
 }
 
-/// Asks the daemon about a Bash command and prints the deny decision if it
-/// gives one. A missing, slow or confused daemon means allow.
+/// Asks the daemon about a Bash command or file write and prints its deny
+/// or rewrite decision if it gives one. A missing, slow or confused daemon means allow.
 fn pre_tool_use(slot_env: &str) {
     let stdin = read_stdin();
     let Some(check) = parse_pre_tool_use(slot_env, &stdin, |k| std::env::var(k).ok()) else {
         return;
     };
+    let input = serde_json::from_slice::<serde_json::Value>(&stdin)
+        .ok()
+        .and_then(|j| j.get("tool_input").cloned());
     let Some(rt) = runtime() else { return };
     let answer = rt.block_on(async {
         tokio::time::timeout(CHECK_WITHIN, async {
             let client = Client::connect(paths::socket_path()).await.ok()?;
-            client.request(Request::CheckBash(check)).await.ok()
+            client.request(check).await.ok()
         })
         .await
         .ok()
         .flatten()
     });
-    if let Some(Response::Verdict { deny: Some(reason) }) = answer {
-        let mut out = std::io::stdout().lock();
-        let _ = writeln!(out, "{}", deny_json(&reason));
-        let _ = out.flush();
+    if let Some(out) = answer
+        .as_ref()
+        .and_then(|a| decision_json(a, input.as_ref()))
+    {
+        let mut stdout = std::io::stdout().lock();
+        let _ = writeln!(stdout, "{out}");
+        let _ = stdout.flush();
     }
 }
 
@@ -244,22 +299,118 @@ mod tests {
     }
 
     #[test]
-    fn pre_tool_use_reads_bash_only() {
+    fn pre_tool_use_reads_bash_and_the_file_tools() {
         let env = |k: &str| (k == "KUBECONFIG").then(|| "/k".to_string());
         let bash = br#"{"session_id":"s","tool_name":"Bash","tool_use_id":"tu-1","cwd":"/w","tool_input":{"command":"git push"}}"#;
-        let c = parse_pre_tool_use("S3", bash, env).unwrap();
+        let Some(Request::CheckBash(c)) = parse_pre_tool_use("S3", bash, env) else {
+            panic!("not a bash check");
+        };
         assert_eq!(c.slot, 3);
         assert_eq!(c.command, "git push");
         assert_eq!(c.tool_use_id.as_deref(), Some("tu-1"));
         assert_eq!(c.session_id.as_deref(), Some("s"));
         assert_eq!(c.cwd, Some(PathBuf::from("/w")));
         assert_eq!(c.env, [("KUBECONFIG".to_string(), "/k".to_string())]);
-        let edit = br#"{"tool_name":"Edit","tool_input":{"file_path":"/a"}}"#;
-        assert!(parse_pre_tool_use("S3", edit, env).is_none());
+        let grep = br#"{"tool_name":"Grep","tool_input":{"pattern":"x"}}"#;
+        assert!(parse_pre_tool_use("S3", grep, env).is_none());
         let no_command = br#"{"tool_name":"Bash","tool_input":{}}"#;
         assert!(parse_pre_tool_use("S3", no_command, env).is_none());
         assert!(parse_pre_tool_use("S9", bash, env).is_none());
         assert!(parse_pre_tool_use("S3", b"junk", env).is_none());
+    }
+
+    #[test]
+    fn edit_of_a_file_tool_becomes_check_write() {
+        let env = |_: &str| None;
+        for tool in ["Edit", "Write", "MultiEdit"] {
+            let json = format!(
+                r#"{{"tool_name":"{tool}","cwd":"/w","tool_input":{{"file_path":"/v/a.md","old_string":"x"}}}}"#
+            );
+            let Some(Request::CheckWrite(c)) = parse_pre_tool_use("S2", json.as_bytes(), env)
+            else {
+                panic!("{tool}: not a write check");
+            };
+            assert_eq!(c.slot, 2);
+            assert_eq!(c.tool, tool);
+            assert_eq!(c.paths, [PathBuf::from("/v/a.md")]);
+            assert_eq!(c.cwd, Some(PathBuf::from("/w")));
+        }
+        let nb = br#"{"tool_name":"NotebookEdit","tool_input":{"notebook_path":"/v/n.ipynb"}}"#;
+        let Some(Request::CheckWrite(c)) = parse_pre_tool_use("S2", nb, env) else {
+            panic!("not a write check");
+        };
+        assert_eq!(c.tool, "NotebookEdit");
+        assert_eq!(c.paths, [PathBuf::from("/v/n.ipynb")]);
+        let none = br#"{"tool_name":"Edit","tool_input":{}}"#;
+        assert!(parse_pre_tool_use("S2", none, env).is_none());
+    }
+
+    #[test]
+    fn rewrite_prints_updated_input() {
+        let v: serde_json::Value =
+            serde_json::from_str(&rewrite_json("overseer ctl bd -- close ov-3", None)).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+                "updatedInput": {"command": "overseer ctl bd -- close ov-3"},
+            }})
+        );
+        assert_eq!(
+            decision_json(
+                &Response::Verdict {
+                    deny: None,
+                    rewrite: Some("x".into())
+                },
+                None
+            )
+            .as_deref(),
+            Some(rewrite_json("x", None).as_str())
+        );
+        assert_eq!(
+            decision_json(
+                &Response::Verdict {
+                    deny: Some("no".into()),
+                    rewrite: Some("x".into())
+                },
+                None
+            )
+            .as_deref(),
+            Some(deny_json("no").as_str())
+        );
+        assert_eq!(
+            decision_json(
+                &Response::Verdict {
+                    deny: None,
+                    rewrite: None
+                },
+                None
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn rewrite_keeps_the_other_tool_input_fields() {
+        let input = serde_json::json!({
+            "command": "bd close ov-3",
+            "description": "close it",
+            "timeout": 5000,
+            "run_in_background": true
+        });
+        let v: serde_json::Value =
+            serde_json::from_str(&rewrite_json("overseer ctl bd -- close ov-3", Some(&input)))
+                .unwrap();
+        assert_eq!(
+            v["hookSpecificOutput"]["updatedInput"],
+            serde_json::json!({
+                "command": "overseer ctl bd -- close ov-3",
+                "description": "close it",
+                "timeout": 5000,
+                "run_in_background": true
+            })
+        );
     }
 
     #[test]

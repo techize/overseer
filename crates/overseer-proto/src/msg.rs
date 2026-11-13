@@ -45,6 +45,10 @@ pub struct SlotInfo {
     /// commands that send no hooks.
     #[serde(default)]
     pub activity: Option<Activity>,
+    /// The slot's session note, relative to the 2ndBrain vault, once the
+    /// ledger has one.
+    #[serde(default)]
+    pub session_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -291,12 +295,14 @@ impl LockView {
 }
 
 /// The variables `BashCheck::env` may carry: the ones a target lookup reads.
-pub const CHECK_ENV: [&str; 5] = [
+pub const CHECK_ENV: [&str; 6] = [
     "KUBECONFIG",
     "TF_WORKSPACE",
     "ARGOCD_SERVER",
     "ARGOCD_CONFIG",
     "HOME",
+    // Which beads database a `bd` write uses (the 2ndBrain writer).
+    "BEADS_DIR",
 ];
 
 /// A Bash command the `PreToolUse` hook asks the daemon to check.
@@ -306,7 +312,11 @@ pub struct BashCheck {
     pub session_id: Option<String>,
     pub tool_use_id: Option<String>,
     pub command: String,
+    /// The session's cwd, from the hook input. It decides which repo's
+    /// beads a `bd` write would use.
+    #[serde(default)]
     pub cwd: Option<PathBuf>,
+    #[serde(default)]
     pub env: Vec<(String, String)>,
 }
 
@@ -399,6 +409,132 @@ pub enum Request {
         text: String,
     },
     CheckBash(BashCheck),
+    /// Queues a pathspec commit of `paths` in the 2ndBrain. `from` is
+    /// `None` for you.
+    Commit {
+        #[serde(default)]
+        from: Option<SlotId>,
+        paths: Vec<String>,
+        message: String,
+    },
+    /// Adds `text` to the `section` of today's journal.
+    AppendJournal {
+        #[serde(default)]
+        from: Option<SlotId>,
+        section: String,
+        text: String,
+    },
+    /// Replaces the one occurrence of `old_text` in a shared file.
+    EditShared {
+        #[serde(default)]
+        from: Option<SlotId>,
+        path: String,
+        old_text: String,
+        new_text: String,
+    },
+    /// Sets a slot's section of `CURRENT_SESSION.md`.
+    UpdateCurrentSession {
+        slot: SlotId,
+        text: String,
+    },
+    /// Runs a `bd` write under the 2ndBrain lock.
+    RunBd {
+        #[serde(default)]
+        from: Option<SlotId>,
+        args: Vec<String>,
+        /// Piped to bd's stdin (a heredoc body); bd's stdin is closed when `None`.
+        #[serde(default)]
+        stdin: Option<String>,
+    },
+    BrainStatus,
+    /// A file write the hook asks about. Answered with `Verdict`.
+    CheckWrite(WriteCheck),
+}
+
+/// Where a queued 2ndBrain commit stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QueueState {
+    Queued,
+    Committed,
+    NothingToCommit,
+    Failed,
+}
+
+/// One commit in the 2ndBrain queue. `at` is unix seconds; `pushed` is
+/// `None` until a push has been tried.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QueueEntry {
+    pub id: i64,
+    pub at: i64,
+    pub from: Sender,
+    pub paths: Vec<String>,
+    pub message: String,
+    pub state: QueueState,
+    pub commit: Option<String>,
+    pub pushed: Option<bool>,
+    pub error: Option<String>,
+}
+
+/// The last backup or sync run. `detail` is the error text when `ok` is
+/// false, else a short note (`3 paths`, `sync done`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BrainRun {
+    pub at: i64,
+    pub ok: bool,
+    #[serde(default)]
+    pub detail: String,
+}
+
+/// A run as an older daemon sent it: `last_backup` was a time and
+/// `last_sync` was `(at, ok)`.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RunWire {
+    Run(BrainRun),
+    At(i64),
+    AtOk(i64, bool),
+}
+
+fn run_compat<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<BrainRun>, D::Error> {
+    Ok(Option::<RunWire>::deserialize(d)?.map(|w| match w {
+        RunWire::Run(r) => r,
+        RunWire::At(at) => BrainRun {
+            at,
+            ok: true,
+            detail: String::new(),
+        },
+        RunWire::AtOk(at, ok) => BrainRun {
+            at,
+            ok,
+            detail: String::new(),
+        },
+    }))
+}
+
+/// The 2ndBrain writer as the board shows it: every queued entry plus the
+/// 20 most recent others, newest first.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BrainView {
+    pub on: bool,
+    pub entries: Vec<QueueEntry>,
+    #[serde(default, deserialize_with = "run_compat")]
+    pub last_backup: Option<BrainRun>,
+    #[serde(default, deserialize_with = "run_compat")]
+    pub last_sync: Option<BrainRun>,
+    pub push_problem: Option<String>,
+    /// The vault directory, so the board can build an absolute path for a
+    /// session note. `None` while the writer is off.
+    #[serde(default)]
+    pub brain_dir: Option<std::path::PathBuf>,
+}
+
+/// A file write the `PreToolUse` hook asks the daemon to check.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WriteCheck {
+    pub slot: SlotId,
+    pub tool: String,
+    pub paths: Vec<PathBuf>,
+    pub cwd: Option<PathBuf>,
 }
 
 // Adjacent tagging because `Slots` is a tuple variant.
@@ -422,10 +558,20 @@ pub enum Response {
     /// The answer to `CheckBash`: `Some` is the deny reason.
     Verdict {
         deny: Option<String>,
+        /// A replacement Bash command to run instead of the original.
+        #[serde(default)]
+        rewrite: Option<String>,
     },
     /// The request was accepted and is waiting, e.g. a queued claim.
     Queued {
         message: String,
+    },
+    Brain(BrainView),
+    /// What a `bd` run printed and its exit code.
+    BdOutput {
+        code: i32,
+        stdout: String,
+        stderr: String,
     },
 }
 
@@ -436,6 +582,7 @@ pub enum Event {
     SlotChanged(SlotInfo),
     WorkChanged(WorkView),
     LocksChanged(LockView),
+    BrainChanged(BrainView),
 }
 
 #[cfg(test)]
@@ -760,9 +907,13 @@ mod tests {
     fn lock_responses_and_event_round_trip() {
         for resp in [
             Response::Locks(lock_view()),
-            Response::Verdict { deny: None },
+            Response::Verdict {
+                deny: None,
+                rewrite: None,
+            },
             Response::Verdict {
                 deny: Some("S2 holds it".into()),
+                rewrite: None,
             },
             Response::Queued {
                 message: "queued".into(),
@@ -807,6 +958,44 @@ mod tests {
     }
 
     #[test]
+    fn brain_runs_from_an_older_daemon_parse() {
+        let v: BrainView = serde_json::from_str(
+            r#"{"on":true,"entries":[],"last_backup":1700000100,"last_sync":[1700000200,false],"push_problem":null}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            v.last_backup,
+            Some(BrainRun {
+                at: 1700000100,
+                ok: true,
+                detail: String::new()
+            })
+        );
+        assert_eq!(
+            v.last_sync,
+            Some(BrainRun {
+                at: 1700000200,
+                ok: false,
+                detail: String::new()
+            })
+        );
+        let v: BrainView =
+            serde_json::from_str(r#"{"on":false,"entries":[],"push_problem":null}"#).unwrap();
+        assert_eq!((v.last_backup, v.last_sync), (None, None));
+    }
+
+    #[test]
+    fn bash_check_without_cwd_or_env_parses() {
+        let c: BashCheck = serde_json::from_str(
+            r#"{"slot":1,"session_id":null,"tool_use_id":null,"command":"bd close DEMO-12"}"#,
+        )
+        .unwrap();
+        assert_eq!(c.cwd, None);
+        assert!(c.env.is_empty());
+        assert!(CHECK_ENV.contains(&"BEADS_DIR"));
+    }
+
+    #[test]
     fn sender_shapes() {
         let v = serde_json::to_value(Sender::Slot { slot: 3 }).unwrap();
         assert_eq!(v, serde_json::json!({"type": "Slot", "slot": 3}));
@@ -816,6 +1005,161 @@ mod tests {
         );
         let back: Sender = serde_json::from_value(v).unwrap();
         assert_eq!(back, Sender::Slot { slot: 3 });
+    }
+
+    fn queue_entry() -> QueueEntry {
+        QueueEntry {
+            id: 4,
+            at: 1700000000,
+            from: Sender::Slot { slot: 3 },
+            paths: vec!["Sprints/sprint-26-01/DEMO-12-demo-lane/notes.md".into()],
+            message: "S3: notes".into(),
+            state: QueueState::Committed,
+            commit: Some("abc1234".into()),
+            pushed: Some(false),
+            error: Some("rejected".into()),
+        }
+    }
+
+    fn brain_view() -> BrainView {
+        BrainView {
+            on: true,
+            entries: vec![
+                queue_entry(),
+                QueueEntry {
+                    id: 3,
+                    at: 1699999000,
+                    from: Sender::You,
+                    paths: vec![],
+                    message: "m".into(),
+                    state: QueueState::Queued,
+                    commit: None,
+                    pushed: None,
+                    error: None,
+                },
+            ],
+            last_backup: Some(BrainRun {
+                at: 1700000100,
+                ok: false,
+                detail: "index.lock still held after 4 attempts".into(),
+            }),
+            last_sync: Some(BrainRun {
+                at: 1700000200,
+                ok: true,
+                detail: "sync done".into(),
+            }),
+            push_problem: None,
+            brain_dir: None,
+        }
+    }
+
+    #[test]
+    fn brain_types_round_trip() {
+        let e = queue_entry();
+        let json = serde_json::to_string(&e).unwrap();
+        assert_eq!(serde_json::from_str::<QueueEntry>(&json).unwrap(), e);
+        for state in [
+            QueueState::Queued,
+            QueueState::Committed,
+            QueueState::NothingToCommit,
+            QueueState::Failed,
+        ] {
+            let json = serde_json::to_string(&state).unwrap();
+            assert_eq!(serde_json::from_str::<QueueState>(&json).unwrap(), state);
+        }
+        let v = brain_view();
+        let json = serde_json::to_string(&v).unwrap();
+        assert_eq!(serde_json::from_str::<BrainView>(&json).unwrap(), v);
+        let ev = Event::BrainChanged(v.clone());
+        let json = serde_json::to_string(&ev).unwrap();
+        assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), ev);
+        let resp = Response::Brain(v);
+        let json = serde_json::to_string(&resp).unwrap();
+        assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), resp);
+        let resp = Response::BdOutput {
+            code: 1,
+            stdout: "o".into(),
+            stderr: "e".into(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), resp);
+    }
+
+    #[test]
+    fn brain_requests_round_trip() {
+        let check = WriteCheck {
+            slot: 2,
+            tool: "Edit".into(),
+            paths: vec![PathBuf::from("/tmp/vault/a b.md")],
+            cwd: Some(PathBuf::from("/tmp/vault")),
+        };
+        let json = serde_json::to_string(&check).unwrap();
+        assert_eq!(serde_json::from_str::<WriteCheck>(&json).unwrap(), check);
+        for req in [
+            Request::Commit {
+                from: Some(2),
+                paths: vec!["a.md".into()],
+                message: "m".into(),
+            },
+            Request::AppendJournal {
+                from: None,
+                section: "Work Log".into(),
+                text: "t".into(),
+            },
+            Request::EditShared {
+                from: Some(1),
+                path: "p".into(),
+                old_text: "o".into(),
+                new_text: "n".into(),
+            },
+            Request::UpdateCurrentSession {
+                slot: 3,
+                text: "t".into(),
+            },
+            Request::RunBd {
+                from: Some(3),
+                args: vec!["list".into()],
+                stdin: Some("body\n".into()),
+            },
+            Request::BrainStatus,
+            Request::CheckWrite(check),
+        ] {
+            let json = serde_json::to_string(&req).unwrap();
+            assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), req);
+        }
+    }
+
+    #[test]
+    fn run_bd_without_stdin_decodes_to_none() {
+        let old = r#"{"type":"RunBd","from":null,"args":["list"]}"#;
+        let req: Request = serde_json::from_str(old).unwrap();
+        assert_eq!(
+            req,
+            Request::RunBd {
+                from: None,
+                args: vec!["list".into()],
+                stdin: None
+            }
+        );
+    }
+
+    #[test]
+    fn verdict_without_rewrite_decodes_to_none() {
+        let resp: Response =
+            serde_json::from_str(r#"{"type":"Verdict","data":{"deny":"no"}}"#).unwrap();
+        assert_eq!(
+            resp,
+            Response::Verdict {
+                deny: Some("no".into()),
+                rewrite: None
+            }
+        );
+        let with = Response::Verdict {
+            deny: None,
+            rewrite: Some("overseer ctl bd -- list".into()),
+        };
+        let json = serde_json::to_string(&with).unwrap();
+        assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), with);
     }
 
     #[test]

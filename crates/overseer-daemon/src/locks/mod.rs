@@ -335,7 +335,10 @@ impl LockService {
     /// failure or a resolution past `RESOLVE_WITHIN` allows the command and
     /// records nothing.
     pub async fn check_bash(&self, check: BashCheck, owned: Vec<String>) -> Response {
-        let allow = Response::Verdict { deny: None };
+        let allow = Response::Verdict {
+            deny: None,
+            rewrite: None,
+        };
         if !valid_id(check.slot) {
             return allow;
         }
@@ -380,7 +383,10 @@ impl LockService {
         let item = only_item(&owned);
         let now = unix_now();
         match self.change("bash check", |conn| bash_on(conn, &check, &hits, item, now)) {
-            Ok(deny) => Response::Verdict { deny },
+            Ok(deny) => Response::Verdict {
+                deny,
+                rewrite: None,
+            },
             Err(_) => allow,
         }
     }

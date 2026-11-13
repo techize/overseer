@@ -26,7 +26,8 @@ use gpui::{
     Subscription, Task, Window,
 };
 use overseer_proto::{
-    Client, Event, Frame, LockView, Request, Response, SlotId, SlotInfo, SlotState, WorkView,
+    BrainView, Client, Event, Frame, LockView, Request, Response, SlotId, SlotInfo, SlotState,
+    WorkView,
 };
 
 use crate::board::Dir;
@@ -81,6 +82,7 @@ actions!(
         AssignSelected,
         OpenMessage,
         OpenRelease,
+        OpenNote,
     ]
 );
 
@@ -119,6 +121,10 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         // nothing; plain m and r still go to it.
         KeyBinding::new("cmd-shift-m", OpenMessage, Some("Session")),
         KeyBinding::new("cmd-shift-r", OpenRelease, Some("Session")),
+        // Plain n goes to the terminal; outside it (the panel has focus) it
+        // opens the session note too.
+        KeyBinding::new("cmd-shift-n", OpenNote, Some("Session")),
+        KeyBinding::new("n", OpenNote, Some("Session && !Terminal && !PanelEntry")),
         KeyBinding::new("left", SelectLeft, Some("Board")),
         KeyBinding::new("right", SelectRight, Some("Board")),
         KeyBinding::new("up", SelectUp, Some("Board")),
@@ -247,6 +253,18 @@ pub fn empty_locks() -> LockView {
     }
 }
 
+/// The 2ndBrain view before the daemon's first answer.
+pub fn empty_brain() -> BrainView {
+    BrainView {
+        on: false,
+        entries: Vec::new(),
+        last_backup: None,
+        last_sync: None,
+        push_problem: None,
+        brain_dir: None,
+    }
+}
+
 fn empty_slots() -> Vec<SlotInfo> {
     (0..7)
         .map(|id| SlotInfo {
@@ -258,6 +276,7 @@ fn empty_slots() -> Vec<SlotInfo> {
             cols: 80,
             rows: 24,
             activity: None,
+            session_note: None,
         })
         .collect()
 }
@@ -276,6 +295,13 @@ pub struct OverseerApp {
     pub(crate) work: WorkView,
     /// Claims, waits and relays from the daemon.
     pub(crate) locks: LockView,
+    /// The 2ndBrain queue and push state, for the board's bottom strip.
+    pub(crate) brain: BrainView,
+    /// The push problem text last announced; see `push_problem_note`.
+    notified_push: Option<String>,
+    /// The strip's list shows while hovered, or until clicked away.
+    pub(crate) brain_hover: bool,
+    pub(crate) brain_pinned: bool,
     pub(crate) screen: Screen,
     pub(crate) selected: SlotId,
     pub(crate) home: Option<PathBuf>,
@@ -331,9 +357,9 @@ impl OverseerApp {
         });
         let mut clicks = crate::notify::clicks();
         let clicked = cx.spawn_in(window, async move |this, cx| {
-            while let Some(id) = clicks.recv().await {
+            while let Some(click) = clicks.recv().await {
                 let alive = this.update_in(cx, |this, window, cx| {
-                    this.notification_clicked(id, window, cx)
+                    this.notification_clicked(click, window, cx)
                 });
                 if alive.is_err() {
                     return;
@@ -353,6 +379,9 @@ impl OverseerApp {
             if result.is_ok() {
                 result = lister.request_marked(Request::ListLocks, |_| true).await;
             }
+            if result.is_ok() {
+                result = lister.request_marked(Request::BrainStatus, |_| true).await;
+            }
             if let Err(e) = result {
                 let _ = this.update(cx, |this, cx| {
                     this.status = Some(format!("{} ({e:#})", crate::terminal_view::LOST_DAEMON));
@@ -369,6 +398,10 @@ impl OverseerApp {
             slots: empty_slots(),
             work: empty_work(),
             locks: empty_locks(),
+            brain: empty_brain(),
+            notified_push: None,
+            brain_hover: false,
+            brain_pinned: false,
             screen: Screen::Board,
             selected: 1,
             home: std::env::var_os("HOME").map(PathBuf::from),
@@ -420,6 +453,22 @@ impl OverseerApp {
                     crate::notify::post(&note);
                 }
                 self.locks = view;
+                cx.notify();
+            }
+            // A push problem waits until a push succeeds, so one already
+            // there on connecting is announced too, once.
+            Frame::Response {
+                resp: Response::Brain(view),
+                ..
+            }
+            | Frame::Event(Event::BrainChanged(view)) => {
+                if let Some(note) = crate::notify::push_problem_note(
+                    &mut self.notified_push,
+                    view.push_problem.as_deref(),
+                ) {
+                    crate::notify::post(&note);
+                }
+                self.brain = view;
                 cx.notify();
             }
             Frame::Event(Event::WorkChanged(view))
@@ -684,6 +733,25 @@ impl OverseerApp {
         }
     }
 
+    /// `n` in the session view: opens the slot's session note in Obsidian.
+    /// With no note yet it does nothing; the panel says so.
+    pub(crate) fn open_note_key(&mut self) {
+        let Screen::Session(id) = self.screen else {
+            return;
+        };
+        let target =
+            crate::session::note_target(&self.slots[id as usize], self.brain.brain_dir.as_deref());
+        if let Some(url) = target {
+            // Waited on off the UI thread so the child does not linger.
+            std::thread::spawn(move || {
+                match std::process::Command::new("open").arg(&url).status() {
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!("could not open the session note: {e}"),
+                }
+            });
+        }
+    }
+
     pub(crate) fn open_message_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Screen::Session(id) = self.screen {
             self.open_message(id, window, cx);
@@ -907,11 +975,19 @@ impl OverseerApp {
     /// A notification was clicked: bring the window forward on that
     /// session. With the start dialog open only the window comes forward,
     /// as Cmd+digit does nothing there either.
-    fn notification_clicked(&mut self, id: SlotId, window: &mut Window, cx: &mut Context<Self>) {
+    fn notification_clicked(
+        &mut self,
+        click: crate::notify::Click,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         cx.activate(true);
         window.activate_window();
         if !self.modal_open() {
-            self.go_session(id, window, cx);
+            match click {
+                crate::notify::Click::Slot(id) => self.go_session(id, window, cx),
+                crate::notify::Click::Board => self.go_board(window, cx),
+            }
         }
     }
 
@@ -1082,6 +1158,17 @@ mod tests {
             assert_eq!(routed(k, TERMINAL), None, "{k}");
         }
         assert_eq!(routed("escape", ENTRY), None);
+    }
+
+    #[test]
+    fn n_opens_the_note_but_never_steals_the_terminals_key() {
+        const ENTRY: &[&str] = &["Overseer", "Session", "PanelEntry"];
+        assert_eq!(routed("n", CHROME), Some("overseer::OpenNote"));
+        assert_eq!(routed("n", TERMINAL), None);
+        assert_eq!(routed("n", ENTRY), None);
+        assert_eq!(routed("n", BOARD), None);
+        assert_eq!(routed("cmd-shift-n", TERMINAL), Some("overseer::OpenNote"));
+        assert_eq!(routed("cmd-shift-n", BOARD), None);
     }
 
     #[test]
