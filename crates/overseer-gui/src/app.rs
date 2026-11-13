@@ -32,6 +32,7 @@ use overseer_proto::{
 
 use crate::board::Dir;
 use crate::picker::{Picker, PickerEvent};
+use crate::plan_view::{PlanEvent, PlanView};
 use crate::session::{incarnation, keep_view, restart_begin, restart_on_change, Incarnation};
 use crate::session::{reply_note, EntryAction, EntryKind, PanelEntry, RestartPlan};
 use crate::start_dialog::{DialogEvent, Prefill, StartDialog};
@@ -94,9 +95,9 @@ pub enum Screen {
     Session(SlotId),
 }
 
-/// Navigation keys work anywhere in the window except the start dialog and
-/// the picker.
-const NAV: &str = "Overseer && !StartDialog && !Picker";
+/// Navigation keys work anywhere in the window except the start dialog, the
+/// picker and the plan view.
+const NAV: &str = "Overseer && !StartDialog && !Picker && !PlanView";
 
 pub fn key_bindings() -> Vec<KeyBinding> {
     let nav = Some(NAV);
@@ -347,6 +348,8 @@ pub struct OverseerApp {
     terminals: HashMap<SlotId, TermEntry>,
     dialog: Option<(Entity<StartDialog>, Subscription)>,
     picker: Option<(Entity<Picker>, Subscription)>,
+    /// The open plan approval view.
+    plan_view: Option<(Entity<PlanView>, Subscription)>,
     /// Pickers closed with an assign on its way; see `PickerEvent::Late`.
     leaving: Vec<(Entity<Picker>, Subscription)>,
     restarts: HashMap<SlotId, RestartPlan>,
@@ -448,6 +451,7 @@ impl OverseerApp {
             terminals: HashMap::new(),
             dialog: None,
             picker: None,
+            plan_view: None,
             leaving: Vec::new(),
             restarts: HashMap::new(),
             kickoffs: HashSet::new(),
@@ -513,15 +517,13 @@ impl OverseerApp {
                 resp: Response::Coord(view),
                 ..
             } => {
-                self.coord = view;
-                cx.notify();
+                self.coord_changed(view, cx);
             }
             Frame::Event(Event::CoordChanged(view)) => {
                 if let Some(note) = crate::notify::plan_note(&self.coord, &view) {
                     crate::notify::post(&note);
                 }
-                self.coord = view;
-                cx.notify();
+                self.coord_changed(view, cx);
             }
             Frame::Event(Event::WorkChanged(view))
             | Frame::Response {
@@ -876,9 +878,9 @@ impl OverseerApp {
             .unwrap_or_default()
     }
 
-    /// The start dialog or the picker is up; navigation waits for it.
+    /// The start dialog, the picker or the plan view is up; navigation waits for it.
     fn modal_open(&self) -> bool {
-        self.dialog.is_some() || self.picker.is_some()
+        self.dialog.is_some() || self.picker.is_some() || self.plan_view.is_some()
     }
 
     /// The work-item picker for `slot`: `a` on the board, `+ assign` on an
@@ -1047,13 +1049,40 @@ impl OverseerApp {
         }
     }
 
-    /// `p` on the board, and a clicked plan notice. Task 9 replaces the body
-    /// with the plan approval view; until then it only says what waits.
-    pub(crate) fn open_plan(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        self.status = Some(match self.coord.pending_plan() {
-            Some(p) => format!("Plan {} is waiting; the plan view is not built yet", p.id),
-            None => "No plan is waiting".to_string(),
+    /// The daemon's new coordinator view: keep it, and let an open plan
+    /// view notice that its plan was decided elsewhere.
+    fn coord_changed(&mut self, view: CoordView, cx: &mut Context<Self>) {
+        if let Some((p, _)) = &self.plan_view {
+            p.update(cx, |p, cx| p.coord_changed(&view, cx));
+        }
+        self.coord = view;
+        cx.notify();
+    }
+
+    /// `p` on the board, and a clicked plan notice: the plan approval view
+    /// for the plan waiting for Jonathan.
+    pub(crate) fn open_plan(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal_open() {
+            return;
+        }
+        let Some(rec) = self.coord.pending_plan().cloned() else {
+            self.status = Some("No plan is waiting".to_string());
+            cx.notify();
+            return;
+        };
+        self.status = None;
+        let client = self.client.clone();
+        let view = cx.new(|cx| PlanView::new(&rec, client, cx));
+        let sub = cx.subscribe_in(&view, window, |this, _, ev: &PlanEvent, window, cx| {
+            this.plan_view = None;
+            if let PlanEvent::Decided(line) = ev {
+                this.status = Some(line.clone());
+            }
+            this.restore_focus(window, cx);
+            cx.notify();
         });
+        window.focus(&view.focus_handle(cx));
+        self.plan_view = Some((view, sub));
         cx.notify();
     }
 
@@ -1143,6 +1172,7 @@ impl Render for OverseerApp {
             .child(screen)
             .children(self.dialog.as_ref().map(|(d, _)| d.clone()))
             .children(self.picker.as_ref().map(|(p, _)| p.clone()))
+            .children(self.plan_view.as_ref().map(|(p, _)| p.clone()))
     }
 }
 
@@ -1180,6 +1210,7 @@ mod tests {
     const BOARD: &[&str] = &["Overseer", "Board"];
     const DIALOG: &[&str] = &["Overseer", "StartDialog"];
     const PICKER: &[&str] = &["Overseer", "Picker"];
+    const PLAN: &[&str] = &["Overseer", "PlanView"];
 
     #[test]
     fn cmd_digits_navigate_from_everywhere_but_the_dialog() {
@@ -1188,6 +1219,25 @@ mod tests {
         assert_eq!(routed("cmd-6", CHROME), Some("overseer::GoS6"));
         assert_eq!(routed("cmd-1", DIALOG), None);
         assert_eq!(routed("cmd-1", PICKER), None);
+    }
+
+    #[test]
+    fn cmd_enter_and_escape_route_to_plan_view() {
+        // Neither is a global binding: both reach the view's own handler.
+        assert_eq!(routed("cmd-enter", PLAN), None);
+        assert_eq!(routed("escape", PLAN), None);
+        for k in ["tab", "enter", "a", "p", "cmd-v"] {
+            assert_eq!(routed(k, PLAN), None, "{k}");
+        }
+        assert_eq!(routed("cmd-q", PLAN), Some("overseer::Quit"));
+    }
+
+    #[test]
+    fn cmd_digits_do_not_route_while_plan_view_open() {
+        for d in ["cmd-0", "cmd-3", "cmd-6", "cmd-n", "cmd-escape"] {
+            assert_eq!(routed(d, PLAN), None, "{d}");
+        }
+        assert_eq!(routed("cmd-3", BOARD), Some("overseer::GoS3"));
     }
 
     #[test]
