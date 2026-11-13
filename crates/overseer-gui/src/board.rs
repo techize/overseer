@@ -18,8 +18,9 @@ use std::path::Path;
 
 use gpui::{div, prelude::*, px, rgb, Context, FontWeight, Window};
 use overseer_proto::{
-    slot_name, Activity, ActivityKind, BrainView, ClaimKind, ItemKind, LockView, QueueEntry,
-    QueueState, RelayState, Sender, SlotId, SlotInfo, SlotState, WorkItem, WorkView,
+    slot_name, Activity, ActivityKind, BrainView, ClaimKind, CoordView, ItemKind, LockView,
+    PlanState, QueueEntry, QueueState, RelayState, Sender, SlotId, SlotInfo, SlotState, WorkItem,
+    WorkView,
 };
 
 use crate::app::{colors, OverseerApp};
@@ -523,13 +524,55 @@ pub fn needs_you_count(slots: &[SlotInfo]) -> usize {
         .count()
 }
 
-/// The header's right-hand text with the sessions that need Jonathan:
-/// `3 running, 1 need you`.
-pub fn header_text(running: usize, need_you: usize) -> String {
-    match need_you {
+/// Done and total tickets in the list: done is status `done`, `closed` or
+/// `resolved`, any case. Beads and tickets that left the list are not
+/// counted.
+pub fn done_count(work: &WorkView) -> (usize, usize) {
+    let tickets = work
+        .items
+        .iter()
+        .filter(|i| i.kind == ItemKind::Ticket && i.in_list);
+    let (mut done, mut total) = (0, 0);
+    for i in tickets {
+        total += 1;
+        let s = i.status.trim().to_lowercase();
+        if matches!(s.as_str(), "done" | "closed" | "resolved") {
+            done += 1;
+        }
+    }
+    (done, total)
+}
+
+/// The header's right-hand text with the sessions that need Jonathan and
+/// the ticket count: `3 running, 1 need you, done 2/5`. No tickets, no
+/// count.
+pub fn header_text(running: usize, need_you: usize, done: (usize, usize)) -> String {
+    let mut text = match need_you {
         0 => header_count(running),
         n => format!("{}, {n} need you", header_count(running)),
+    };
+    if done.1 > 0 {
+        text.push_str(&format!(", done {}/{}", done.0, done.1));
     }
+    text
+}
+
+/// The coordinator panel's summary: a title (`Updated 14:05`, or `No
+/// summary yet`) and the text.
+pub fn summary_lines(view: &CoordView, clock: impl Fn(i64) -> String) -> (String, String) {
+    match &view.summary {
+        Some(s) => (format!("Updated {}", clock(s.at)), s.text.clone()),
+        None => (
+            "No summary yet".into(),
+            "Ask S0 \"what's going on?\" to get one.".into(),
+        ),
+    }
+}
+
+/// The coordinator panel's line for the plan waiting for Jonathan.
+pub fn plan_line(view: &CoordView) -> Option<String> {
+    let plan = view.plans.iter().find(|p| p.state == PlanState::Pending)?;
+    Some(format!("Plan {} waiting for you (p)", plan.id))
 }
 
 /// Arrow-key moves between cards.
@@ -763,6 +806,8 @@ impl OverseerApp {
         let running = running_count(&self.slots);
         let need_you = needs_you_count(&self.slots);
         let strip = strip_lines(&self.locks, local_hhmm, 5);
+        let (summary_title, summary_body) = summary_lines(&self.coord, local_hhmm);
+        let plan_line = plan_line(&self.coord);
         let (strip_label, strip_tone) = strip_text(&self.brain);
         let show_list = self.brain_hover || self.brain_pinned;
         let s0 = self.render_card(0, now, cx);
@@ -802,6 +847,9 @@ impl OverseerApp {
                     this.open_picker(this.selected, window, cx)
                 }),
             )
+            .on_action(cx.listener(|this, _: &crate::app::OpenPlan, window, cx| {
+                this.open_plan(window, cx)
+            }))
             .on_action(
                 cx.listener(|this, _: &crate::app::OpenSelected, window, cx| {
                     this.open_card(this.selected, window, cx)
@@ -835,7 +883,7 @@ impl OverseerApp {
                                     } else {
                                         colors::MUTED
                                     }))
-                                    .child(header_text(running, need_you)),
+                                    .child(header_text(running, need_you, done_count(&self.work))),
                             )
                             .child(
                                 div()
@@ -863,10 +911,29 @@ impl OverseerApp {
                     )
                     .child(
                         div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
                             .text_sm()
-                            .text_color(rgb(colors::TEXT_DIM))
-                            .child("Coordinator summary appears here in phase 6"),
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(colors::MUTED))
+                                    .child(summary_title),
+                            )
+                            .child(
+                                div()
+                                    .text_color(rgb(colors::TEXT_DIM))
+                                    .child(summary_body),
+                            ),
                     )
+                    .children(plan_line.map(|line| {
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(colors::ORANGE))
+                            .child(line)
+                    }))
                     .child(div().flex().child(s0)),
             )
             .child(div().flex().flex_col().gap_2().child(top).child(bottom))
@@ -1647,10 +1714,10 @@ mod tests {
             info(4, "", SlotState::Empty),
         ];
         assert_eq!(needs_you_count(&slots), 2);
-        assert_eq!(header_text(3, 2), "3 running, 2 need you");
-        assert_eq!(header_text(3, 1), "3 running, 1 need you");
-        assert_eq!(header_text(3, 0), "3 running");
-        assert_eq!(header_text(0, 0), "none running");
+        assert_eq!(header_text(3, 2, (0, 0)), "3 running, 2 need you");
+        assert_eq!(header_text(3, 1, (0, 0)), "3 running, 1 need you");
+        assert_eq!(header_text(3, 0, (0, 0)), "3 running");
+        assert_eq!(header_text(0, 0, (0, 0)), "none running");
         slots.truncate(2);
         assert_eq!(needs_you_count(&slots), 1);
     }
@@ -1728,5 +1795,74 @@ mod tests {
         assert_eq!(move_selection(5, Down), 5);
         assert_eq!(move_selection(5, Up), 2);
         assert_eq!(move_selection(4, Left), 4);
+    }
+    fn ticket(key: &str, status: &str, kind: ItemKind) -> WorkItem {
+        WorkItem {
+            key: key.into(),
+            kind,
+            title: "t".into(),
+            status: status.into(),
+            priority: None,
+            parent: None,
+            owner: None,
+            in_list: true,
+            folder: None,
+        }
+    }
+
+    #[test]
+    fn summary_lines_with_and_without_summary() {
+        let mut view = crate::app::empty_coord();
+        assert_eq!(
+            summary_lines(&view, hhmm),
+            (
+                "No summary yet".to_string(),
+                "Ask S0 \"what's going on?\" to get one.".to_string()
+            )
+        );
+        view.summary = Some(overseer_proto::Summary {
+            at: 14 * 60 + 5,
+            text: "DEMO-12 is in review.".into(),
+        });
+        assert_eq!(
+            summary_lines(&view, hhmm),
+            (
+                "Updated 14:05".to_string(),
+                "DEMO-12 is in review.".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn done_count_counts_done_closed_resolved_tickets_only() {
+        let mut work = crate::app::empty_work();
+        assert_eq!(done_count(&work), (0, 0));
+        work.items = vec![
+            ticket("DEMO-1", "Done", ItemKind::Ticket),
+            ticket("DEMO-2", "closed", ItemKind::Ticket),
+            ticket("DEMO-3", "RESOLVED", ItemKind::Ticket),
+            ticket("DEMO-4", "In Progress", ItemKind::Ticket),
+            ticket("demo-b1", "done", ItemKind::Bead),
+        ];
+        assert_eq!(done_count(&work), (3, 4));
+    }
+
+    #[test]
+    fn header_text_has_done_count() {
+        assert_eq!(header_text(3, 1, (2, 5)), "3 running, 1 need you, done 2/5");
+        assert_eq!(header_text(0, 0, (0, 4)), "none running, done 0/4");
+        assert_eq!(header_text(3, 0, (0, 0)), "3 running");
+    }
+
+    #[test]
+    fn plan_line_names_the_pending_plan() {
+        let mut view = crate::app::empty_coord();
+        assert_eq!(plan_line(&view), None);
+        view.plans
+            .push(crate::app::test_plan(7, overseer_proto::PlanState::Pending));
+        assert_eq!(
+            plan_line(&view).as_deref(),
+            Some("Plan 7 waiting for you (p)")
+        );
     }
 }

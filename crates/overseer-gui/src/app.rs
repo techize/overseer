@@ -26,8 +26,8 @@ use gpui::{
     Subscription, Task, Window,
 };
 use overseer_proto::{
-    BrainView, Client, Event, Frame, LockView, Request, Response, SlotId, SlotInfo, SlotState,
-    WorkView,
+    BrainView, Client, CoordView, Event, Frame, LockView, Request, Response, SlotId, SlotInfo,
+    SlotState, WorkView,
 };
 
 use crate::board::Dir;
@@ -83,6 +83,7 @@ actions!(
         OpenMessage,
         OpenRelease,
         OpenNote,
+        OpenPlan,
     ]
 );
 
@@ -132,6 +133,7 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("enter", OpenSelected, Some("Board")),
         KeyBinding::new("r", ResumeSelected, Some("Board")),
         KeyBinding::new("a", AssignSelected, Some("Board")),
+        KeyBinding::new("p", OpenPlan, Some("Board")),
         KeyBinding::new("cmd-q", Quit, None),
     ]
 }
@@ -265,6 +267,34 @@ pub fn empty_brain() -> BrainView {
     }
 }
 
+/// The coordinator view before the daemon's first answer.
+pub fn empty_coord() -> CoordView {
+    CoordView {
+        summary: None,
+        plans: Vec::new(),
+        reports: Vec::new(),
+        status_asked: Vec::new(),
+    }
+}
+
+/// A plan record for tests in this crate.
+#[cfg(test)]
+pub(crate) fn test_plan(id: i64, state: overseer_proto::PlanState) -> overseer_proto::PlanRecord {
+    overseer_proto::PlanRecord {
+        id,
+        at: 0,
+        plan: overseer_proto::Plan {
+            summary: String::new(),
+            slots: Vec::new(),
+        },
+        state,
+        decided_at: None,
+        edited: false,
+        warnings: Vec::new(),
+        outcome: Vec::new(),
+    }
+}
+
 fn empty_slots() -> Vec<SlotInfo> {
     (0..7)
         .map(|id| SlotInfo {
@@ -297,6 +327,8 @@ pub struct OverseerApp {
     pub(crate) locks: LockView,
     /// The 2ndBrain queue and push state, for the board's bottom strip.
     pub(crate) brain: BrainView,
+    /// S0's summary, the plans and the timeline from the daemon.
+    pub(crate) coord: CoordView,
     /// The push problem text last announced; see `push_problem_note`.
     notified_push: Option<String>,
     /// The strip's list shows while hovered, or until clicked away.
@@ -382,6 +414,9 @@ impl OverseerApp {
             if result.is_ok() {
                 result = lister.request_marked(Request::BrainStatus, |_| true).await;
             }
+            if result.is_ok() {
+                result = lister.request_marked(Request::CoordStatus, |_| true).await;
+            }
             if let Err(e) = result {
                 let _ = this.update(cx, |this, cx| {
                     this.status = Some(format!("{} ({e:#})", crate::terminal_view::LOST_DAEMON));
@@ -399,6 +434,7 @@ impl OverseerApp {
             work: empty_work(),
             locks: empty_locks(),
             brain: empty_brain(),
+            coord: empty_coord(),
             notified_push: None,
             brain_hover: false,
             brain_pinned: false,
@@ -469,6 +505,22 @@ impl OverseerApp {
                     crate::notify::post(&note);
                 }
                 self.brain = view;
+                cx.notify();
+            }
+            // The view asked for on connecting is not news: a plan already
+            // waiting shows on the board but does not notify.
+            Frame::Response {
+                resp: Response::Coord(view),
+                ..
+            } => {
+                self.coord = view;
+                cx.notify();
+            }
+            Frame::Event(Event::CoordChanged(view)) => {
+                if let Some(note) = crate::notify::plan_note(&self.coord, &view) {
+                    crate::notify::post(&note);
+                }
+                self.coord = view;
                 cx.notify();
             }
             Frame::Event(Event::WorkChanged(view))
@@ -987,8 +1039,22 @@ impl OverseerApp {
             match click {
                 crate::notify::Click::Slot(id) => self.go_session(id, window, cx),
                 crate::notify::Click::Board => self.go_board(window, cx),
+                crate::notify::Click::Plan => {
+                    self.go_board(window, cx);
+                    self.open_plan(window, cx);
+                }
             }
         }
+    }
+
+    /// `p` on the board, and a clicked plan notice. Task 9 replaces the body
+    /// with the plan approval view; until then it only says what waits.
+    pub(crate) fn open_plan(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.status = Some(match self.coord.pending_plan() {
+            Some(p) => format!("Plan {} is waiting; the plan view is not built yet", p.id),
+            None => "No plan is waiting".to_string(),
+        });
+        cx.notify();
     }
 
     pub(crate) fn open_card(&mut self, id: SlotId, window: &mut Window, cx: &mut Context<Self>) {
@@ -1314,5 +1380,12 @@ mod tests {
         let mut ex = s[2].clone();
         ex.state = SlotState::Exited { code: None, at: 0 };
         assert_eq!(card_click(&ex), CardClick::Open(2));
+    }
+    #[test]
+    fn p_routes_on_the_board_only() {
+        assert_eq!(routed("p", BOARD), Some("overseer::OpenPlan"));
+        for ctx in [TERMINAL, CHROME, DIALOG, PICKER] {
+            assert_eq!(routed("p", ctx), None);
+        }
     }
 }

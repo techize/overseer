@@ -11,7 +11,7 @@
 
 use std::sync::Mutex;
 
-use overseer_proto::{slot_name, ActivityKind, LockView, SlotId, SlotInfo};
+use overseer_proto::{slot_name, ActivityKind, CoordView, LockView, SlotId, SlotInfo};
 use tokio::sync::mpsc;
 
 /// Whether `next` should raise a notification. Only a change into NeedsYou
@@ -34,6 +34,8 @@ pub struct Note {
     /// The 2ndBrain push notice: it has its own identifier and a click
     /// opens the board, not a session.
     pub push: bool,
+    /// S0 proposed a plan: a click opens the board and the plan.
+    pub plan: bool,
     /// `S3 needs you`.
     pub title: String,
     /// `label: reason`, or whichever of the two there is.
@@ -58,6 +60,7 @@ pub fn note_for(info: &SlotInfo) -> Note {
     Note {
         slot: info.id,
         push: false,
+        plan: false,
         title: format!("{name} needs you"),
         body,
     }
@@ -80,6 +83,7 @@ pub fn new_waits(prev: &LockView, next: &LockView) -> Vec<Note> {
             Some(Note {
                 slot: w.slot,
                 push: false,
+                plan: false,
                 title: format!(
                     "{} blocked: {} is held by {}",
                     slot_name(w.slot),
@@ -109,8 +113,35 @@ pub fn push_problem_note(notified: &mut Option<String>, next: Option<&str>) -> O
     Some(Note {
         slot: 0,
         push: true,
+        plan: false,
         title: "2ndBrain".into(),
         body: next.to_string(),
+    })
+}
+
+/// The notification for a plan that became pending in `next` and was not
+/// in `prev`: once per plan id. The body is the first line of the plan's
+/// summary, or names the plan when there is none.
+pub fn plan_note(prev: &CoordView, next: &CoordView) -> Option<Note> {
+    let plan = next.pending_plan()?;
+    if prev.pending_plan().is_some_and(|p| p.id == plan.id) {
+        return None;
+    }
+    let first = plan
+        .plan
+        .summary
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty());
+    Some(Note {
+        slot: 0,
+        push: false,
+        plan: true,
+        title: "S0 proposed a plan".into(),
+        body: match first {
+            Some(l) => l.to_string(),
+            None => format!("Plan {} is waiting for you", plan.id),
+        },
     })
 }
 
@@ -119,9 +150,17 @@ pub fn push_problem_note(notified: &mut Option<String>, next: Option<&str>) -> O
 pub enum Click {
     Slot(SlotId),
     Board,
+    /// The board, then the plan waiting there.
+    Plan,
 }
 
 const PUSH_PREFIX: &str = "overseer-push-";
+const PLAN_PREFIX: &str = "overseer-plan-";
+
+/// The request identifier for the `seq`th plan notice.
+pub fn plan_identifier(seq: u64) -> String {
+    format!("{PLAN_PREFIX}{seq}")
+}
 
 /// The request identifier for the `seq`th push notice; never one of a
 /// slot's.
@@ -133,6 +172,9 @@ pub fn push_identifier(seq: u64) -> String {
 pub fn click_from_identifier(id: &str) -> Option<Click> {
     if id.starts_with(PUSH_PREFIX) {
         return Some(Click::Board);
+    }
+    if id.starts_with(PLAN_PREFIX) {
+        return Some(Click::Plan);
     }
     slot_from_identifier(id).map(Click::Slot)
 }
@@ -335,9 +377,11 @@ mod platform {
     /// push notice replaces only an earlier push notice (entry 7).
     fn next_identifier(note: &Note) -> (String, Option<String>) {
         static SEQ: AtomicU64 = AtomicU64::new(0);
-        static LAST: Mutex<[Option<String>; 8]> = Mutex::new([const { None }; 8]);
+        static LAST: Mutex<[Option<String>; 9]> = Mutex::new([const { None }; 9]);
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-        let (ident, key) = if note.push {
+        let (ident, key) = if note.plan {
+            (super::plan_identifier(seq), 8)
+        } else if note.push {
             (super::push_identifier(seq), 7)
         } else {
             (super::identifier(note.slot, seq), note.slot as usize)
@@ -594,5 +638,42 @@ mod tests {
         assert!(notes[0].title.ends_with("tf:demo is held by S4"));
         // The wait going away notifies nothing.
         assert!(new_waits(&two, &none).is_empty());
+    }
+    #[test]
+    fn plan_note_fires_once_per_new_plan() {
+        use overseer_proto::PlanState;
+        let empty = crate::app::empty_coord();
+        // Nothing pending: nothing to announce (also the first sync, which
+        // the app applies without asking).
+        assert_eq!(plan_note(&empty, &empty), None);
+        let mut one = empty.clone();
+        one.plans.push(crate::app::test_plan(1, PlanState::Pending));
+        let mut two = empty.clone();
+        let mut p2 = crate::app::test_plan(2, PlanState::Pending);
+        p2.plan.summary = "Move DEMO-12 first\nthen DEMO-13".into();
+        two.plans.push(p2);
+        two.plans
+            .push(crate::app::test_plan(1, PlanState::Superseded));
+        let note = plan_note(&one, &two).expect("plan 2 is new");
+        assert_eq!(note.title, "S0 proposed a plan");
+        assert_eq!(note.body, "Move DEMO-12 first");
+        assert!(note.plan);
+        assert_eq!(plan_note(&two, &two), None);
+        // No summary: the fallback names the plan.
+        let note = plan_note(&empty, &one).unwrap();
+        assert_eq!(note.body, "Plan 1 is waiting for you");
+        // A decision is not news.
+        let mut done = two.clone();
+        done.plans[0].state = PlanState::Approved;
+        assert_eq!(plan_note(&two, &done), None);
+    }
+
+    #[test]
+    fn the_plan_notice_opens_the_plan() {
+        assert_eq!(
+            click_from_identifier(&plan_identifier(3)),
+            Some(Click::Plan)
+        );
+        assert_eq!(slot_from_identifier(&plan_identifier(3)), None);
     }
 }

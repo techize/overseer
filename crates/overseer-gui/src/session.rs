@@ -14,14 +14,14 @@ use std::path::{Path, PathBuf};
 use gpui::Keystroke;
 use gpui::{div, prelude::*, px, relative, rgb, Context, FontWeight, SharedString, Window};
 use overseer_proto::{
-    slot_name, ActivityKind, ClaimKind, LockView, Notice, RelayState, Request, Response, Sender,
-    SlotId, SlotInfo, SlotState, WorkView,
+    slot_name, ActivityKind, ClaimKind, CoordView, LockView, Notice, RelayState, ReportKind,
+    Request, Response, Sender, SlotId, SlotInfo, SlotState, WorkView,
 };
 
 use crate::app::{colors, OpenMessage, OpenNote, OpenRelease, OverseerApp};
 use crate::board::{
     activity_detail, activity_state, format_elapsed, local_hhmm, one_line, owned_by, slot_title,
-    tilde,
+    tilde, Tone,
 };
 use crate::start_dialog::{edit_key, DialogKey, TextField};
 
@@ -629,13 +629,28 @@ fn panel_box(title: &'static str) -> gpui::Div {
 /// How many relays the Relays box lists.
 const RELAY_ROWS: usize = 6;
 
-fn placeholder(title: &'static str, phase: &'static str) -> gpui::Div {
-    panel_box(title).child(
-        div()
-            .text_sm()
-            .text_color(rgb(colors::TEXT_DIM))
-            .child(format!("Filled in {phase}")),
-    )
+/// How many lines the Progress box lists.
+const PROGRESS_ROWS: usize = 10;
+
+/// `slot`'s reports and state changes, newest first, `max` of them:
+/// `14:05 tests written`. Reports are `Tone::Running` (normal text), state
+/// changes `Tone::Idle` (muted).
+pub fn progress_rows(
+    view: &CoordView,
+    slot: SlotId,
+    clock: impl Fn(i64) -> String,
+    max: usize,
+) -> Vec<(String, Tone)> {
+    view.reports_for(slot)
+        .take(max)
+        .map(|r| {
+            let tone = match r.kind {
+                ReportKind::Report => Tone::Running,
+                ReportKind::State => Tone::Idle,
+            };
+            (format!("{} {}", clock(r.at), one_line(&r.text, 120)), tone)
+        })
+        .collect()
 }
 
 impl OverseerApp {
@@ -783,7 +798,7 @@ impl OverseerApp {
             .child(self.render_owns(id, cx))
             .child(self.render_holds(id, now, cx))
             .child(self.render_relays(id, cx))
-            .child(placeholder("Progress", "phase 4"))
+            .child(self.render_progress(id))
             .children(
                 self.status
                     .clone()
@@ -1066,6 +1081,29 @@ impl OverseerApp {
                     cx.listener(move |this, _, window, cx| this.open_claim(id, window, cx)),
                 ),
             ))
+    }
+
+    fn render_progress(&self, id: SlotId) -> impl IntoElement {
+        let rows = progress_rows(&self.coord, id, local_hhmm, PROGRESS_ROWS);
+        let empty = rows.is_empty();
+        panel_box("Progress")
+            .children(empty.then(|| {
+                div()
+                    .text_sm()
+                    .text_color(rgb(colors::TEXT_DIM))
+                    .child("Nothing reported yet")
+            }))
+            .children(rows.into_iter().map(|(line, tone)| {
+                let color = match tone {
+                    Tone::Idle => colors::TEXT_DIM,
+                    _ => colors::TEXT,
+                };
+                div()
+                    .text_sm()
+                    .truncate()
+                    .text_color(rgb(color))
+                    .child(line)
+            }))
     }
 
     fn render_relays(&self, id: SlotId, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1880,5 +1918,34 @@ mod tests {
         assert_eq!(reply_note(&Ok(err)).as_deref(), Some("no such target"));
         assert_eq!(reply_note(&Ok(Response::Ok)), None);
         assert_eq!(reply_note(&Err("lost".into())).as_deref(), Some("lost"));
+    }
+    #[test]
+    fn progress_rows_newest_first_states_muted() {
+        use crate::board::Tone;
+        use overseer_proto::{Report, ReportKind};
+        let mut view = crate::app::empty_coord();
+        let r = |id, at, slot, kind, text: &str| Report {
+            id,
+            at,
+            slot,
+            kind,
+            text: text.into(),
+        };
+        view.reports = vec![
+            r(3, 30, 1, ReportKind::State, "idle"),
+            r(2, 20, 2, ReportKind::Report, "other slot"),
+            r(1, 10, 1, ReportKind::Report, "tests written"),
+        ];
+        // Out of order on purpose: the rows are sorted, not trusted.
+        view.reports.reverse();
+        assert_eq!(
+            progress_rows(&view, 1, clock, 10),
+            vec![
+                ("T30 idle".to_string(), Tone::Idle),
+                ("T10 tests written".to_string(), Tone::Running),
+            ]
+        );
+        assert_eq!(progress_rows(&view, 1, clock, 1).len(), 1);
+        assert!(progress_rows(&view, 4, clock, 10).is_empty());
     }
 }
