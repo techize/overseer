@@ -700,6 +700,42 @@ async fn queue_survives_restart_without_double_commits() {
     assert_eq!(svc.view().entries.len(), 2);
 }
 
+/// An entry that was tried before is looked for by its trailer, even
+/// when it was not in the queue the service saw at startup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tried_entry_is_found_by_its_trailer() {
+    let v = Vault::new("triedtrailer");
+    let ledger = Arc::new(Ledger::in_memory());
+    let svc = v.service(ledger.clone(), v.options());
+    // The worker's first pass, on an empty queue.
+    sleep(Duration::from_millis(300)).await;
+    let id = ledger
+        .queue_push(now(), &Sender::Slot { slot: 1 }, &["a.md".into()], "S1: a")
+        .unwrap();
+    ledger.queue_begin(id).unwrap();
+    write(&v.vault.join("a.md"), "a\n");
+    sh(&v.vault, &["add", "--", "a.md"]);
+    sh(
+        &v.vault,
+        &[
+            "commit",
+            "-m",
+            &format!("S1: a\n\nOverseer-Queue: {id}"),
+            "--",
+            "a.md",
+        ],
+    );
+    let sha = sh(&v.vault, &["rev-parse", "HEAD"]).trim().to_string();
+    let r = svc
+        .append_journal(Sender::Slot { slot: 2 }, "Work Log", "- wake")
+        .await;
+    assert!(text(&r).contains("committed"), "{r:?}");
+    let view = svc.view();
+    let e = view.entries.iter().find(|e| e.id == id).unwrap();
+    assert_eq!(e.state, QueueState::Committed);
+    assert_eq!(e.commit.as_deref(), Some(sha.as_str()));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bd_gets_the_stdin_it_was_sent() {
     let v = Vault::new("bdstdin");

@@ -198,8 +198,8 @@ struct Runtime {
     /// The queue waits until then after `index.lock` was held.
     retry_at: Option<Instant>,
     next_backup: Option<Instant>,
-    /// Entries queued when the service started: one may have been committed
-    /// by the daemon that went down, so its trailer is looked for first.
+    /// Entries whose state write failed: one may have been committed, so
+    /// its trailer is looked for first. Entries with attempts are too.
     recovering: HashSet<i64>,
     /// Commits found by trailer that may not have been pushed.
     need_push: bool,
@@ -249,19 +249,11 @@ impl BrainService {
             return None;
         }
         let git = VaultGit::new(cfg.brain_dir.clone(), cfg.push).with_lock_wait(opts.lock_wait);
-        let recovering = ledger
-            .queue_recent(0)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|e| e.state == QueueState::Queued)
-            .map(|e| e.id)
-            .collect();
         let push_problem = match ledger.brain_run("push") {
             Ok(Some((_, false, detail))) => Some(detail),
             _ => None,
         };
         let rt = Runtime {
-            recovering,
             push_problem,
             next_backup: opts.backup.map(|d| Instant::now() + d),
             ..Runtime::default()
@@ -1088,8 +1080,21 @@ impl BrainService {
     }
 
     async fn process(&self, g: &VaultGuard<'_>, e: QueueEntry) {
-        let recovering = self.rt().recovering.remove(&e.id);
-        if recovering {
+        // An entry tried before may have been committed by a daemon that
+        // went down before recording it.
+        let held = self.rt().recovering.remove(&e.id);
+        let tried = match self.ledger.queue_attempts(e.id) {
+            Ok(n) => n > 0,
+            Err(err) => {
+                tracing::warn!(
+                    "2ndBrain queue entry {}: attempts unreadable: {err:#}",
+                    e.id
+                );
+                self.hold(e.id);
+                return;
+            }
+        };
+        if held || tried {
             match self.find_trailer(g, &e).await {
                 Ok(Some(sha)) => {
                     tracing::info!(
