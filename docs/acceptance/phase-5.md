@@ -39,6 +39,8 @@ or `~/.claude.json` are read or written). Step 0 records the real vault and
 ```
 git -C ~/Repos/2ndBrain status --short > /tmp/ov-hand5-real-status.before
 cp -L ~/.claude/CURRENT_SESSION.md /tmp/ov-hand5-real-cs.before
+touch /tmp/ov-hand5-real-marker
+find ~/Library/Application\ Support/Overseer -type f 2>/dev/null | sort > /tmp/ov-hand5-real-state.before
 ```
 
 (`/tmp/ov-hand5-*` is outside `/tmp/ov-hand5/`, so `rm -rf /tmp/ov-hand5` at the
@@ -172,7 +174,6 @@ Start from this tab with the isolation variables (a temp `HOME`, a login shell
 that reads its `.profile`, and a throwaway Claude config folder):
 
 ```
-export HOME_REAL=$HOME
 HOME=$OVERSEER_HOME/home SHELL=/bin/sh CLAUDE_CONFIG_DIR=$OVERSEER_HOME/claude-config $OV &
 ```
 
@@ -231,7 +232,15 @@ caller; without `OVERSEER_SLOT` it acts as Jonathan.
 | Q5 | Odd paths (Review Focus 4) | `ctl commit` of, in turn: `../outside.md` (create it beside the vault); an absolute path outside (`/tmp/ov-hand5/outside.md`); a symlink inside the vault pointing out (`ln -s /tmp/ov-hand5/outside.md $V/link.md`); `"My Notes ü.md"` (spaces and non-ASCII, a real file); the folder `Sprints`; a vault-absolute path `$V/free.md`; a path with `n[1].md` next to a real `n1.md` | Outside, link and `../` are each refused with `<path as given> is outside 2ndBrain` and nothing outside the vault is committed or touched; the spaced and non-ASCII file commits under its exact name; the folder is refused with `Sprints is a folder`; the absolute vault path is normalised to `free.md`; `n[1].md` stages only `n[1].md`, never `n1.md` | pending |
 | Q6 | Restart with a queued commit (Review Focus 5) | `touch $V/.git/index.lock`; in the background `OVERSEER_SLOT=S1 $OV ctl commit -m "S1 restart" $N1` (edit `$N1` first); within 5 s `$OV ctl shutdown`; `rm $V/.git/index.lock`; start the app or daemon again | The entry survives in the ledger and is committed exactly once after the restart: `git log --oneline \| grep -c "S1 restart"` prints 1, and the commit carries the `Overseer-Queue` trailer. `ctl brain` shows it committed, nothing queued | pending |
 | Q7 | A path another slot owns is refused (S1 owns the DEMO-12 folder only after the Step 5 pre-flight) | As S2: `ctl commit -m x $N1`; as S2: `ctl commit -m x Sprints/sprint-26-01/DEMO-12-demo-lane/notes.md` | Each fails with `<path> belongs to S1 (session note). Ask Jonathan before writing it.` and with `(DEMO-12)` for the ticket folder; as Jonathan (no `OVERSEER_SLOT`) the same paths commit | pending |
-| Q8 | A stale `index.lock` is cleared after 60 s, a young one is waited on | `touch $V/.git/index.lock`, wait 65 s, `ctl commit` a changed path; then `touch` it again and `rm` it after 3 s while a `ctl commit` waits; then hold a fresh one for 20 s | The old lock is removed, the commit lands, and the ledger log gets the line `removed a stale .git/index.lock (older than 60 s)` (source `2ndBrain`, kind `index.lock`); the lock released within 5 s is waited out, the commit lands and no such line is written; the one held 20 s fails the first attempt with `index.lock held, will retry`, is retried after 10 s, at most 3 times, then fails with `index.lock still held after 3 attempts` (release it and the next commit works) | pending |
+| Q8 | A stale `index.lock` is cleared after 60 s, a young one is waited on | `touch $V/.git/index.lock`, wait 65 s, `ctl commit` a changed path; then `touch` it again and `rm` it after 3 s while a `ctl commit` waits; then hold a fresh one for about 45 s with the loop under this table, so its mtime never gets old enough to be removed as stale | The old lock is removed, the commit lands, and the ledger log gets the line `removed a stale .git/index.lock (older than 60 s)` (source `2ndBrain`, kind `index.lock`); the lock released within 5 s is waited out, the commit lands and no such line is written; the one held about 45 s fails the first attempt with `index.lock held, will retry` and is retried after 10 s; with the first try that is 4 attempts (MAX_ATTEMPTS = 4, each waiting up to 5 s), so it ends with `index.lock still held after 4 attempts` (release it and the next commit works) | pending |
+
+The refreshed lock for Q8 (run in a second tab, start the `ctl commit` just after it):
+
+```
+touch $V/.git/index.lock
+for i in 1 2 3 4 5 6 7 8 9; do sleep 5; touch $V/.git/index.lock; done
+rm -f $V/.git/index.lock
+```
 
 ## Shared files and the journal (Review Focus 3)
 
@@ -337,7 +346,7 @@ Setup steps 1 to 5 with the app open; S1 running (real, for `n`).
 
 | ID | Check | Steps | Pass | Result |
 |----|-------|-------|------|--------|
-| Z1 | The real vault and the real `CURRENT_SESSION.md` are untouched | After every other row, before the cleanup: `git -C ~/Repos/2ndBrain status --short \| diff - /tmp/ov-hand5-real-status.before`; `diff <(cat ~/.claude/CURRENT_SESSION.md) /tmp/ov-hand5-real-cs.before`; `git -C ~/Repos/2ndBrain log -3 --format=%h\ %s` against what you saw before | Both diffs empty; no new commit in the real vault; nothing under `~/Library/Application Support/Overseer` changed | pending |
+| Z1 | The real vault, the real `CURRENT_SESSION.md` and the installed app's state are untouched | After every other row, before the cleanup (do not edit the real vault in Obsidian during the run, or the diff is a false alarm): `git -C ~/Repos/2ndBrain status --short \| diff - /tmp/ov-hand5-real-status.before`; `diff <(cat ~/.claude/CURRENT_SESSION.md) /tmp/ov-hand5-real-cs.before`; `git -C ~/Repos/2ndBrain log -3 --format=%h\ %s` against what you saw before; `find ~/Library/Application\ Support/Overseer -type f -newer /tmp/ov-hand5-real-marker`; `find ~/Library/Application\ Support/Overseer -type f \| sort \| diff - /tmp/ov-hand5-real-state.before` | Both diffs empty; no new commit in the real vault; both `find` commands print nothing (no file changed or appeared; a running installed app may touch its own files, in which case say so and check they are its own) | pending |
 
 ## Known flake to watch
 
