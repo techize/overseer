@@ -252,6 +252,7 @@ fn pre_tool_use_prints_the_deny() {
     let reason = "Overseer: repo:demo-api:main is held by S2. Wait.";
     let answer = Response::Verdict {
         deny: Some(reason.into()),
+        rewrite: None,
     };
     let (rx, t) = fake_daemon_with(&home, Some(answer), Duration::ZERO);
     let (out, _) = run_pre_tool_use(&home, BASH);
@@ -288,7 +289,10 @@ fn pre_tool_use_allows_when_the_daemon_allows() {
     let home = temp_home("pallow");
     let (rx, t) = fake_daemon_with(
         &home,
-        Some(Response::Verdict { deny: None }),
+        Some(Response::Verdict {
+            deny: None,
+            rewrite: None,
+        }),
         Duration::ZERO,
     );
     let (out, _) = run_pre_tool_use(&home, BASH);
@@ -303,6 +307,7 @@ fn pre_tool_use_ignores_other_tools() {
     let home = temp_home("pother");
     let answer = Response::Verdict {
         deny: Some("no".into()),
+        rewrite: None,
     };
     // Never joined: it waits for a connection that must not come.
     let (rx, _t) = fake_daemon_with(&home, Some(answer), Duration::ZERO);

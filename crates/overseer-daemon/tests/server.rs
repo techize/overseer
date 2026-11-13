@@ -2011,7 +2011,7 @@ impl Client {
     /// The deny reason, if any.
     async fn check(&mut self, slot: u8, tool_use_id: &str, command: &str) -> Option<String> {
         match self.request(bash(slot, tool_use_id, command)).await {
-            Response::Verdict { deny } => deny,
+            Response::Verdict { deny, .. } => deny,
             other => panic!("unexpected {other:?}"),
         }
     }

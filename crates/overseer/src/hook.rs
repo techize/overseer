@@ -147,7 +147,10 @@ fn pre_tool_use(slot_env: &str) {
         .ok()
         .flatten()
     });
-    if let Some(Response::Verdict { deny: Some(reason) }) = answer {
+    if let Some(Response::Verdict {
+        deny: Some(reason), ..
+    }) = answer
+    {
         let mut out = std::io::stdout().lock();
         let _ = writeln!(out, "{}", deny_json(&reason));
         let _ = out.flush();

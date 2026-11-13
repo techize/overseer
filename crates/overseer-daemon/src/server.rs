@@ -624,7 +624,18 @@ fn handle_request(
         }
         // Answered in `handle_frame` from a task; this arm only keeps the
         // match whole.
-        Request::CheckBash(_) => Response::Verdict { deny: None },
+        Request::CheckBash(_) => Response::Verdict {
+            deny: None,
+            rewrite: None,
+        },
+        // The 2ndBrain writer arrives in a later task.
+        Request::Commit { .. }
+        | Request::AppendJournal { .. }
+        | Request::EditShared { .. }
+        | Request::UpdateCurrentSession { .. }
+        | Request::RunBd { .. }
+        | Request::BrainStatus
+        | Request::CheckWrite(_) => err("not implemented yet".to_string()),
         Request::Kickoff { slot } if !valid_id(slot) => err(format!("invalid slot id {slot}")),
         Request::Kickoff { slot } => {
             let items = store.view().items;

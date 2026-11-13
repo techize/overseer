@@ -16,6 +16,23 @@ pub struct Config {
     pub brain_dir: PathBuf,
     /// Minutes a lock may go unused before the board flags it as long-held.
     pub lock_idle_mins: u64,
+    /// The 2ndBrain writer is opt-in: while false, none of its tools, hook
+    /// checks, backup or sync run.
+    pub brain_writer: bool,
+    /// Globs under `brain_dir` for the shared files; `*` matches one path segment.
+    pub shared_files: Vec<String>,
+    /// Today's journal under `brain_dir`; `{yyyy}`, `{mm}`, `{Month}` and `{dd}` are filled in.
+    pub journal_path: String,
+    /// A session's note under `brain_dir`; also takes `{slot}` and `{label}`.
+    pub session_note: String,
+    /// Outside the vault and never committed.
+    pub current_session: PathBuf,
+    /// Minutes between timed backups; 0 turns the backup off.
+    pub backup_mins: u64,
+    pub push: bool,
+    /// Run in `brain_dir` after the queue drains; skipped when the file is missing.
+    pub sync_command: Vec<String>,
+    pub bd_command: Vec<String>,
 }
 
 impl Default for Config {
@@ -35,6 +52,26 @@ impl Default for Config {
             ticket_pattern: r"PLAT-\d+".to_string(),
             brain_dir: PathBuf::from("~/Repos/2ndBrain"),
             lock_idle_mins: 60,
+            brain_writer: false,
+            shared_files: [
+                "06-Daily/*/*/*-journal.md",
+                "Sprints/*/SPRINT-DASHBOARD.md",
+                "Sprints/*/sprint-*.md",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+            journal_path: "06-Daily/{yyyy}/{mm}-{Month}/{yyyy}-{mm}-{dd}-journal.md".to_string(),
+            session_note: "Sessions/{yyyy}/{mm}-{Month}/{yyyy}-{mm}-{dd}-{slot}-{label}.md"
+                .to_string(),
+            current_session: PathBuf::from("~/.claude/CURRENT_SESSION.md"),
+            backup_mins: 5,
+            push: true,
+            sync_command: ["05-Meta/Sync-System/sync-run.sh", "--auto"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            bd_command: vec!["bd".to_string()],
         }
     }
 }
@@ -53,6 +90,7 @@ impl Config {
         };
         config.beads_dir = expand(&config.beads_dir, home);
         config.brain_dir = expand(&config.brain_dir, home);
+        config.current_session = expand(&config.current_session, home);
         (config, err)
     }
 }
@@ -107,6 +145,34 @@ mod tests {
         assert_eq!(c.beads_dir, PathBuf::from("/Users/me/Repos/2ndBrain"));
         assert_eq!(c.brain_dir, PathBuf::from("/Users/me/Repos/2ndBrain"));
         assert_eq!(c.lock_idle_mins, 60);
+        assert!(!c.brain_writer);
+        assert_eq!(
+            c.shared_files,
+            vec![
+                "06-Daily/*/*/*-journal.md",
+                "Sprints/*/SPRINT-DASHBOARD.md",
+                "Sprints/*/sprint-*.md"
+            ]
+        );
+        assert_eq!(
+            c.journal_path,
+            "06-Daily/{yyyy}/{mm}-{Month}/{yyyy}-{mm}-{dd}-journal.md"
+        );
+        assert_eq!(
+            c.session_note,
+            "Sessions/{yyyy}/{mm}-{Month}/{yyyy}-{mm}-{dd}-{slot}-{label}.md"
+        );
+        assert_eq!(
+            c.current_session,
+            PathBuf::from("/Users/me/.claude/CURRENT_SESSION.md")
+        );
+        assert_eq!(c.backup_mins, 5);
+        assert!(c.push);
+        assert_eq!(
+            c.sync_command,
+            vec!["05-Meta/Sync-System/sync-run.sh", "--auto"]
+        );
+        assert_eq!(c.bd_command, vec!["bd"]);
     }
 
     #[test]
@@ -119,6 +185,17 @@ mod tests {
         assert_eq!(c.jira_poll_secs, 300);
         assert_eq!(c.jira_command.len(), 9);
         assert_eq!(c.ticket_pattern, r"PLAT-\d+");
+        assert!(!c.brain_writer);
+        assert_eq!(c.backup_mins, 5);
+
+        let (_d, p) =
+            write("brain_writer = true\nbackup_mins = 0\ncurrent_session = \"~/cs.md\"\n");
+        let (c, err) = Config::load(&p, &home());
+        assert!(err.is_none());
+        assert!(c.brain_writer);
+        assert_eq!(c.backup_mins, 0);
+        assert_eq!(c.current_session, PathBuf::from("/Users/me/cs.md"));
+        assert_eq!(c.shared_files.len(), 3);
     }
 
     #[test]
