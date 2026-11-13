@@ -187,6 +187,8 @@ fn folder_for(folders: &[(String, PathBuf)], key: &str) -> Option<PathBuf> {
         .map(|(_, p)| p.clone())
 }
 
+// Short-lived, built and matched on one call path: boxing buys nothing.
+#[allow(clippy::large_enum_variant)]
 enum Outcome {
     Reply(Response),
     /// The flag says a relay was queued, so lock watchers need telling.

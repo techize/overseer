@@ -8,7 +8,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::Result;
-use overseer_proto::msg::{LockView, Notice, QueueEntry, QueueState, Sender, SlotId};
+use overseer_proto::msg::{
+    LockView, Notice, Plan, PlanRecord, PlanState, QueueEntry, QueueState, Report, ReportKind,
+    Sender, SlotId, Summary,
+};
 use rusqlite::Connection;
 
 use crate::locks::table;
@@ -130,20 +133,192 @@ CREATE TABLE IF NOT EXISTS brain_runs (
 );
 ALTER TABLE sessions ADD COLUMN session_note TEXT";
 
-const VERSION: i64 = 4;
+/// What version 5 adds: the coordinator's plans, the report timeline, the
+/// board summary and pending status requests. `plan` is what runs (the
+/// edited plan after an approval with edits); `proposed` never changes.
+const V5_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS plans (
+    id INTEGER PRIMARY KEY,
+    at INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    plan TEXT NOT NULL,
+    proposed TEXT NOT NULL,
+    decided_at INTEGER,
+    edited INTEGER NOT NULL DEFAULT 0,
+    warnings TEXT NOT NULL DEFAULT '[]',
+    outcome TEXT NOT NULL DEFAULT '[]'
+);
+CREATE TABLE IF NOT EXISTS reports (
+    id INTEGER PRIMARY KEY,
+    at INTEGER NOT NULL,
+    slot INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    text TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS board_summary (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    at INTEGER NOT NULL,
+    text TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS status_requests (
+    slot INTEGER PRIMARY KEY,
+    at INTEGER NOT NULL
+)";
+
+const VERSION: i64 = 5;
+
+/// Reports and state changes kept per slot.
+const REPORTS_PER_SLOT: i64 = 200;
 
 /// Creates any missing tables and brings the file up to [`VERSION`]. An
-/// older file keeps its rows; the new tables are added beside them. The
-/// tables and the version bump commit together.
+/// older file keeps its rows; the new tables are added beside them. Each
+/// step runs only for files older than it (V4 has a non-idempotent `ALTER`),
+/// and the steps and the version bump commit together.
 fn migrate(conn: &Connection) -> Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version >= VERSION {
         return Ok(());
     }
-    conn.execute_batch(&format!(
-        "BEGIN;\n{SESSIONS_SCHEMA};\n{V2_SCHEMA};\n{V3_SCHEMA};\n{V4_SCHEMA};\nPRAGMA user_version = {VERSION};\nCOMMIT;"
-    ))?;
+    let steps: [(i64, &str); 5] = [
+        (1, SESSIONS_SCHEMA),
+        (2, V2_SCHEMA),
+        (3, V3_SCHEMA),
+        (4, V4_SCHEMA),
+        (5, V5_SCHEMA),
+    ];
+    let mut batch = String::from("BEGIN;\n");
+    for (n, sql) in steps {
+        if version < n {
+            batch.push_str(sql);
+            batch.push_str(";\n");
+        }
+    }
+    batch.push_str(&format!("PRAGMA user_version = {VERSION};\nCOMMIT;"));
+    conn.execute_batch(&batch)?;
     Ok(())
+}
+
+/// The name an enum is stored under in a text column.
+fn enum_name<T: serde::Serialize>(v: &T) -> String {
+    serde_json::to_string(v)
+        .unwrap_or_default()
+        .trim_matches('"')
+        .to_string()
+}
+
+fn enum_from_name<T: serde::de::DeserializeOwned>(name: &str) -> Option<T> {
+    serde_json::from_str(&format!("\"{name}\"")).ok()
+}
+
+const PLAN_COLS: &str = "id, at, state, plan, decided_at, edited, warnings, outcome";
+
+/// A plan row, or `None` (logged) when it cannot be read.
+fn plan_record(r: &rusqlite::Row) -> rusqlite::Result<Option<PlanRecord>> {
+    let id: i64 = r.get(0)?;
+    let state: String = r.get(2)?;
+    let plan: String = r.get(3)?;
+    let warnings: String = r.get(6)?;
+    let outcome: String = r.get(7)?;
+    let (Some(state), Ok(plan), Ok(warnings), Ok(outcome)) = (
+        enum_from_name::<PlanState>(&state),
+        serde_json::from_str::<Plan>(&plan),
+        serde_json::from_str::<Vec<String>>(&warnings),
+        serde_json::from_str::<Vec<String>>(&outcome),
+    ) else {
+        tracing::warn!("plan {id}: unreadable row, skipped");
+        return Ok(None);
+    };
+    Ok(Some(PlanRecord {
+        id,
+        at: r.get(1)?,
+        plan,
+        state,
+        decided_at: r.get(4)?,
+        edited: r.get::<_, i64>(5)? != 0,
+        warnings,
+        outcome,
+    }))
+}
+
+/// Records a new pending plan, superseding the one already pending.
+/// Returns the new id and the superseded id.
+pub(crate) fn add_plan_on(
+    conn: &Connection,
+    plan: &Plan,
+    warnings: &[String],
+    now: i64,
+) -> Result<(i64, Option<i64>)> {
+    let old: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM plans WHERE state = ?1 ORDER BY id DESC LIMIT 1",
+            rusqlite::params![enum_name(&PlanState::Pending)],
+            |r| r.get(0),
+        )
+        .map(Some)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            e => Err(e),
+        })?;
+    if let Some(old) = old {
+        conn.execute(
+            "UPDATE plans SET state = ?2, decided_at = ?3 WHERE id = ?1",
+            rusqlite::params![old, enum_name(&PlanState::Superseded), now],
+        )?;
+    }
+    let json = serde_json::to_string(plan)?;
+    conn.execute(
+        "INSERT INTO plans (at, state, plan, proposed, warnings) VALUES (?1, ?2, ?3, ?3, ?4)",
+        rusqlite::params![
+            now,
+            enum_name(&PlanState::Pending),
+            json,
+            serde_json::to_string(warnings)?
+        ],
+    )?;
+    Ok((conn.last_insert_rowid(), old))
+}
+
+/// Up to `limit` plans: the pending one first, then newest first.
+pub(crate) fn plans_on(conn: &Connection, limit: usize) -> Result<Vec<PlanRecord>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {PLAN_COLS} FROM plans
+         ORDER BY (state = ?1) DESC, id DESC LIMIT ?2"
+    ))?;
+    let rows = stmt.query_map(
+        rusqlite::params![enum_name(&PlanState::Pending), limit as i64],
+        plan_record,
+    )?;
+    let mut out = Vec::new();
+    for r in rows {
+        if let Some(p) = r? {
+            out.push(p);
+        }
+    }
+    Ok(out)
+}
+
+/// Settles a pending plan as `state`, storing `plan` as the version that
+/// runs. False when plan `id` is not pending (decided already, or unknown).
+pub fn decide_plan_on(
+    conn: &Connection,
+    id: i64,
+    state: PlanState,
+    plan: &Plan,
+    edited: bool,
+    now: i64,
+) -> Result<bool> {
+    let n = conn.execute(
+        "UPDATE plans SET state = ?2, plan = ?3, edited = ?4, decided_at = ?5
+         WHERE id = ?1 AND state = ?6",
+        rusqlite::params![
+            id,
+            enum_name(&state),
+            serde_json::to_string(plan)?,
+            edited,
+            now,
+            enum_name(&PlanState::Pending)
+        ],
+    )?;
+    Ok(n > 0)
 }
 
 /// A queue row, or `None` (logged) when its sender or state cannot be read:
@@ -538,6 +713,138 @@ impl Ledger {
         queue_recent_on(&self.conn(), n)
     }
 
+    /// Records a new pending plan, superseding the pending one. Returns the
+    /// new id and the superseded id.
+    pub fn add_plan(
+        &self,
+        plan: &Plan,
+        warnings: &[String],
+        now: i64,
+    ) -> Result<(i64, Option<i64>)> {
+        self.transaction(|c| add_plan_on(c, plan, warnings, now))
+    }
+
+    /// Up to `limit` plans: pending first, then newest first.
+    pub fn plans(&self, limit: usize) -> Result<Vec<PlanRecord>> {
+        plans_on(&self.conn(), limit)
+    }
+
+    /// Stores what running an approved plan did, one line per step.
+    pub fn set_plan_outcome(&self, id: i64, outcome: &[String]) -> Result<()> {
+        self.conn().execute(
+            "UPDATE plans SET outcome = ?2 WHERE id = ?1",
+            rusqlite::params![id, serde_json::to_string(outcome)?],
+        )?;
+        Ok(())
+    }
+
+    /// Adds a report or state change for a slot, keeping its newest 200.
+    pub fn add_report(&self, slot: SlotId, kind: ReportKind, text: &str, now: i64) -> Result<i64> {
+        self.transaction(|c| {
+            c.execute(
+                "INSERT INTO reports (at, slot, kind, text) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![now, slot, enum_name(&kind), text],
+            )?;
+            let id = c.last_insert_rowid();
+            c.execute(
+                "DELETE FROM reports WHERE slot = ?1 AND id NOT IN
+                 (SELECT id FROM reports WHERE slot = ?1 ORDER BY id DESC LIMIT ?2)",
+                rusqlite::params![slot, REPORTS_PER_SLOT],
+            )?;
+            Ok(id)
+        })
+    }
+
+    /// The newest `limit` reports and state changes, newest first.
+    pub fn reports(&self, limit: usize) -> Result<Vec<Report>> {
+        let conn = self.conn();
+        let mut stmt =
+            conn.prepare("SELECT id, at, slot, kind, text FROM reports ORDER BY id DESC LIMIT ?1")?;
+        let rows = stmt.query_map(rusqlite::params![limit as i64], |r| {
+            let id: i64 = r.get(0)?;
+            let kind: String = r.get(3)?;
+            let Some(kind) = enum_from_name::<ReportKind>(&kind) else {
+                tracing::warn!("report {id}: unknown kind {kind:?}, skipped");
+                return Ok(None);
+            };
+            Ok(Some(Report {
+                id,
+                at: r.get(1)?,
+                slot: r.get(2)?,
+                kind,
+                text: r.get(4)?,
+            }))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            if let Some(r) = r? {
+                out.push(r);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Replaces the board summary.
+    pub fn set_summary(&self, text: &str, now: i64) -> Result<()> {
+        self.conn().execute(
+            "INSERT OR REPLACE INTO board_summary (id, at, text) VALUES (1, ?1, ?2)",
+            rusqlite::params![now, text],
+        )?;
+        Ok(())
+    }
+
+    pub fn summary(&self) -> Result<Option<Summary>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT at, text FROM board_summary WHERE id = 1")?;
+        let mut rows = stmt.query_map([], |r| {
+            Ok(Summary {
+                at: r.get(0)?,
+                text: r.get(1)?,
+            })
+        })?;
+        Ok(rows.next().transpose()?)
+    }
+
+    /// Records a status request for `slot`. When one is already pending its
+    /// time is replaced and the earlier time returned.
+    pub fn ask_status(&self, slot: SlotId, now: i64) -> Result<Option<i64>> {
+        self.transaction(|c| {
+            let prev = c
+                .query_row(
+                    "SELECT at FROM status_requests WHERE slot = ?1",
+                    rusqlite::params![slot],
+                    |r| r.get(0),
+                )
+                .map(Some)
+                .or_else(|e| match e {
+                    rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                    e => Err(e),
+                })?;
+            c.execute(
+                "INSERT OR REPLACE INTO status_requests (slot, at) VALUES (?1, ?2)",
+                rusqlite::params![slot, now],
+            )?;
+            Ok(prev)
+        })
+    }
+
+    /// Clears a pending status request; true when there was one.
+    pub fn answer_status(&self, slot: SlotId) -> Result<bool> {
+        let n = self.conn().execute(
+            "DELETE FROM status_requests WHERE slot = ?1",
+            rusqlite::params![slot],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Pending status requests as `(slot, asked at)`, by slot.
+    pub fn status_asked(&self) -> Result<Vec<(SlotId, i64)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT slot, at FROM status_requests ORDER BY slot")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// Records the last `backup` or `sync` run as `(at, ok, detail)`.
     pub fn set_brain_run(&self, kind: &str, at: i64, ok: bool, detail: &str) -> Result<()> {
         self.conn().execute(
@@ -751,7 +1058,7 @@ mod tests {
     }
 
     #[test]
-    fn version_1_file_migrates_to_4() {
+    fn version_1_file_migrates_to_5() {
         let path = temp_db("migrate");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         {
@@ -773,12 +1080,12 @@ mod tests {
         assert!(l.notices().unwrap().is_empty());
         l.log(1, "k", None, "e", "d").unwrap();
         lock_tables_are_empty(&l);
-        assert_eq!(user_version(&l), 4);
+        assert_eq!(user_version(&l), 5);
         let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
     }
 
     #[test]
-    fn version_2_file_migrates_to_4_keeping_assignments() {
+    fn version_2_file_migrates_to_5_keeping_assignments() {
         let path = temp_db("migrate-v2");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         {
@@ -798,29 +1105,29 @@ mod tests {
             .unwrap();
         }
         let l = Ledger::open(&path).unwrap();
-        assert_eq!(user_version(&l), 4);
+        assert_eq!(user_version(&l), 5);
         assert_eq!(l.assignments().unwrap(), vec![("DEMO-12".to_string(), 3)]);
         assert_eq!(l.notices().unwrap()[0].text, "moved");
         lock_tables_are_empty(&l);
         drop(l);
-        // Opening a v4 file again changes nothing.
+        // Opening a v5 file again changes nothing.
         let l = Ledger::open(&path).unwrap();
-        assert_eq!(user_version(&l), 4);
+        assert_eq!(user_version(&l), 5);
         assert_eq!(l.assignments().unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
     }
 
     #[test]
-    fn fresh_file_is_created_at_4() {
+    fn fresh_file_is_created_at_5() {
         let path = temp_db("fresh");
         let l = Ledger::open(&path).unwrap();
-        assert_eq!(user_version(&l), 4);
+        assert_eq!(user_version(&l), 5);
         lock_tables_are_empty(&l);
         let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
     }
 
     #[test]
-    fn version_3_file_migrates_to_4() {
+    fn version_3_file_migrates_to_5() {
         let path = temp_db("migrate-v3");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         {
@@ -843,7 +1150,7 @@ mod tests {
             .unwrap();
         }
         let l = Ledger::open(&path).unwrap();
-        assert_eq!(user_version(&l), 4);
+        assert_eq!(user_version(&l), 5);
         let live = l.live_at_shutdown().unwrap();
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].session_id, "old-id");
@@ -852,11 +1159,205 @@ mod tests {
         assert!(l.queue_recent(10).unwrap().is_empty());
         assert_eq!(l.session_note(2).unwrap(), None);
         drop(l);
-        // Opening a v4 file again changes nothing.
+        // Opening a v5 file again changes nothing.
         let l = Ledger::open(&path).unwrap();
-        assert_eq!(user_version(&l), 4);
+        assert_eq!(user_version(&l), 5);
         assert_eq!(l.live_at_shutdown().unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+    }
+
+    fn tplan(slot: SlotId) -> Plan {
+        Plan {
+            summary: format!("lane {slot}"),
+            slots: vec![overseer_proto::msg::PlanSlot {
+                slot,
+                label: String::new(),
+                items: vec![],
+                targets: vec![],
+                worktree: None,
+                cwd: None,
+                kickoff: String::new(),
+                rules: vec![],
+            }],
+        }
+    }
+
+    /// The v4 file as the previous release wrote it.
+    fn v4_file(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(&format!(
+            "{SESSIONS_SCHEMA};\n{V2_SCHEMA};\n{V3_SCHEMA};\n{V4_SCHEMA};\nPRAGMA user_version = 4;"
+        ))
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (slot, session_id, label, cwd, command, started, session_note)
+             VALUES (2, 'old-id', 'lane', '/tmp/work', '[\"claude\"]', 1700000000, 'Sessions/n.md')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO brain_queue (at, sender, paths, message, state)
+             VALUES (5, '{\"type\":\"You\"}', '[]', 'msg', 'Queued')",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn v4_file_migrates_to_v5_keeping_rows() {
+        let path = temp_db("migrate-v4");
+        v4_file(&path);
+        let l = Ledger::open(&path).unwrap();
+        assert_eq!(user_version(&l), 5);
+        assert_eq!(l.live_at_shutdown().unwrap().len(), 1);
+        assert_eq!(l.session_note(2).unwrap().as_deref(), Some("Sessions/n.md"));
+        assert_eq!(l.queue_recent(10).unwrap().len(), 1);
+        assert_eq!(l.add_plan(&tplan(3), &[], 10).unwrap(), (1, None));
+        drop(l);
+        let l = Ledger::open(&path).unwrap();
+        assert_eq!(user_version(&l), 5);
+        assert_eq!(l.plans(10).unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn v3_file_migrates_to_v5() {
+        let path = temp_db("migrate-v3-to-5");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(&format!(
+                "{SESSIONS_SCHEMA};\n{V2_SCHEMA};\n{V3_SCHEMA};\nPRAGMA user_version = 3;"
+            ))
+            .unwrap();
+            conn.execute(
+                "INSERT INTO claims (target, slot, kind, since, last_used)
+                 VALUES ('uat/root', 2, 'claim', 10, 11)",
+                [],
+            )
+            .unwrap();
+        }
+        let l = Ledger::open(&path).unwrap();
+        assert_eq!(user_version(&l), 5);
+        assert_eq!(l.lock_view(50, 3600).unwrap().claims.len(), 1);
+        assert_eq!(l.session_note(2).unwrap(), None);
+        assert!(l.plans(10).unwrap().is_empty());
+        l.set_summary("hi", 1).unwrap();
+        let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn fresh_file_is_v5() {
+        let path = temp_db("fresh-v5");
+        let l = Ledger::open(&path).unwrap();
+        assert_eq!(user_version(&l), 5);
+        assert!(l.plans(10).unwrap().is_empty());
+        assert!(l.reports(10).unwrap().is_empty());
+        assert_eq!(l.summary().unwrap(), None);
+        assert!(l.status_asked().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn second_plan_supersedes_the_pending_one() {
+        let l = Ledger::in_memory();
+        assert_eq!(l.add_plan(&tplan(1), &["w".into()], 10).unwrap(), (1, None));
+        assert_eq!(l.add_plan(&tplan(2), &[], 20).unwrap(), (2, Some(1)));
+        let plans = l.plans(10).unwrap();
+        assert_eq!(plans.len(), 2);
+        assert_eq!((plans[0].id, plans[0].state), (2, PlanState::Pending));
+        assert_eq!((plans[1].id, plans[1].state), (1, PlanState::Superseded));
+        assert_eq!(plans[1].warnings, vec!["w".to_string()]);
+        assert_eq!(plans[1].decided_at, Some(20));
+    }
+
+    #[test]
+    fn pending_plan_lists_first_even_when_older() {
+        let l = Ledger::in_memory();
+        l.add_plan(&tplan(1), &[], 10).unwrap();
+        l.transaction(|c| decide_plan_on(c, 1, PlanState::Rejected, &tplan(1), false, 11))
+            .unwrap();
+        l.add_plan(&tplan(2), &[], 12).unwrap();
+        l.transaction(|c| decide_plan_on(c, 2, PlanState::Approved, &tplan(2), false, 13))
+            .unwrap();
+        l.add_plan(&tplan(3), &[], 14).unwrap();
+        l.transaction(|c| decide_plan_on(c, 3, PlanState::Rejected, &tplan(3), false, 15))
+            .unwrap();
+        let (id, _) = l.add_plan(&tplan(4), &[], 16).unwrap();
+        let ids: Vec<i64> = l.plans(10).unwrap().iter().map(|p| p.id).collect();
+        assert_eq!(ids, vec![id, 3, 2, 1]);
+        assert_eq!(l.plans(2).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn deciding_twice_runs_once() {
+        let l = Ledger::in_memory();
+        let (id, _) = l.add_plan(&tplan(3), &[], 10).unwrap();
+        let edited = tplan(4);
+        assert!(l
+            .transaction(|c| decide_plan_on(c, id, PlanState::Approved, &edited, true, 11))
+            .unwrap());
+        assert!(!l
+            .transaction(|c| decide_plan_on(c, id, PlanState::Rejected, &tplan(3), false, 12))
+            .unwrap());
+        assert!(!l
+            .transaction(|c| decide_plan_on(c, 99, PlanState::Approved, &edited, false, 12))
+            .unwrap());
+        let p = &l.plans(10).unwrap()[0];
+        assert_eq!(p.state, PlanState::Approved);
+        assert!(p.edited);
+        assert_eq!(p.plan, edited);
+        assert_eq!(p.decided_at, Some(11));
+        l.set_plan_outcome(id, &["S4: started in /x".into()])
+            .unwrap();
+        assert_eq!(l.plans(10).unwrap()[0].outcome, vec!["S4: started in /x"]);
+    }
+
+    #[test]
+    fn reports_keep_200_per_slot() {
+        let l = Ledger::in_memory();
+        for i in 0..205 {
+            l.add_report(3, ReportKind::Report, &format!("r{i}"), i)
+                .unwrap();
+        }
+        for i in 0..3 {
+            l.add_report(4, ReportKind::State, "working", 1000 + i)
+                .unwrap();
+        }
+        let all = l.reports(1000).unwrap();
+        assert_eq!(all.iter().filter(|r| r.slot == 3).count(), 200);
+        assert_eq!(all.iter().filter(|r| r.slot == 4).count(), 3);
+        assert_eq!(all[0].slot, 4, "newest first");
+        assert!(all.iter().any(|r| r.text == "r204"));
+        assert!(!all.iter().any(|r| r.text == "r4"));
+        assert_eq!(l.reports(5).unwrap().len(), 5);
+    }
+
+    #[test]
+    fn summary_is_replaced() {
+        let l = Ledger::in_memory();
+        assert_eq!(l.summary().unwrap(), None);
+        l.set_summary("one", 1).unwrap();
+        l.set_summary("two", 2).unwrap();
+        assert_eq!(
+            l.summary().unwrap(),
+            Some(Summary {
+                at: 2,
+                text: "two".into()
+            })
+        );
+    }
+
+    #[test]
+    fn status_ask_and_answer() {
+        let l = Ledger::in_memory();
+        assert_eq!(l.ask_status(3, 100).unwrap(), None);
+        assert_eq!(l.ask_status(3, 200).unwrap(), Some(100));
+        assert_eq!(l.status_asked().unwrap(), vec![(3, 200)]);
+        assert!(l.answer_status(3).unwrap());
+        assert!(!l.answer_status(3).unwrap());
+        assert!(l.status_asked().unwrap().is_empty());
     }
 
     #[test]

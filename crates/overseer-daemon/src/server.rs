@@ -919,6 +919,14 @@ fn handle_request(
             None => err(format!("{} is empty", slot_name(id))),
         },
         Request::Shutdown => Response::Ok,
+        // Coordinator requests: the service arrives in a later task.
+        Request::GetBoard
+        | Request::CoordStatus
+        | Request::ProposePlan { .. }
+        | Request::DecidePlan { .. }
+        | Request::RequestStatus { .. }
+        | Request::ReportProgress { .. }
+        | Request::SetBoardSummary { .. } => err("not implemented yet".into()),
         // Always Ok: a hook runs inside Claude and must never see a failure
         // because of the daemon's state.
         Request::Hook(ev) => {

@@ -449,6 +449,176 @@ pub enum Request {
     BrainStatus,
     /// A file write the hook asks about. Answered with `Verdict`.
     CheckWrite(WriteCheck),
+    /// The whole board in one answer: `Response::Board`.
+    GetBoard,
+    /// The coordinator's part of the board: `Response::Coord`.
+    CoordStatus,
+    /// S0 (or Jonathan through `ctl`) proposes a plan for approval.
+    ProposePlan {
+        #[serde(default)]
+        from: Option<SlotId>,
+        plan: Plan,
+    },
+    /// Jonathan approves (with the plan as he edited it) or rejects plan `id`.
+    DecidePlan {
+        id: i64,
+        #[serde(default)]
+        from: Option<SlotId>,
+        decision: PlanDecision,
+    },
+    /// S0 asks `slot` for a short status.
+    RequestStatus {
+        #[serde(default)]
+        from: Option<SlotId>,
+        slot: SlotId,
+    },
+    /// A slot reports its progress.
+    ReportProgress {
+        slot: SlotId,
+        text: String,
+    },
+    /// S0 sets the board summary.
+    SetBoardSummary {
+        #[serde(default)]
+        from: Option<SlotId>,
+        text: String,
+    },
+}
+
+/// One write target a plan has a slot claim.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlanTarget {
+    pub target: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// A git worktree a plan has made for a slot: `<worktree_root>/<repo>-<ticket>`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlanWorktree {
+    pub repo: PathBuf,
+    pub ticket: String,
+}
+
+/// What a plan does for one slot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlanSlot {
+    pub slot: SlotId,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub items: Vec<String>,
+    #[serde(default)]
+    pub targets: Vec<PlanTarget>,
+    #[serde(default)]
+    pub worktree: Option<PlanWorktree>,
+    #[serde(default)]
+    pub cwd: Option<PathBuf>,
+    #[serde(default)]
+    pub kickoff: String,
+    #[serde(default)]
+    pub rules: Vec<String>,
+}
+
+/// A plan S0 proposes and Jonathan approves.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Plan {
+    #[serde(default)]
+    pub summary: String,
+    pub slots: Vec<PlanSlot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlanState {
+    Pending,
+    Approved,
+    Rejected,
+    Superseded,
+}
+
+/// A plan as the ledger holds it. `plan` is the version that was (or will
+/// be) run: the edited one after an approval with edits.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlanRecord {
+    pub id: i64,
+    pub at: i64,
+    pub plan: Plan,
+    pub state: PlanState,
+    pub decided_at: Option<i64>,
+    pub edited: bool,
+    pub warnings: Vec<String>,
+    pub outcome: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReportKind {
+    Report,
+    State,
+}
+
+/// A line on the timeline: a slot's own report or a state change noted by
+/// the daemon.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Report {
+    pub id: i64,
+    pub at: i64,
+    pub slot: SlotId,
+    pub kind: ReportKind,
+    pub text: String,
+}
+
+/// The board summary S0 keeps.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Summary {
+    pub at: i64,
+    pub text: String,
+}
+
+/// The coordinator's part of the board.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CoordView {
+    pub summary: Option<Summary>,
+    /// Pending first, then newest.
+    pub plans: Vec<PlanRecord>,
+    /// Newest first.
+    pub reports: Vec<Report>,
+    /// Slots with an unanswered status request, and when it was asked.
+    pub status_asked: Vec<(SlotId, i64)>,
+}
+
+impl CoordView {
+    /// The plan waiting for Jonathan, if any.
+    pub fn pending_plan(&self) -> Option<&PlanRecord> {
+        self.plans.iter().find(|p| p.state == PlanState::Pending)
+    }
+
+    /// The reports and state changes of one slot, newest first.
+    pub fn reports_for(&self, slot: SlotId) -> impl Iterator<Item = &Report> {
+        let mut rows: Vec<&Report> = self.reports.iter().filter(|r| r.slot == slot).collect();
+        rows.sort_by(|a, b| b.at.cmp(&a.at).then(b.id.cmp(&a.id)));
+        rows.into_iter()
+    }
+}
+
+/// Everything the board shows, in one answer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BoardView {
+    pub slots: Vec<SlotInfo>,
+    pub work: WorkView,
+    pub locks: LockView,
+    pub coord: CoordView,
+}
+
+/// Jonathan's answer to a plan.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum PlanDecision {
+    Approve {
+        plan: Plan,
+    },
+    Reject {
+        #[serde(default)]
+        reason: String,
+    },
 }
 
 /// Where a queued 2ndBrain commit stands.
@@ -573,6 +743,8 @@ pub enum Response {
         stdout: String,
         stderr: String,
     },
+    Board(BoardView),
+    Coord(CoordView),
 }
 
 // Adjacent tagging because `SlotChanged` is a tuple variant.
@@ -583,11 +755,164 @@ pub enum Event {
     WorkChanged(WorkView),
     LocksChanged(LockView),
     BrainChanged(BrainView),
+    CoordChanged(CoordView),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plan_round_trips_with_defaults() {
+        let plan: Plan = serde_json::from_str(r#"{"slots":[{"slot":3}]}"#).unwrap();
+        assert_eq!(plan.summary, "");
+        let s = &plan.slots[0];
+        assert_eq!(s.slot, 3);
+        assert!(s.label.is_empty() && s.items.is_empty() && s.targets.is_empty());
+        assert!(s.kickoff.is_empty() && s.rules.is_empty());
+        assert!(s.worktree.is_none() && s.cwd.is_none());
+        let back: Plan = serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
+        assert_eq!(back, plan);
+    }
+
+    fn coord() -> CoordView {
+        let plan = Plan {
+            summary: "two lanes".into(),
+            slots: vec![PlanSlot {
+                slot: 3,
+                label: "demo".into(),
+                items: vec!["DEMO-12".into()],
+                targets: vec![PlanTarget {
+                    target: "repo:demo-api:main".into(),
+                    reason: Some("merge".into()),
+                }],
+                worktree: Some(PlanWorktree {
+                    repo: PathBuf::from("/r/demo-api"),
+                    ticket: "DEMO-12".into(),
+                }),
+                cwd: None,
+                kickoff: "go".into(),
+                rules: vec!["wait for S2".into()],
+            }],
+        };
+        let rep = |id, at, slot| Report {
+            id,
+            at,
+            slot,
+            kind: ReportKind::Report,
+            text: "x".into(),
+        };
+        CoordView {
+            summary: Some(Summary {
+                at: 5,
+                text: "ok".into(),
+            }),
+            plans: vec![
+                PlanRecord {
+                    id: 2,
+                    at: 9,
+                    plan: plan.clone(),
+                    state: PlanState::Pending,
+                    decided_at: None,
+                    edited: false,
+                    warnings: vec!["w".into()],
+                    outcome: vec![],
+                },
+                PlanRecord {
+                    id: 1,
+                    at: 4,
+                    plan,
+                    state: PlanState::Superseded,
+                    decided_at: Some(9),
+                    edited: false,
+                    warnings: vec![],
+                    outcome: vec![],
+                },
+            ],
+            reports: vec![rep(3, 30, 3), rep(2, 20, 4), rep(1, 10, 3)],
+            status_asked: vec![(3, 40)],
+        }
+    }
+
+    #[test]
+    fn coord_view_helpers() {
+        let c = coord();
+        assert_eq!(c.pending_plan().map(|p| p.id), Some(2));
+        let ids: Vec<i64> = c.reports_for(3).map(|r| r.id).collect();
+        assert_eq!(ids, vec![3, 1]);
+        assert_eq!(c.reports_for(6).count(), 0);
+    }
+
+    #[test]
+    fn coordinator_messages_round_trip() {
+        let plan = coord().plans[0].plan.clone();
+        let reqs = vec![
+            Request::GetBoard,
+            Request::CoordStatus,
+            Request::ProposePlan {
+                from: Some(0),
+                plan: plan.clone(),
+            },
+            Request::DecidePlan {
+                id: 2,
+                from: None,
+                decision: PlanDecision::Approve { plan },
+            },
+            Request::DecidePlan {
+                id: 2,
+                from: None,
+                decision: PlanDecision::Reject {
+                    reason: "no".into(),
+                },
+            },
+            Request::RequestStatus {
+                from: Some(0),
+                slot: 3,
+            },
+            Request::ReportProgress {
+                slot: 3,
+                text: "done".into(),
+            },
+            Request::SetBoardSummary {
+                from: None,
+                text: "all quiet".into(),
+            },
+        ];
+        for r in reqs {
+            let back: Request = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+            assert_eq!(back, r);
+        }
+        let reject: PlanDecision = serde_json::from_str(r#"{"Reject":{}}"#).unwrap();
+        assert_eq!(
+            reject,
+            PlanDecision::Reject {
+                reason: String::new()
+            }
+        );
+        let resp = Response::Coord(coord());
+        let back: Response = serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
+        assert_eq!(back, resp);
+        let ev = Event::CoordChanged(coord());
+        let back: Event = serde_json::from_str(&serde_json::to_string(&ev).unwrap()).unwrap();
+        assert_eq!(back, ev);
+        let board = Response::Board(BoardView {
+            slots: vec![],
+            work: WorkView {
+                items: vec![],
+                sources: vec![],
+                notices: vec![],
+            },
+            locks: LockView {
+                claims: vec![],
+                waits: vec![],
+                relays: vec![],
+                flag_after_secs: 3600,
+            },
+            coord: coord(),
+        });
+        let back: Response = serde_json::from_str(&serde_json::to_string(&board).unwrap()).unwrap();
+        assert_eq!(back, board);
+    }
 
     #[test]
     fn names() {
