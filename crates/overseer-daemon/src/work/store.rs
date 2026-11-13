@@ -301,7 +301,7 @@ impl WorkStore {
                 key: key.clone(),
                 kind: self.guess_kind(key),
                 title: key.clone(),
-                status: "unknown".into(),
+                status: overseer_proto::UNKNOWN_STATUS.into(),
                 priority: None,
                 parent: None,
                 owner: Some(*slot),

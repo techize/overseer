@@ -75,7 +75,7 @@ pub fn group(tickets: &[Ticket], beads: &[Bead], pattern: &Regex) -> Vec<WorkIte
         out.push(ticket_item(&Ticket {
             key: k.clone(),
             title: k.clone(),
-            status: "unknown".into(),
+            status: overseer_proto::UNKNOWN_STATUS.into(),
             priority: None,
         }));
         for b in bs {
@@ -179,6 +179,8 @@ mod tests {
         assert_eq!(items[1].kind, ItemKind::Ticket);
         assert_eq!(items[1].title, "DEMO-9");
         assert_eq!(items[1].status, "unknown");
+        assert!(items[1].is_placeholder());
+        assert!(!items[0].is_placeholder());
         assert_eq!(items[2].parent.as_deref(), Some("DEMO-9"));
     }
 

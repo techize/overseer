@@ -108,6 +108,10 @@ pub enum ItemKind {
     Bead,
 }
 
+/// The status of an item the sources did not describe: a ticket known only
+/// from bead titles, or an owned item that has left the list.
+pub const UNKNOWN_STATUS: &str = "unknown";
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkItem {
     pub key: String,
@@ -122,6 +126,14 @@ pub struct WorkItem {
     pub in_list: bool,
     /// The 2ndBrain ticket folder, when found.
     pub folder: Option<PathBuf>,
+}
+
+impl WorkItem {
+    /// A ticket row the daemon made up from bead titles because the ticket
+    /// source did not list it: its title is its key and its status unknown.
+    pub fn is_placeholder(&self) -> bool {
+        self.kind == ItemKind::Ticket && self.status == UNKNOWN_STATUS && self.title == self.key
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

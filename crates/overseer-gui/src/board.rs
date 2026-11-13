@@ -525,13 +525,14 @@ pub fn needs_you_count(slots: &[SlotInfo]) -> usize {
 }
 
 /// Done and total tickets in the list: done is status `done`, `closed` or
-/// `resolved`, any case. Beads and tickets that left the list are not
+/// `resolved`, any case. Beads, tickets that left the list and placeholder
+/// tickets made from bead titles (their status is not known) are not
 /// counted.
 pub fn done_count(work: &WorkView) -> (usize, usize) {
     let tickets = work
         .items
         .iter()
-        .filter(|i| i.kind == ItemKind::Ticket && i.in_list);
+        .filter(|i| i.kind == ItemKind::Ticket && i.in_list && !i.is_placeholder());
     let (mut done, mut total) = (0, 0);
     for i in tickets {
         total += 1;
@@ -1879,6 +1880,21 @@ mod tests {
             ticket("demo-b1", "done", ItemKind::Bead),
         ];
         assert_eq!(done_count(&work), (3, 4));
+    }
+
+    #[test]
+    fn done_count_leaves_out_tickets_known_only_from_beads() {
+        let mut work = crate::app::empty_work();
+        // Jira returned nothing: the ticket rows are built from bead titles.
+        let placeholder = |key: &str| WorkItem {
+            title: key.into(),
+            ..ticket(key, overseer_proto::UNKNOWN_STATUS, ItemKind::Ticket)
+        };
+        work.items = vec![placeholder("DEMO-12"), placeholder("DEMO-13")];
+        assert_eq!(done_count(&work), (0, 0));
+        assert_eq!(header_text(1, 0, done_count(&work)), "1 running");
+        work.items.push(ticket("DEMO-14", "Done", ItemKind::Ticket));
+        assert_eq!(done_count(&work), (1, 1));
     }
 
     #[test]

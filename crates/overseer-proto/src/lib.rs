@@ -13,5 +13,5 @@ pub use msg::{
     LockView, Notice, Plan, PlanDecision, PlanRecord, PlanSlot, PlanState, PlanTarget,
     PlanWorktree, QueueEntry, QueueState, Relay, RelayState, Report, ReportKind, Request, Response,
     Sender, SlotId, SlotInfo, SlotState, SourceStatus, Summary, Wait, WorkItem, WorkView,
-    WriteCheck, CHECK_ENV, JIRA_OFF,
+    WriteCheck, CHECK_ENV, JIRA_OFF, UNKNOWN_STATUS,
 };
