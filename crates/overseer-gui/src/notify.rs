@@ -87,6 +87,18 @@ pub fn new_waits(prev: &LockView, next: &LockView) -> Vec<Note> {
         .collect()
 }
 
+/// The notification for a push problem that is new in `next`: set where
+/// `prev` had none, or with different text. The coordinator's slot (S0) is
+/// the one a click opens.
+pub fn push_problem_note(prev: Option<&str>, next: Option<&str>) -> Option<Note> {
+    let next = next?;
+    (prev != Some(next)).then(|| Note {
+        slot: 0,
+        title: "2ndBrain push needs you".into(),
+        body: next.to_string(),
+    })
+}
+
 const ID_PREFIX: &str = "overseer-slot-";
 
 /// The request identifier for `slot`'s `seq`th notification. Each post
@@ -358,6 +370,7 @@ mod tests {
                 reason: reason.map(String::from),
                 idle_wait: false,
             }),
+            session_note: None,
         }
     }
 
@@ -441,6 +454,25 @@ mod tests {
         assert_eq!(slot_from_identifier("overseer-slot-x-1"), None);
         assert_eq!(slot_from_identifier("overseer-slot-9"), None);
         assert_eq!(slot_from_identifier("something-else"), None);
+    }
+
+    #[test]
+    fn a_new_push_problem_notifies_once() {
+        let n = push_problem_note(None, Some("push rejected")).unwrap();
+        assert_eq!(n.title, "2ndBrain push needs you");
+        assert_eq!(n.body, "push rejected");
+        assert_eq!(n.slot, 0);
+        // The same text again is the same alert; clearing is silent.
+        assert_eq!(
+            push_problem_note(Some("push rejected"), Some("push rejected")),
+            None
+        );
+        assert_eq!(push_problem_note(Some("push rejected"), None), None);
+        assert_eq!(push_problem_note(None, None), None);
+        // A different text is news, and the autostash text arrives in full.
+        let full = "Resolve the conflicted files in the vault, then drop that stash.";
+        let n = push_problem_note(Some("push rejected"), Some(full)).unwrap();
+        assert_eq!(n.body, full);
     }
 
     #[test]

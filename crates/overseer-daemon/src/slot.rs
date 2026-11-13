@@ -295,6 +295,7 @@ impl Slot {
             cols,
             rows,
             activity: None,
+            session_note: None,
         }
     }
 

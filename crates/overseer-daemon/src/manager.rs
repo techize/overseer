@@ -48,6 +48,8 @@ struct Entry {
     /// what clients see and send back on a restart: reporting the flagged
     /// argv would make every restart add a second set of flags.
     command: Vec<String>,
+    /// The ledger's session note for the slot, relative to the vault.
+    session_note: Option<String>,
 }
 
 impl Entry {
@@ -57,6 +59,7 @@ impl Entry {
             activity: None,
             session_id,
             command,
+            session_note: None,
         }
     }
 
@@ -64,6 +67,7 @@ impl Entry {
         SlotInfo {
             activity: self.activity.clone(),
             command: Some(self.command.clone()),
+            session_note: self.session_note.clone(),
             ..self.slot.info()
         }
     }
@@ -182,6 +186,7 @@ impl SlotManager {
                 cols: DEFAULT_COLS,
                 rows: DEFAULT_ROWS,
                 activity: None,
+                session_note: launch.ledger.session_note(row.slot).ok().flatten(),
             };
             let session_id = if resumable {
                 row.session_id
@@ -358,7 +363,8 @@ impl SlotManager {
         }
         // N4: tear down whatever occupied the slot before (an exited child;
         // kill is a no-op then, but keeps the invariant in one place).
-        let entry = Entry::new(slot.clone(), entry_session_id, command.clone());
+        let mut entry = Entry::new(slot.clone(), entry_session_id, command.clone());
+        entry.session_note = note.clone().filter(|_| self.launch.is_some());
         let started = entry.info();
         if let Some(old) = slots[id as usize].replace(entry) {
             old.slot.kill();
@@ -488,6 +494,7 @@ impl SlotManager {
             cols: DEFAULT_COLS,
             rows: DEFAULT_ROWS,
             activity: None,
+            session_note: None,
         }
     }
 
@@ -753,6 +760,10 @@ mod restore_tests {
             None,
         )
         .unwrap();
+        assert_eq!(
+            m.list()[6].session_note.as_deref(),
+            Some("Sessions/2020/01-January/2020-01-02-s6-old.md")
+        );
         assert!(
             role_note(6)
                 .starts_with("/tmp/demo-brain/Sessions/2020/01-January/2020-01-02-s6-old.md."),
@@ -777,6 +788,11 @@ mod restore_tests {
         .unwrap();
         assert_eq!(
             ledger.session_note(3).unwrap().as_deref(),
+            Some("Sessions/s3-demo-lane.md")
+        );
+        // The slot's info carries the note for the board.
+        assert_eq!(
+            m.list()[3].session_note.as_deref(),
             Some("Sessions/s3-demo-lane.md")
         );
         // A resume keeps the row, note included.

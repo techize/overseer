@@ -642,6 +642,7 @@ mod tests {
             cols: 80,
             rows: 24,
             activity: None,
+            session_note: None,
         };
         assert_eq!(
             initial_fields(2, Some(&last), home),
@@ -835,6 +836,7 @@ mod tests {
             cols: 80,
             rows: 24,
             activity: None,
+            session_note: None,
         };
         assert_eq!(
             prefilled_fields(3, Some(&last), home(), Some(&prefill)),

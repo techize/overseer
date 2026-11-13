@@ -878,6 +878,7 @@ mod tests {
             cols: 80,
             rows: 24,
             activity: None,
+            session_note: None,
         };
         assert_eq!(format_slot(&s), "S3  resumable  eks");
     }

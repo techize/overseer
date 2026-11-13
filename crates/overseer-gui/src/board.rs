@@ -18,8 +18,8 @@ use std::path::Path;
 
 use gpui::{div, prelude::*, px, rgb, Context, FontWeight, Window};
 use overseer_proto::{
-    slot_name, Activity, ActivityKind, ClaimKind, ItemKind, LockView, RelayState, SlotId, SlotInfo,
-    SlotState, WorkItem, WorkView,
+    slot_name, Activity, ActivityKind, BrainView, ClaimKind, ItemKind, LockView, QueueEntry,
+    QueueState, RelayState, Sender, SlotId, SlotInfo, SlotState, WorkItem, WorkView,
 };
 
 use crate::app::{colors, OverseerApp};
@@ -404,6 +404,64 @@ pub(crate) fn one_line(text: &str, max: usize) -> String {
     }
 }
 
+/// The 2ndBrain strip's text and colour. Writer off beats a push problem,
+/// which beats a queue, which beats the last commit time.
+pub fn strip_text(v: &BrainView) -> (String, Tone) {
+    if !v.on {
+        return ("2ndBrain: writer off".into(), Tone::Empty);
+    }
+    if v.push_problem.is_some() {
+        return ("2ndBrain: push needs you".into(), Tone::NeedsYou);
+    }
+    let queued = v
+        .entries
+        .iter()
+        .filter(|e| e.state == QueueState::Queued)
+        .count();
+    if queued > 0 {
+        return (format!("2ndBrain: {queued} queued"), Tone::Idle);
+    }
+    match v
+        .entries
+        .iter()
+        .filter(|e| e.state == QueueState::Committed)
+        .map(|e| e.at)
+        .max()
+    {
+        Some(at) => (
+            format!("2ndBrain: committed {}", local_hhmm(at)),
+            Tone::Idle,
+        ),
+        None => ("2ndBrain: nothing yet".into(), Tone::Idle),
+    }
+}
+
+/// One line of the strip's list: `09:41 S1  Sessions/.../s1-demo.md  committed, pushed`.
+pub fn entry_line(e: &QueueEntry) -> String {
+    let who = match e.from {
+        Sender::Overseer => "Overseer".to_string(),
+        Sender::You => "you".to_string(),
+        Sender::Slot { slot } => slot_name(slot),
+    };
+    let what = match e.paths.as_slice() {
+        [] => one_line(&e.message, 60),
+        [only] => only.clone(),
+        [first, rest @ ..] => format!("{first} (+{} more)", rest.len()),
+    };
+    let state = match (e.state, e.pushed) {
+        (QueueState::Queued, _) => "queued".to_string(),
+        (QueueState::Committed, Some(true)) => "committed, pushed".to_string(),
+        (QueueState::Committed, Some(false)) => "committed, not pushed".to_string(),
+        (QueueState::Committed, None) => "committed".to_string(),
+        (QueueState::NothingToCommit, _) => "nothing to commit".to_string(),
+        (QueueState::Failed, _) => match e.error.as_deref().map(str::trim) {
+            Some(err) if !err.is_empty() => format!("failed: {}", one_line(err, 80)),
+            _ => "failed".to_string(),
+        },
+    };
+    format!("{} {who}  {what}  {state}", local_hhmm(e.at))
+}
+
 pub fn running_count(slots: &[SlotInfo]) -> usize {
     slots
         .iter()
@@ -671,6 +729,8 @@ impl OverseerApp {
         let running = running_count(&self.slots);
         let need_you = needs_you_count(&self.slots);
         let strip = strip_lines(&self.locks, local_hhmm, 5);
+        let (strip_label, strip_tone) = strip_text(&self.brain);
+        let show_list = self.brain_hover || self.brain_pinned;
         let s0 = self.render_card(0, now, cx);
         let row = |ids: [SlotId; 3], this: &Self, cx: &mut Context<Self>| {
             let cards: Vec<_> = ids
@@ -791,12 +851,58 @@ impl OverseerApp {
                     .text_color(rgb(colors::TEXT_DIM))
                     .children(strip.into_iter().map(|l| div().truncate().child(l)))
             }))
+            .children(show_list.then(|| {
+                div()
+                    .mt_auto()
+                    .flex()
+                    .flex_col()
+                    .text_xs()
+                    .text_color(rgb(colors::TEXT_DIM))
+                    .children(
+                        self.brain
+                            .push_problem
+                            .clone()
+                            .map(|p| div().text_color(rgb(colors::ORANGE)).child(p)),
+                    )
+                    .children(
+                        self.brain
+                            .entries
+                            .iter()
+                            .take(5)
+                            .map(|e| div().truncate().child(entry_line(e))),
+                    )
+                    .children(self.brain.entries.is_empty().then(|| div().child("Nothing queued")))
+            }))
             .child(
                 div()
-                    .when(self.locks.relays.is_empty(), |d| d.mt_auto())
+                    .when(self.locks.relays.is_empty() && !show_list, |d| d.mt_auto())
+                    .flex()
+                    .gap_2()
                     .text_xs()
-                    .text_color(rgb(colors::MUTED))
-                    .child("Click a card or press Enter to open it · A assigns work · Cmd+0 to Cmd+6 open a session · Cmd+N starts the selected slot"),
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_color(rgb(colors::MUTED))
+                            .child("Click a card or press Enter to open it · A assigns work · Cmd+0 to Cmd+6 open a session · Cmd+N starts the selected slot"),
+                    )
+                    .child(
+                        div()
+                            .id("brain-strip")
+                            .flex_none()
+                            .cursor_pointer()
+                            .text_color(rgb(tone_color(strip_tone)))
+                            .child(strip_label)
+                            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                                this.brain_hover = *hovered;
+                                cx.notify();
+                            }))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.brain_pinned = !this.brain_pinned;
+                                cx.notify();
+                            })),
+                    ),
             )
     }
 }
@@ -819,6 +925,7 @@ mod tests {
             cols: 80,
             rows: 24,
             activity: None,
+            session_note: None,
         }
     }
 
@@ -979,6 +1086,112 @@ mod tests {
         v.relays = vec![relay(1, 2, 5, None, "a"), relay(2, 2, 6, Some(7), "b")];
         let m = card_model(&running(2, None), 10, None, &no_work(), &v);
         assert_eq!(m.pending.as_deref(), Some("1 relay pending"));
+    }
+
+    fn q(id: i64, at: i64, state: QueueState) -> QueueEntry {
+        QueueEntry {
+            id,
+            at,
+            from: Sender::Slot { slot: 1 },
+            paths: vec!["Sessions/2026/11-November/2026-11-13-s1-demo.md".into()],
+            message: "S1: note".into(),
+            state,
+            commit: None,
+            pushed: None,
+            error: None,
+        }
+    }
+
+    fn brain(entries: Vec<QueueEntry>) -> BrainView {
+        BrainView {
+            on: true,
+            entries,
+            last_backup: None,
+            last_sync: None,
+            push_problem: None,
+            brain_dir: None,
+        }
+    }
+
+    #[test]
+    fn strip_counts_the_queue() {
+        let v = brain(vec![
+            q(3, 30, QueueState::Queued),
+            q(2, 20, QueueState::Queued),
+            q(1, 10, QueueState::Committed),
+        ]);
+        let (text, tone) = strip_text(&v);
+        assert_eq!(text, "2ndBrain: 2 queued");
+        assert_eq!(tone, Tone::Idle);
+    }
+
+    #[test]
+    fn strip_shows_the_newest_commit_time() {
+        let v = brain(vec![
+            q(3, 5, QueueState::Failed),
+            q(2, 2000, QueueState::Committed),
+            q(1, 1000, QueueState::Committed),
+        ]);
+        let (text, tone) = strip_text(&v);
+        assert_eq!(text, format!("2ndBrain: committed {}", local_hhmm(2000)));
+        assert_eq!(tone, Tone::Idle);
+    }
+
+    #[test]
+    fn strip_says_push_needs_you_in_orange() {
+        let mut v = brain(vec![q(1, 10, QueueState::Queued)]);
+        v.push_problem = Some("push rejected".into());
+        let (text, tone) = strip_text(&v);
+        assert_eq!(text, "2ndBrain: push needs you");
+        assert_eq!(tone, Tone::NeedsYou);
+        assert_eq!(tone_color(tone), colors::ORANGE);
+    }
+
+    #[test]
+    fn strip_writer_off_is_grey_and_beats_everything() {
+        let mut v = brain(vec![q(1, 10, QueueState::Queued)]);
+        v.on = false;
+        v.push_problem = Some("push rejected".into());
+        let (text, tone) = strip_text(&v);
+        assert_eq!(text, "2ndBrain: writer off");
+        assert_eq!(tone, Tone::Empty);
+        assert_eq!(tone_color(tone), colors::GREY);
+    }
+
+    #[test]
+    fn strip_with_nothing_yet() {
+        let (text, tone) = strip_text(&brain(vec![q(1, 10, QueueState::NothingToCommit)]));
+        assert_eq!(text, "2ndBrain: nothing yet");
+        assert_eq!(tone, Tone::Idle);
+    }
+
+    #[test]
+    fn entry_lines_say_where_each_commit_stands() {
+        let mut e = q(1, 3000, QueueState::Committed);
+        e.pushed = Some(true);
+        assert_eq!(
+            entry_line(&e),
+            format!(
+                "{} S1  Sessions/2026/11-November/2026-11-13-s1-demo.md  committed, pushed",
+                local_hhmm(3000)
+            )
+        );
+        e.pushed = Some(false);
+        assert!(entry_line(&e).ends_with("committed, not pushed"));
+        e.pushed = None;
+        assert!(entry_line(&e).ends_with("  committed"));
+        e.state = QueueState::Queued;
+        assert!(entry_line(&e).ends_with("  queued"));
+        e.state = QueueState::NothingToCommit;
+        assert!(entry_line(&e).ends_with("  nothing to commit"));
+        e.state = QueueState::Failed;
+        e.error = Some("index.lock held".into());
+        assert!(entry_line(&e).ends_with("  failed: index.lock held"));
+        e.from = Sender::You;
+        e.paths = vec!["a.md".into(), "b.md".into()];
+        assert!(entry_line(&e).contains(" you  a.md (+1 more)  "));
+        e.paths = vec![];
+        assert!(entry_line(&e).contains(" you  S1: note  "));
     }
 
     #[test]

@@ -290,6 +290,7 @@ impl BrainService {
             last_backup: None,
             last_sync: None,
             push_problem: None,
+            brain_dir: None,
         }
     }
 
@@ -333,6 +334,7 @@ impl BrainService {
             last_backup: run("backup").map(|(at, _, _)| at),
             last_sync: run("sync").map(|(at, ok, _)| (at, ok)),
             push_problem: self.rt().push_problem.clone(),
+            brain_dir: Some(self.cfg.brain.clone()),
         }
     }
 

@@ -45,6 +45,10 @@ pub struct SlotInfo {
     /// commands that send no hooks.
     #[serde(default)]
     pub activity: Option<Activity>,
+    /// The slot's session note, relative to the 2ndBrain vault, once the
+    /// ledger has one.
+    #[serde(default)]
+    pub session_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -474,6 +478,10 @@ pub struct BrainView {
     pub last_backup: Option<i64>,
     pub last_sync: Option<(i64, bool)>,
     pub push_problem: Option<String>,
+    /// The vault directory, so the board can build an absolute path for a
+    /// session note. `None` while the writer is off.
+    #[serde(default)]
+    pub brain_dir: Option<std::path::PathBuf>,
 }
 
 /// A file write the `PreToolUse` hook asks the daemon to check.
@@ -951,6 +959,7 @@ mod tests {
             last_backup: Some(1700000100),
             last_sync: Some((1700000200, true)),
             push_problem: None,
+            brain_dir: None,
         }
     }
 
