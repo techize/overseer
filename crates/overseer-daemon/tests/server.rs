@@ -4284,3 +4284,60 @@ async fn pending_plan_survives_a_restart_and_approved_never_reruns() {
     let resp = c.approve(1, plan_of(vec![rig.slot4()])).await;
     assert!(is_error(&resp, "plan 1 is no longer pending"), "{resp:?}");
 }
+
+async fn kickoff_text_of(c: &mut Client, slot: u8) -> String {
+    match c.request(Request::Kickoff { slot }).await {
+        Response::Text { text } => text,
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn manual_kickoff_names_targets_and_current_session() {
+    let rig = PlanRig::new("manual-kickoff");
+    let (_d, mut c) = rig.start().await;
+    assert_eq!(c.assign("DEMO-12", 3, false, false).await, Response::Ok);
+    assert!(matches!(
+        c.request(claim_target(3, "repo:demo-api:main", None)).await,
+        Response::Ok | Response::Text { .. }
+    ));
+    let text = kickoff_text_of(&mut c, 3).await;
+    assert!(text.contains("DEMO-12"), "{text}");
+    assert!(
+        text.contains("You hold these targets: repo:demo-api:main"),
+        "{text}"
+    );
+    assert!(text.contains("Keep your section of"), "{text}");
+    assert!(
+        text.contains(&rig.s.dir.join("CURRENT_SESSION.md").display().to_string()),
+        "{text}"
+    );
+}
+
+/// A slot working in a folder under `worktree_root` is told to work there; a
+/// slot working anywhere else is not.
+#[tokio::test]
+async fn manual_kickoff_names_the_worktree_only_under_the_root() {
+    let rig = PlanRig::new("manual-kickoff-wt");
+    let (_d, mut c) = rig.start().await;
+    let wt = rig.worktrees.join("demo-api-DEMO-12");
+    std::fs::create_dir_all(&wt).unwrap();
+    assert_eq!(c.assign("DEMO-12", 3, false, false).await, Response::Ok);
+    let start = |cwd: PathBuf| Request::StartSlot {
+        id: 3,
+        label: "t3".into(),
+        cwd,
+        command: None,
+        prompt: None,
+    };
+    assert_eq!(c.request(start(rig.work5.clone())).await, Response::Ok);
+    let text = kickoff_text_of(&mut c, 3).await;
+    assert!(!text.contains("Work in "), "{text}");
+    assert_eq!(c.request(Request::StopSlot { id: 3 }).await, Response::Ok);
+    assert_eq!(c.request(start(wt.clone())).await, Response::Ok);
+    let text = kickoff_text_of(&mut c, 3).await;
+    assert!(
+        text.contains(&format!("Work in {}.", wt.display())),
+        "{text}"
+    );
+}

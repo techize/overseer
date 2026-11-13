@@ -900,7 +900,7 @@ fn handle_request(
                     .filter(|c| c.slot == slot)
                     .map(|c| c.target.clone())
                     .collect(),
-                worktree: None,
+                worktree: slot_worktree(ctx.plans, ctx.manager, slot),
                 rules: Vec::new(),
                 current_session: ctx.plans.current_session.clone(),
             };
@@ -1161,6 +1161,22 @@ fn start_stream(gate: StreamGate, att: Attachment, outbox: &Outbox, streams: &mu
             }
         }
     }));
+}
+
+/// The slot's cwd when it lies under `worktree_root`, else `None`. The guard
+/// is dropped before the caller awaits anything.
+fn slot_worktree(plans: &PlanCtx, manager: &Mutex<SlotManager>, slot: SlotId) -> Option<PathBuf> {
+    let cwd = manager
+        .lock()
+        .unwrap()
+        .list()
+        .get(slot as usize)?
+        .cwd
+        .clone()?;
+    let root = &plans.worktree_root;
+    let under = |cwd: &Path, root: &Path| cwd != root && cwd.starts_with(root);
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    (under(&cwd, root) || under(&canon(&cwd), &canon(root))).then_some(cwd)
 }
 
 #[cfg(test)]
