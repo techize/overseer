@@ -350,6 +350,9 @@ pub struct OverseerApp {
     picker: Option<(Entity<Picker>, Subscription)>,
     /// The open plan approval view.
     plan_view: Option<(Entity<PlanView>, Subscription)>,
+    /// Plan views closed with a decision still on its way, kept for the
+    /// answer.
+    plan_leaving: Vec<(Entity<PlanView>, Subscription)>,
     /// Pickers closed with an assign on its way; see `PickerEvent::Late`.
     leaving: Vec<(Entity<Picker>, Subscription)>,
     restarts: HashMap<SlotId, RestartPlan>,
@@ -452,6 +455,7 @@ impl OverseerApp {
             dialog: None,
             picker: None,
             plan_view: None,
+            plan_leaving: Vec::new(),
             leaving: Vec::new(),
             restarts: HashMap::new(),
             kickoffs: HashSet::new(),
@@ -1073,12 +1077,26 @@ impl OverseerApp {
         self.status = None;
         let client = self.client.clone();
         let view = cx.new(|cx| PlanView::new(&rec, client, cx));
-        let sub = cx.subscribe_in(&view, window, |this, _, ev: &PlanEvent, window, cx| {
-            this.plan_view = None;
-            if let PlanEvent::Decided(line) = ev {
-                this.status = Some(line.clone());
+        let sub = cx.subscribe_in(&view, window, |this, view, ev: &PlanEvent, window, cx| {
+            let open = this.plan_view.take_if(|(v, _)| v == view);
+            let was_front = open.is_some();
+            match ev {
+                PlanEvent::Closed => {
+                    // Kept until its decision is answered.
+                    if let Some(open) = open {
+                        if open.0.read(cx).busy() {
+                            this.plan_leaving.push(open);
+                        }
+                    }
+                }
+                PlanEvent::Decided(line) => {
+                    this.plan_leaving.retain(|(v, _)| v != view);
+                    this.status = Some(line.clone());
+                }
             }
-            this.restore_focus(window, cx);
+            if was_front {
+                this.restore_focus(window, cx);
+            }
             cx.notify();
         });
         window.focus(&view.focus_handle(cx));

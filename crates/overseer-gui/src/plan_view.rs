@@ -234,6 +234,8 @@ pub struct Editor {
     pub active: Field,
     pub busy: bool,
     pub error: Option<String>,
+    /// The newest coordinator view seen while a decision was in flight.
+    pub latest: Option<CoordView>,
 }
 
 impl Editor {
@@ -255,6 +257,7 @@ impl Editor {
             active,
             busy: false,
             error: None,
+            latest: None,
         }
     }
 
@@ -311,6 +314,9 @@ impl Editor {
     }
 
     pub fn key(&mut self, ks: &Keystroke) -> PlanAction {
+        if ks.key == "escape" {
+            return PlanAction::Close;
+        }
         if self.busy {
             return PlanAction::Ignored;
         }
@@ -321,9 +327,6 @@ impl Editor {
             } else {
                 PlanAction::Ignored
             };
-        }
-        if ks.key == "escape" {
-            return PlanAction::Close;
         }
         let result = edit_key(self.field_mut(), ks);
         match result {
@@ -382,9 +385,13 @@ impl Editor {
             } else {
                 format!("Plan {} rejected", self.id)
             }),
-            Ok(Response::Error { message }) | Ok(Response::NeedsConfirm { message }) => {
-                Reply::Failed(message)
-            }
+            // Decided elsewhere while this request was in flight: say so
+            // instead of showing the daemon's refusal.
+            Ok(Response::Error { message }) | Ok(Response::NeedsConfirm { message }) => self
+                .latest
+                .as_ref()
+                .and_then(|v| gone_note(self.id, v))
+                .map_or(Reply::Failed(message), Reply::Done),
             Ok(other) => Reply::Failed(format!("Unexpected reply: {other:?}")),
             Err(e) => Reply::Failed(e),
         }
@@ -410,6 +417,8 @@ pub struct PlanView {
     client: Arc<Client>,
     scroll: ScrollHandle,
     focus_handle: FocusHandle,
+    /// Closed with a request on its way; its answer goes to the status.
+    closed: bool,
 }
 
 impl EventEmitter<PlanEvent> for PlanView {}
@@ -428,6 +437,7 @@ impl PlanView {
             client,
             scroll: ScrollHandle::new(),
             focus_handle: cx.focus_handle(),
+            closed: false,
         }
     }
 
@@ -436,6 +446,7 @@ impl PlanView {
     /// view.
     pub fn coord_changed(&mut self, view: &CoordView, cx: &mut Context<Self>) {
         if self.editor.busy {
+            self.editor.latest = Some(view.clone());
             return;
         }
         if let Some(note) = gone_note(self.editor.id, view) {
@@ -443,14 +454,21 @@ impl PlanView {
         }
     }
 
+    /// A decision is on its way; the app keeps a closed view until it is
+    /// answered.
+    pub fn busy(&self) -> bool {
+        self.editor.busy
+    }
+
+    /// Closes without cancelling a request in flight: the daemon has no
+    /// timeout for it, so Close must not wait for the answer.
     fn close(&mut self, cx: &mut Context<Self>) {
-        if !self.editor.busy {
-            cx.emit(PlanEvent::Closed);
-        }
+        self.closed = true;
+        cx.emit(PlanEvent::Closed);
     }
 
     fn decide(&mut self, approving: bool, cx: &mut Context<Self>) {
-        if self.editor.busy || (approving && !self.editor.draft.can_approve()) {
+        if self.closed || self.editor.busy || (approving && !self.editor.draft.can_approve()) {
             return;
         }
         let req = if approving {
@@ -469,6 +487,10 @@ impl PlanView {
             let _ = this.update(cx, |this, cx| {
                 match this.editor.reply(reply, approving) {
                     Reply::Done(line) => cx.emit(PlanEvent::Decided(line)),
+                    Reply::Failed(e) if this.closed => cx.emit(PlanEvent::Decided(format!(
+                        "Plan {} not decided: {e}",
+                        this.editor.id
+                    ))),
                     Reply::Failed(e) => {
                         this.editor.busy = false;
                         this.editor.error = Some(e);
@@ -744,7 +766,7 @@ impl Render for PlanView {
                             .child(hint),
                     )
                     .child(
-                        button("plan-close", "Close", false, !busy)
+                        button("plan-close", "Close", false, true)
                             .on_click(cx.listener(|this, _, _, cx| this.close(cx))),
                     )
                     .child(
@@ -919,11 +941,42 @@ mod tests {
     }
 
     #[test]
-    fn a_busy_editor_ignores_decisions() {
+    fn a_busy_editor_ignores_decisions_but_can_close() {
         let mut e = Editor::new(&record());
         e.busy = true;
         assert_eq!(e.key(&ks("cmd-enter")), PlanAction::Ignored);
-        assert_eq!(e.key(&ks("escape")), PlanAction::Ignored);
+        assert_eq!(e.key(&ks("escape")), PlanAction::Close);
+    }
+
+    #[test]
+    fn a_refusal_after_an_outside_decision_reads_as_decided_elsewhere() {
+        let mut e = Editor::new(&record());
+        let refusal = || {
+            Ok(Response::Error {
+                message: "plan 4 is no longer pending".into(),
+            })
+        };
+        // No newer view seen: the refusal is shown as is.
+        assert_eq!(
+            e.reply(refusal(), true),
+            Reply::Failed("plan 4 is no longer pending".into())
+        );
+        // Still pending in the latest view: still the refusal.
+        let mut view = overseer_proto::CoordView {
+            summary: None,
+            plans: vec![test_plan(4, PlanState::Pending)],
+            reports: Vec::new(),
+            status_asked: Vec::new(),
+        };
+        e.latest = Some(view.clone());
+        assert!(matches!(e.reply(refusal(), true), Reply::Failed(_)));
+        // Decided elsewhere meanwhile.
+        view.plans[0].state = PlanState::Approved;
+        e.latest = Some(view);
+        assert_eq!(
+            e.reply(refusal(), true),
+            Reply::Done("Plan 4 was approved elsewhere".into())
+        );
     }
 
     #[test]
