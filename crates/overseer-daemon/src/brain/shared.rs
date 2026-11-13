@@ -37,14 +37,26 @@ impl FileLocks {
     }
 }
 
-/// Writes `text` to `<name>.overseer-tmp` beside `path`, then renames it over
-/// `path`, so a reader never sees half a file.
+/// Writes `text` to `<name>.overseer-tmp` beside the file `path` resolves to
+/// (a symlink stays a symlink), keeps that file's mode, syncs, then renames
+/// the tmp over it. The tmp is removed on any error.
 pub fn write_atomic(path: &Path, text: &str) -> io::Result<()> {
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    use std::io::Write;
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut name = target.file_name().unwrap_or_default().to_os_string();
     name.push(".overseer-tmp");
-    let tmp = path.with_file_name(name);
-    std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, path).inspect_err(|_| {
+    let tmp = target.with_file_name(name);
+    let run = || -> io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        if let Ok(m) = std::fs::metadata(&target) {
+            f.set_permissions(m.permissions())?;
+        }
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, &target)
+    };
+    run().inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })
 }
@@ -99,7 +111,7 @@ pub fn replace_once(file: &str, old: &str, new: &str) -> Result<String, String> 
     if old.is_empty() {
         return Err("old_text is empty".into());
     }
-    match file.matches(old).count() {
+    match count_overlapping(file, old) {
         1 => Ok(file.replacen(old, new, 1)),
         0 => Err(format!(
             "old_text was not found; the file has changed. Current text:\n{}",
@@ -107,6 +119,18 @@ pub fn replace_once(file: &str, old: &str, new: &str) -> Result<String, String> 
         )),
         n => Err(format!("old_text occurs {n} times; include more context.")),
     }
+}
+
+/// Occurrences of `needle`, overlapping ones included.
+fn count_overlapping(hay: &str, needle: &str) -> usize {
+    let mut n = 0;
+    let mut from = 0;
+    while let Some(i) = hay[from..].find(needle) {
+        n += 1;
+        let at = from + i;
+        from = at + hay[at..].chars().next().map_or(1, char::len_utf8);
+    }
+    n
 }
 
 fn tail(file: &str) -> String {
@@ -192,6 +216,38 @@ mod tests {
             replace_once("b b", "b", "X").unwrap_err(),
             "old_text occurs 2 times; include more context."
         );
+    }
+
+    #[test]
+    fn overlapping_matches_count() {
+        assert_eq!(
+            replace_once("aaa", "aa", "X").unwrap_err(),
+            "old_text occurs 2 times; include more context."
+        );
+        assert_eq!(replace_once("a\u{e9}b", "\u{e9}", "X").unwrap(), "aXb");
+    }
+
+    #[test]
+    fn write_atomic_keeps_symlink_and_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp("link");
+        let target = dir.join("real.md");
+        std::fs::write(&target, "old").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.join("link.md");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        write_atomic(&link, "new").unwrap();
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert!(!dir.join("real.md.overseer-tmp").exists());
+        // a failed write leaves no tmp behind
+        let bad = dir.join("missing-dir").join("f.md");
+        assert!(write_atomic(&bad, "x").is_err());
     }
 
     #[test]
