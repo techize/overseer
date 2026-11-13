@@ -627,11 +627,8 @@ pub fn format_board(view: &BoardView, now: i64) -> String {
             line.push_str(&format!("  status asked {}", local_hhmm(*at)));
         }
         out.push(line);
-        if let Some(r) = view
-            .coord
-            .reports_for(s.id)
-            .find(|r| r.kind == ReportKind::Report)
-        {
+        // Only a report from the slot's current (or last) session.
+        if let Some(r) = view.coord.last_report(s) {
             out.push(format!(
                 "  last report {}: {}",
                 local_hhmm(r.at),
@@ -1388,6 +1385,29 @@ mod tests {
             lines.last().unwrap(),
             &format!("Plan 2 waiting for Jonathan since {}", local_hhmm(400))
         );
+    }
+
+    #[test]
+    fn board_text_drops_a_last_report_from_an_earlier_session() {
+        let mut v = board(None);
+        // S3's report was made at 500; its session now started at 700.
+        v.slots[3].state = SlotState::Running { pid: 2, since: 700 };
+        let text = format_board(&v, 1000);
+        assert!(!text.contains("last report"), "{text}");
+        // A report from the new session shows.
+        v.coord.reports.push(overseer_proto::Report {
+            id: 2,
+            at: 800,
+            slot: 3,
+            kind: ReportKind::Report,
+            text: "schema done".into(),
+        });
+        let text = format_board(&v, 1000);
+        assert!(
+            text.contains(&format!("  last report {}: schema done", local_hhmm(800))),
+            "{text}"
+        );
+        assert!(!text.contains("tests green"), "{text}");
     }
 
     #[test]
