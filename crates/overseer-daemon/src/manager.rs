@@ -691,24 +691,37 @@ mod restore_tests {
         }
     }
 
-    fn manager(ledger: Arc<Ledger>) -> SlotManager {
+    /// A state folder of the test's own, removed when it ends.
+    struct StateDir(PathBuf);
+
+    impl StateDir {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!("ovm-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for StateDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn manager(ledger: Arc<Ledger>, state: &StateDir) -> SlotManager {
         let (events, _) = broadcast::channel(16);
         SlotManager::new(vec!["claude".into()], events).with_launch(
-            std::env::temp_dir(),
+            state.0.clone(),
             PathBuf::from("/bin/true"),
             ledger,
             RoleDirs::default(),
         )
     }
 
-    fn role_note(slot: SlotId) -> String {
-        let role = std::fs::read_to_string(
-            std::env::temp_dir()
-                .join("slots")
-                .join(slot_name(slot))
-                .join("role.md"),
-        )
-        .unwrap();
+    fn role_note(state: &StateDir, slot: SlotId) -> String {
+        let role =
+            std::fs::read_to_string(state.0.join("slots").join(slot_name(slot)).join("role.md"))
+                .unwrap();
         role.lines()
             .find_map(|l| l.split("session note is ").nth(1))
             .unwrap_or("")
@@ -718,12 +731,14 @@ mod restore_tests {
     #[tokio::test]
     async fn the_role_names_the_ledgers_note_fresh_and_resumed() {
         let ledger = Arc::new(Ledger::in_memory());
-        let mut m = manager(ledger.clone()).with_session_note("Sessions/{slot}-{label}.md".into());
+        let state = StateDir::new();
+        let mut m =
+            manager(ledger.clone(), &state).with_session_note("Sessions/{slot}-{label}.md".into());
         // The role needs the writer on to name a note.
         m.launch.as_mut().unwrap().dirs.brain_writer = true;
         m.launch.as_mut().unwrap().dirs.brain = PathBuf::from("/tmp/demo-brain");
         // Only a claude command gets a role file: a stand-in named claude.
-        let bin = std::env::temp_dir().join(format!("ovm-{}-claude", std::process::id()));
+        let bin = state.0.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         let fake = bin.join("claude");
         std::fs::write(&fake, "#!/bin/sh\nsleep 30\n").unwrap();
@@ -739,7 +754,7 @@ mod restore_tests {
         )
         .unwrap();
         let fresh = ledger.session_note(6).unwrap().unwrap();
-        assert_eq!(role_note(6), format!("/tmp/demo-brain/{fresh}. Write it, and any ticket folder you own (for example Sprints/sprint-26-01/DEMO-12-demo-lane/), directly with your file tools."));
+        assert_eq!(role_note(&state, 6), format!("/tmp/demo-brain/{fresh}. Write it, and any ticket folder you own (for example Sprints/sprint-26-01/DEMO-12-demo-lane/), directly with your file tools."));
         m.stop(6).unwrap();
         for _ in 0..100 {
             if !matches!(m.list()[6].state, SlotState::Running { .. }) {
@@ -765,10 +780,10 @@ mod restore_tests {
             Some("Sessions/2020/01-January/2020-01-02-s6-old.md")
         );
         assert!(
-            role_note(6)
+            role_note(&state, 6)
                 .starts_with("/tmp/demo-brain/Sessions/2020/01-January/2020-01-02-s6-old.md."),
             "{}",
-            role_note(6)
+            role_note(&state, 6)
         );
         m.shutdown_all();
     }
@@ -776,7 +791,9 @@ mod restore_tests {
     #[tokio::test]
     async fn a_fresh_start_fixes_the_session_note() {
         let ledger = Arc::new(Ledger::in_memory());
-        let mut m = manager(ledger.clone()).with_session_note("Sessions/{slot}-{label}.md".into());
+        let state = StateDir::new();
+        let mut m =
+            manager(ledger.clone(), &state).with_session_note("Sessions/{slot}-{label}.md".into());
         let sleep = Some(vec!["/bin/sleep".to_string(), "30".to_string()]);
         m.start(
             3,
@@ -817,10 +834,11 @@ mod restore_tests {
     #[test]
     fn corrupt_row_is_not_resumable() {
         let ledger = Arc::new(Ledger::in_memory());
+        let state = StateDir::new();
         // A command that reads back as empty, as a corrupt row does.
         ledger.record_start(&row(1, "abc", &[])).unwrap();
         ledger.record_start(&row(2, "def", &["claude"])).unwrap();
-        let mut m = manager(ledger.clone());
+        let mut m = manager(ledger.clone(), &state);
         m.restore();
         let slots = m.list();
         assert_eq!(slots[1].state, SlotState::Exited { code: None, at: 77 });
