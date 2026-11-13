@@ -575,6 +575,31 @@ pub fn plan_line(view: &CoordView) -> Option<String> {
     Some(format!("Plan {} waiting for you (p)", plan.id))
 }
 
+/// The coordinator panel's lines for the newest approved plan's outcome, so
+/// an approval made through ctl shows too: a header, then each failed step.
+pub fn outcome_lines(view: &CoordView) -> Vec<String> {
+    let Some(plan) = view.plans.iter().find(|p| p.state == PlanState::Approved) else {
+        return Vec::new();
+    };
+    let failed: Vec<&String> = plan
+        .outcome
+        .iter()
+        .filter(|l| l.contains(" failed: "))
+        .collect();
+    let steps = plan.outcome.len();
+    let mut out = vec![if failed.is_empty() {
+        format!("Plan {} approved: {steps} steps, none failed", plan.id)
+    } else {
+        format!(
+            "Plan {} approved: {steps} steps, {} failed",
+            plan.id,
+            failed.len()
+        )
+    }];
+    out.extend(failed.into_iter().cloned());
+    out
+}
+
 /// Arrow-key moves between cards.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dir {
@@ -808,6 +833,7 @@ impl OverseerApp {
         let strip = strip_lines(&self.locks, local_hhmm, 5);
         let (summary_title, summary_body) = summary_lines(&self.coord, local_hhmm);
         let plan_line = plan_line(&self.coord);
+        let outcome_lines = outcome_lines(&self.coord);
         let (strip_label, strip_tone) = strip_text(&self.brain);
         let show_list = self.brain_hover || self.brain_pinned;
         let s0 = self.render_card(0, now, cx);
@@ -933,6 +959,14 @@ impl OverseerApp {
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(colors::ORANGE))
                             .child(line)
+                    }))
+                    .children((!outcome_lines.is_empty()).then(|| {
+                        div()
+                            .flex()
+                            .flex_col()
+                            .text_xs()
+                            .text_color(rgb(colors::TEXT_DIM))
+                            .children(outcome_lines.into_iter().map(|l| div().child(l)))
                     }))
                     .child(div().flex().child(s0)),
             )
@@ -1863,6 +1897,32 @@ mod tests {
         assert_eq!(
             plan_line(&view).as_deref(),
             Some("Plan 7 waiting for you (p)")
+        );
+    }
+
+    #[test]
+    fn outcome_lines_show_the_newest_approved_plan() {
+        let mut view = crate::app::empty_coord();
+        assert!(outcome_lines(&view).is_empty());
+        let mut ok = crate::app::test_plan(8, overseer_proto::PlanState::Approved);
+        ok.outcome = vec!["S3: assigned DEMO-12".into(), "S3: started in /x".into()];
+        view.plans.push(ok);
+        assert_eq!(
+            outcome_lines(&view),
+            vec!["Plan 8 approved: 2 steps, none failed"]
+        );
+        let mut bad = crate::app::test_plan(9, overseer_proto::PlanState::Approved);
+        bad.outcome = vec![
+            "S3: assigned DEMO-12".into(),
+            "S4: worktree failed: no repo; the rest of S4's plan was skipped".into(),
+        ];
+        view.plans.insert(0, bad);
+        assert_eq!(
+            outcome_lines(&view),
+            vec![
+                "Plan 9 approved: 2 steps, 1 failed".to_string(),
+                "S4: worktree failed: no repo; the rest of S4's plan was skipped".to_string()
+            ]
         );
     }
 }

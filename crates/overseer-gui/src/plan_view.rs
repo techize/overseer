@@ -375,11 +375,9 @@ impl Editor {
     /// The daemon's answer to Approve (`approving`) or Reject.
     pub fn reply(&self, reply: Result<Response, String>, approving: bool) -> Reply {
         match reply {
-            Ok(Response::Text { text }) if approving => Reply::Done(
-                text.lines()
-                    .find(|l| !l.trim().is_empty())
-                    .map_or_else(|| format!("Plan {} approved", self.id), str::to_string),
-            ),
+            Ok(Response::Text { text }) if approving => {
+                Reply::Done(approval_status(self.id, &text))
+            }
             Ok(Response::Ok) | Ok(Response::Text { .. }) => Reply::Done(if approving {
                 format!("Plan {} approved", self.id)
             } else {
@@ -395,6 +393,21 @@ impl Editor {
             Ok(other) => Reply::Failed(format!("Unexpected reply: {other:?}")),
             Err(e) => Reply::Failed(e),
         }
+    }
+}
+
+/// The status line after an approval: the first failed step when there is
+/// one (with a count of the others), else the first outcome line.
+fn approval_status(id: i64, text: &str) -> String {
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let failed: Vec<&&str> = lines.iter().filter(|l| l.contains(" failed: ")).collect();
+    match (failed.first(), lines.first()) {
+        (Some(first), _) if failed.len() > 1 => {
+            format!("{first} (+{} more failed)", failed.len() - 1)
+        }
+        (Some(first), _) => (**first).to_string(),
+        (None, Some(first)) => (*first).to_string(),
+        (None, None) => format!("Plan {id} approved"),
     }
 }
 
@@ -1032,6 +1045,24 @@ mod tests {
             Reply::Failed("plan 4 is no longer pending".into())
         );
         assert!(matches!(e.reply(Err("lost".into()), true), Reply::Failed(m) if m == "lost"));
+    }
+
+    #[test]
+    fn approval_status_names_failures() {
+        let text = "S3: assigned DEMO-12\nS4: worktree failed: no repo; the rest of S4's plan was skipped\nS5: start failed: busy; the rest of S5's plan was skipped";
+        assert_eq!(
+            approval_status(4, text),
+            "S4: worktree failed: no repo; the rest of S4's plan was skipped (+1 more failed)"
+        );
+        let one = "S3: assigned DEMO-12\nS4: start failed: busy; the rest of S4's plan was skipped";
+        assert_eq!(
+            approval_status(4, one),
+            "S4: start failed: busy; the rest of S4's plan was skipped"
+        );
+        assert_eq!(
+            approval_status(4, "S3: assigned DEMO-12"),
+            "S3: assigned DEMO-12"
+        );
     }
 
     #[test]
