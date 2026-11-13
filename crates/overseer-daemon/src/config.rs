@@ -25,7 +25,9 @@ pub struct Config {
     pub journal_path: String,
     /// A session's note under `brain_dir`; also takes `{slot}` and `{label}`.
     pub session_note: String,
-    /// Outside the vault and never committed.
+    /// Each slot's section is written by Overseer only. Usually outside the
+    /// vault; where it is in the vault, or a symlink into it (R7), the
+    /// backup commits it like a free file.
     pub current_session: PathBuf,
     /// Minutes between timed backups; 0 turns the backup off.
     pub backup_mins: u64,
