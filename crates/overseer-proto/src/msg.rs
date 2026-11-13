@@ -597,6 +597,30 @@ impl CoordView {
         self.plans.iter().find(|p| p.state == PlanState::Pending)
     }
 
+    /// When the slot's current session started, or its last one for an
+    /// exited slot (the newest `started` state change before the exit;
+    /// `i64::MIN`, so everything counts, when that has left the timeline).
+    /// `None` for an empty slot, which has no session.
+    pub fn session_start(&self, info: &SlotInfo) -> Option<i64> {
+        match &info.state {
+            SlotState::Empty => None,
+            SlotState::Running { since, .. } => Some(*since),
+            SlotState::Resumable { at, .. } => Some(*at),
+            SlotState::Exited { at, .. } => Some(
+                self.reports_for(info.id)
+                    .find(|r| r.kind == ReportKind::State && r.text == "started" && r.at <= *at)
+                    .map_or(i64::MIN, |r| r.at),
+            ),
+        }
+    }
+
+    /// The slot's newest own report from its current (or last) session.
+    pub fn last_report(&self, info: &SlotInfo) -> Option<&Report> {
+        let start = self.session_start(info)?;
+        self.reports_for(info.id)
+            .find(|r| r.kind == ReportKind::Report && r.at >= start)
+    }
+
     /// The reports and state changes of one slot, newest first.
     pub fn reports_for(&self, slot: SlotId) -> impl Iterator<Item = &Report> {
         let mut rows: Vec<&Report> = self.reports.iter().filter(|r| r.slot == slot).collect();
@@ -852,6 +876,66 @@ mod tests {
         let ids: Vec<i64> = c.reports_for(3).map(|r| r.id).collect();
         assert_eq!(ids, vec![3, 1]);
         assert_eq!(c.reports_for(6).count(), 0);
+    }
+
+    #[test]
+    fn session_start_and_last_report_belong_to_the_current_session() {
+        let row = |id, at, kind, text: &str| Report {
+            id,
+            at,
+            slot: 3,
+            kind,
+            text: text.into(),
+        };
+        let mut c = coord();
+        c.reports = vec![
+            row(1, 10, ReportKind::State, "started"),
+            row(2, 20, ReportKind::Report, "old session report"),
+            row(3, 30, ReportKind::State, "exited"),
+            row(4, 40, ReportKind::State, "started"),
+            row(5, 50, ReportKind::State, "exited"),
+        ];
+        let info = |state| SlotInfo {
+            id: 3,
+            label: String::new(),
+            cwd: None,
+            command: None,
+            state,
+            cols: 80,
+            rows: 24,
+            activity: None,
+            session_note: None,
+        };
+        let running = info(SlotState::Running { pid: 1, since: 40 });
+        assert_eq!(c.session_start(&running), Some(40));
+        assert_eq!(c.last_report(&running), None);
+        let resumable = info(SlotState::Resumable {
+            session_id: "s".into(),
+            at: 40,
+        });
+        assert_eq!(c.session_start(&resumable), Some(40));
+        // An exited session started at its newest `started` row before the exit.
+        let exited = info(SlotState::Exited { code: None, at: 50 });
+        assert_eq!(c.session_start(&exited), Some(40));
+        assert_eq!(c.last_report(&exited), None);
+        let first_exit = info(SlotState::Exited { code: None, at: 30 });
+        assert_eq!(c.session_start(&first_exit), Some(10));
+        assert_eq!(
+            c.last_report(&first_exit).map(|r| r.text.as_str()),
+            Some("old session report")
+        );
+        // No `started` row left on the timeline: every report counts.
+        c.reports.retain(|r| r.text != "started");
+        assert_eq!(c.session_start(&exited), Some(i64::MIN));
+        assert_eq!(c.last_report(&exited).map(|r| r.id), Some(2));
+        // No session at all.
+        let empty = info(SlotState::Empty);
+        assert_eq!(c.session_start(&empty), None);
+        assert_eq!(c.last_report(&empty), None);
+        // A report in the current session is the last report.
+        c.reports
+            .push(row(6, 45, ReportKind::Report, "new session report"));
+        assert_eq!(c.last_report(&running).map(|r| r.id), Some(6));
     }
 
     #[test]

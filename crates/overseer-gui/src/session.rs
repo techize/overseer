@@ -289,12 +289,28 @@ fn sender_name(s: Sender) -> String {
 /// delivered, else creation time, ties by id): `14:05 from S0: <text>`,
 /// `14:06 to S0: <text>`. A pending one ends `(pending: <reason>)`, a
 /// dropped one `(for S3, dropped: session ended)`.
-pub fn relay_rows(view: &LockView, slot: SlotId, clock: impl Fn(i64) -> String) -> Vec<String> {
+///
+/// Only the current session's relays are listed: those it received or sent
+/// since `start` (`CoordView::session_start`), and any still pending. With
+/// no session (`None`) only pending ones are.
+pub fn relay_rows(
+    view: &LockView,
+    slot: SlotId,
+    start: Option<i64>,
+    clock: impl Fn(i64) -> String,
+) -> Vec<String> {
     let when = |r: &overseer_proto::Relay| r.delivered_at.or(r.dropped_at).unwrap_or(r.at);
+    let current = |r: &overseer_proto::Relay| {
+        // A relay this slot sent belongs to the session that sent it; one
+        // it received to the session it reached.
+        let at = if r.to == slot { when(r) } else { r.at };
+        r.state == RelayState::Pending || start.is_some_and(|s| at >= s)
+    };
     let mut relays: Vec<_> = view
         .relays
         .iter()
         .filter(|r| r.to == slot || r.from == (Sender::Slot { slot }))
+        .filter(|r| current(r))
         .collect();
     relays.sort_by_key(|r| std::cmp::Reverse((when(r), r.id)));
     relays
@@ -609,7 +625,9 @@ fn button(
 }
 
 fn panel_box(title: &'static str) -> gpui::Div {
+    // Kept at its full height: the panel scrolls instead of squeezing boxes.
     div()
+        .flex_none()
         .flex()
         .flex_col()
         .gap_1()
@@ -757,9 +775,13 @@ impl OverseerApp {
             Some(_) => self.entry_focus.clone(),
             None => self.session_focus.clone(),
         };
+        // Scrolls as a whole, so a long Relays box does not hide Progress.
         div()
+            .id(("session-panel", usize::from(id)))
             .flex_1()
             .min_w(px(0.))
+            .min_h(px(0.))
+            .overflow_y_scroll()
             .flex()
             .flex_col()
             .gap_2()
@@ -1107,7 +1129,8 @@ impl OverseerApp {
     }
 
     fn render_relays(&self, id: SlotId, cx: &mut Context<Self>) -> impl IntoElement {
-        let rows: Vec<_> = relay_rows(&self.locks, id, local_hhmm)
+        let start = self.coord.session_start(&self.slots[id as usize]);
+        let rows: Vec<_> = relay_rows(&self.locks, id, start, local_hhmm)
             .into_iter()
             .take(RELAY_ROWS)
             .map(|line| div().text_sm().truncate().child(line))
@@ -1791,7 +1814,7 @@ mod tests {
             ),
         ];
         assert_eq!(
-            relay_rows(&v, 2, clock),
+            relay_rows(&v, 2, Some(0), clock),
             vec![
                 "T108 from Overseer: moved (pending)".to_string(),
                 "T107 from you: line one line two (pending: session is working)".to_string(),
@@ -1818,11 +1841,57 @@ mod tests {
         ];
         let clock = |t: i64| format!("T{t}");
         assert_eq!(
-            relay_rows(&v, 2, clock),
+            relay_rows(&v, 2, Some(0), clock),
             vec![
                 "T120 from S0: status? (for S2, dropped: session ended)".to_string(),
                 "T110 to S0: on it (for S0, dropped: session ended)".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn relay_rows_keep_to_the_current_session() {
+        let mut v = locks();
+        v.relays = vec![
+            // Delivered to the session before this one.
+            relay(1, Sender::You, 2, 100, Some(101), None, "old news"),
+            // Sent by the session before this one, delivered later.
+            relay(
+                2,
+                Sender::Slot { slot: 2 },
+                0,
+                102,
+                Some(210),
+                None,
+                "old reply",
+            ),
+            // Queued before this session, delivered to it.
+            relay(3, Sender::You, 2, 150, Some(201), None, "welcome"),
+            relay(
+                4,
+                Sender::Slot { slot: 2 },
+                0,
+                205,
+                Some(206),
+                None,
+                "on it",
+            ),
+            // Still waiting: always shown.
+            relay(5, Sender::Overseer, 2, 90, None, None, "queued"),
+        ];
+        let clock = |t: i64| format!("T{t}");
+        assert_eq!(
+            relay_rows(&v, 2, Some(200), clock),
+            vec![
+                "T206 to S0: on it".to_string(),
+                "T201 from you: welcome".to_string(),
+                "T90 from Overseer: queued (pending)".to_string(),
+            ]
+        );
+        // No session: only what is waiting.
+        assert_eq!(
+            relay_rows(&v, 2, None, clock),
+            vec!["T90 from Overseer: queued (pending)".to_string()]
         );
     }
 
