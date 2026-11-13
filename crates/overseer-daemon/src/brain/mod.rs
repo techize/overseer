@@ -187,6 +187,9 @@ struct Runtime {
     /// the backup tick may try it again (Ruling 8).
     sync_held: bool,
     push_problem: Option<String>,
+    /// `push_problem` was raised for unmerged paths found before a commit,
+    /// not by a push, so it clears once they are resolved.
+    conflict_problem: bool,
     /// The queue waits until then after `index.lock` was held.
     retry_at: Option<Instant>,
     next_backup: Option<Instant>,
@@ -751,9 +754,29 @@ impl BrainService {
                 return;
             }
         };
+        // A conflicted file holds conflict markers: never backed up (C1).
+        let unmerged = match self.git.unmerged(&g).await {
+            Ok(u) => u,
+            Err(e) => {
+                let _ = self.ledger.set_brain_run(
+                    "backup",
+                    now,
+                    false,
+                    &format!("cannot list unmerged paths: {e}"),
+                );
+                drop(g);
+                self.announce();
+                return;
+            }
+        };
+        self.note_unmerged(&unmerged);
         let mut keep: Vec<String> = Vec::new();
         for rel in changed {
-            if !keep.contains(&rel) && !queued.contains(&rel) && self.backup_takes(&rel, &ctx) {
+            if !keep.contains(&rel)
+                && !queued.contains(&rel)
+                && !unmerged.contains(&rel)
+                && self.backup_takes(&rel, &ctx)
+            {
                 keep.push(rel);
             }
         }
@@ -991,6 +1014,30 @@ impl BrainService {
 
     /// Commits one entry and pushes; records and answers the outcome.
     async fn attempt(&self, g: &VaultGuard<'_>, e: &QueueEntry) -> QueueState {
+        // Unmerged paths hold conflict markers. While any exist the queue
+        // waits (C1); a backup only leaves them out, since it picks its
+        // paths again each time.
+        let unmerged = match self.git.unmerged(g).await {
+            Ok(u) => u,
+            Err(err) => {
+                let msg = format!("held: cannot list unmerged paths: {err}");
+                return self.hold_queued(e.id, &msg);
+            }
+        };
+        self.note_unmerged(&unmerged);
+        let mut e = e.clone();
+        if is_backup(&e) {
+            let ctx = self.context();
+            e.paths
+                .retain(|p| !unmerged.contains(p) && self.backup_takes(p, &ctx));
+        } else if !unmerged.is_empty() {
+            let msg = format!(
+                "held: 2ndBrain has unresolved conflicts in {}; committed once they are resolved",
+                list_paths(&unmerged)
+            );
+            return self.hold_queued(e.id, &msg);
+        }
+        let e = &e;
         let attempts = match self.ledger.queue_begin(e.id) {
             Ok(n) => n,
             Err(err) => {
@@ -1059,18 +1106,62 @@ impl BrainService {
                 e.id,
                 &format!("index.lock still held after {attempts} attempts"),
             ),
-            Err(err) => {
-                let mut msg = err.to_string();
-                if let Ok(out) = self.git.run(g, &["ls-files", "-u"]).await {
-                    if !out.trim().is_empty() {
-                        msg.push_str(
-                            " (2ndBrain has unresolved conflicts; Jonathan must resolve them first)",
-                        );
-                    }
+            Err(err) => self.fail(e.id, &err.to_string()),
+        }
+    }
+
+    /// Leaves an entry queued with `msg` as its reason and tries again
+    /// after `retry`. Not an attempt.
+    fn hold_queued(&self, id: i64, msg: &str) -> QueueState {
+        self.rt().retry_at = Some(Instant::now() + self.opts.retry);
+        if !self.record(id, QueueState::Queued, None, None, Some(msg)) {
+            return QueueState::Queued;
+        }
+        self.announce();
+        self.reply(
+            id,
+            Response::Queued {
+                message: msg.to_string(),
+            },
+        );
+        QueueState::Queued
+    }
+
+    /// Keeps `push_problem` set while unmerged paths exist, and clears the
+    /// one this raised once they are gone.
+    fn note_unmerged(&self, unmerged: &[String]) {
+        let text = {
+            let mut rt = self.rt();
+            if unmerged.is_empty() {
+                if !std::mem::take(&mut rt.conflict_problem) {
+                    return;
                 }
-                self.fail(e.id, &msg)
+                rt.push_problem = None;
+                None
+            } else {
+                if rt.push_problem.is_some() {
+                    return;
+                }
+                let text = format!(
+                    "2ndBrain push needs you: unresolved conflicts in {}. Resolve them in 2ndBrain (git status); Overseer holds its commits, backup and sync of them until then.",
+                    list_paths(unmerged)
+                );
+                rt.push_problem = Some(text.clone());
+                rt.conflict_problem = true;
+                Some(text)
+            }
+        };
+        let now = unix_now();
+        match text {
+            Some(t) => {
+                tracing::warn!("{t}");
+                let _ = self.ledger.set_brain_run("push", now, false, &t);
+            }
+            None => {
+                let _ = self.ledger.set_brain_run("push", now, true, "");
             }
         }
+        self.announce();
     }
 
     /// Writes an entry's state. On failure the entry is held: the queue
@@ -1132,6 +1223,20 @@ impl BrainService {
         if !self.cfg.push {
             return;
         }
+        // A pull would stop on the unmerged index; wait for Jonathan.
+        match self.git.unmerged(g).await {
+            Ok(u) if !u.is_empty() => {
+                self.note_unmerged(&u);
+                if let Some(id) = id {
+                    let head = self.git.run(g, &["rev-parse", "HEAD"]).await.ok();
+                    let line = format!("held: unresolved conflicts in {}", list_paths(&u));
+                    self.note_push(id, head.as_deref().map(str::trim), false, Some(&line));
+                }
+                self.announce();
+                return;
+            }
+            _ => {}
+        }
         let result = self.git.push(g).await;
         let head = self
             .git
@@ -1148,7 +1253,11 @@ impl BrainService {
                 for e in self.ledger.queue_unpushed().unwrap_or_default() {
                     self.note_push(e.id, e.commit.as_deref(), true, None);
                 }
-                let had = self.rt().push_problem.take().is_some();
+                let had = {
+                    let mut rt = self.rt();
+                    rt.conflict_problem = false;
+                    rt.push_problem.take().is_some()
+                };
                 if had || id.is_none() {
                     let _ = self.ledger.set_brain_run("push", now, true, "");
                 }
@@ -1160,7 +1269,7 @@ impl BrainService {
                 };
                 let text = match &err {
                     GitError::Conflict(m) if m.contains("stash") => format!(
-                        "2ndBrain push needs you: {m}. Resolve the conflicted files in 2ndBrain (git status), then drop that stash; commits fail until then."
+                        "2ndBrain push needs you: {m}. Resolve the conflicted files in 2ndBrain (git status), then drop that stash (git stash list --format='%gd %H' shows its stash@{{n}}); Overseer holds its commits, backup and sync until then."
                     ),
                     GitError::Conflict(m) => format!("2ndBrain push needs you: {m}"),
                     _ => format!(
@@ -1172,7 +1281,9 @@ impl BrainService {
                     self.note_push(id, head.as_deref(), false, Some(&line));
                 }
                 let _ = self.ledger.set_brain_run("push", now, false, &text);
-                self.rt().push_problem = Some(text);
+                let mut rt = self.rt();
+                rt.push_problem = Some(text);
+                rt.conflict_problem = false;
             }
         }
         self.announce();
@@ -1224,6 +1335,25 @@ impl BrainService {
                 return;
             }
         };
+        // The sync script commits what it finds, conflict markers too (C1).
+        match self.git.unmerged(&g).await {
+            Ok(u) if u.is_empty() => {}
+            r => {
+                let detail = match r {
+                    Ok(u) => {
+                        self.note_unmerged(&u);
+                        format!("held: unresolved conflicts in {}", list_paths(&u))
+                    }
+                    Err(e) => format!("held: cannot list unmerged paths: {e}"),
+                };
+                tracing::warn!("2ndBrain sync {detail}");
+                let _ = self
+                    .ledger
+                    .set_brain_run("sync", unix_now(), false, &detail);
+                self.rt().sync_held = true;
+                return;
+            }
+        }
         let pctx = self.path_ctx(&ctx.owners, None);
         let held = changed.iter().any(|rel| {
             matches!(classify(Path::new(rel), &pctx),
@@ -1244,6 +1374,20 @@ impl BrainService {
         let mut rt = self.rt();
         rt.sync_pending = false;
         rt.sync_held = false;
+    }
+}
+
+/// The timed backup's own entries are the only ones Overseer sends.
+fn is_backup(e: &QueueEntry) -> bool {
+    e.from == Sender::Overseer
+}
+
+/// `a.md, b.md` and, past three, `(+2 more)`.
+fn list_paths(paths: &[String]) -> String {
+    let shown = paths.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+    match paths.len() {
+        n if n > 3 => format!("{shown} (+{} more)", n - 3),
+        _ => shown,
     }
 }
 

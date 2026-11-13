@@ -853,6 +853,143 @@ async fn push_conflict_keeps_the_commit_and_tells_jonathan() {
     );
 }
 
+/// Every commit reachable from `rev` whose patch adds a conflict marker.
+fn commits_with_markers(dir: &Path, rev: &str) -> Vec<String> {
+    let log = sh(dir, &["log", "-p", "--format=commit %s", rev]);
+    let mut subject = String::new();
+    let mut hits = Vec::new();
+    for line in log.lines() {
+        if let Some(s) = line.strip_prefix("commit ") {
+            subject = s.to_string();
+        } else if (line.starts_with("+<<<<<<<") || line.starts_with("+>>>>>>>"))
+            && !hits.contains(&subject)
+        {
+            hits.push(subject.clone());
+        }
+    }
+    hits
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn autostash_conflict_holds_commits_backup_and_sync() {
+    let v = Vault::new("autostash");
+    sh(&v.base, &["clone", v.remote.to_str().unwrap(), "other"]);
+    let other = v.base.join("other");
+    sh(&other, &["config", "user.name", "Other"]);
+    sh(&other, &["config", "user.email", "other@example.com"]);
+    write(&other.join("README.md"), "theirs\n");
+    sh(&other, &["commit", "-am", "theirs"]);
+    sh(&other, &["push"]);
+    let ledger = Arc::new(Ledger::in_memory());
+    let svc = v.service(ledger.clone(), v.options());
+    shared_context(&svc, BrainContext::default());
+
+    // Jonathan's own unsaved edit is stashed by the pull and does not re-apply.
+    write(&v.vault.join("README.md"), "ours, not committed\n");
+    write(&v.vault.join("free.md"), "x\n");
+    let r = svc
+        .commit(
+            Sender::You,
+            vec!["free.md".into()],
+            "free".into(),
+            &Owners::default(),
+        )
+        .await;
+    assert!(text(&r).contains("committed"), "{r:?}");
+    until("the push problem", || svc.view().push_problem.is_some()).await;
+    let problem = svc.view().push_problem.unwrap();
+    assert!(problem.contains("safe in stash "), "{problem}");
+    assert!(!problem.contains("stash@{0}"), "named by hash: {problem}");
+    assert!(sh(&v.vault, &["ls-files", "-u"]).contains("README.md"));
+    let readme = std::fs::read_to_string(v.vault.join("README.md")).unwrap();
+    assert!(readme.contains("<<<<<<<"), "{readme}");
+
+    // The sync after the drain is held, not run.
+    until("the held sync record", || {
+        ledger.brain_run("sync").unwrap().is_some()
+    })
+    .await;
+    let (_, ok, detail) = ledger.brain_run("sync").unwrap().unwrap();
+    assert!(!ok, "{detail}");
+    assert!(detail.contains("README.md"), "{detail}");
+    assert!(v.log("sync.log").is_empty(), "{:?}", v.log("sync.log"));
+
+    // A session's append is held in the queue, not failed.
+    let svc2 = svc.clone();
+    let append = tokio::spawn(async move {
+        svc2.append_journal(Sender::Slot { slot: 2 }, "Work Log", "- held")
+            .await
+    });
+    let r = append.await.unwrap();
+    match &r {
+        Response::Queued { message } => {
+            assert!(
+                message.contains("unresolved conflicts in README.md"),
+                "{message}"
+            )
+        }
+        other => panic!("{other:?}"),
+    }
+    let journal = svc.view().entries[0].clone();
+    assert_eq!(journal.state, QueueState::Queued);
+
+    // The backup takes the other changed paths and leaves the conflicted one.
+    write(&v.vault.join("free2.md"), "y\n");
+    svc.backup_now().await;
+    let files = sh(&v.vault, &["show", "--name-only", "--format=", "HEAD"]);
+    assert_eq!(files.trim(), "free2.md");
+    assert!(sh(&v.vault, &["ls-files", "-u"]).contains("README.md"));
+    assert!(svc.view().push_problem.is_some());
+    assert_eq!(commits_with_markers(&v.vault, "HEAD"), Vec::<String>::new());
+    assert_eq!(
+        commits_with_markers(&v.remote, "main"),
+        Vec::<String>::new()
+    );
+    sleep(DRAIN * 3).await;
+    assert!(v.log("sync.log").is_empty(), "{:?}", v.log("sync.log"));
+    assert_eq!(
+        svc.view()
+            .entries
+            .iter()
+            .find(|e| e.id == journal.id)
+            .unwrap()
+            .state,
+        QueueState::Queued
+    );
+
+    // Once Jonathan resolves it, the held entry commits and everything pushes.
+    let stash = problem
+        .split("safe in stash ")
+        .nth(1)
+        .unwrap()
+        .split(|c: char| !c.is_ascii_hexdigit())
+        .next()
+        .unwrap()
+        .to_string();
+    assert_eq!(stash.len(), 40, "{problem}");
+    write(&v.vault.join("README.md"), "theirs and ours\n");
+    sh(&v.vault, &["add", "README.md"]);
+    let list = sh(&v.vault, &["stash", "list", "--format=%gd %H"]);
+    let entry = list
+        .lines()
+        .find_map(|l| l.strip_suffix(&format!(" {stash}")))
+        .unwrap_or_else(|| panic!("{list}"))
+        .to_string();
+    sh(&v.vault, &["stash", "drop", &entry]);
+    until("the held entry", || {
+        svc.view()
+            .entries
+            .iter()
+            .any(|e| e.id == journal.id && e.state == QueueState::Committed)
+    })
+    .await;
+    until("the push", || svc.view().push_problem.is_none()).await;
+    assert_eq!(
+        commits_with_markers(&v.remote, "main"),
+        Vec::<String>::new()
+    );
+}
+
 /// A trigger on the file ledger that makes one kind of queue write fail,
 /// as a full disk or a locked database would.
 fn break_ledger(db: &Path, name: &str, when: &str) -> rusqlite::Connection {

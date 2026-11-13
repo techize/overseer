@@ -291,15 +291,18 @@ impl VaultGit {
             }
             return Err(GitError::Failed(msg));
         }
-        // The autostash can fail to re-apply while git still exits 0.
-        let unmerged = self.exec(&["ls-files", "-u"]).await?;
+        // The autostash can fail to re-apply while git still exits 0. The
+        // stash stack is shared, so the stash is named by its hash.
+        let unmerged = self.unmerged_inner().await?;
         let said = format!("{}{}", pull.stdout, pull.stderr);
-        if !unmerged.stdout.trim().is_empty()
-            || said.contains("Applying autostash resulted in conflicts")
-        {
-            return Err(GitError::Conflict(
-                "autostash did not re-apply; your changes are safe in stash@{0}".to_string(),
-            ));
+        if !unmerged.is_empty() || said.contains("Applying autostash resulted in conflicts") {
+            let stash = match self.autostash_sha(&said).await {
+                Some(sha) => format!("stash {sha}"),
+                None => "the stash (git stash list)".to_string(),
+            };
+            return Err(GitError::Conflict(format!(
+                "autostash did not re-apply; your changes are safe in {stash}"
+            )));
         }
         let second = self.exec(&["push"]).await?;
         if second.ok {
@@ -307,6 +310,58 @@ impl VaultGit {
         } else {
             Err(GitError::Failed(first_line(&second.stderr)))
         }
+    }
+
+    /// The full hash of the stash `pull --autostash` left behind: from its
+    /// `Created autostash: <sha>` line, else the newest stash entry git
+    /// stored as `autostash`.
+    async fn autostash_sha(&self, said: &str) -> Option<String> {
+        let short = said
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("Created autostash: "))
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_hexdigit()));
+        if let Some(short) = short {
+            let spec = format!("{short}^{{commit}}");
+            if let Ok(full) = self
+                .run_inner(&["rev-parse", "-q", "--verify", &spec])
+                .await
+            {
+                let full = full.trim();
+                if !full.is_empty() {
+                    return Some(full.to_string());
+                }
+            }
+        }
+        let list = self
+            .run_inner(&["log", "-g", "--format=%H %gs", "refs/stash", "--"])
+            .await
+            .ok()?;
+        list.lines().find_map(|l| {
+            let (sha, subject) = l.split_once(' ')?;
+            (subject.trim() == "autostash").then(|| sha.to_string())
+        })
+    }
+
+    /// Paths with unmerged index entries (`git ls-files -u -z`), each once.
+    /// While any exist, nothing the daemon commits may include them: a
+    /// conflicted file holds conflict markers.
+    pub async fn unmerged(&self, _g: &VaultGuard<'_>) -> Result<Vec<String>, GitError> {
+        self.unmerged_inner().await
+    }
+
+    async fn unmerged_inner(&self) -> Result<Vec<String>, GitError> {
+        let out = self.run_inner(&["ls-files", "-u", "-z"]).await?;
+        let mut paths: Vec<String> = Vec::new();
+        for entry in out.split('\0').filter(|s| !s.is_empty()) {
+            // `<mode> <sha> <stage>\t<path>`
+            if let Some((_, path)) = entry.split_once('\t') {
+                if !paths.iter().any(|p| p == path) {
+                    paths.push(path.to_string());
+                }
+            }
+        }
+        Ok(paths)
     }
 
     /// Every path `git status` reports as changed; renames list both paths.
@@ -611,12 +666,21 @@ mod tests {
             .await
             .unwrap();
         let err = v.git.push(&g).await.unwrap_err();
-        match err {
-            GitError::Conflict(m) => assert!(m.contains("stash"), "{m}"),
+        match &err {
+            GitError::Conflict(m) => assert!(m.contains("safe in stash "), "{m}"),
             e => panic!("{e:?}"),
         }
-        let stash = sh(&v.vault, &["stash", "show", "-p", "stash@{0}"]);
+        let sha = match &err {
+            GitError::Conflict(m) => m.rsplit(' ').next().unwrap().to_string(),
+            _ => unreachable!(),
+        };
+        assert_eq!(sha.len(), 40, "named by its full hash: {err:?}");
+        let stash = sh(&v.vault, &["stash", "show", "-p", &sha]);
         assert!(stash.contains("mine"), "{stash}");
+        assert_eq!(
+            v.git.unmerged(&g).await.unwrap(),
+            vec!["jonathan.md".to_string()]
+        );
         let remote = sh(&v.remote, &["log", "--format=%s", "main"]);
         assert!(!remote.contains("S1: a"));
     }
