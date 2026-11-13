@@ -32,10 +32,10 @@ fn tools() -> Value {
                 "type": "object",
                 "properties": {
                     "target": {"type": "string", "description": "The target key, for example repo:demo-api:main."},
-                    "reason": {"type": "string", "description": "What you are going to do with it."},
+                    "reason": {"type": "string", "description": "What you are going to do with it. Optional, but it tells Jonathan and other sessions why you hold it."},
                     "item": {"type": "string", "description": "The work item the claim is for, for example DEMO-33 or ov-3."}
                 },
-                "required": ["target", "reason"]
+                "required": ["target"]
             }
         },
         {
@@ -118,8 +118,8 @@ fn tool_request(name: &str, args: &Value, slot: Option<SlotId>) -> Result<ToolPl
         "claim_target" => ToolPlan::Send(Request::ClaimTarget {
             slot: own,
             target: str_arg(args, "target")?.to_owned(),
-            // The schema requires it; read it as a string either way.
-            reason: Some(str_arg(args, "reason")?.to_owned()),
+            // Optional, as for `ctl claim` and the GUI.
+            reason: opt_str_arg(args, "reason")?,
             item: opt_str_arg(args, "item")?,
         }),
         "release_target" => ToolPlan::Send(Request::ReleaseTarget {
@@ -383,7 +383,7 @@ mod tests {
         for msg in [
             tool("claim_target", json!({"reason": "push"})),
             tool("claim_target", json!({"target": 5, "reason": "push"})),
-            tool("claim_target", json!({"target": "a"})),
+            tool("claim_target", json!({"target": "a", "reason": 5})),
             tool("release_target", json!({})),
             tool("notify_session", json!({"slot": "main", "text": "hi"})),
             tool("notify_session", json!({"slot": 1.5, "text": "hi"})),
@@ -424,6 +424,22 @@ mod tests {
             }]
         );
         assert_eq!(text_of(&out.unwrap()), ("Queued behind S1.", false));
+    }
+
+    #[test]
+    fn claim_without_a_reason_is_sent_without_one() {
+        let msg = tool("claim_target", json!({"target": "custom:demo-lane"}));
+        let (out, seen) = call_with(&msg, Some(3), Ok(Response::Ok));
+        assert_eq!(
+            seen,
+            [Request::ClaimTarget {
+                slot: 3,
+                target: "custom:demo-lane".into(),
+                reason: None,
+                item: None,
+            }]
+        );
+        assert!(out.unwrap().get("error").is_none());
     }
 
     #[test]
