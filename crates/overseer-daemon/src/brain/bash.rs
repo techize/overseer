@@ -22,11 +22,25 @@ pub enum BdCall {
     Compound,
 }
 
-/// `bd` subcommands that write (Ruling 10); `comments` writes only as
-/// `comments add`.
-const BD_WRITES: [&str; 11] = [
-    "create", "update", "close", "reopen", "dep", "label", "comment", "delete", "sync", "edit",
+/// `bd` subcommands that write (Ruling 10, with the review's additions);
+/// `comments` writes only as `comments add`, `config` only as `config set`.
+const BD_WRITES: [&str; 16] = [
+    "create",
+    "update",
+    "close",
+    "reopen",
+    "dep",
+    "label",
+    "comment",
+    "delete",
+    "sync",
+    "edit",
     "assign",
+    "import",
+    "compact",
+    "rename-prefix",
+    "init",
+    "migrate",
 ];
 
 /// `bd` global flags that take a value.
@@ -562,7 +576,8 @@ pub fn bd_call(command: &str) -> BdCall {
         }
         let Some(sub) = args.get(i) else { continue };
         let is_write = BD_WRITES.contains(&sub.as_str())
-            || (sub == "comments" && args.get(i + 1).is_some_and(|a| a == "add"));
+            || (sub == "comments" && args.get(i + 1).is_some_and(|a| a == "add"))
+            || (sub == "config" && args.get(i + 1).is_some_and(|a| a == "set"));
         if is_write && write.is_none() {
             write = Some(args.to_vec());
         }
@@ -846,6 +861,18 @@ mod tests {
         assert_eq!(bd_call("bd close ov-3 && git push"), BdCall::Compound);
         assert_eq!(bd_call("cd x; bd sync"), BdCall::Compound);
         assert_eq!(bd_call("echo bd update"), BdCall::None);
+        for w in [
+            "bd import -i issues.jsonl",
+            "bd compact --all",
+            "bd rename-prefix demo-",
+            "bd init",
+            "bd migrate",
+            "bd config set sync.branch main",
+        ] {
+            assert!(matches!(bd_call(w), BdCall::Write(_)), "{w}");
+        }
+        assert_eq!(bd_call("bd config get sync.branch"), BdCall::Read);
+        assert_eq!(bd_call("bd config list"), BdCall::Read);
     }
 
     #[test]
