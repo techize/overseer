@@ -651,8 +651,8 @@ impl BrainService {
     /// Runs `bd_command` with `args` in `beads_dir`, under the vault lock
     /// when the beads live in the vault, then queues a `bd sync` for the
     /// next drain (Ruling 10).
-    pub async fn run_bd(&self, args: Vec<String>) -> Response {
-        let out = self.bd(&args).await;
+    pub async fn run_bd(&self, args: Vec<String>, stdin: Option<String>) -> Response {
+        let out = self.bd(&args, stdin).await;
         let now = unix_now();
         let shown = format!("bd {}", args.join(" "));
         let resp = match out {
@@ -691,7 +691,7 @@ impl BrainService {
         canon(&self.cfg.beads).starts_with(canon(&self.cfg.brain))
     }
 
-    async fn bd(&self, args: &[String]) -> Result<RunOut, String> {
+    async fn bd(&self, args: &[String], stdin: Option<String>) -> Result<RunOut, String> {
         let Some((program, base)) = self.cfg.bd_command.split_first() else {
             return Err("bd_command is empty".into());
         };
@@ -702,7 +702,14 @@ impl BrainService {
         } else {
             None
         };
-        run_program(Path::new(program), &argv, &self.cfg.beads, BD_TIMEOUT).await
+        run_program(
+            Path::new(program),
+            &argv,
+            &self.cfg.beads,
+            BD_TIMEOUT,
+            stdin,
+        )
+        .await
     }
 
     /// Commits whatever is changed and free, or owned only by slots that
@@ -1178,7 +1185,7 @@ impl BrainService {
             (std::mem::take(&mut rt.bd_sync_pending), rt.sync_pending)
         };
         if bd_sync {
-            let r = self.bd(&["sync".to_string()]).await;
+            let r = self.bd(&["sync".to_string()], None).await;
             let (ok, detail) = match r {
                 Ok(o) => (o.code == 0, last_line(&o.stdout, &o.stderr)),
                 Err(e) => (false, e),
@@ -1225,7 +1232,7 @@ impl BrainService {
             self.rt().sync_held = true;
             return;
         }
-        let r = run_program(&program, args, &self.cfg.brain, SYNC_TIMEOUT).await;
+        let r = run_program(&program, args, &self.cfg.brain, SYNC_TIMEOUT, None).await;
         drop(g);
         let (ok, detail) = match r {
             Ok(o) => (o.code == 0, last_line(&o.stdout, &o.stderr)),
@@ -1270,15 +1277,33 @@ async fn run_program(
     args: &[String],
     cwd: &Path,
     limit: Duration,
+    stdin: Option<String>,
 ) -> Result<RunOut, String> {
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(args)
         .current_dir(cwd)
         .env("OVERSEER_COMMIT", "1")
-        .stdin(Stdio::null())
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
     let name = program.display();
-    match tokio::time::timeout(limit, cmd.output()).await {
+    let run = async {
+        let mut child = cmd.spawn()?;
+        if let (Some(text), Some(mut pipe)) = (stdin, child.stdin.take()) {
+            use tokio::io::AsyncWriteExt;
+            // A child that exits without reading closes the pipe early;
+            // that is its answer, not an error here. Dropping `pipe` is
+            // the EOF bd waits for.
+            let _ = pipe.write_all(text.as_bytes()).await;
+        }
+        child.wait_with_output().await
+    };
+    match tokio::time::timeout(limit, run).await {
         Ok(Ok(o)) => Ok(RunOut {
             code: o.status.code().unwrap_or(-1),
             stdout: String::from_utf8_lossy(&o.stdout).into_owned(),

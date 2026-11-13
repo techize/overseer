@@ -10,8 +10,8 @@ use anyhow::{bail, Context};
 use clap::Subcommand;
 use overseer_proto::paths::{log_dir, socket_path};
 use overseer_proto::{
-    slot_name, ClaimKind, Client, ItemKind, LockView, RelayState, Request, Response, SlotId,
-    SlotInfo, SlotState, WorkItem, WorkView,
+    slot_name, BrainView, ClaimKind, Client, ItemKind, LockView, QueueState, RelayState, Request,
+    Response, SlotId, SlotInfo, SlotState, WorkItem, WorkView,
 };
 
 #[derive(Subcommand)]
@@ -87,6 +87,41 @@ pub enum CtlCmd {
     Refresh,
     /// Print the kickoff text for a slot's assigned items.
     Kickoff { n: SlotId },
+    /// Commit and push files in the 2ndBrain through the daemon's queue.
+    /// Paths are relative to the vault or absolute.
+    Commit {
+        #[arg(short, long)]
+        message: String,
+        #[arg(required = true)]
+        paths: Vec<String>,
+    },
+    /// Add text to a section of today's journal. `-` reads the text from stdin.
+    Journal {
+        section: String,
+        #[arg(allow_hyphen_values = true)]
+        text: String,
+    },
+    /// Set a slot's section of CURRENT_SESSION.md. `-` reads the text from
+    /// stdin. The slot is `--slot`, else `$OVERSEER_SLOT`.
+    CurrentSession {
+        #[arg(long)]
+        slot: Option<String>,
+        #[arg(allow_hyphen_values = true)]
+        text: String,
+    },
+    /// Run a bd write under the 2ndBrain lock: `ctl bd -- update ov-3 ...`.
+    /// Prints bd's output and exits with its code. Stdin, when it is not a
+    /// terminal, is passed to bd.
+    Bd {
+        #[arg(last = true, allow_hyphen_values = true, required = true)]
+        args: Vec<String>,
+    },
+    /// The 2ndBrain writer: commit queue, last backup and sync, push trouble.
+    Brain {
+        /// Print the raw BrainView as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Stop the daemon and every session.
     Shutdown,
 }
@@ -314,6 +349,82 @@ fn print_text_or_queued(resp: Response) -> anyhow::Result<()> {
     }
 }
 
+/// `$OVERSEER_SLOT`, when it names a slot: who a 2ndBrain write is from.
+fn env_slot() -> Option<SlotId> {
+    std::env::var("OVERSEER_SLOT")
+        .ok()
+        .and_then(|s| crate::hook::slot(&s))
+}
+
+/// The argument, or all of stdin when it is `-` (trailing newlines cut).
+fn text_or_stdin(text: String) -> anyhow::Result<String> {
+    if text != "-" {
+        return Ok(text);
+    }
+    let mut buf = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf).context("read stdin")?;
+    Ok(buf.trim_end_matches('\n').to_string())
+}
+
+/// Stdin for `ctl bd` (a heredoc the hook kept), unless it is a terminal
+/// or empty.
+fn piped_stdin() -> Option<String> {
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut std::io::stdin(), &mut bytes).ok()?;
+    (!bytes.is_empty()).then(|| String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Prints a writer reply. A `Queued` entry is durable and will be committed,
+/// so it is success: scripts must not retry it.
+fn print_brain_text(resp: Response) -> anyhow::Result<()> {
+    match resp {
+        Response::Text { text } | Response::Queued { message: text } => {
+            println!("{text}");
+            Ok(())
+        }
+        // `current-session` answers a bare Ok.
+        Response::Ok => Ok(()),
+        Response::Error { message } => bail!("{message}"),
+        other => bail!("unexpected reply: {other:?}"),
+    }
+}
+
+/// A short human summary of the writer.
+pub fn format_brain(v: &BrainView) -> Vec<String> {
+    if !v.on {
+        return vec!["2ndBrain writer is off (brain_writer in config.toml)".into()];
+    }
+    let count = |st: QueueState| v.entries.iter().filter(|e| e.state == st).count();
+    let when = |at: Option<i64>| at.map(local_hhmm).unwrap_or_else(|| "never".into());
+    let mut out = vec![
+        "2ndBrain writer is on".to_string(),
+        format!(
+            "queue  {} queued  {} committed  {} nothing to commit  {} failed",
+            count(QueueState::Queued),
+            count(QueueState::Committed),
+            count(QueueState::NothingToCommit),
+            count(QueueState::Failed)
+        ),
+        format!("last backup  {}", when(v.last_backup)),
+        match v.last_sync {
+            Some((at, ok)) => format!(
+                "last sync  {}  {}",
+                local_hhmm(at),
+                if ok { "ok" } else { "failed" }
+            ),
+            None => "last sync  never".to_string(),
+        },
+    ];
+    if let Some(p) = &v.push_problem {
+        out.push(format!("push problem  {p}"));
+    }
+    out
+}
+
 fn item_line(v: &WorkView, i: &WorkItem, indent: &str) -> String {
     let owner = i.owner.map(slot_name).unwrap_or_else(|| "-".into());
     let gone = if i.in_list {
@@ -423,15 +534,84 @@ pub async fn run(cmd: CtlCmd) -> anyhow::Result<()> {
             text,
             raw: false,
         } => {
-            let from = std::env::var("OVERSEER_SLOT")
-                .ok()
-                .and_then(|s| crate::hook::slot(&s));
+            let from = env_slot();
             print_text_or_queued(
                 client
                     .request(Request::SendRelay { from, to: n, text })
                     .await?,
             )
         }
+        CtlCmd::Commit { message, paths } => print_brain_text(
+            client
+                .request(Request::Commit {
+                    from: env_slot(),
+                    paths,
+                    message,
+                })
+                .await?,
+        ),
+        CtlCmd::Journal { section, text } => print_brain_text(
+            client
+                .request(Request::AppendJournal {
+                    from: env_slot(),
+                    section,
+                    text: text_or_stdin(text)?,
+                })
+                .await?,
+        ),
+        CtlCmd::CurrentSession { slot, text } => {
+            let slot = match slot {
+                Some(s) => parse_slot(&s)?,
+                None => env_slot().context("name the slot with --slot S<n>")?,
+            };
+            print_brain_text(
+                client
+                    .request(Request::UpdateCurrentSession {
+                        slot,
+                        text: text_or_stdin(text)?,
+                    })
+                    .await?,
+            )
+        }
+        CtlCmd::Bd { args } => {
+            let stdin = piped_stdin();
+            match client
+                .request(Request::RunBd {
+                    from: env_slot(),
+                    args,
+                    stdin,
+                })
+                .await?
+            {
+                Response::BdOutput {
+                    code,
+                    stdout,
+                    stderr,
+                } => {
+                    use std::io::Write;
+                    let _ = std::io::stdout().write_all(stdout.as_bytes());
+                    let _ = std::io::stderr().write_all(stderr.as_bytes());
+                    let _ = std::io::stdout().flush();
+                    std::process::exit(if code < 0 { 1 } else { code });
+                }
+                Response::Error { message } => bail!("{message}"),
+                other => bail!("unexpected reply: {other:?}"),
+            }
+        }
+        CtlCmd::Brain { json } => match client.request(Request::BrainStatus).await? {
+            Response::Brain(v) => {
+                if json {
+                    println!("{}", serde_json::to_string(&v)?);
+                } else {
+                    for l in format_brain(&v) {
+                        println!("{l}");
+                    }
+                }
+                Ok(())
+            }
+            Response::Error { message } => bail!("{message}"),
+            other => bail!("unexpected reply: {other:?}"),
+        },
         CtlCmd::Locks { json } => match client.request(Request::ListLocks).await? {
             Response::Locks(v) => {
                 if json {

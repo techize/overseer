@@ -13,6 +13,19 @@ use serde_json::{json, Value};
 
 /// Budget for connect plus the round trip of one tool call.
 const CALL_WITHIN: Duration = Duration::from_secs(5);
+/// A 2ndBrain write waits its turn in the queue, and a commit blocked by an
+/// `index.lock` is answered after up to 600 s (as `Queued`).
+const BRAIN_CALL_WITHIN: Duration = Duration::from_secs(660);
+
+fn call_within(req: &Request) -> Duration {
+    match req {
+        Request::Commit { .. }
+        | Request::AppendJournal { .. }
+        | Request::EditShared { .. }
+        | Request::UpdateCurrentSession { .. } => BRAIN_CALL_WITHIN,
+        _ => CALL_WITHIN,
+    }
+}
 const LATEST_VERSION: &str = "2025-06-18";
 const SUPPORTED_VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
@@ -65,6 +78,54 @@ fn tools() -> Value {
             "name": "list_targets",
             "description": "List the targets that are held, who holds them and who is waiting. Read-only.",
             "inputSchema": {"type": "object", "properties": {}}
+        },
+        {
+            "name": "commit_2ndbrain",
+            "description": "Commit and push files in the 2ndBrain vault. Overseer commits only the paths you name, one commit at a time, so you never sweep up another session's half-finished edits. Use this instead of git. Replies with the commit, or says the commit is queued and will land.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "paths": {"type": "array", "items": {"type": "string"}, "description": "Files to commit, relative to the vault or absolute. Deletions count."},
+                    "message": {"type": "string", "description": "The commit message."}
+                },
+                "required": ["paths", "message"]
+            }
+        },
+        {
+            "name": "append_journal",
+            "description": "Add text to a section of today's journal and commit it. The text goes at the end of the `## <section>` block; a missing section is created at the end of the file.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "section": {"type": "string", "description": "The section heading without the leading ##, for example Work Log."},
+                    "text": {"type": "string", "description": "What to add."}
+                },
+                "required": ["section", "text"]
+            }
+        },
+        {
+            "name": "edit_shared_file",
+            "description": "Replace one exact piece of text in a shared 2ndBrain file (a sprint dashboard, a journal) and commit it. `old_text` must occur exactly once; if the file has changed since you read it the edit fails and shows you the current text.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "The shared file, relative to the vault or absolute."},
+                    "old_text": {"type": "string", "description": "The exact text to replace. It must occur once."},
+                    "new_text": {"type": "string", "description": "What to put there."}
+                },
+                "required": ["path", "old_text", "new_text"]
+            }
+        },
+        {
+            "name": "update_current_session",
+            "description": "Set your section of CURRENT_SESSION.md: what you are working on and where you got to. It replaces your previous text and leaves every other session's section alone.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "Your section's text."}
+                },
+                "required": ["text"]
+            }
         }
     ])
 }
@@ -86,6 +147,19 @@ fn str_arg<'a>(args: &'a Value, name: &str) -> Result<&'a str, String> {
     match args.get(name) {
         Some(Value::String(s)) => Ok(s),
         Some(_) => Err(format!("`{name}` must be a string")),
+        None => Err(format!("missing `{name}`")),
+    }
+}
+
+/// A list of strings that must be present.
+fn str_list_arg(args: &Value, name: &str) -> Result<Vec<String>, String> {
+    match args.get(name) {
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|v| v.as_str().map(str::to_owned))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| format!("`{name}` must be an array of strings")),
+        Some(_) => Err(format!("`{name}` must be an array of strings")),
         None => Err(format!("missing `{name}`")),
     }
 }
@@ -139,6 +213,27 @@ fn tool_request(name: &str, args: &Value, slot: Option<SlotId>) -> Result<ToolPl
             })
         }
         "list_targets" => ToolPlan::Send(Request::ListLocks),
+        "commit_2ndbrain" => ToolPlan::Send(Request::Commit {
+            from: slot,
+            paths: str_list_arg(args, "paths")?,
+            message: str_arg(args, "message")?.to_owned(),
+        }),
+        "append_journal" => ToolPlan::Send(Request::AppendJournal {
+            from: slot,
+            section: str_arg(args, "section")?.to_owned(),
+            text: str_arg(args, "text")?.to_owned(),
+        }),
+        "edit_shared_file" => ToolPlan::Send(Request::EditShared {
+            from: slot,
+            path: str_arg(args, "path")?.to_owned(),
+            old_text: str_arg(args, "old_text")?.to_owned(),
+            new_text: str_arg(args, "new_text")?.to_owned(),
+        }),
+        // The daemon names the section after the slot and its label.
+        "update_current_session" => ToolPlan::Send(Request::UpdateCurrentSession {
+            slot: own,
+            text: str_arg(args, "text")?.to_owned(),
+        }),
         other => return Err(format!("unknown tool `{other}`")),
     })
 }
@@ -242,8 +337,9 @@ pub fn handle(msg: &Value, slot: Option<SlotId>, call: &mut Call) -> Option<Valu
 
 /// One request to the daemon over a fresh connection, within `CALL_WITHIN`.
 fn ask_daemon(rt: &tokio::runtime::Runtime, req: Request) -> Result<Response, String> {
+    let within = call_within(&req);
     rt.block_on(async {
-        tokio::time::timeout(CALL_WITHIN, async {
+        tokio::time::timeout(within, async {
             let client = Client::connect(paths::socket_path())
                 .await
                 .map_err(|e| e.to_string())?;
@@ -358,7 +454,162 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_names_the_four_tools() {
+    fn brain_tools_send_the_calling_slot() {
+        let cases = [
+            (
+                "commit_2ndbrain",
+                json!({"paths": ["a.md", "b.md"], "message": "S2: notes"}),
+                Request::Commit {
+                    from: Some(2),
+                    paths: vec!["a.md".into(), "b.md".into()],
+                    message: "S2: notes".into(),
+                },
+            ),
+            (
+                "append_journal",
+                json!({"section": "Work Log", "text": "did a thing"}),
+                Request::AppendJournal {
+                    from: Some(2),
+                    section: "Work Log".into(),
+                    text: "did a thing".into(),
+                },
+            ),
+            (
+                "edit_shared_file",
+                json!({"path": "Sprints/sprint-26-01/SPRINT-DASHBOARD.md", "old_text": "a", "new_text": "b"}),
+                Request::EditShared {
+                    from: Some(2),
+                    path: "Sprints/sprint-26-01/SPRINT-DASHBOARD.md".into(),
+                    old_text: "a".into(),
+                    new_text: "b".into(),
+                },
+            ),
+            (
+                "update_current_session",
+                json!({"text": "working on DEMO-12"}),
+                Request::UpdateCurrentSession {
+                    slot: 2,
+                    text: "working on DEMO-12".into(),
+                },
+            ),
+        ];
+        for (name, args, want) in cases {
+            let (out, seen) = call_with(
+                &tool(name, args),
+                Some(2),
+                Ok(Response::Text {
+                    text: "committed abc1234: S2".into(),
+                }),
+            );
+            assert_eq!(seen, [want], "{name}");
+            assert_eq!(text_of(&out.unwrap()), ("committed abc1234: S2", false));
+        }
+    }
+
+    #[test]
+    fn brain_tool_argument_errors_are_rpc_errors() {
+        let bad = [
+            (
+                "commit_2ndbrain",
+                json!({"message": "m"}),
+                "missing `paths`",
+            ),
+            (
+                "commit_2ndbrain",
+                json!({"paths": "a.md", "message": "m"}),
+                "`paths` must be an array of strings",
+            ),
+            (
+                "commit_2ndbrain",
+                json!({"paths": ["a.md", 3], "message": "m"}),
+                "`paths` must be an array of strings",
+            ),
+            ("commit_2ndbrain", json!({"paths": []}), "missing `message`"),
+            ("append_journal", json!({"section": "S"}), "missing `text`"),
+            (
+                "append_journal",
+                json!({"section": "S", "text": 5}),
+                "`text` must be a string",
+            ),
+            (
+                "edit_shared_file",
+                json!({"path": "p", "old_text": "a"}),
+                "missing `new_text`",
+            ),
+            (
+                "update_current_session",
+                json!({"text": ["x"]}),
+                "`text` must be a string",
+            ),
+            ("update_current_session", json!({}), "missing `text`"),
+        ];
+        for (name, args, why) in bad {
+            let (out, seen) = call_with(&tool(name, args), Some(1), Ok(Response::Ok));
+            let out = out.unwrap();
+            assert_eq!(out["error"]["code"], -32602, "{name}: {out}");
+            assert_eq!(out["error"]["message"], why, "{name}");
+            assert!(seen.is_empty(), "{name} must not reach the daemon");
+        }
+    }
+
+    #[test]
+    fn brain_tools_outside_a_slot_are_tool_errors() {
+        for (name, args) in [
+            ("commit_2ndbrain", json!({"paths": ["a"], "message": "m"})),
+            ("update_current_session", json!({"text": "t"})),
+        ] {
+            let (out, seen) = call_with(&tool(name, args), None, Ok(Response::Ok));
+            assert_eq!(text_of(&out.unwrap()), (NOT_IN_A_SLOT, true));
+            assert!(seen.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_queued_commit_is_success_and_a_daemon_error_is_not() {
+        let args = json!({"paths": ["a.md"], "message": "m"});
+        let (out, _) = call_with(
+            &tool("commit_2ndbrain", args.clone()),
+            Some(1),
+            Ok(Response::Queued {
+                message: "index.lock held, will retry".into(),
+            }),
+        );
+        assert_eq!(
+            text_of(&out.unwrap()),
+            ("index.lock held, will retry", false)
+        );
+        let (out, _) = call_with(
+            &tool("commit_2ndbrain", args),
+            Some(1),
+            Ok(Response::Error {
+                message: "the 2ndBrain writer is off (brain_writer in config.toml)".into(),
+            }),
+        );
+        let out = out.unwrap();
+        assert!(text_of(&out).1);
+        assert!(text_of(&out).0.contains("writer is off"));
+    }
+
+    #[test]
+    fn brain_calls_wait_longer_than_lock_calls() {
+        assert!(
+            call_within(&Request::ListLocks)
+                < call_within(&Request::UpdateCurrentSession {
+                    slot: 1,
+                    text: String::new()
+                })
+        );
+        assert!(
+            call_within(&Request::Commit {
+                from: Some(1),
+                paths: vec![],
+                message: String::new()
+            }) > Duration::from_secs(600)
+        );
+    }
+
+    #[test]
+    fn tools_list_names_the_eight_tools() {
         let (out, _) = call_with(&rpc("tools/list", json!({})), Some(1), Ok(Response::Ok));
         let out = out.unwrap();
         let names: Vec<&str> = out["result"]["tools"]
@@ -373,7 +624,11 @@ mod tests {
                 "claim_target",
                 "release_target",
                 "notify_session",
-                "list_targets"
+                "list_targets",
+                "commit_2ndbrain",
+                "append_journal",
+                "edit_shared_file",
+                "update_current_session"
             ]
         );
     }

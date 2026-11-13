@@ -690,7 +690,7 @@ async fn brain_request(brain: &BrainService, req: Request, label: &str) -> Respo
         Request::UpdateCurrentSession { slot, text } => {
             brain.update_current_session(slot, label, &text).await
         }
-        Request::RunBd { args, .. } => brain.run_bd(args).await,
+        Request::RunBd { args, stdin, .. } => brain.run_bd(args, stdin).await,
         other => Response::Error {
             message: format!("not a 2ndBrain writer request: {other:?}"),
         },

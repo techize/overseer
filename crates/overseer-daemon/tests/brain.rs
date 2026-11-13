@@ -90,8 +90,9 @@ impl Vault {
         script(
             &base.join("bd-stub.sh"),
             &format!(
-                "#!/bin/sh\necho \"$(pwd -P)|$OVERSEER_COMMIT|$*\" >> '{}'\necho bd said $1\n",
-                bd_log.display()
+                "#!/bin/sh\necho \"$(pwd -P)|$OVERSEER_COMMIT|$*\" >> '{}'\necho \"stdin=$(cat)\" >> '{}'\necho bd said $1\n",
+                bd_log.display(),
+                base.join("bd-stdin.log").display()
             ),
         );
         sh(&vault, &["add", "-A"]);
@@ -660,6 +661,28 @@ async fn queue_survives_restart_without_double_commits() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bd_gets_the_stdin_it_was_sent() {
+    let v = Vault::new("bdstdin");
+    let svc = v.service(Arc::new(Ledger::in_memory()), v.options());
+    let r = svc
+        .run_bd(
+            ["create", "--body-file", "-"].map(String::from).to_vec(),
+            Some("first line\nsecond line\n".into()),
+        )
+        .await;
+    assert!(matches!(r, Response::BdOutput { code: 0, .. }), "{r:?}");
+    // The stub joins stdin lines with `$(...)`, which drops the final newline.
+    assert_eq!(
+        v.log("bd-stdin.log")[..2],
+        ["stdin=first line", "second line"]
+    );
+    // Nothing sent: bd's stdin is closed, so it reads nothing.
+    let r = svc.run_bd(vec!["close".into()], None).await;
+    assert!(matches!(r, Response::BdOutput { code: 0, .. }), "{r:?}");
+    assert!(v.log("bd-stdin.log").contains(&"stdin=".to_string()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bd_runs_under_the_lock_then_syncs() {
     let v = Vault::new("bd");
     let svc = v.service(Arc::new(Ledger::in_memory()), v.options());
@@ -671,6 +694,7 @@ async fn bd_runs_under_the_lock_then_syncs() {
                 ["update", "ov-3", "--status", "in_progress"]
                     .map(String::from)
                     .to_vec(),
+                None,
             )
             .await
         })
@@ -1062,6 +1086,7 @@ async fn writer_off_answers_with_the_config_hint() {
         Request::RunBd {
             from: None,
             args: vec!["update".into()],
+            stdin: None,
         },
     ] {
         assert_eq!(
@@ -1138,6 +1163,7 @@ async fn daemon_serves_the_writer_requests() {
         Request::RunBd {
             from: Some(1),
             args: vec!["close".into(), "ov-3".into()],
+            stdin: None,
         },
     )
     .await

@@ -69,6 +69,62 @@ EOF
         env
     }
 
+    /// The 2ndBrain writer on: a throwaway vault with a bare remote, a stub
+    /// `bd` that exits 3 and logs what it was given, and no backup or sync.
+    fn with_brain() -> Env {
+        use std::os::unix::fs::PermissionsExt;
+        let env = Env::new();
+        let h = &env.home;
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let o = StdCommand::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(
+                o.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+        };
+        let (vault, remote, beads) = (h.join("vault"), h.join("remote.git"), h.join("beads"));
+        for d in [&vault, &remote, &beads] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        git(&remote, &["init", "--bare", "-b", "main"]);
+        git(&vault, &["init", "-b", "main"]);
+        git(&vault, &["config", "user.name", "T"]);
+        git(&vault, &["config", "user.email", "t@example.com"]);
+        git(
+            &vault,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        std::fs::write(vault.join("README.md"), "vault\n").unwrap();
+        git(&vault, &["add", "-A"]);
+        git(&vault, &["commit", "-m", "initial"]);
+        git(&vault, &["push", "-u", "origin", "main"]);
+        let stub = h.join("bd-stub.sh");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> '{log}'\ncat >> '{log}.stdin'\necho bd out\necho bd err >&2\nexit 3\n",
+                log = h.join("bd.log").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cfg = format!(
+            "beads_dir = \"{beads}\"\nbrain_dir = \"{vault}\"\njira_command = []\nbrain_writer = true\nbackup_mins = 0\ncurrent_session = \"{cs}\"\nsync_command = [\"{vault}/no-such-sync\"]\nbd_command = [\"{stub}\"]\n",
+            beads = beads.display(),
+            vault = vault.display(),
+            cs = h.join("CURRENT_SESSION.md").display(),
+            stub = stub.display(),
+        );
+        std::fs::write(h.join("config.toml"), cfg).unwrap();
+        env
+    }
+
     fn ctl(&self, args: &[&str]) -> Command {
         let mut c = Command::cargo_bin("overseer").unwrap();
         c.env("OVERSEER_HOME", &self.home)
@@ -483,4 +539,116 @@ fn send_queues_a_relay() {
     let line = out.lines().find(|l| l.starts_with("relay")).expect(&out);
     assert!(line.starts_with("relay  S3  pending"), "{out}");
     assert!(line.ends_with("check the DEMO-33 branch"), "{out}");
+}
+
+fn brain_view(env: &Env) -> serde_json::Value {
+    serde_json::from_str(&stdout_of(&mut env.ctl(&["brain", "--json"]))).unwrap()
+}
+
+#[test]
+fn ctl_bd_passes_args_and_exit_code() {
+    let env = Env::with_brain();
+    let out = env
+        .ctl(&["bd", "--", "create", "--body-file", "-", "--title", "x"])
+        .write_stdin("heredoc body\n")
+        .assert()
+        .code(3)
+        .get_output()
+        .clone();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "bd out\n");
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "bd err\n");
+    let log = std::fs::read_to_string(env.home.join("bd.log")).unwrap();
+    assert!(log.starts_with("create --body-file - --title x\n"), "{log}");
+    let stdin = std::fs::read_to_string(env.home.join("bd.log.stdin")).unwrap();
+    assert_eq!(stdin, "heredoc body\n");
+}
+
+#[test]
+fn ctl_commit_without_slot_is_jonathan() {
+    let env = Env::with_brain();
+    std::fs::write(env.home.join("vault/notes.md"), "one\n").unwrap();
+    std::fs::write(env.home.join("vault/other.md"), "two\n").unwrap();
+    let out = stdout_of(&mut env.ctl(&["commit", "-m", "add notes", "notes.md"]));
+    assert!(out.starts_with("committed "), "{out}");
+    assert!(out.trim_end().ends_with(": add notes"), "{out}");
+    let v = brain_view(&env);
+    assert_eq!(v["on"], true);
+    assert_eq!(v["entries"][0]["from"]["type"], "You", "{v}");
+    assert_eq!(v["entries"][0]["state"], "Committed");
+    // A session commit is from its slot.
+    std::fs::write(env.home.join("vault/more.md"), "three\n").unwrap();
+    stdout_of(
+        env.ctl(&["commit", "-m", "S2: more", "more.md"])
+            .env("OVERSEER_SLOT", "S2"),
+    );
+    let v = brain_view(&env);
+    assert_eq!(v["entries"][0]["from"]["type"], "Slot", "{v}");
+    assert_eq!(v["entries"][0]["from"]["slot"], 2);
+    // Only the named path was committed.
+    let status = StdCommand::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(env.home.join("vault"))
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&status.stdout), "?? other.md\n");
+    let human = stdout_of(&mut env.ctl(&["brain"]));
+    assert!(human.contains("2ndBrain writer is on"), "{human}");
+    assert!(human.contains("0 queued  2 committed"), "{human}");
+    assert!(human.contains("last backup  never"), "{human}");
+}
+
+#[test]
+fn ctl_journal_and_current_session_read_stdin() {
+    let env = Env::with_brain();
+    let out = stdout_of(
+        env.ctl(&["journal", "Work Log", "-"])
+            .write_stdin("did the thing\n"),
+    );
+    assert!(out.starts_with("committed "), "{out}");
+    let found = std::process::Command::new("grep")
+        .args([
+            "-r",
+            "did the thing",
+            env.home.join("vault/06-Daily").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(found.status.success(), "journal not written");
+    // No slot, no --slot: refused.
+    let err = env
+        .ctl(&["current-session", "hello"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    assert!(
+        String::from_utf8_lossy(&err.stderr).contains("--slot"),
+        "{err:?}"
+    );
+    env.ctl(&["current-session", "--slot", "S2", "-"])
+        .write_stdin("on DEMO-12\n")
+        .assert()
+        .success();
+    let cs = std::fs::read_to_string(env.home.join("CURRENT_SESSION.md")).unwrap();
+    assert!(
+        cs.contains("<!-- overseer:S2 -->") && cs.contains("on DEMO-12"),
+        "{cs}"
+    );
+}
+
+#[test]
+fn brain_commands_say_when_the_writer_is_off() {
+    let env = Env::new();
+    let err = env
+        .ctl(&["commit", "-m", "x", "a.md"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    assert!(
+        String::from_utf8_lossy(&err.stderr).contains("the 2ndBrain writer is off"),
+        "{err:?}"
+    );
+    let out = stdout_of(&mut env.ctl(&["brain"]));
+    assert!(out.contains("writer is off"), "{out}");
 }

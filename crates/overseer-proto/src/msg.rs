@@ -432,6 +432,9 @@ pub enum Request {
         #[serde(default)]
         from: Option<SlotId>,
         args: Vec<String>,
+        /// Piped to bd's stdin (a heredoc body); bd's stdin is closed when `None`.
+        #[serde(default)]
+        stdin: Option<String>,
     },
     BrainStatus,
     /// A file write the hook asks about. Answered with `Verdict`.
@@ -1017,6 +1020,7 @@ mod tests {
             Request::RunBd {
                 from: Some(3),
                 args: vec!["list".into()],
+                stdin: Some("body\n".into()),
             },
             Request::BrainStatus,
             Request::CheckWrite(check),
@@ -1024,6 +1028,20 @@ mod tests {
             let json = serde_json::to_string(&req).unwrap();
             assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), req);
         }
+    }
+
+    #[test]
+    fn run_bd_without_stdin_decodes_to_none() {
+        let old = r#"{"type":"RunBd","from":null,"args":["list"]}"#;
+        let req: Request = serde_json::from_str(old).unwrap();
+        assert_eq!(
+            req,
+            Request::RunBd {
+                from: None,
+                args: vec!["list".into()],
+                stdin: None
+            }
+        );
     }
 
     #[test]
