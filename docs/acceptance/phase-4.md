@@ -239,7 +239,7 @@ $OVERSEER_HOME/work/demo-api --label demo-1`.
 |----|-------|-------|------|--------|
 | MR1 | The tools are seen | In S1's terminal run `/mcp` | `overseer` is listed as connected, with `claim_target`, `release_target`, `notify_session` and `list_targets` | Pass, 2026-11-12 at 11a20aa: `/mcp` listed `overseer` under Built-in MCPs as connected with 4 tools; its tool list read `claim_target`, `release_target`, `notify_session`, `list_targets` |
 | MR2 | `OVERSEER_SLOT` and the socket reach the server, and no permission prompt appears | Ask S1: `Use the overseer list_targets tool, then claim_target custom:demo-lane with reason "hand check", then list_targets again, then release_target custom:demo-lane.` Meanwhile in another tab `$OV ctl locks` after the claim | Claude runs all four with no permission prompt; `ctl locks` shows `custom:demo-lane  S1  claim` with `for hand check`, so the server knew it was S1 and reached the temp daemon; the last call releases it | Pass: Claude called `list_targets` (`No targets are held.`), `claim_target` (`You hold custom:demo-lane.`), `list_targets` (`custom:demo-lane  S1  since 17:24  for hand check`) and `release_target` (`Released custom:demo-lane.`) with no prompt; `ctl locks` during the run read `custom:demo-lane  S1  claim  since 17:24  for hand check` and was empty after. The slot settings allow the four tools; Jonathan's user settings also default to auto mode |
-| MR3 | `notify_session` from a real session | `OVERSEER_SLOT=S0 $OV ctl send 1 "Reply to me with notify_session: ok"`; wait for it to be typed in | Claude calls `notify_session` for S0 with no prompt; `$OV ctl locks` shows a pending relay for S0 (`slot is not running`); a second `notify_session` for S0 is refused | Pass, with the Pass text out of date: with S0 empty Claude called `notify_session` with no prompt and got `S0 has no session to message.` (the a55f1a2 rule, see E3 and F5), so nothing was queued. With a session started in S0 the same send gave `relay  S0  pending (session is working)`, then `waiting at a prompt for Jonathan`, and S0 got `Message from S1 via Overseer: ok` once. Asked twice for a second call, Claude refused on its own and never called the tool, so the server's refusal was not exercised by hand (the reply rule rows cover it) |
+| MR3 | `notify_session` from a real session | Start a session in S0 (a slot with no session refuses messages since a55f1a2), then `OVERSEER_SLOT=S0 $OV ctl send 1 "Reply to me with notify_session: ok"`; wait for it to be typed in | Claude calls `notify_session` for S0 with no prompt; `$OV ctl locks` shows a relay for S0, pending while S0 works, and S0 gets `Message from S1 via Overseer: ok` once; a second `notify_session` for S0 is refused | Pass, with the Pass text out of date: with S0 empty Claude called `notify_session` with no prompt and got `S0 has no session to message.` (the a55f1a2 rule, see E3 and F5), so nothing was queued. With a session started in S0 the same send gave `relay  S0  pending (session is working)`, then `waiting at a prompt for Jonathan`, and S0 got `Message from S1 via Overseer: ok` once. Asked twice for a second call, Claude refused on its own and never called the tool, so the server's refusal was not exercised by hand (the reply rule rows cover it) |
 
 ## The input-box reader against Claude Code 2.1 (hand)
 
@@ -318,7 +318,8 @@ No scriptable check failed. Observations:
 - **F4 (note): `claim_target` without `reason` is a protocol error
   (`-32602 missing reason`) rather than a tool error,** while `ctl claim` and
   the GUI treat the reason as optional. A session that leaves it out sees a
-  failed tool call, not text it can act on.
+  failed tool call, not text it can act on. Fixed after sign-off: `reason`
+  is optional in the schema and the call.
 - **F5 (note): a relay for a slot that is empty or exited stays pending
   forever** (`slot is not running`), including the replies S2 queued for S0 when
   no S0 session exists. It is shown, not lost, and is listed by `ctl locks`.
@@ -346,21 +347,33 @@ Jonathan; nothing was fixed.
   sends no `Stop` hook for an interrupt, so the slot keeps `Needs you`,
   `Claude needs your permission` and every relay for it stays `pending
   (waiting at a prompt for Jonathan)` until the next prompt ends. Answering
-  Yes is not affected. Repro: I4 with No.
+  Yes is not affected. Repro: I4 with No. Fixed after sign-off: the
+  courier now reads the screen of a slot waiting at a prompt, and once two
+  looks a second apart show the empty input box and no `esc to interrupt`
+  working line, the relay goes. Recheck I4 with No by hand.
 - **F7 (gap, U5): the Holds box leaves out the reason and the pin revision,**
   which `ctl locks` shows (`for lane test`, `at feat-x`), and the `since`
   text is cut short (`claim sinc`) when `held long` and `waiting:` share the
   row. `render_holds` in `crates/overseer-gui/src/session.rs` draws only
-  target, kind, since, held long and waiters.
+  target, kind, since, held long and waiters. Fixed after sign-off: each
+  hold has two lines, the target and `<kind> since <time>` first, never
+  cut, then `held long`, `for <item or reason>`, `at <revision>` and
+  `waiting:`. Recheck U5 by hand.
 - **F8 (note): `ctl send --raw` does not submit text that wraps.** A short
   text (`/mcp`, `say hi`) is submitted, but the MR2 request and a two-line
   text arrived with the Enter as a newline in the box, so the prompt sat
-  unsent until Enter was pressed by hand.
+  unsent until Enter was pressed by hand. Fixed after sign-off: `--raw`
+  sends the text, waits 100 ms, then sends Enter on its own, as the courier
+  does.
 - **F9 (note): the coordinator's role file points at `~/Repos/2ndBrain` even
   under a temp `OVERSEER_HOME`.** When S0 was started for MR3 it began a
   start-of-day round and read the real journal and `bd ready --json` (reads
   only; S0 was stopped afterwards). A hand run that starts S0 touches real
-  data unless the role's folder follows the temp config.
+  data unless the role's folder follows the temp config. Fixed after
+  sign-off: the coordinator role says `{brain}` and `{beads}`, filled from
+  `brain_dir` and `beads_dir` in `config.toml` (the hand run's config sets
+  both to `/tmp/ov-hand4/work`). An unedited older `roles/coordinator.md`
+  is upgraded in place; an edited one keeps its fixed path.
 - **Not a finding:** two relays went in while a `sleep 30` was asked for.
   The transcripts show Claude Code refused the standalone sleep and ended the
   turn, so the slot was idle.
@@ -434,3 +447,7 @@ any failures here.
   - F4: `claim_target` without `reason` is a protocol error, not a tool error.
   - MR3's expected result predates the a55f1a2 rule and should say a session
     must be running in S0.
+  - All of the above were fixed on 2026-11-13 after sign-off, on branch
+    `phase-4/followups`; MR3's row now says to start S0 first. I4 (with No)
+    and U5 want a hand recheck. The same branch fixes a race in the
+    `restart_offers_resume` test's stub that failed CI once.
