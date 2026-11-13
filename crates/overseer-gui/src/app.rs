@@ -298,6 +298,8 @@ pub struct OverseerApp {
     /// The 2ndBrain queue and push state, for the board's bottom strip.
     pub(crate) brain: BrainView,
     /// The strip's list shows while hovered, or until clicked away.
+    /// The push problem text last announced; see `push_problem_note`.
+    notified_push: Option<String>,
     pub(crate) brain_hover: bool,
     pub(crate) brain_pinned: bool,
     pub(crate) screen: Screen,
@@ -355,9 +357,9 @@ impl OverseerApp {
         });
         let mut clicks = crate::notify::clicks();
         let clicked = cx.spawn_in(window, async move |this, cx| {
-            while let Some(id) = clicks.recv().await {
+            while let Some(click) = clicks.recv().await {
                 let alive = this.update_in(cx, |this, window, cx| {
-                    this.notification_clicked(id, window, cx)
+                    this.notification_clicked(click, window, cx)
                 });
                 if alive.is_err() {
                     return;
@@ -397,6 +399,7 @@ impl OverseerApp {
             work: empty_work(),
             locks: empty_locks(),
             brain: empty_brain(),
+            notified_push: None,
             brain_hover: false,
             brain_pinned: false,
             screen: Screen::Board,
@@ -452,18 +455,15 @@ impl OverseerApp {
                 self.locks = view;
                 cx.notify();
             }
-            // What the daemon says on connecting is not news, so it never
-            // notifies; a change to the push problem does.
+            // A push problem waits until a push succeeds, so one already
+            // there on connecting is announced too, once.
             Frame::Response {
                 resp: Response::Brain(view),
                 ..
-            } => {
-                self.brain = view;
-                cx.notify();
             }
-            Frame::Event(Event::BrainChanged(view)) => {
+            | Frame::Event(Event::BrainChanged(view)) => {
                 if let Some(note) = crate::notify::push_problem_note(
-                    self.brain.push_problem.as_deref(),
+                    &mut self.notified_push,
                     view.push_problem.as_deref(),
                 ) {
                     crate::notify::post(&note);
@@ -735,17 +735,20 @@ impl OverseerApp {
 
     /// `n` in the session view: opens the slot's session note in Obsidian.
     /// With no note yet it does nothing; the panel says so.
-    pub(crate) fn open_note_key(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn open_note_key(&mut self) {
         let Screen::Session(id) = self.screen else {
             return;
         };
         let target =
             crate::session::note_target(&self.slots[id as usize], self.brain.brain_dir.as_deref());
         if let Some(url) = target {
-            if let Err(e) = std::process::Command::new("open").arg(&url).spawn() {
-                self.status = Some(format!("Could not open the note ({e})"));
-                cx.notify();
-            }
+            // Waited on off the UI thread so the child does not linger.
+            std::thread::spawn(move || {
+                match std::process::Command::new("open").arg(&url).status() {
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!("could not open the session note: {e}"),
+                }
+            });
         }
     }
 
@@ -972,11 +975,19 @@ impl OverseerApp {
     /// A notification was clicked: bring the window forward on that
     /// session. With the start dialog open only the window comes forward,
     /// as Cmd+digit does nothing there either.
-    fn notification_clicked(&mut self, id: SlotId, window: &mut Window, cx: &mut Context<Self>) {
+    fn notification_clicked(
+        &mut self,
+        click: crate::notify::Click,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         cx.activate(true);
         window.activate_window();
         if !self.modal_open() {
-            self.go_session(id, window, cx);
+            match click {
+                crate::notify::Click::Slot(id) => self.go_session(id, window, cx),
+                crate::notify::Click::Board => self.go_board(window, cx),
+            }
         }
     }
 
