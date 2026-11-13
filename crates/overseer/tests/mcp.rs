@@ -207,3 +207,43 @@ fn outside_a_slot_tools_fail_but_initialize_answers() {
     drop(mcp);
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn s0_proposes_and_gets_the_board() {
+    let d = TempDaemon::start("plan");
+    let mut s0 = Mcp::start(&d.home, "S0");
+    let (text, err) = s0.tool(
+        "propose_plan",
+        json!({"summary": "one lane", "slots": [{"slot": "S3", "label": "demo lane", "cwd": "/tmp"}]}),
+    );
+    assert!(!err, "{text}");
+    assert_eq!(text, "Plan 1 is waiting for Jonathan.");
+    let (text, err) = s0.tool("get_board", json!({}));
+    assert!(!err, "{text}");
+    assert!(text.starts_with("Summary: none yet"), "{text}");
+    assert!(
+        text.contains("Plan 1 waiting for Jonathan since "),
+        "{text}"
+    );
+    let (text, err) = s0.tool("set_board_summary", json!({"text": "One lane waits."}));
+    assert!(!err, "{text}");
+    let (text, _) = s0.tool("get_board", json!({}));
+    assert!(text.contains("): One lane waits."), "{text}");
+    let (text, err) = s0.tool("get_work_items", json!({}));
+    assert!(!err, "{text}");
+}
+
+#[test]
+fn worker_cannot_propose() {
+    let d = TempDaemon::start("worker");
+    let mut s3 = Mcp::start(&d.home, "S3");
+    let (text, err) = s3.tool(
+        "propose_plan",
+        json!({"summary": "mine", "slots": [{"slot": 3, "cwd": "/tmp"}]}),
+    );
+    assert!(err);
+    assert_eq!(text, "only the coordinator (S0) can propose a plan");
+    // A worker may still read the board.
+    let (text, err) = s3.tool("get_board", json!({}));
+    assert!(!err, "{text}");
+}

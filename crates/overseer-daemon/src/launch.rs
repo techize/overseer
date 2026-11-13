@@ -180,7 +180,7 @@ fn hook_shape(event: &str) -> (Option<&'static str>, u64) {
 }
 
 /// The Overseer MCP tools a session may use without being asked.
-const ALLOWED_TOOLS: [&str; 8] = [
+const ALLOWED_TOOLS: [&str; 14] = [
     "mcp__overseer__claim_target",
     "mcp__overseer__release_target",
     "mcp__overseer__notify_session",
@@ -189,6 +189,12 @@ const ALLOWED_TOOLS: [&str; 8] = [
     "mcp__overseer__append_journal",
     "mcp__overseer__edit_shared_file",
     "mcp__overseer__update_current_session",
+    "mcp__overseer__get_board",
+    "mcp__overseer__get_work_items",
+    "mcp__overseer__propose_plan",
+    "mcp__overseer__request_status",
+    "mcp__overseer__report_progress",
+    "mcp__overseer__set_board_summary",
 ];
 
 /// Files generated for one slot's start.
@@ -592,6 +598,12 @@ mod tests {
                 "mcp__overseer__append_journal",
                 "mcp__overseer__edit_shared_file",
                 "mcp__overseer__update_current_session",
+                "mcp__overseer__get_board",
+                "mcp__overseer__get_work_items",
+                "mcp__overseer__propose_plan",
+                "mcp__overseer__request_status",
+                "mcp__overseer__report_progress",
+                "mcp__overseer__set_board_summary",
             ])
         );
     }

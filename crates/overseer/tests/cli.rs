@@ -701,3 +701,76 @@ fn brain_commands_say_when_the_writer_is_off() {
     let out = stdout_of(&mut env.ctl(&["brain"]));
     assert!(out.contains("writer is off"), "{out}");
 }
+
+#[test]
+fn plan_approve_inside_a_session_is_refused() {
+    let env = Env::new();
+    let out = env
+        .ctl(&["plan", "approve", "1"])
+        .env("OVERSEER_SLOT", "S3")
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("only Jonathan can approve or reject a plan"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn plan_approve_as_jonathan_runs_it() {
+    let env = Env::new();
+    let plan =
+        r#"{"summary": "one lane", "slots": [{"slot": "S3", "label": "demo", "cwd": "/tmp"}]}"#;
+    let out = stdout_of(env.ctl(&["plan", "propose", "-"]).write_stdin(plan));
+    assert!(out.contains("Plan 1 is waiting for Jonathan."), "{out}");
+    let listed = stdout_of(&mut env.ctl(&["plan"]));
+    assert!(listed.contains("Plan 1  pending"), "{listed}");
+    let board = stdout_of(&mut env.ctl(&["board"]));
+    assert!(
+        board.contains("Plan 1 waiting for Jonathan since "),
+        "{board}"
+    );
+    stdout_of(&mut env.ctl(&["plan", "approve", "1"]));
+    let status = stdout_of(&mut env.ctl(&["status"]));
+    let s3 = status.lines().find(|l| l.starts_with("S3")).unwrap();
+    assert!(s3.starts_with("S3  running"), "{status}");
+    let listed = stdout_of(&mut env.ctl(&["plan"]));
+    assert!(listed.contains("Plan 1  approved"), "{listed}");
+    assert!(listed.contains("S3: started in /tmp"), "{listed}");
+    // A second approval finds it settled.
+    let again = env
+        .ctl(&["plan", "approve", "1"])
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    assert!(
+        String::from_utf8_lossy(&again.stderr).contains("plan 1 is no longer pending"),
+        "{again:?}"
+    );
+}
+
+#[test]
+fn report_needs_a_slot_and_summary_and_reject_work() {
+    let env = Env::new();
+    let out = env
+        .ctl(&["report", "done"])
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("report needs a slot; run it from a session"),
+        "{out:?}"
+    );
+    env.ctl(&["summary", "All quiet."]).assert().success();
+    let board = stdout_of(&mut env.ctl(&["board"]));
+    assert!(board.contains("): All quiet."), "{board}");
+    let plan = r#"{"summary": "x", "slots": [{"slot": 2, "cwd": "/tmp"}]}"#;
+    stdout_of(env.ctl(&["plan", "propose", "-"]).write_stdin(plan));
+    let out = stdout_of(&mut env.ctl(&["plan", "reject", "1", "not now"]));
+    assert_eq!(out.trim(), "Plan 1 rejected.");
+}
