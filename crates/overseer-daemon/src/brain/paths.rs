@@ -108,6 +108,8 @@ fn resolve(brain: &Path, cwd: Option<&Path>, p: &Path, home: &Path) -> Option<Pa
             Component::CurDir => {}
             Component::ParentDir => {
                 cur.pop();
+                // Back in a directory that may exist: symlinks can follow.
+                tail = false;
             }
             Component::Normal(n) if !tail => {
                 let cand = cur.join(n);
@@ -491,6 +493,14 @@ mod tests {
             .unwrap_err()
             .ends_with("is outside 2ndBrain"));
         assert_eq!(rel("../inlink/../x").unwrap(), "c/x");
+        // `..` out of a missing folder lands where symlinks count again.
+        assert!(rel("../new/../link/x")
+            .unwrap_err()
+            .ends_with("is outside 2ndBrain"));
+        assert_eq!(
+            vault_rel(&brain, Some(&cwd), &brain.join("../vault/x"), &home).unwrap(),
+            "x"
+        );
         // `~` resolves against home; home here is outside the vault.
         assert!(rel("~/a.md").unwrap_err().ends_with("is outside 2ndBrain"));
         // No cwd: a relative path is read against the vault.
