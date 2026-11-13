@@ -18,7 +18,8 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use overseer_proto::msg::{
-    BashCheck, BrainView, Event, QueueEntry, QueueState, Response, Sender, SlotId, WriteCheck,
+    BashCheck, BrainRun, BrainView, Event, QueueEntry, QueueState, Response, Sender, SlotId,
+    WriteCheck,
 };
 use tokio::sync::{broadcast, oneshot, Notify, OwnedMutexGuard};
 use tokio::time::Instant;
@@ -327,15 +328,21 @@ impl BrainService {
     }
 
     pub fn view(&self) -> BrainView {
-        let run = |kind: &str| self.ledger.brain_run(kind).ok().flatten();
+        let run = |kind: &str| {
+            self.ledger
+                .brain_run(kind)
+                .ok()
+                .flatten()
+                .map(|(at, ok, detail)| BrainRun { at, ok, detail })
+        };
         BrainView {
             on: true,
             entries: self.ledger.queue_recent(RECENT).unwrap_or_else(|e| {
                 tracing::warn!("2ndBrain queue unreadable: {e:#}");
                 Vec::new()
             }),
-            last_backup: run("backup").map(|(at, _, _)| at),
-            last_sync: run("sync").map(|(at, ok, _)| (at, ok)),
+            last_backup: run("backup"),
+            last_sync: run("sync"),
             push_problem: self.rt().push_problem.clone(),
             brain_dir: Some(self.cfg.brain.clone()),
         }
@@ -869,8 +876,15 @@ impl BrainService {
                         error: None,
                     };
                     let state = self.attempt(&g, &entry).await;
-                    let ok = matches!(state, QueueState::Committed | QueueState::NothingToCommit);
-                    let detail = format!("{} paths", keep.len());
+                    let paths = format!("{} paths", keep.len());
+                    let (ok, detail) = match state {
+                        QueueState::Committed | QueueState::NothingToCommit => (true, paths),
+                        // Retried by the queue, like any held entry.
+                        QueueState::Queued => {
+                            (true, format!("{paths}, queued: {}", self.entry_error(id)))
+                        }
+                        QueueState::Failed => (false, self.entry_error(id)),
+                    };
                     let _ = self.ledger.set_brain_run("backup", now, ok, &detail);
                 }
                 Err(e) => {
@@ -882,6 +896,16 @@ impl BrainService {
         }
         drop(g);
         self.announce();
+    }
+
+    /// The error recorded on queue entry `id`, or a stand-in.
+    fn entry_error(&self, id: i64) -> String {
+        self.ledger
+            .queue_recent(RECENT)
+            .ok()
+            .and_then(|es| es.into_iter().find(|e| e.id == id))
+            .and_then(|e| e.error)
+            .unwrap_or_else(|| "the commit did not finish".into())
     }
 
     fn backup_takes(&self, rel: &str, ctx: &BrainContext) -> bool {
@@ -1376,14 +1400,22 @@ impl BrainService {
         self.announce();
     }
 
+    /// Every exit is recorded, so the board shows a sync that did not run.
     async fn sync(&self) {
+        let record = |ok: bool, detail: &str| {
+            let _ = self.ledger.set_brain_run("sync", unix_now(), ok, detail);
+        };
         let Some((first, args)) = self.cfg.sync_command.split_first() else {
-            self.rt().sync_pending = false;
+            record(true, "skipped: sync_command is empty");
+            let mut rt = self.rt();
+            rt.sync_pending = false;
+            rt.sync_held = false;
             return;
         };
         let program = self.cfg.brain.join(first);
         if !program.is_file() {
-            // Not set up on this machine.
+            // Not set up on this machine (Ruling 2).
+            record(true, &format!("skipped: {first} not found"));
             let mut rt = self.rt();
             rt.sync_pending = false;
             rt.sync_held = false;
@@ -1394,7 +1426,11 @@ impl BrainService {
         let changed = match self.git.changed_paths(&g).await {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!("2ndBrain sync held back: git status failed: {e}");
+                // Tried again at the next backup tick.
+                let detail = format!("held: git status failed: {e}");
+                tracing::warn!("2ndBrain sync {detail}");
+                record(false, &detail);
+                self.rt().sync_held = true;
                 return;
             }
         };
@@ -1410,9 +1446,7 @@ impl BrainService {
                     Err(e) => format!("held: cannot list unmerged paths: {e}"),
                 };
                 tracing::warn!("2ndBrain sync {detail}");
-                let _ = self
-                    .ledger
-                    .set_brain_run("sync", unix_now(), false, &detail);
+                record(false, &detail);
                 self.rt().sync_held = true;
                 return;
             }
@@ -1423,7 +1457,10 @@ impl BrainService {
                 PathClass::Owned(list) if list.iter().any(|(s, _)| ctx.running.contains(s)))
         });
         if held {
-            tracing::info!("2ndBrain sync waits: a running slot has uncommitted changes");
+            // Not a failure: the sync waits for the slot (Ruling 8).
+            let detail = "waiting: a running slot has uncommitted changes";
+            tracing::info!("2ndBrain sync {detail}");
+            record(true, detail);
             self.rt().sync_held = true;
             return;
         }
@@ -1433,7 +1470,7 @@ impl BrainService {
             Ok(o) => (o.code == 0, last_line(&o.stdout, &o.stderr)),
             Err(e) => (false, e),
         };
-        let _ = self.ledger.set_brain_run("sync", unix_now(), ok, &detail);
+        record(ok, &detail);
         let mut rt = self.rt();
         rt.sync_pending = false;
         rt.sync_held = false;

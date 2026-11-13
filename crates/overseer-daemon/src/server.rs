@@ -653,13 +653,11 @@ fn handle_frame(
 
 /// The writer's requests that wait (see `handle_frame`).
 async fn brain_request(brain: &BrainService, req: Request, label: &str) -> Response {
-    let sender = |from: Option<SlotId>| -> Result<overseer_proto::Sender, Response> {
+    let sender = |from: Option<SlotId>| -> Result<overseer_proto::Sender, String> {
         match from {
             None => Ok(overseer_proto::Sender::You),
             Some(slot) if valid_id(slot) => Ok(overseer_proto::Sender::Slot { slot }),
-            Some(slot) => Err(Response::Error {
-                message: format!("invalid slot id {slot}"),
-            }),
+            Some(slot) => Err(format!("invalid slot id {slot}")),
         }
     };
     let from = match &req {
@@ -668,7 +666,7 @@ async fn brain_request(brain: &BrainService, req: Request, label: &str) -> Respo
         | Request::EditShared { from, .. }
         | Request::RunBd { from, .. } => match sender(*from) {
             Ok(s) => s,
-            Err(r) => return r,
+            Err(message) => return Response::Error { message },
         },
         _ => overseer_proto::Sender::You,
     };

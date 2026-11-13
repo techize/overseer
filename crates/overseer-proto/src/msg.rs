@@ -475,14 +475,52 @@ pub struct QueueEntry {
     pub error: Option<String>,
 }
 
+/// The last backup or sync run. `detail` is the error text when `ok` is
+/// false, else a short note (`3 paths`, `sync done`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BrainRun {
+    pub at: i64,
+    pub ok: bool,
+    #[serde(default)]
+    pub detail: String,
+}
+
+/// A run as an older daemon sent it: `last_backup` was a time and
+/// `last_sync` was `(at, ok)`.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RunWire {
+    Run(BrainRun),
+    At(i64),
+    AtOk(i64, bool),
+}
+
+fn run_compat<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<BrainRun>, D::Error> {
+    Ok(Option::<RunWire>::deserialize(d)?.map(|w| match w {
+        RunWire::Run(r) => r,
+        RunWire::At(at) => BrainRun {
+            at,
+            ok: true,
+            detail: String::new(),
+        },
+        RunWire::AtOk(at, ok) => BrainRun {
+            at,
+            ok,
+            detail: String::new(),
+        },
+    }))
+}
+
 /// The 2ndBrain writer as the board shows it: every queued entry plus the
-/// 20 most recent others, newest first. `last_sync` is `(at, ok)`.
+/// 20 most recent others, newest first.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BrainView {
     pub on: bool,
     pub entries: Vec<QueueEntry>,
-    pub last_backup: Option<i64>,
-    pub last_sync: Option<(i64, bool)>,
+    #[serde(default, deserialize_with = "run_compat")]
+    pub last_backup: Option<BrainRun>,
+    #[serde(default, deserialize_with = "run_compat")]
+    pub last_sync: Option<BrainRun>,
     pub push_problem: Option<String>,
     /// The vault directory, so the board can build an absolute path for a
     /// session note. `None` while the writer is off.
@@ -920,6 +958,33 @@ mod tests {
     }
 
     #[test]
+    fn brain_runs_from_an_older_daemon_parse() {
+        let v: BrainView = serde_json::from_str(
+            r#"{"on":true,"entries":[],"last_backup":1700000100,"last_sync":[1700000200,false],"push_problem":null}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            v.last_backup,
+            Some(BrainRun {
+                at: 1700000100,
+                ok: true,
+                detail: String::new()
+            })
+        );
+        assert_eq!(
+            v.last_sync,
+            Some(BrainRun {
+                at: 1700000200,
+                ok: false,
+                detail: String::new()
+            })
+        );
+        let v: BrainView =
+            serde_json::from_str(r#"{"on":false,"entries":[],"push_problem":null}"#).unwrap();
+        assert_eq!((v.last_backup, v.last_sync), (None, None));
+    }
+
+    #[test]
     fn bash_check_without_cwd_or_env_parses() {
         let c: BashCheck = serde_json::from_str(
             r#"{"slot":1,"session_id":null,"tool_use_id":null,"command":"bd close DEMO-12"}"#,
@@ -973,8 +1038,16 @@ mod tests {
                     error: None,
                 },
             ],
-            last_backup: Some(1700000100),
-            last_sync: Some((1700000200, true)),
+            last_backup: Some(BrainRun {
+                at: 1700000100,
+                ok: false,
+                detail: "index.lock still held after 4 attempts".into(),
+            }),
+            last_sync: Some(BrainRun {
+                at: 1700000200,
+                ok: true,
+                detail: "sync done".into(),
+            }),
             push_problem: None,
             brain_dir: None,
         }

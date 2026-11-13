@@ -405,13 +405,17 @@ pub(crate) fn one_line(text: &str, max: usize) -> String {
 }
 
 /// The 2ndBrain strip's text and colour. Writer off beats a push problem,
-/// which beats a queue, which beats the last commit time.
+/// which beats a failure, which beats a queue, which beats the last
+/// commit time. Problems use the warning tone (orange).
 pub fn strip_text(v: &BrainView) -> (String, Tone) {
     if !v.on {
         return ("2ndBrain: writer off".into(), Tone::Empty);
     }
     if v.push_problem.is_some() {
         return ("2ndBrain: push needs you".into(), Tone::NeedsYou);
+    }
+    if let Some(why) = brain_failure(v) {
+        return (format!("2ndBrain: {why}"), Tone::NeedsYou);
     }
     let queued = v
         .entries
@@ -434,6 +438,36 @@ pub fn strip_text(v: &BrainView) -> (String, Tone) {
         ),
         None => ("2ndBrain: nothing yet".into(), Tone::Idle),
     }
+}
+
+/// What failed last, with a short reason: a queue entry that failed after
+/// the newest commit, else the last backup, else the last sync.
+fn brain_failure(v: &BrainView) -> Option<String> {
+    let short = |what: &str, why: &str| match one_line(why, 40) {
+        r if r.is_empty() => format!("{what} failed"),
+        r => format!("{what} failed: {r}"),
+    };
+    let newest_commit = v
+        .entries
+        .iter()
+        .filter(|e| e.state == QueueState::Committed)
+        .map(|e| e.id)
+        .max();
+    let failed = v
+        .entries
+        .iter()
+        .filter(|e| e.state == QueueState::Failed && Some(e.id) > newest_commit)
+        .max_by_key(|e| e.id);
+    if let Some(e) = failed {
+        return Some(short("commit", e.error.as_deref().unwrap_or("")));
+    }
+    if let Some(r) = v.last_backup.as_ref().filter(|r| !r.ok) {
+        return Some(short("backup", &r.detail));
+    }
+    v.last_sync
+        .as_ref()
+        .filter(|r| !r.ok)
+        .map(|r| short("sync", &r.detail))
 }
 
 /// One line of the strip's list: `09:41 S1  Sessions/.../s1-demo.md  committed, pushed`.
@@ -911,7 +945,8 @@ impl OverseerApp {
 mod tests {
     use super::*;
     use overseer_proto::{
-        Activity, ActivityKind, Claim, ItemKind, Relay, Sender, SourceStatus, Wait, WorkItem,
+        Activity, ActivityKind, BrainRun, Claim, ItemKind, Relay, Sender, SourceStatus, Wait,
+        WorkItem,
     };
     use std::path::PathBuf;
 
@@ -1127,10 +1162,11 @@ mod tests {
 
     #[test]
     fn strip_shows_the_newest_commit_time() {
+        // A failure that a later commit has passed is history.
         let v = brain(vec![
-            q(3, 5, QueueState::Failed),
-            q(2, 2000, QueueState::Committed),
-            q(1, 1000, QueueState::Committed),
+            q(3, 2000, QueueState::Committed),
+            q(2, 1000, QueueState::Committed),
+            q(1, 5, QueueState::Failed),
         ]);
         let (text, tone) = strip_text(&v);
         assert_eq!(text, format!("2ndBrain: committed {}", local_hhmm(2000)));
@@ -1145,6 +1181,71 @@ mod tests {
         assert_eq!(text, "2ndBrain: push needs you");
         assert_eq!(tone, Tone::NeedsYou);
         assert_eq!(tone_color(tone), colors::ORANGE);
+    }
+
+    #[test]
+    fn strip_warns_of_a_failed_entry_with_its_reason() {
+        let mut failed = q(2, 20, QueueState::Failed);
+        failed.error = Some("index.lock still held after 4 attempts".into());
+        let v = brain(vec![
+            q(3, 30, QueueState::Queued),
+            failed,
+            q(1, 10, QueueState::Committed),
+        ]);
+        let (text, tone) = strip_text(&v);
+        assert_eq!(
+            text,
+            "2ndBrain: commit failed: index.lock still held after 4 attempts"
+        );
+        assert_eq!(tone, Tone::NeedsYou);
+        assert_eq!(tone_color(tone), colors::ORANGE);
+        // A long reason is cut short.
+        let mut long = q(2, 20, QueueState::Failed);
+        long.error = Some(format!("pathspec {} did not match", "x".repeat(80)));
+        let (text, _) = strip_text(&brain(vec![long]));
+        assert!(
+            text.starts_with("2ndBrain: commit failed: pathspec xxx"),
+            "{text}"
+        );
+        assert!(text.ends_with('…'), "{text}");
+    }
+
+    #[test]
+    fn strip_warns_of_a_failed_backup() {
+        let mut v = brain(vec![q(1, 10, QueueState::Committed)]);
+        v.last_backup = Some(BrainRun {
+            at: 20,
+            ok: false,
+            detail: "git status failed".into(),
+        });
+        v.last_sync = Some(BrainRun {
+            at: 30,
+            ok: false,
+            detail: "sync-run.sh exited 1".into(),
+        });
+        let (text, tone) = strip_text(&v);
+        assert_eq!(text, "2ndBrain: backup failed: git status failed");
+        assert_eq!(tone, Tone::NeedsYou);
+        // A good backup shows the commit time as before.
+        v.last_backup.as_mut().unwrap().ok = true;
+        v.last_sync.as_mut().unwrap().ok = true;
+        assert_eq!(strip_text(&v).1, Tone::Idle);
+    }
+
+    #[test]
+    fn strip_warns_of_a_failed_sync() {
+        let mut v = brain(vec![q(1, 10, QueueState::Committed)]);
+        v.last_sync = Some(BrainRun {
+            at: 30,
+            ok: false,
+            detail: "held: git status failed".into(),
+        });
+        let (text, tone) = strip_text(&v);
+        assert_eq!(text, "2ndBrain: sync failed: held: git status failed");
+        assert_eq!(tone, Tone::NeedsYou);
+        // A push problem still comes first.
+        v.push_problem = Some("push rejected".into());
+        assert_eq!(strip_text(&v).0, "2ndBrain: push needs you");
     }
 
     #[test]

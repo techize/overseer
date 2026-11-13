@@ -514,7 +514,7 @@ async fn sync_runs_once_after_the_queue_drains() {
     sleep(drain * 3).await;
     assert_eq!(v.log("sync.log"), vec!["OVERSEER_COMMIT=1 --auto"]);
     until("the sync record", || svc.view().last_sync.is_some()).await;
-    assert!(svc.view().last_sync.unwrap().1);
+    assert!(svc.view().last_sync.unwrap().ok);
 
     // A working slot with an uncommitted path of its own holds the sync back.
     let s3_note = "Sessions/s3.md";
@@ -548,6 +548,42 @@ async fn sync_runs_once_after_the_queue_drains() {
     )
     .await;
     until("the second sync", || v.log("sync.log").len() == 2).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_sync_and_backup_reach_the_view() {
+    let v = Vault::new("syncfail");
+    let drain = Duration::from_millis(1500);
+    let svc = v.service(
+        Arc::new(Ledger::in_memory()),
+        BrainOptions {
+            drain,
+            ..v.options()
+        },
+    );
+    shared_context(&svc, BrainContext::default());
+    write(&v.vault.join("free.md"), "x\n");
+    let r = svc
+        .commit(
+            Sender::You,
+            vec!["free.md".into()],
+            "free".into(),
+            &Owners::default(),
+        )
+        .await;
+    assert!(text(&r).contains("committed"), "{r:?}");
+    until("the push", || svc.view().entries[0].pushed == Some(true)).await;
+    // git status now fails, so the sync after the drain cannot look.
+    std::fs::write(v.vault.join(".git/index"), "not an index").unwrap();
+    until("the sync record", || svc.view().last_sync.is_some()).await;
+    let sync = svc.view().last_sync.unwrap();
+    assert!(!sync.ok, "{sync:?}");
+    assert!(sync.detail.starts_with("held: git status failed"), "{sync:?}");
+    assert!(v.log("sync.log").is_empty());
+    svc.backup_now().await;
+    let backup = svc.view().last_backup.unwrap();
+    assert!(!backup.ok, "{backup:?}");
+    assert!(!backup.detail.is_empty(), "{backup:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

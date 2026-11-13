@@ -10,8 +10,8 @@ use anyhow::{bail, Context};
 use clap::Subcommand;
 use overseer_proto::paths::{log_dir, socket_path};
 use overseer_proto::{
-    slot_name, BrainView, ClaimKind, Client, ItemKind, LockView, QueueState, RelayState, Request,
-    Response, SlotId, SlotInfo, SlotState, WorkItem, WorkView,
+    slot_name, BrainRun, BrainView, ClaimKind, Client, ItemKind, LockView, QueueState, RelayState,
+    Request, Response, SlotId, SlotInfo, SlotState, WorkItem, WorkView,
 };
 
 #[derive(Subcommand)]
@@ -404,7 +404,11 @@ pub fn format_brain(v: &BrainView) -> Vec<String> {
         return vec!["2ndBrain writer is off (brain_writer in config.toml)".into()];
     }
     let count = |st: QueueState| v.entries.iter().filter(|e| e.state == st).count();
-    let when = |at: Option<i64>| at.map(local_hhmm).unwrap_or_else(|| "never".into());
+    let run = |name: &str, r: &Option<BrainRun>| match r {
+        Some(r) if r.ok => format!("last {name}  {}  ok", local_hhmm(r.at)),
+        Some(r) => format!("last {name}  {}  failed: {}", local_hhmm(r.at), r.detail),
+        None => format!("last {name}  never"),
+    };
     let mut out = vec![
         "2ndBrain writer is on".to_string(),
         format!(
@@ -414,15 +418,8 @@ pub fn format_brain(v: &BrainView) -> Vec<String> {
             count(QueueState::NothingToCommit),
             count(QueueState::Failed)
         ),
-        format!("last backup  {}", when(v.last_backup)),
-        match v.last_sync {
-            Some((at, ok)) => format!(
-                "last sync  {}  {}",
-                local_hhmm(at),
-                if ok { "ok" } else { "failed" }
-            ),
-            None => "last sync  never".to_string(),
-        },
+        run("backup", &v.last_backup),
+        run("sync", &v.last_sync),
     ];
     if let Some(p) = &v.push_problem {
         out.push(format!("push problem  {p}"));
