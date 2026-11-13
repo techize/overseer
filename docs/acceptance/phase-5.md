@@ -63,17 +63,18 @@ cargo build --release -p overseer
 scripts/bundle.sh target/release/overseer /tmp/ov-hand5/Overseer.app
 ```
 
-The hook's `bd` rewrite runs the bare command `overseer ctl bd -- ...`, so a
-session's shell must find a command named `overseer`:
+The hook's `bd` rewrite names the daemon's own binary by its path
+(`'<path>' ctl bd -- ...`). The `ctl` checks below still run a bare
+`overseer`, so put one on the `PATH`:
 
 ```
 printf '#!/bin/sh\nexec %s "$@"\n' "$OV" > $OVERSEER_HOME/bin/overseer
 chmod +x $OVERSEER_HOME/bin/overseer
 ```
 
-The daemon runs `bd` for its work list through the login shell's `PATH`, not
-through `bd_command`, so put the stubs first on a temp `HOME`'s login `PATH`
-(as phase 4 did) and use `SHELL=/bin/sh`:
+The daemon runs `bd_command` for its work list and its label writes with the
+login shell's environment, so put the stubs first on a temp `HOME`'s login
+`PATH` (as phase 4 did) and use `SHELL=/bin/sh`:
 
 ```
 printf 'export PATH=/tmp/ov-hand5/stubs:/tmp/ov-hand5/bin:$PATH\n' > $OVERSEER_HOME/home/.profile

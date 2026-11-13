@@ -25,6 +25,7 @@ use tokio::sync::{broadcast, oneshot, Notify, OwnedMutexGuard};
 use tokio::time::Instant;
 
 use crate::config::Config;
+use crate::env::BaseEnv;
 use crate::ledger::Ledger;
 use git::{GitError, VaultGit, VaultGuard};
 use paths::{
@@ -215,6 +216,7 @@ pub struct BrainService {
     wake: Arc<Notify>,
     rt: Mutex<Runtime>,
     context: Mutex<Option<ContextFn>>,
+    env: std::sync::OnceLock<BaseEnv>,
 }
 
 impl Drop for BrainService {
@@ -284,6 +286,7 @@ impl BrainService {
             wake: Arc::new(Notify::new()),
             rt: Mutex::new(rt),
             context: Mutex::new(None),
+            env: std::sync::OnceLock::new(),
         });
         tokio::spawn(worker(Arc::downgrade(&svc), svc.wake.clone()));
         Some(svc)
@@ -776,6 +779,15 @@ impl BrainService {
         };
         let mut argv: Vec<String> = base.to_vec();
         argv.extend(args.iter().cloned());
+        // The login shell's PATH is what finds bd under a LaunchAgent.
+        let env = self.env.get().cloned();
+        let vars = match env {
+            Some(mut e) => {
+                e.wait().await;
+                Some(e.get())
+            }
+            None => None,
+        };
         let _g = if self.beads_in_vault() {
             Some(self.git.lock().await)
         } else {
@@ -787,8 +799,34 @@ impl BrainService {
             &self.cfg.beads,
             BD_TIMEOUT,
             stdin,
+            vars.as_deref().map(Vec::as_slice),
         )
         .await
+    }
+
+    /// Where `bd` and the sync find their programs: the daemon's base
+    /// environment (the login shell's). Set once at start-up; without it
+    /// they inherit the daemon's own.
+    pub fn set_env(&self, env: BaseEnv) {
+        let _ = self.env.set(env);
+    }
+
+    /// A bead label change from the work store, run like a session's `bd`
+    /// write: under the vault lock, followed by a `bd sync` at the next drain.
+    pub async fn write_label(&self, args: Vec<String>) -> Result<(), String> {
+        match self.run_bd(args, None).await {
+            Response::BdOutput { code: 0, .. } => Ok(()),
+            Response::BdOutput { code, stderr, .. } => {
+                let first = stderr.lines().next().unwrap_or("").trim().to_string();
+                Err(if first.is_empty() {
+                    format!("bd exited with {code}")
+                } else {
+                    format!("bd exited with {code}: {first}")
+                })
+            }
+            Response::Error { message } => Err(message),
+            other => Err(format!("unexpected reply: {other:?}")),
+        }
     }
 
     /// Commits whatever is changed and free, or owned only by slots that
@@ -1468,7 +1506,7 @@ impl BrainService {
             self.rt().sync_held = true;
             return;
         }
-        let r = run_program(&program, args, &self.cfg.brain, SYNC_TIMEOUT, None).await;
+        let r = run_program(&program, args, &self.cfg.brain, SYNC_TIMEOUT, None, None).await;
         drop(g);
         let (ok, detail) = match r {
             Ok(o) => (o.code == 0, last_line(&o.stdout, &o.stderr)),
@@ -1528,8 +1566,12 @@ async fn run_program(
     cwd: &Path,
     limit: Duration,
     stdin: Option<String>,
+    env: Option<&[(std::ffi::OsString, std::ffi::OsString)]>,
 ) -> Result<RunOut, String> {
     let mut cmd = tokio::process::Command::new(program);
+    if let Some(vars) = env {
+        cmd.env_clear().envs(vars.iter().map(|(k, v)| (k, v)));
+    }
     cmd.args(args)
         .current_dir(cwd)
         .env("OVERSEER_COMMIT", "1")

@@ -1487,6 +1487,76 @@ async fn bead_assign_labels_through_bd() {
     assert!(!all.contains("DEMO-40"), "{all}");
 }
 
+/// A bd stub at `bin/<name>` that logs `cwd|OVERSEER_COMMIT|args` and
+/// answers `list` (its first argument after `--sandbox`).
+fn configured_bd(s: &Sources, name: &str) -> String {
+    let path = s.dir.join("bin").join(name);
+    write_script(
+        &path,
+        &format!(
+            "printf '%s|%s|%s\\n' \"$(pwd -P)\" \"$OVERSEER_COMMIT\" \"$*\" >> '{}'\n\
+             if [ \"$2\" = list ]; then cat '{FIXTURES}/bd-list.json'; fi\n",
+            s.bd_log.display()
+        ),
+    );
+    std::fs::remove_file(s.dir.join("bin/bd")).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+#[tokio::test]
+async fn work_store_runs_the_configured_bd_command() {
+    let s = stub_sources("bdcmd", false);
+    let bd = configured_bd(&s, "bd-alt");
+    let settings = overseer_daemon::Config {
+        bd_command: vec![bd, "--sandbox".into()],
+        ..s.settings()
+    };
+    let d = start_daemon_cfg(temp_socket(), s.env(), settings).await;
+    let mut c = Client::connect(&d.socket).await;
+    c.refresh().await;
+    assert_eq!(
+        item(&c.work().await, "ov-3").owner,
+        None,
+        "listed through bd-alt"
+    );
+    wait_for_line(&s.bd_log, "||--sandbox list --json --limit 0").await;
+    assert_eq!(c.assign("ov-3", 2, false, false).await, Response::Ok);
+    wait_for_line(&s.bd_log, "||--sandbox update ov-3 --add-label overseer:S2").await;
+}
+
+#[tokio::test]
+async fn label_writes_go_through_the_brain_when_the_writer_is_on() {
+    let s = stub_sources("bdbrain", false);
+    let bd = configured_bd(&s, "bd-alt");
+    // The beads live in the vault, as on the home Mac.
+    let brain = s.beads_dir.clone();
+    let settings = overseer_daemon::Config {
+        brain_writer: true,
+        brain_dir: brain.clone(),
+        current_session: s.dir.join("home/.claude/CURRENT_SESSION.md"),
+        backup_mins: 0,
+        bd_command: vec![bd, "--sandbox".into()],
+        ..s.settings()
+    };
+    let d = start_daemon_cfg(temp_socket(), s.env(), settings).await;
+    let mut c = Client::connect(&d.socket).await;
+    c.refresh().await;
+    assert_eq!(c.assign("ov-3", 2, false, false).await, Response::Ok);
+    // OVERSEER_COMMIT=1 is set only by the writer's bd runner.
+    let line = wait_for_line(
+        &s.bd_log,
+        "|1|--sandbox update ov-3 --add-label overseer:S2",
+    )
+    .await;
+    assert_eq!(
+        line,
+        format!(
+            "{}|1|--sandbox update ov-3 --add-label overseer:S2",
+            s.beads_dir.display()
+        )
+    );
+}
+
 #[tokio::test]
 async fn bead_label_failure_becomes_a_notice() {
     let s = stub_sources("label-fail", false);

@@ -145,9 +145,24 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
     locks.reconcile_exits(&ended, unix_now());
     let manager: Manager = Arc::new(Mutex::new(mgr));
     if let Some(b) = &brain {
-        let (manager, store, ledger) = (manager.clone(), store.clone(), ledger.clone());
-        let dir = cfg.settings.brain_dir.clone();
-        b.set_context(move || brain_context(&manager, &store, &ledger, &dir));
+        {
+            let (manager, store, ledger) = (manager.clone(), store.clone(), ledger.clone());
+            let dir = cfg.settings.brain_dir.clone();
+            b.set_context(move || brain_context(&manager, &store, &ledger, &dir));
+        }
+        b.set_env(env.clone());
+        // Label writes take the vault lock like a session's bd write. Weak:
+        // the brain's context already holds the store.
+        let weak = Arc::downgrade(b);
+        store.route_label_writes(Box::new(move |args| {
+            let weak = weak.clone();
+            Box::pin(async move {
+                match weak.upgrade() {
+                    Some(b) => b.write_label(args).await,
+                    None => Err("the 2ndBrain writer has stopped".into()),
+                }
+            })
+        }));
     }
     locks.on_sessionless({
         let manager = manager.clone();
