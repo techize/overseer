@@ -169,6 +169,21 @@ pub fn format_slot(s: &SlotInfo) -> String {
     line
 }
 
+/// Between `send --raw`'s text and its Enter, as the courier waits.
+const RAW_RETURN_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Input is fire-and-forget; a round trip proves the daemon read it (it
+/// handles frames in order) before going on or exiting.
+async fn synced(client: &overseer_proto::client::Client) -> anyhow::Result<()> {
+    expect_ok(
+        client
+            .request(Request::Hello {
+                client: "ctl".into(),
+            })
+            .await?,
+    )
+}
+
 fn expect_ok(resp: Response) -> anyhow::Result<()> {
     match resp {
         Response::Ok => Ok(()),
@@ -395,16 +410,13 @@ pub async fn run(cmd: CtlCmd) -> anyhow::Result<()> {
         CtlCmd::Stop { n } => expect_ok(client.request(Request::StopSlot { id: n }).await?),
         CtlCmd::Resume { n } => expect_ok(client.request(Request::ResumeSlot { id: n }).await?),
         CtlCmd::Send { n, text, raw: true } => {
-            client.send_input(n, format!("{text}\r").as_bytes()).await?;
-            // Input is fire-and-forget; a round trip proves the daemon read it
-            // (it handles frames in order) before this process exits.
-            expect_ok(
-                client
-                    .request(Request::Hello {
-                        client: "ctl".into(),
-                    })
-                    .await?,
-            )
+            // Text and Enter go apart: Claude Code reads a long burst as a
+            // paste, and an Enter inside a paste is a newline, not a submit.
+            client.send_input(n, text.as_bytes()).await?;
+            synced(&client).await?;
+            tokio::time::sleep(RAW_RETURN_DELAY).await;
+            client.send_input(n, b"\r").await?;
+            synced(&client).await
         }
         CtlCmd::Send {
             n,

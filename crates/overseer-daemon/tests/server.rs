@@ -750,11 +750,13 @@ fn stub_claude(dir: &std::path::Path) -> (PathBuf, PathBuf) {
     std::fs::write(
         &bin,
         format!(
-            "#!/bin/sh\nprintf '%s|%s\\n' \"$(pwd -P)\" \"$*\" >> '{}'\n\
-             # Like claude, save the conversation for a new session id.\n\
+            "#!/bin/sh\n\
+             # Like claude, save the conversation for a new session id. Saved\n\
+             # before the call is logged, so a test that has seen the log line\n\
+             # never stops the stub between the two.\n\
              if [ \"$1\" = --session-id ] && [ -n \"$STUB_SAVES\" ]; then\n\
              mkdir -p \"$CLAUDE_CONFIG_DIR/projects/p\" && : > \"$CLAUDE_CONFIG_DIR/projects/p/$2.jsonl\"\n\
-             fi\nexec sleep 30\n",
+             fi\nprintf '%s|%s\\n' \"$(pwd -P)\" \"$*\" >> '{}'\nexec sleep 30\n",
             log.display()
         ),
     )
@@ -2706,6 +2708,19 @@ reader=$!
 draw() {{
   cols=$(stty size | cut -d' ' -f2)
   rule=$(awk -v n="$cols" 'BEGIN {{ for (i = 0; i < n; i++) printf "\342\224\200" }}')
+  b=$(cat '{boxf}' 2>/dev/null)
+  if [ "$b" = @dialog ]; then
+    printf '\033[2J\033[H{mode}Bash command\r\n  kubectl apply -f demo-api.yaml\r\nDo you want to proceed?\r\n\342\235\257 1. Yes\r\n  2. No\r\n'
+    echo drawn >> '{draws}'
+    return
+  fi
+  if [ "$b" = @working ]; then
+    printf '\033[2J\033[H{mode}\342\234\273 Churning\342\200\246 (4s \302\267 \342\206\223 323 tokens)\r\n\r\n%s\r\n' "$rule"
+    printf '\342\235\257 \033[7mT\033[0m\033[2mry "fix the failing test"\033[0m\r\n'
+    printf '%s\r\n  ? for shortcuts' "$rule"
+    echo drawn >> '{draws}'
+    return
+  fi
   printf '\033[2J\033[H{mode}Working on DEMO-12 in demo-api\r\n\r\n%s\r\n' "$rule"
   if [ -s '{boxf}' ]; then
     printf '\342\235\257 %s\r\n' "$(cat '{boxf}')"
@@ -2774,6 +2789,8 @@ impl BoxStub {
     }
 
     /// Sets the input box (`None` is empty) and has the stub redraw it.
+    /// `@dialog` draws a permission dialog in its place, `@working` an empty
+    /// box under Claude Code's working line.
     async fn set_box(&self, text: Option<&str>, pid: u32) {
         std::fs::write(&self.box_file, text.unwrap_or("")).unwrap();
         let before = self.draws();
@@ -2885,8 +2902,9 @@ async fn permission_prompt_never_gets_a_relay() {
     let stub = box_stub("permission");
     let d = start_daemon_with(temp_socket(), stub.env()).await;
     let mut c = Client::connect(&d.socket).await;
-    c.start_stub(2, &stub).await;
+    let pid = c.start_stub(2, &stub).await;
     c.hook(hook(2, HookKind::UserPromptSubmit)).await;
+    stub.set_box(Some("@dialog"), pid).await;
     c.notification(
         2,
         "permission_prompt",
@@ -2902,7 +2920,35 @@ async fn permission_prompt_never_gets_a_relay() {
         Some("waiting at a prompt for Jonathan")
     );
     assert_eq!(v.relays[0].state, RelayState::Pending);
+    // Answered Yes: the tool runs under the working line, still no hook.
+    stub.set_box(Some("@working"), pid).await;
+    stub.reads_nothing_for(3).await;
+    stub.set_box(None, pid).await;
     c.hook(hook(2, HookKind::Stop)).await;
+    assert_eq!(stub.read_until(&pasted(HELLO)).await, pasted(HELLO));
+    c.all_delivered(2).await;
+}
+
+/// Answering No ends the turn with no `Stop` hook (F6): once the empty box
+/// is back with no working line, the relay goes.
+#[tokio::test]
+async fn prompt_answered_no_gets_the_relay() {
+    let stub = box_stub("answered-no");
+    let d = start_daemon_with(temp_socket(), stub.env()).await;
+    let mut c = Client::connect(&d.socket).await;
+    let pid = c.start_stub(2, &stub).await;
+    c.hook(hook(2, HookKind::UserPromptSubmit)).await;
+    stub.set_box(Some("@dialog"), pid).await;
+    c.notification(
+        2,
+        "permission_prompt",
+        "Claude needs your permission to use Bash",
+    )
+    .await;
+    assert_eq!(c.relay(None, 2, "hello").await, queued_for(2));
+    c.held_for(2, "waiting at a prompt for Jonathan").await;
+    stub.reads_nothing_for(2).await;
+    stub.set_box(None, pid).await;
     assert_eq!(stub.read_until(&pasted(HELLO)).await, pasted(HELLO));
     c.all_delivered(2).await;
 }

@@ -25,6 +25,7 @@ const PREVIOUS_COORDINATOR: &[u64] = &[
     0xfb1eff022d50a360,
     0x4baeb879ce73cf13,
     0x7ddaa223f4bdd1f6,
+    0xf98858507513ed2d,
 ];
 const PREVIOUS_WORKER: &[u64] = &[0x215de771dfd84eb4, 0xbd3ab0020d4d25b1];
 const PREVIOUS_KICKOFF: &[u64] = &[];
@@ -277,15 +278,36 @@ fn mcp_json(overseer_bin: &Path, slot: SlotId) -> String {
     .expect("mcp config serialises")
 }
 
+/// The folders a role names, from the daemon's config: `{brain}` is the
+/// 2ndBrain folder S0 works in and reads the journal from, `{beads}` where
+/// it runs `bd`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RoleDirs {
+    pub brain: PathBuf,
+    pub beads: PathBuf,
+}
+
+impl Default for RoleDirs {
+    /// As the config defaults name them, unexpanded.
+    fn default() -> Self {
+        RoleDirs {
+            brain: PathBuf::from("~/Repos/2ndBrain"),
+            beads: PathBuf::from("~/Repos/2ndBrain"),
+        }
+    }
+}
+
 /// Writes `slots/S<n>/settings.json`, `mcp.json` and `role.md` under
 /// `state_dir`, replacing them on every start. The role is copied from
 /// `roles/coordinator.md` for S0 and `roles/worker.md` otherwise (created from the compiled-in default if missing;
-/// an unedited older default is upgraded, an edited file is kept) with `{slot}`, `{label}` and `{overseer}` filled in.
+/// an unedited older default is upgraded, an edited file is kept) with `{slot}`, `{label}`, `{overseer}`,
+/// `{brain}` and `{beads}` filled in.
 pub fn write_slot_files(
     state_dir: &Path,
     slot: SlotId,
     label: &str,
     overseer_bin: &Path,
+    dirs: &RoleDirs,
 ) -> io::Result<LaunchFiles> {
     let roles = state_dir.join("roles");
     // All defaults are written so Jonathan finds every file to edit.
@@ -304,6 +326,8 @@ pub fn write_slot_files(
     let role_text = template
         .replace("{slot}", &slot_name(slot))
         .replace("{overseer}", &overseer_bin.to_string_lossy())
+        .replace("{brain}", &dirs.brain.to_string_lossy())
+        .replace("{beads}", &dirs.beads.to_string_lossy())
         .replace("{label}", label);
 
     let dir = state_dir.join("slots").join(slot_name(slot));
@@ -456,7 +480,7 @@ mod tests {
     fn settings_file_has_six_hooks() {
         let dir = temp("settings");
         let bin = Path::new("/Applications/My App/overseer");
-        let f = write_slot_files(&dir, 3, "api", bin).unwrap();
+        let f = write_slot_files(&dir, 3, "api", bin, &RoleDirs::default()).unwrap();
         let v = json(&f.settings);
         let hooks = v["hooks"].as_object().unwrap();
         assert_eq!(hooks.len(), 6);
@@ -492,7 +516,7 @@ mod tests {
     #[test]
     fn settings_allow_the_overseer_tools() {
         let dir = temp("allow");
-        let f = write_slot_files(&dir, 2, "api", Path::new("/o")).unwrap();
+        let f = write_slot_files(&dir, 2, "api", Path::new("/o"), &RoleDirs::default()).unwrap();
         let v = json(&f.settings);
         assert_eq!(
             v["permissions"]["allow"],
@@ -509,7 +533,7 @@ mod tests {
     fn mcp_file_names_the_slot() {
         let dir = temp("mcp");
         let bin = Path::new("/Applications/My App/overseer");
-        let f = write_slot_files(&dir, 4, "api", bin).unwrap();
+        let f = write_slot_files(&dir, 4, "api", bin, &RoleDirs::default()).unwrap();
         assert!(f.mcp.ends_with("slots/S4/mcp.json"));
         assert_eq!(
             json(&f.mcp),
@@ -541,13 +565,13 @@ mod tests {
     #[test]
     fn edited_role_template_is_kept() {
         let dir = temp("template");
-        write_slot_files(&dir, 1, "a", Path::new("/o")).unwrap();
+        write_slot_files(&dir, 1, "a", Path::new("/o"), &RoleDirs::default()).unwrap();
         std::fs::write(
             dir.join("roles/worker.md"),
             "mine {slot} {label} {overseer}",
         )
         .unwrap();
-        let f = write_slot_files(&dir, 1, "{slot}", Path::new("/o")).unwrap();
+        let f = write_slot_files(&dir, 1, "{slot}", Path::new("/o"), &RoleDirs::default()).unwrap();
         assert_eq!(
             std::fs::read_to_string(f.role).unwrap(),
             "mine S1 {slot} /o"
@@ -743,10 +767,10 @@ mod tests {
     #[test]
     fn edited_template_is_not_overwritten() {
         let dir = temp("keep");
-        write_slot_files(&dir, 0, "a", Path::new("/o")).unwrap();
+        write_slot_files(&dir, 0, "a", Path::new("/o"), &RoleDirs::default()).unwrap();
         std::fs::write(dir.join("roles/coordinator.md"), "my coordinator").unwrap();
         std::fs::write(dir.join("roles/kickoff.md"), "my kickoff").unwrap();
-        let f = write_slot_files(&dir, 0, "a", Path::new("/o")).unwrap();
+        let f = write_slot_files(&dir, 0, "a", Path::new("/o"), &RoleDirs::default()).unwrap();
         assert_eq!(std::fs::read_to_string(f.role).unwrap(), "my coordinator");
         assert_eq!(kickoff_prompt(&dir).unwrap(), "my kickoff");
     }
@@ -755,8 +779,18 @@ mod tests {
     fn slot_zero_uses_the_coordinator_and_others_the_worker() {
         let dir = temp("which");
         let o = Path::new("/Apps/overseer");
-        let c = std::fs::read_to_string(write_slot_files(&dir, 0, "", o).unwrap().role).unwrap();
-        let w = std::fs::read_to_string(write_slot_files(&dir, 4, "x", o).unwrap().role).unwrap();
+        let c = std::fs::read_to_string(
+            write_slot_files(&dir, 0, "", o, &RoleDirs::default())
+                .unwrap()
+                .role,
+        )
+        .unwrap();
+        let w = std::fs::read_to_string(
+            write_slot_files(&dir, 4, "x", o, &RoleDirs::default())
+                .unwrap()
+                .role,
+        )
+        .unwrap();
         assert!(c.contains("bd ready --json"), "{c}");
         assert!(!c.contains("You are S0 of an Overseer team"), "{c}");
         assert!(w.contains("You are S4 of an Overseer team"), "{w}");
@@ -766,7 +800,7 @@ mod tests {
     fn overseer_path_with_a_space_is_quoted() {
         let dir = temp("space");
         let o = Path::new("/Applications/My App/overseer");
-        let f = write_slot_files(&dir, 0, "", o).unwrap();
+        let f = write_slot_files(&dir, 0, "", o, &RoleDirs::default()).unwrap();
         let role = std::fs::read_to_string(f.role).unwrap();
         assert!(
             role.contains("\"/Applications/My App/overseer\" ctl status"),
@@ -777,7 +811,14 @@ mod tests {
     #[test]
     fn placeholders_are_filled() {
         let dir = temp("fill");
-        let f = write_slot_files(&dir, 0, "lbl", Path::new("/Apps/overseer")).unwrap();
+        let f = write_slot_files(
+            &dir,
+            0,
+            "lbl",
+            Path::new("/Apps/overseer"),
+            &RoleDirs::default(),
+        )
+        .unwrap();
         let role = std::fs::read_to_string(f.role).unwrap();
         assert!(role.contains("\"/Apps/overseer\" ctl start"), "{role}");
         assert!(
@@ -785,6 +826,25 @@ mod tests {
             "{role}"
         );
         assert!(!role.contains('\u{2014}'), "no em dashes");
+        // The folders come from the config, never a fixed path.
+        let dirs = RoleDirs {
+            brain: PathBuf::from("/tmp/demo-brain"),
+            beads: PathBuf::from("/tmp/demo-beads"),
+        };
+        let f = write_slot_files(&dir, 0, "lbl", Path::new("/Apps/overseer"), &dirs).unwrap();
+        let role = std::fs::read_to_string(f.role).unwrap();
+        assert!(
+            role.contains("Your working folder is /tmp/demo-brain."),
+            "{role}"
+        );
+        assert!(
+            role.contains("`bd ready --json` in /tmp/demo-beads"),
+            "{role}"
+        );
+        assert!(
+            !role.contains("2ndBrain") && !role.contains("{brain}"),
+            "{role}"
+        );
         // Bead and Jira text must not be shell-expanded.
         assert!(
             role.contains("ctl start <n> --cwd <dir> --label '<item key>' --prompt '<text>'"),
@@ -815,8 +875,22 @@ mod tests {
         std::fs::create_dir_all(&roles).unwrap();
         std::fs::write(roles.join("worker.md"), PHASE_3_WORKER).unwrap();
         std::fs::write(roles.join("coordinator.md"), PHASE_3_COORDINATOR).unwrap();
-        write_slot_files(&dir, 1, "lbl", Path::new("/Apps/overseer")).unwrap();
-        write_slot_files(&dir, 0, "lbl", Path::new("/Apps/overseer")).unwrap();
+        write_slot_files(
+            &dir,
+            1,
+            "lbl",
+            Path::new("/Apps/overseer"),
+            &RoleDirs::default(),
+        )
+        .unwrap();
+        write_slot_files(
+            &dir,
+            0,
+            "lbl",
+            Path::new("/Apps/overseer"),
+            &RoleDirs::default(),
+        )
+        .unwrap();
         assert_eq!(
             std::fs::read_to_string(roles.join("worker.md")).unwrap(),
             WORKER_ROLE
@@ -832,7 +906,14 @@ mod tests {
     #[test]
     fn worker_role_names_the_tools() {
         let dir = temp("workertools");
-        let f = write_slot_files(&dir, 2, "lbl", Path::new("/Apps/overseer")).unwrap();
+        let f = write_slot_files(
+            &dir,
+            2,
+            "lbl",
+            Path::new("/Apps/overseer"),
+            &RoleDirs::default(),
+        )
+        .unwrap();
         let role = std::fs::read_to_string(f.role).unwrap();
         for t in [
             "claim_target",

@@ -167,6 +167,9 @@ pub struct HoldRow {
     pub kind: String,
     /// Local clock time the hold began.
     pub since: String,
+    /// `for <item or reason>` and `at <revision>`, as `ctl locks` words them,
+    /// or empty.
+    pub detail: String,
     /// Unused for longer than the long-held limit.
     pub flagged: bool,
     /// The slots queued for the target, first in line first.
@@ -193,6 +196,16 @@ pub fn holds_rows(
             }
             .into(),
             since: clock(c.since),
+            detail: {
+                let mut parts = Vec::new();
+                if let Some(why) = c.item.as_deref().or(c.reason.as_deref()) {
+                    parts.push(format!("for {why}"));
+                }
+                if let Some(rev) = &c.pin_revision {
+                    parts.push(format!("at {rev}"));
+                }
+                parts.join("  ")
+            },
             flagged: view.flagged(c, now),
             waiters: view
                 .waits
@@ -893,6 +906,34 @@ impl OverseerApp {
                     let names: Vec<_> = h.waiters.iter().map(|w| slot_name(*w)).collect();
                     Some(format!("waiting: {}", names.join(", ")))
                 };
+                // The target and its time on the first line, never cut; what
+                // it is for, the flag and the queue on the second, which may
+                // be cut at the right.
+                let detail: Vec<String> = [Some(h.detail), queued]
+                    .into_iter()
+                    .flatten()
+                    .filter(|t| !t.is_empty())
+                    .collect();
+                let second = (h.flagged || !detail.is_empty()).then(|| {
+                    div()
+                        .flex()
+                        .gap_2()
+                        .min_w(px(0.))
+                        .children(h.flagged.then(|| {
+                            div()
+                                .flex_none()
+                                .text_color(rgb(colors::ORANGE))
+                                .child("held long")
+                        }))
+                        .children((!detail.is_empty()).then(|| {
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .truncate()
+                                .text_color(rgb(colors::TEXT_DIM))
+                                .child(detail.join("  "))
+                        }))
+                });
                 div()
                     .flex()
                     .items_center()
@@ -900,29 +941,31 @@ impl OverseerApp {
                     .text_sm()
                     .child(
                         div()
-                            .flex_shrink()
-                            .min_w(px(0.))
-                            .truncate()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(h.target),
-                    )
-                    .child(
-                        div()
+                            .flex()
+                            .flex_col()
                             .flex_1()
                             .min_w(px(0.))
-                            .truncate()
-                            .text_color(rgb(colors::MUTED))
-                            .child(format!("{} since {}", h.kind, h.since)),
-                    )
-                    .children(h.flagged.then(|| {
-                        div()
-                            .flex_none()
-                            .text_color(rgb(colors::ORANGE))
-                            .child("held long")
-                    }))
-                    .children(
-                        queued
-                            .map(|q| div().flex_none().text_color(rgb(colors::TEXT_DIM)).child(q)),
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .min_w(px(0.))
+                                    .child(
+                                        div()
+                                            .flex_shrink()
+                                            .min_w(px(0.))
+                                            .truncate()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child(h.target),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .text_color(rgb(colors::MUTED))
+                                            .child(format!("{} since {}", h.kind, h.since)),
+                                    ),
+                            )
+                            .children(second),
                     )
                     .child(
                         button(("release-hold", n), "Release", true)
@@ -1476,9 +1519,17 @@ mod tests {
         let mut v = locks();
         v.flag_after_secs = 100;
         v.claims = vec![
-            claim(2, "argo:uat/root", ClaimKind::Pin, 10, 10),
+            overseer_proto::Claim {
+                reason: Some("lane test".into()),
+                item: Some("DEMO-12".into()),
+                pin_revision: Some("abc1234".into()),
+                ..claim(2, "argo:uat/root", ClaimKind::Pin, 10, 10)
+            },
             claim(3, "repo:demo-api:main", ClaimKind::Command, 20, 190),
-            claim(2, "tf:default", ClaimKind::Claim, 30, 30),
+            overseer_proto::Claim {
+                reason: Some("lane test".into()),
+                ..claim(2, "tf:default", ClaimKind::Claim, 30, 30)
+            },
         ];
         v.waits = vec![
             wait(4, "argo:uat/root"),
@@ -1493,11 +1544,13 @@ mod tests {
                 target: "argo:uat/root".into(),
                 kind: "pin".into(),
                 since: "T10".into(),
+                detail: "for DEMO-12  at abc1234".into(),
                 flagged: true,
                 waiters: vec![4, 5],
             }
         );
         assert_eq!(rows[1].kind, "claim");
+        assert_eq!(rows[1].detail, "for lane test");
         assert!(rows[1].waiters.is_empty());
         let other = holds_rows(&v, 3, 200, clock);
         assert_eq!(other.len(), 1);

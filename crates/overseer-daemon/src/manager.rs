@@ -15,7 +15,7 @@ use crate::activity::apply;
 use crate::env::BaseEnv;
 use crate::launch::{
     claude_argv, claude_projects_dir, first_prompt, has_transcript, is_claude, write_slot_files,
-    Start,
+    RoleDirs, Start,
 };
 use crate::ledger::{Ledger, SessionRow};
 use crate::slot::Slot;
@@ -104,6 +104,7 @@ struct Launch {
     /// The binary the generated hooks call.
     hook_program: PathBuf,
     ledger: Arc<Ledger>,
+    dirs: RoleDirs,
 }
 
 fn unix_now() -> i64 {
@@ -194,11 +195,13 @@ impl SlotManager {
         state_dir: PathBuf,
         hook_program: PathBuf,
         ledger: Arc<Ledger>,
+        dirs: RoleDirs,
     ) -> Self {
         self.launch = Some(Launch {
             state_dir,
             hook_program,
             ledger,
+            dirs,
         });
         self
     }
@@ -280,8 +283,14 @@ impl SlotManager {
         let mut argv = command.clone();
         let env = self.env.get();
         if let Some(launch) = self.launch.as_ref().filter(|_| is_claude(&command)) {
-            let files = write_slot_files(&launch.state_dir, id, &label, &launch.hook_program)
-                .map_err(|e| format!("cannot write {} launch files: {e}", slot_name(id)))?;
+            let files = write_slot_files(
+                &launch.state_dir,
+                id,
+                &label,
+                &launch.hook_program,
+                &launch.dirs,
+            )
+            .map_err(|e| format!("cannot write {} launch files: {e}", slot_name(id)))?;
             let how = match &resume {
                 // A session that never had a message has nothing to resume,
                 // and `--resume` would exit at once, so it starts fresh under
@@ -653,6 +662,7 @@ mod restore_tests {
             std::env::temp_dir(),
             PathBuf::from("/bin/true"),
             ledger,
+            RoleDirs::default(),
         )
     }
 
