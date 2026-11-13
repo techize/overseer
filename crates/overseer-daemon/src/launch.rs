@@ -1092,6 +1092,7 @@ mod tests {
             "ctl start",
             "Never claim targets",
             "To give work to a running slot",
+            "Only propose idle slots",
         ] {
             assert!(!COORDINATOR_ROLE.contains(gone), "still has {gone}");
         }
