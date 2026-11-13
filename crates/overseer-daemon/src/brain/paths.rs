@@ -88,9 +88,12 @@ pub fn owners(
     out
 }
 
-/// `~` and a relative path resolved, `.` and `..` folded. A relative path is
-/// read against `cwd`, else against the vault.
-fn absolute(brain: &Path, cwd: Option<&Path>, p: &Path, home: &Path) -> PathBuf {
+/// `p` with `~` and a relative path resolved (against `cwd`, else the
+/// vault) and symlinks followed component by component, so a `..` after a
+/// symlink steps out of where the link points, as the kernel does. Once a
+/// component does not exist no symlink can follow, so the rest is folded
+/// lexically. A dangling symlink gives `None`: where it leads is unknown.
+fn resolve(brain: &Path, cwd: Option<&Path>, p: &Path, home: &Path) -> Option<PathBuf> {
     let joined = if let Ok(rest) = p.strip_prefix("~") {
         home.join(rest)
     } else if p.is_absolute() {
@@ -98,39 +101,27 @@ fn absolute(brain: &Path, cwd: Option<&Path>, p: &Path, home: &Path) -> PathBuf 
     } else {
         cwd.unwrap_or(brain).join(p)
     };
-    let mut out = PathBuf::new();
+    let mut cur = PathBuf::new();
+    let mut tail = false;
     for c in joined.components() {
         match c {
             Component::CurDir => {}
             Component::ParentDir => {
-                out.pop();
+                cur.pop();
             }
-            c => out.push(c),
-        }
-    }
-    out
-}
-
-/// Symlinks resolved for the longest existing prefix, the rest appended. A
-/// dangling symlink in the prefix gives `None`: where it leads is unknown.
-fn resolve(abs: &Path) -> Option<PathBuf> {
-    let mut rest: Vec<&std::ffi::OsStr> = Vec::new();
-    let mut cur = abs;
-    loop {
-        match cur.canonicalize() {
-            Ok(mut base) => {
-                base.extend(rest.iter().rev());
-                return Some(base);
-            }
-            Err(_) => {
-                if cur.symlink_metadata().is_ok() {
-                    return None;
+            Component::Normal(n) if !tail => {
+                let cand = cur.join(n);
+                if cand.symlink_metadata().is_ok() {
+                    cur = cand.canonicalize().ok()?;
+                } else {
+                    tail = true;
+                    cur = cand;
                 }
-                rest.push(cur.file_name()?);
-                cur = cur.parent()?;
             }
+            c => cur.push(c),
         }
     }
+    Some(cur)
 }
 
 /// The vault-relative form of `p`, with whether it is a folder.
@@ -141,8 +132,8 @@ fn locate(
     home: &Path,
 ) -> Result<(String, bool), String> {
     let outside = || format!("{} is outside 2ndBrain", p.display());
-    let root = resolve(&absolute(brain, None, brain, home)).ok_or_else(outside)?;
-    let full = resolve(&absolute(brain, cwd, p, home)).ok_or_else(outside)?;
+    let root = resolve(brain, None, brain, home).ok_or_else(outside)?;
+    let full = resolve(brain, cwd, p, home).ok_or_else(outside)?;
     let rel = full.strip_prefix(&root).map_err(|_| outside())?;
     let rel = rel.to_str().ok_or_else(outside)?;
     Ok((rel.to_string(), full.is_dir()))
@@ -164,7 +155,7 @@ pub fn vault_rel(
 }
 
 pub fn classify(p: &Path, ctx: &PathContext) -> PathClass {
-    let abs = |x: &Path| resolve(&absolute(ctx.brain, ctx.cwd, x, ctx.home));
+    let abs = |x: &Path| resolve(ctx.brain, ctx.cwd, x, ctx.home);
     if let (Some(a), Some(b)) = (abs(p), abs(ctx.current_session)) {
         if a == b {
             return PathClass::CurrentSession;
@@ -493,6 +484,13 @@ mod tests {
             "Sessions/notes/demo api é.md"
         );
         assert_eq!(rel("notes").unwrap_err(), "notes is a folder");
+        // `..` after a symlink steps out of the link's target, as the kernel does.
+        std::fs::create_dir_all(brain.join("c/d")).unwrap();
+        std::os::unix::fs::symlink(brain.join("c/d"), brain.join("inlink")).unwrap();
+        assert!(rel("../link/../x")
+            .unwrap_err()
+            .ends_with("is outside 2ndBrain"));
+        assert_eq!(rel("../inlink/../x").unwrap(), "c/x");
         // `~` resolves against home; home here is outside the vault.
         assert!(rel("~/a.md").unwrap_err().ends_with("is outside 2ndBrain"));
         // No cwd: a relative path is read against the vault.
