@@ -14,6 +14,9 @@ use tokio::sync::{Mutex, MutexGuard};
 const LOCK_WAIT: Duration = Duration::from_secs(5);
 /// A lock older than this after the wait is treated as stale and removed.
 const STALE_AFTER: Duration = Duration::from_secs(60);
+/// Timeouts per child: network commands, then everything else.
+const NET_TIMEOUT: Duration = Duration::from_secs(120);
+const LOCAL_TIMEOUT: Duration = Duration::from_secs(30);
 const LOCK_POLL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +50,8 @@ pub struct VaultGit {
     lock: Mutex<()>,
     push: bool,
     lock_wait: Duration,
+    timeout: Option<Duration>,
+    git_bin: PathBuf,
     removed_stale_lock: AtomicBool,
 }
 
@@ -72,6 +77,8 @@ impl VaultGit {
             lock: Mutex::new(()),
             push,
             lock_wait: LOCK_WAIT,
+            timeout: None,
+            git_bin: PathBuf::from("git"),
             removed_stale_lock: AtomicBool::new(false),
         }
     }
@@ -79,6 +86,18 @@ impl VaultGit {
     /// Shorten the `index.lock` wait (tests).
     pub fn with_lock_wait(mut self, wait: Duration) -> Self {
         self.lock_wait = wait;
+        self
+    }
+
+    /// Override the per-command timeout (tests).
+    pub fn with_timeout(mut self, t: Duration) -> Self {
+        self.timeout = Some(t);
+        self
+    }
+
+    /// Use another git executable (tests).
+    pub fn with_git_bin(mut self, bin: PathBuf) -> Self {
+        self.git_bin = bin;
         self
     }
 
@@ -99,15 +118,34 @@ impl VaultGit {
     }
 
     async fn exec(&self, args: &[&str]) -> Result<Out, GitError> {
-        let out = Command::new("git")
-            .args(args)
+        let limit = self.timeout.unwrap_or(match args.first() {
+            Some(&"push") | Some(&"pull") => NET_TIMEOUT,
+            _ => LOCAL_TIMEOUT,
+        });
+        let mut cmd = Command::new(&self.git_bin);
+        cmd.args(args)
             .current_dir(&self.root)
             .env("OVERSEER_COMMIT", "1")
             .env("GIT_TERMINAL_PROMPT", "0")
+            // Paths are file names, never patterns.
+            .env("GIT_LITERAL_PATHSPECS", "1")
+            // Untranslated messages: push rejection is detected from stderr text.
+            .env("LC_ALL", "C")
+            .env("LANG", "C")
             .stdin(Stdio::null())
-            .output()
-            .await
-            .map_err(|e| GitError::Failed(format!("could not run git: {e}")))?;
+            .kill_on_drop(true);
+        if std::env::var_os("GIT_SSH_COMMAND").is_none() {
+            cmd.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
+        }
+        let out = match tokio::time::timeout(limit, cmd.output()).await {
+            Ok(r) => r.map_err(|e| GitError::Failed(format!("could not run git: {e}")))?,
+            Err(_) => {
+                return Err(GitError::Failed(format!(
+                    "git {} timed out",
+                    args.first().copied().unwrap_or("")
+                )))
+            }
+        };
         Ok(Out {
             ok: out.status.success(),
             code: out.status.code(),
@@ -231,7 +269,15 @@ impl VaultGit {
                 first_line(&pull.stderr)
             };
             if self.rebase_in_progress() {
-                let _ = self.exec(&["rebase", "--abort"]).await;
+                let abort = self.exec(&["rebase", "--abort"]).await;
+                let aborted = matches!(&abort, Ok(o) if o.ok) && !self.rebase_in_progress();
+                if !aborted {
+                    let why = match abort {
+                        Ok(o) => first_line(&o.stderr),
+                        Err(e) => e.to_string(),
+                    };
+                    return Err(GitError::Failed(format!("rebase --abort failed: {why}")));
+                }
                 // Prefer the conflict line git printed on stdout when stderr is generic.
                 let line = pull
                     .stdout
@@ -244,6 +290,16 @@ impl VaultGit {
                 return Err(GitError::Conflict(line));
             }
             return Err(GitError::Failed(msg));
+        }
+        // The autostash can fail to re-apply while git still exits 0.
+        let unmerged = self.exec(&["ls-files", "-u"]).await?;
+        let said = format!("{}{}", pull.stdout, pull.stderr);
+        if !unmerged.stdout.trim().is_empty()
+            || said.contains("Applying autostash resulted in conflicts")
+        {
+            return Err(GitError::Conflict(
+                "autostash did not re-apply; your changes are safe in stash@{0}".to_string(),
+            ));
         }
         let second = self.exec(&["push"]).await?;
         if second.ok {
@@ -537,5 +593,99 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "1");
+    }
+
+    #[tokio::test]
+    async fn autostash_conflict_is_reported_and_text_kept() {
+        let v = TestVault::new("autostash");
+        let other = v.clone_other();
+        std::fs::write(other.join("jonathan.md"), "theirs\n").unwrap();
+        sh(&other, &["add", "-A"]);
+        sh(&other, &["commit", "-m", "theirs"]);
+        sh(&other, &["push"]);
+        std::fs::write(v.vault.join("jonathan.md"), "line one\nmine\n").unwrap();
+        std::fs::write(v.vault.join("a.md"), "a2\n").unwrap();
+        let g = v.git.lock().await;
+        v.git
+            .commit_paths(&g, &["a.md".into()], "S1: a")
+            .await
+            .unwrap();
+        let err = v.git.push(&g).await.unwrap_err();
+        match err {
+            GitError::Conflict(m) => assert!(m.contains("stash"), "{m}"),
+            e => panic!("{e:?}"),
+        }
+        let stash = sh(&v.vault, &["stash", "show", "-p", "stash@{0}"]);
+        assert!(stash.contains("mine"), "{stash}");
+        let remote = sh(&v.remote, &["log", "--format=%s", "main"]);
+        assert!(!remote.contains("S1: a"));
+    }
+
+    #[tokio::test]
+    async fn pathspecs_are_literal() {
+        let v = TestVault::new("literal");
+        std::fs::write(v.vault.join("n[1].md"), "x\n").unwrap();
+        std::fs::write(v.vault.join("n1.md"), "y\n").unwrap();
+        let g = v.git.lock().await;
+        v.git
+            .commit_paths(&g, &["n[1].md".into()], "S1: n")
+            .await
+            .unwrap();
+        let shown = sh(&v.vault, &["show", "--name-only", "--format=", "HEAD"]);
+        assert_eq!(shown.trim(), "n[1].md");
+        assert!(v
+            .git
+            .changed_paths(&g)
+            .await
+            .unwrap()
+            .contains(&"n1.md".to_string()));
+        assert!(sh(&v.vault, &["ls-files", "--others"]).contains("n1.md"));
+    }
+
+    #[tokio::test]
+    async fn failed_abort_is_failed_not_conflict() {
+        let v = TestVault::new("abort");
+        let other = v.clone_other();
+        std::fs::write(other.join("jonathan.md"), "theirs\n").unwrap();
+        sh(&other, &["add", "-A"]);
+        sh(&other, &["commit", "-m", "theirs"]);
+        sh(&other, &["push"]);
+        std::fs::write(v.vault.join("jonathan.md"), "ours\n").unwrap();
+        let g = v.git.lock().await;
+        v.git
+            .commit_paths(&g, &["jonathan.md".into()], "S1: ours")
+            .await
+            .unwrap();
+        let wrapper = v.base.join("git-wrap.sh");
+        std::fs::write(
+            &wrapper,
+            "#!/bin/sh\nif [ \"$1\" = rebase ] && [ \"$2\" = --abort ]; then echo 'abort refused' >&2; exit 1; fi\nexec git \"$@\"\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let git = VaultGit::new(v.vault.clone(), true).with_git_bin(wrapper);
+        drop(g);
+        let g = git.lock().await;
+        let r = git.push(&g).await;
+        match r {
+            Err(GitError::Failed(m)) => assert!(m.contains("rebase --abort failed"), "{m}"),
+            e => panic!("{e:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn hung_push_times_out() {
+        let v = TestVault::new("timeout");
+        let hook = v.vault.join(".git/hooks/pre-push");
+        std::fs::write(&hook, "#!/bin/sh\nexec sleep 10\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let git = VaultGit::new(v.vault.clone(), true).with_timeout(Duration::from_secs(1));
+        let g = git.lock().await;
+        let t = std::time::Instant::now();
+        let r = git.push(&g).await;
+        assert_eq!(r, Err(GitError::Failed("git push timed out".into())));
+        assert!(t.elapsed() < Duration::from_secs(5));
     }
 }
