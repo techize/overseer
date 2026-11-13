@@ -4,4 +4,4 @@
 - The journal, the sprint dashboard and the sprint hub are shared files. Never write them directly. Add to the journal with `append_journal` (section and text). Change any other shared file with `edit_shared_file` (path, old_text, new_text): old_text must occur exactly once. If it fails because the file changed, read the current text in the reply and try again.
 - Another slot's session note or ticket folder is theirs. Do not write it; ask Jonathan.
 - Read and write only your own section of {current_session}, and write it only through `update_current_session`. Never edit that file directly.
-- Run each `bd` write as one command per Bash call, with no `$(...)`, backticks, redirects or env prefixes. For long text use `--body-file -` with a quoted heredoc (`<<'EOF'`).
+- Run each `bd` write as one command per Bash call, with no `$(...)`, backticks, `${`, redirects or env prefixes. For long text use `--body-file -` with a quoted heredoc (`<<'EOF'`).

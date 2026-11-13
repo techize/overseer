@@ -127,7 +127,6 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
                 brain: cfg.settings.brain_dir.clone(),
                 beads: cfg.settings.beads_dir.clone(),
                 brain_writer: cfg.settings.brain_writer,
-                session_note: cfg.settings.session_note.clone(),
                 current_session: cfg.settings.current_session.clone(),
             },
         );

@@ -288,6 +288,18 @@ impl SlotManager {
             }
         }
         let command = command.unwrap_or_else(|| self.default_command.clone());
+        // One clock reading and one note for the role, the row and the
+        // ledger: a fresh start fixes the note from `start_time`, a resume keeps
+        // the stored one (it may be from another day).
+        let start_time = unix_now();
+        let note = match (&resume, &self.launch) {
+            (Some(_), Some(l)) => l.ledger.session_note(id).ok().flatten(),
+            (None, _) => self
+                .session_note
+                .as_ref()
+                .map(|t| crate::brain::paths::fill_template(t, start_time, id, &label)),
+            _ => None,
+        };
         // Claude gets Overseer's hooks, role prompt and a session id of our
         // choosing; anything else runs as given and has no session id.
         let mut session_id = String::new();
@@ -300,6 +312,7 @@ impl SlotManager {
                 &label,
                 &launch.hook_program,
                 &launch.dirs,
+                note.as_deref(),
             )
             .map_err(|e| format!("cannot write {} launch files: {e}", slot_name(id)))?;
             let how = match &resume {
@@ -367,13 +380,12 @@ impl SlotManager {
                 label: row_label,
                 cwd: cwd.to_path_buf(),
                 command: command.clone(),
-                started: unix_now(),
+                started: start_time,
             };
             if let Err(e) = launch.ledger.record_start(&row) {
                 tracing::warn!("{} ledger start not recorded: {e:#}", slot_name(id));
-            } else if let Some(t) = &self.session_note {
-                let note = crate::brain::paths::fill_template(t, row.started, id, &row.label);
-                if let Err(e) = launch.ledger.set_session_note(id, &note) {
+            } else if let Some(note) = &note {
+                if let Err(e) = launch.ledger.set_session_note(id, note) {
                     tracing::warn!("{} session note not recorded: {e:#}", slot_name(id));
                 }
             }
@@ -680,6 +692,74 @@ mod restore_tests {
             ledger,
             RoleDirs::default(),
         )
+    }
+
+    fn role_note(slot: SlotId) -> String {
+        let role = std::fs::read_to_string(
+            std::env::temp_dir()
+                .join("slots")
+                .join(slot_name(slot))
+                .join("role.md"),
+        )
+        .unwrap();
+        role.lines()
+            .find_map(|l| l.split("session note is ").nth(1))
+            .unwrap_or("")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn the_role_names_the_ledgers_note_fresh_and_resumed() {
+        let ledger = Arc::new(Ledger::in_memory());
+        let mut m = manager(ledger.clone()).with_session_note("Sessions/{slot}-{label}.md".into());
+        // The role needs the writer on to name a note.
+        m.launch.as_mut().unwrap().dirs.brain_writer = true;
+        m.launch.as_mut().unwrap().dirs.brain = PathBuf::from("/tmp/demo-brain");
+        // Only a claude command gets a role file: a stand-in named claude.
+        let bin = std::env::temp_dir().join(format!("ovm-{}-claude", std::process::id()));
+        std::fs::create_dir_all(&bin).unwrap();
+        let fake = bin.join("claude");
+        std::fs::write(&fake, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let sleep = Some(vec![fake.to_string_lossy().to_string()]);
+        m.start(
+            6,
+            "Demo Lane".into(),
+            Path::new("/tmp"),
+            sleep.clone(),
+            None,
+        )
+        .unwrap();
+        let fresh = ledger.session_note(6).unwrap().unwrap();
+        assert_eq!(role_note(6), format!("/tmp/demo-brain/{fresh}. Write it, and any ticket folder you own (for example Sprints/sprint-26-01/DEMO-12-demo-lane/), directly with your file tools."));
+        m.stop(6).unwrap();
+        for _ in 0..100 {
+            if !matches!(m.list()[6].state, SlotState::Running { .. }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // A resume the next day keeps the stored note, not today's.
+        ledger
+            .set_session_note(6, "Sessions/2020/01-January/2020-01-02-s6-old.md")
+            .unwrap();
+        m.launch_slot(
+            6,
+            "Demo Lane".into(),
+            Path::new("/tmp"),
+            sleep,
+            Some("sid-6".into()),
+            None,
+        )
+        .unwrap();
+        assert!(
+            role_note(6)
+                .starts_with("/tmp/demo-brain/Sessions/2020/01-January/2020-01-02-s6-old.md."),
+            "{}",
+            role_note(6)
+        );
+        m.shutdown_all();
     }
 
     #[tokio::test]
