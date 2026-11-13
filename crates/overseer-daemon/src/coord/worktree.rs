@@ -44,12 +44,19 @@ struct Out {
     stderr: String,
 }
 
+/// The first `fatal:` or `error:` line of git's stderr without its prefix,
+/// else the first non-empty line. `git worktree add` prints a progress line
+/// ("Preparing worktree") before a later failure, which must not be the answer.
 fn first_line(s: &str) -> String {
-    s.lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .unwrap_or("git failed")
-        .to_string()
+    let lines = || s.lines().map(str::trim).filter(|l| !l.is_empty());
+    lines()
+        .find_map(|l| {
+            l.strip_prefix("fatal:")
+                .or_else(|| l.strip_prefix("error:"))
+                .map(|r| r.trim().to_string())
+        })
+        .or_else(|| lines().next().map(str::to_string))
+        .unwrap_or_else(|| "git failed".to_string())
 }
 
 async fn git(dir: &Path, args: &[&str]) -> Result<Out, String> {
@@ -228,6 +235,31 @@ mod tests {
         std::fs::rename(root.join("other-DEMO-12"), root.join("demo-api-DEMO-12")).unwrap();
         let err = ensure_worktree(&root, &repo, "DEMO-12").await;
         assert!(err.unwrap_err().contains("is not a worktree of"));
+    }
+
+    #[tokio::test]
+    async fn reports_the_real_cause_when_git_refuses() {
+        let (_d, repo, root) = fixture();
+        ensure_worktree(&root, &repo, "DEMO-12").await.unwrap();
+        // The branch is checked out in the first worktree, so a second path fails.
+        let other_root = root.join("second");
+        let err = ensure_worktree(&other_root, &repo, "DEMO-12").await;
+        // Same ticket under another root is a new path, on a branch already in use.
+        let msg = err.unwrap_err();
+        assert!(!msg.starts_with("Preparing worktree"), "{msg}");
+        assert!(msg.contains("DEMO-12"), "{msg}");
+        let bad = ensure_worktree(&root, &repo, "a..b").await.unwrap_err();
+        assert!(!bad.starts_with("Preparing worktree"), "{bad}");
+    }
+
+    #[test]
+    fn first_line_prefers_the_fatal_line() {
+        assert_eq!(
+            first_line("Preparing worktree (new branch 'x')\nfatal: 'x' is already used\n"),
+            "'x' is already used"
+        );
+        assert_eq!(first_line("plain\nmore"), "plain");
+        assert_eq!(first_line(""), "git failed");
     }
 
     #[test]
