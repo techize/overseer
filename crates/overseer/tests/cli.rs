@@ -560,7 +560,11 @@ fn ctl_bd_passes_args_and_exit_code() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "bd out\n");
     assert_eq!(String::from_utf8_lossy(&out.stderr), "bd err\n");
     let log = std::fs::read_to_string(env.home.join("bd.log")).unwrap();
-    assert!(log.starts_with("create --body-file - --title x\n"), "{log}");
+    // The work list runs the same bd_command, so its calls are logged too.
+    assert!(
+        log.lines().any(|l| l == "create --body-file - --title x"),
+        "{log}"
+    );
     let stdin = std::fs::read_to_string(env.home.join("bd.log.stdin")).unwrap();
     assert_eq!(stdin, "heredoc body\n");
 }
