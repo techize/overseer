@@ -750,11 +750,13 @@ fn stub_claude(dir: &std::path::Path) -> (PathBuf, PathBuf) {
     std::fs::write(
         &bin,
         format!(
-            "#!/bin/sh\nprintf '%s|%s\\n' \"$(pwd -P)\" \"$*\" >> '{}'\n\
-             # Like claude, save the conversation for a new session id.\n\
+            "#!/bin/sh\n\
+             # Like claude, save the conversation for a new session id. Saved\n\
+             # before the call is logged, so a test that has seen the log line\n\
+             # never stops the stub between the two.\n\
              if [ \"$1\" = --session-id ] && [ -n \"$STUB_SAVES\" ]; then\n\
              mkdir -p \"$CLAUDE_CONFIG_DIR/projects/p\" && : > \"$CLAUDE_CONFIG_DIR/projects/p/$2.jsonl\"\n\
-             fi\nexec sleep 30\n",
+             fi\nprintf '%s|%s\\n' \"$(pwd -P)\" \"$*\" >> '{}'\nexec sleep 30\n",
             log.display()
         ),
     )
