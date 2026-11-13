@@ -1317,8 +1317,10 @@ mod tests {
         // Neither is a global binding: both reach the view's own handler.
         assert_eq!(routed("cmd-enter", PLAN), None);
         assert_eq!(routed("escape", PLAN), None);
-        for k in ["tab", "enter", "a", "p", "cmd-v"] {
+        // Cmd+A (select all) too: no binding takes it from the text fields.
+        for k in ["tab", "enter", "a", "p", "cmd-v", "cmd-a"] {
             assert_eq!(routed(k, PLAN), None, "{k}");
+            assert_eq!(routed(k, DIALOG), None, "{k}");
         }
         assert_eq!(routed("cmd-q", PLAN), Some("overseer::Quit"));
     }

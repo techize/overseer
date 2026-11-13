@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use gpui::{
     div, prelude::*, px, rgb, rgba, Context, EventEmitter, FocusHandle, Focusable, FontWeight,
-    KeyDownEvent, Keystroke, MouseButton, PathPromptOptions, SharedString, Window,
+    KeyDownEvent, Keystroke, MouseButton, PathPromptOptions, Window,
 };
 use overseer_proto::{slot_name, Client, Request, Response, SlotId, SlotInfo};
 
@@ -27,10 +27,14 @@ pub const DEFAULT_COMMAND: &str = "claude";
 // ---------------------------------------------------------------------------
 
 /// One line of editable text. `cursor` is a byte offset on a char boundary.
+/// `selected` is Cmd+A's selection, always the whole text: the next typed
+/// or pasted text replaces it, Backspace and Delete clear it, an arrow
+/// drops it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TextField {
     pub text: String,
     pub cursor: usize,
+    pub selected: bool,
 }
 
 impl TextField {
@@ -38,7 +42,24 @@ impl TextField {
         TextField {
             text: text.into(),
             cursor: text.len(),
+            selected: false,
         }
+    }
+
+    /// Cmd+A: selects the whole text, when there is any.
+    pub fn select_all(&mut self) {
+        self.selected = !self.text.is_empty();
+        self.cursor = self.text.len();
+    }
+
+    /// Removes the selected text. True when there was a selection.
+    fn take_selection(&mut self) -> bool {
+        let had = std::mem::take(&mut self.selected);
+        if had {
+            self.text.clear();
+            self.cursor = 0;
+        }
+        had
     }
 
     pub fn set(&mut self, text: &str) {
@@ -48,6 +69,7 @@ impl TextField {
     pub fn insert(&mut self, s: &str) {
         // One line: drop newlines from pastes.
         let s: String = s.chars().filter(|c| *c != '\n' && *c != '\r').collect();
+        self.take_selection();
         self.text.insert_str(self.cursor, &s);
         self.cursor += s.len();
     }
@@ -67,22 +89,61 @@ impl TextField {
     }
 
     pub fn backspace(&mut self) {
+        if self.take_selection() {
+            return;
+        }
         let p = self.prev();
         self.text.replace_range(p..self.cursor, "");
         self.cursor = p;
     }
 
     pub fn delete(&mut self) {
+        if self.take_selection() {
+            return;
+        }
         let n = self.next();
         self.text.replace_range(self.cursor..n, "");
     }
 
+    /// With a selection, goes to its start instead.
     pub fn left(&mut self) {
-        self.cursor = self.prev();
+        self.cursor = if std::mem::take(&mut self.selected) {
+            0
+        } else {
+            self.prev()
+        };
     }
 
+    /// With a selection, goes to its end instead.
     pub fn right(&mut self) {
-        self.cursor = self.next();
+        self.cursor = if std::mem::take(&mut self.selected) {
+            self.text.len()
+        } else {
+            self.next()
+        };
+    }
+
+    /// Puts the cursor at `at` (a char boundary), dropping any selection.
+    fn move_to(&mut self, at: usize) {
+        self.selected = false;
+        self.cursor = at;
+    }
+
+    /// The field as drawn: while `editing`, the selection highlighted or
+    /// a bar at the cursor; otherwise the plain text.
+    pub fn display(&self, editing: bool) -> gpui::StyledText {
+        if editing && self.selected {
+            let all = 0..self.text.len();
+            let style = gpui::HighlightStyle {
+                background_color: Some(gpui::rgb(crate::app::colors::ACCENT_BG).into()),
+                ..Default::default()
+            };
+            gpui::StyledText::new(self.text.clone()).with_highlights([(all, style)])
+        } else if editing {
+            gpui::StyledText::new(self.with_cursor())
+        } else {
+            gpui::StyledText::new(self.text.clone())
+        }
     }
 
     /// The text with a bar at the cursor, for display.
@@ -115,17 +176,23 @@ pub fn edit_key(field: &mut TextField, ks: &Keystroke) -> DialogKey {
     if m.platform && !m.control && !m.alt {
         return match ks.key.as_str() {
             "v" => DialogKey::Paste,
+            "a" => {
+                field.select_all();
+                DialogKey::Edited
+            }
             "backspace" => {
-                field.text.replace_range(..field.cursor, "");
-                field.cursor = 0;
+                if !field.take_selection() {
+                    field.text.replace_range(..field.cursor, "");
+                    field.cursor = 0;
+                }
                 DialogKey::Edited
             }
             "left" => {
-                field.cursor = 0;
+                field.move_to(0);
                 DialogKey::Edited
             }
             "right" => {
-                field.cursor = field.text.len();
+                field.move_to(field.text.len());
                 DialogKey::Edited
             }
             _ => DialogKey::Ignored,
@@ -153,11 +220,11 @@ pub fn edit_key(field: &mut TextField, ks: &Keystroke) -> DialogKey {
             return DialogKey::Edited;
         }
         "home" => {
-            field.cursor = 0;
+            field.move_to(0);
             return DialogKey::Edited;
         }
         "end" => {
-            field.cursor = field.text.len();
+            field.move_to(field.text.len());
             return DialogKey::Edited;
         }
         _ => {}
@@ -508,11 +575,7 @@ impl Render for StartDialog {
             .map(|i| {
                 let active = i == self.active;
                 let f = &self.fields[i];
-                let text = if active && focused {
-                    f.with_cursor()
-                } else {
-                    f.text.clone()
-                };
+                let text = f.display(active && focused);
                 let field = div()
                     .id(("field", i))
                     .flex_1()
@@ -528,7 +591,7 @@ impl Render for StartDialog {
                         colors::BORDER
                     }))
                     .cursor_text()
-                    .child(SharedString::from(text))
+                    .child(text)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.active = i;
                         cx.notify();
@@ -719,6 +782,42 @@ mod tests {
         assert_eq!(f.text, "");
         edit_key(&mut f, &key("space", Some(" ")));
         assert_eq!(f.text, " ");
+    }
+
+    #[test]
+    fn cmd_a_selects_all_and_the_next_edit_replaces_it() {
+        let mut f = TextField::new("demo-api");
+        assert_eq!(edit_key(&mut f, &key("cmd-a", None)), DialogKey::Edited);
+        assert!(f.selected);
+        // Typing replaces the selection.
+        edit_key(&mut f, &key("x", Some("x")));
+        assert_eq!(f.with_cursor(), "x|");
+        assert!(!f.selected);
+        // So does a paste.
+        edit_key(&mut f, &key("cmd-a", None));
+        f.insert("uat/root");
+        assert_eq!(f.with_cursor(), "uat/root|");
+        // Backspace and Delete clear it.
+        edit_key(&mut f, &key("cmd-a", None));
+        edit_key(&mut f, &key("backspace", None));
+        assert_eq!(f.with_cursor(), "|");
+        f.set("DEMO-12");
+        edit_key(&mut f, &key("cmd-a", None));
+        edit_key(&mut f, &key("delete", None));
+        assert_eq!(f.text, "");
+        // An arrow drops the selection and goes to that end.
+        f.set("DEMO-12");
+        edit_key(&mut f, &key("cmd-a", None));
+        edit_key(&mut f, &key("left", None));
+        assert!(!f.selected);
+        assert_eq!(f.with_cursor(), "|DEMO-12");
+        edit_key(&mut f, &key("cmd-a", None));
+        edit_key(&mut f, &key("right", None));
+        assert_eq!(f.with_cursor(), "DEMO-12|");
+        // Nothing to select in an empty field.
+        let mut empty = TextField::default();
+        edit_key(&mut empty, &key("cmd-a", None));
+        assert!(!empty.selected);
     }
 
     #[test]

@@ -941,7 +941,7 @@ impl OverseerApp {
         let focused = self.entry_focus.clone();
         let shown = match entry.kind {
             EntryKind::Release { .. } => None,
-            _ => Some(entry.field.with_cursor()),
+            _ => Some(entry.field.display(true)),
         };
         let hint = matches!(entry.kind, EntryKind::Claim) && entry.field.text.is_empty();
         Some(
@@ -968,10 +968,7 @@ impl OverseerApp {
                         .flex()
                         .gap_2()
                         .child(div().text_color(rgb(colors::ACCENT)).child(entry.prompt()))
-                        .children(
-                            shown
-                                .map(|t| div().flex_1().min_w(px(0.)).child(SharedString::from(t))),
-                        )
+                        .children(shown.map(|t| div().flex_1().min_w(px(0.)).child(t)))
                         .children(hint.then(|| {
                             div()
                                 .text_color(rgb(colors::MUTED))

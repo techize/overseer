@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use gpui::{
     div, prelude::*, px, rgb, rgba, Context, EventEmitter, FocusHandle, Focusable, FontWeight,
-    KeyDownEvent, Keystroke, MouseButton, ScrollHandle, SharedString, Window,
+    KeyDownEvent, Keystroke, MouseButton, ScrollHandle, Window,
 };
 use overseer_proto::{
     slot_name, Client, CoordView, Plan, PlanDecision, PlanRecord, PlanState, Request, Response,
@@ -600,11 +600,7 @@ impl PlanView {
     ) -> gpui::Stateful<gpui::Div> {
         let on = self.editor.active == f;
         let tf = self.editor.field(f);
-        let text = if on {
-            tf.with_cursor()
-        } else {
-            tf.text.clone()
-        };
+        let text = tf.display(on);
         div()
             .id(id)
             .px_2()
@@ -614,7 +610,7 @@ impl PlanView {
             .border_1()
             .border_color(rgb(if on { colors::ACCENT } else { colors::BORDER }))
             .cursor_text()
-            .child(SharedString::from(text))
+            .child(text)
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.editor.active = f;
                 cx.notify();

@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use gpui::{
     div, prelude::*, px, rgb, rgba, Context, EventEmitter, FocusHandle, Focusable, FontWeight,
-    KeyDownEvent, Keystroke, MouseButton, ScrollHandle, SharedString, Window,
+    KeyDownEvent, Keystroke, MouseButton, ScrollHandle, Window,
 };
 use overseer_proto::{
     owner_in_refusal, slot_name, Client, Request, Response, SlotId, WorkItem, WorkView,
@@ -487,11 +487,7 @@ impl Render for Picker {
         let slot = self.state.slot;
         let rows = self.rows();
         let busy = self.state.in_flight.is_some();
-        let filter = if focused {
-            self.state.filter.with_cursor()
-        } else {
-            self.state.filter.text.clone()
-        };
+        let filter = self.state.filter.display(focused);
         let list: Vec<_> = rows
             .into_iter()
             .enumerate()
@@ -577,7 +573,7 @@ impl Render for Picker {
                     .bg(rgb(colors::FIELD))
                     .border_1()
                     .border_color(rgb(colors::ACCENT))
-                    .child(SharedString::from(filter)),
+                    .child(filter),
             )
             .child(
                 div()
