@@ -3513,6 +3513,28 @@ async fn vault_write_checks_deny_shared_files_and_git_and_rewrite_bd() {
 }
 
 #[tokio::test]
+async fn fresh_start_clears_the_slots_section_before_answering() {
+    let (d, vault) = brain_daemon(true).await;
+    let cs = vault
+        .parent()
+        .unwrap()
+        .join("home/.claude/CURRENT_SESSION.md");
+    let mut c = Client::connect(&d.socket).await;
+    let r = c
+        .request(Request::UpdateCurrentSession {
+            slot: 2,
+            text: "old work on DEMO-12".into(),
+        })
+        .await;
+    assert_eq!(r, Response::Ok);
+    assert!(std::fs::read_to_string(&cs).unwrap().contains("old work"));
+    assert_eq!(c.start(2).await, Response::Ok);
+    // Read at once: a session's first update cannot be cleared after this.
+    let file = std::fs::read_to_string(&cs).unwrap();
+    assert!(!file.contains("old work"), "{file}");
+}
+
+#[tokio::test]
 async fn writer_off_allows_everything() {
     let (d, vault) = brain_daemon(false).await;
     let mut c = Client::connect(&d.socket).await;

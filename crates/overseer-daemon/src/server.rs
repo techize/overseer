@@ -502,6 +502,27 @@ async fn handle_conn(
                     ) {
                         env.wait().await;
                     }
+                    // A fresh session starts with no section of its own.
+                    // Cleared before the start, so its first update cannot
+                    // be lost to the clear.
+                    if let (
+                        Frame::Request {
+                            req: Request::StartSlot { id, .. },
+                            ..
+                        },
+                        Some(b),
+                    ) = (&f, &brain)
+                    {
+                        let id = *id;
+                        let running = valid_id(id)
+                            && matches!(
+                                manager.lock().unwrap().list()[id as usize].state,
+                                SlotState::Running { .. }
+                            );
+                        if valid_id(id) && !running {
+                            b.clear_current_session(id).await;
+                        }
+                    }
                     let ctx = Ctx {
                         manager: &manager,
                         store: &store,
@@ -849,13 +870,8 @@ fn handle_request(
                 locks.on_session_ended(id, unix_now());
             }
             match m.start(id, label, &cwd, command, prompt) {
-                Ok(()) => {
-                    // A new session starts with no section of its own.
-                    if let Some(b) = ctx.brain.cloned() {
-                        tokio::spawn(async move { b.clear_current_session(id).await });
-                    }
-                    Response::Ok
-                }
+                // CURRENT_SESSION.md was cleared before this (`handle_conn`).
+                Ok(()) => Response::Ok,
                 Err(e) => err(e),
             }
         }
