@@ -8,7 +8,9 @@ done by code: each step changes something outside the Overseer repo (the
 vault's git hooks, Obsidian's settings, the global hooks and skills) and is
 applied by hand, with your approval, one at a time.
 
-Do the steps in order. Steps 1 to 4 are safe with the writer still off. Do not
+Run the acceptance list (`docs/acceptance/phase-5.md`) on the home Mac before
+step 4: it starts real sessions, and a global hook that is not Overseer-aware
+yet must not see them. Do the steps in order. Steps 1 to 4 are safe with the writer still off. Do not
 do step 6 until 1 to 5 are done, or Obsidian Git and the daemon will both
 commit the same vault.
 
@@ -122,12 +124,12 @@ take the slot from `OVERSEER_SLOT`):
 - `overseer ctl bd -- <bd args>` runs a bd write under the vault lock. A
   session's own `bd` writes need no change: the hook rewrites them.
 
-Snippet for a shell hook or skill script. Keep the original commands in the
-`else` branch unchanged:
+Snippet for a shell hook or skill script. `ctl journal` commits its own file, so do not add a separate commit for the
+journal. Keep the original commands in the `else` branch unchanged:
 
 ```sh
 if [ -n "$OVERSEER_SLOT" ]; then
-  overseer ctl commit -m "$MSG" 06-Daily/2026/11-November/2026-11-13-journal.md
+  overseer ctl commit -m "$MSG" Sessions/2026/11-November/2026-11-13-s1-demo.md   # a file you wrote, not the journal
   overseer ctl journal "Work Log" "$LINE"
   printf '%s\n' "$STATE" | overseer ctl current-session -
 else
@@ -136,7 +138,8 @@ else
 fi
 ```
 
-Snippet for `git-cmd.js` (Node):
+Snippet for `git-cmd.js` (Node); it goes at the top of the function in that
+file that runs git, where `message` and `paths` are that function's inputs:
 
 ```js
 const { spawnSync } = require('node:child_process');
@@ -182,22 +185,25 @@ defaults:
 - `sync_command`, `bd_command` (defaults `["05-Meta/Sync-System/sync-run.sh", "--auto"]`
   and `["bd"]`)
 
-Do not turn the writer on yet. First look at the two role files the daemon
-keeps in its state folder, `~/Library/Application Support/Overseer/roles/`:
+The daemon keeps two role files in its state folder,
+`~/Library/Application Support/Overseer/roles/`. They are checked when a session starts in a slot, not when the daemon
+starts. So after turning the writer on (step 6), start a session in S0 and one
+in S1, then `grep -E 'role template|brain_rules' ~/Library/Logs/Overseer/daemon.log`:
 
 - `worker.md` and `coordinator.md`, if you have never edited them, are
-  upgraded to the new text on the next daemon start (the daemon logs
-  `upgraded role template`). Nothing to do.
+  upgraded to the current text (the log says `upgraded role template ...`).
+  Nothing to do.
 - If you have edited either one, it is kept as it is, and the new default is
-  written beside it as `worker.md.new` or `coordinator.md.new`. An edited
-  role that has no `{brain_rules}` line gets no 2ndBrain rules at all: its
-  sessions would not know about `commit_2ndbrain`, the shared-file tools or
-  their own CURRENT_SESSION section, and would meet only the hook's deny
-  texts. Add a line holding just `{brain_rules}` where the rules belong (see
-  the `.new` file), by hand.
-- After step 6, check `~/Library/Logs/Overseer/daemon.log` for
-  `role ... is edited and has no {brain_rules}: add it, see ... .new`. No such
-  line means both roles are fine.
+  written beside it as `worker.md.new` or `coordinator.md.new`. The log has
+  `role template <path> was edited; the current default is in <path>.new`.
+  If that role also has no `{brain_rules}` line, you also see
+  `role worker.md is edited and has no {brain_rules}: add it, see worker.md.new`,
+  and its sessions get no 2ndBrain rules at all: they would not know about
+  `commit_2ndbrain`, the shared-file tools or their own CURRENT_SESSION
+  section, and would meet only the hook's deny texts. Add a line holding just
+  `{brain_rules}` where the rules belong (see the `.new` file), by hand, and
+  start new sessions.
+- No such lines means both roles are fine.
 
 ## 6. Turn it on
 
@@ -207,7 +213,9 @@ keeps in its state folder, `~/Library/Application Support/Overseer/roles/`:
    `launchctl kickstart -k gui/$(id -u)/uk.co.techize.overseer` if the
    LaunchAgent is installed).
 3. `overseer ctl brain` should say `2ndBrain writer is on`.
-4. The board's bottom strip should read `2ndBrain: nothing yet`, then
+4. Do the role check from step 5 now (start a session in S0 and one in S1,
+   then grep the log).
+5. The board's bottom strip should read `2ndBrain: nothing yet`, then
    `2ndBrain: committed HH:MM` after the first commit. See the acceptance list
    (`docs/acceptance/phase-5.md`) for the checks to run on the home Mac before
    doing this on the work laptop.
@@ -223,7 +231,8 @@ the global hooks then need switching back by hand.
   vault. A script that a session writes and runs can still write anywhere.
   This is guard rails, not a sandbox.
 - Inside the vault the hook allows only `git status`, `log`, `diff`, `show`,
-  `blame`, `branch` (no arguments), `remote -v`, `rev-parse` and `ls-files`.
+  `blame`, `rev-parse`, `ls-files`, `describe`, `remote -v` and `branch` with
+  only listing flags (`-a`, `-r`, `-v`, `-vv`, `--list`, `--show-current`).
   Other read-only commands (`git grep`, `git reflog`, `git stash list`, ...)
   are denied there with `use the commit_2ndbrain tool; Overseer commits and
   pushes 2ndBrain`. Run them in your own terminal, which the hook never sees.
