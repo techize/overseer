@@ -179,6 +179,9 @@ struct Runtime {
     last_change: Option<Instant>,
     sync_pending: bool,
     bd_sync_pending: bool,
+    /// The last sync attempt was held back by a running slot's changes;
+    /// the backup tick may try it again (Ruling 8).
+    sync_held: bool,
     push_problem: Option<String>,
     /// The queue waits until then after `index.lock` was held.
     retry_at: Option<Instant>,
@@ -635,9 +638,28 @@ impl BrainService {
                 return;
             }
         };
+        // A queued entry commits its own paths with its own message.
+        let queued: HashSet<String> = match self.ledger.queue_recent(0) {
+            Ok(entries) => entries
+                .into_iter()
+                .filter(|e| e.state == QueueState::Queued)
+                .flat_map(|e| e.paths)
+                .collect(),
+            Err(e) => {
+                let _ = self.ledger.set_brain_run(
+                    "backup",
+                    now,
+                    false,
+                    &format!("queue unreadable: {e:#}"),
+                );
+                drop(g);
+                self.announce();
+                return;
+            }
+        };
         let mut keep: Vec<String> = Vec::new();
         for rel in changed {
-            if !keep.contains(&rel) && self.backup_takes(&rel, &ctx) {
+            if !keep.contains(&rel) && !queued.contains(&rel) && self.backup_takes(&rel, &ctx) {
                 keep.push(rel);
             }
         }
@@ -771,12 +793,16 @@ impl BrainService {
                 self.backup_now().await;
                 self.rt().next_backup = Some(Instant::now() + every);
                 wait = wait.min(every);
-                // A sync held back at the last drain is tried again now.
-                let pending = {
+                // A sync held back at the last drain is tried again now,
+                // but only after the usual quiet period.
+                let retry = {
                     let rt = self.rt();
-                    rt.sync_pending || rt.bd_sync_pending
+                    rt.sync_held
+                        && rt
+                            .last_change
+                            .is_none_or(|t| t.elapsed() >= self.opts.drain)
                 };
-                if pending && queue_empty {
+                if retry && queue_empty {
                     self.drain().await;
                 }
             } else {
@@ -822,15 +848,18 @@ impl BrainService {
                         "2ndBrain queue entry {} was committed before a restart",
                         e.id
                     );
-                    let _ =
-                        self.ledger
-                            .queue_set(e.id, QueueState::Committed, Some(&sha), None, None);
-                    let mut rt = self.rt();
-                    rt.need_push = true;
-                    rt.sync_pending = true;
-                    rt.last_change = Some(Instant::now());
-                    drop(rt);
+                    if !self.record(e.id, QueueState::Committed, Some(&sha), None, None) {
+                        return;
+                    }
+                    {
+                        let mut rt = self.rt();
+                        rt.need_push = true;
+                        rt.sync_pending = true;
+                        rt.last_change = Some(Instant::now());
+                    }
                     self.announce();
+                    // A caller may still be waiting, after a failed write.
+                    self.reply(e.id, committed_text(&sha, &e.message));
                     return;
                 }
                 Ok(None) => {}
@@ -868,7 +897,18 @@ impl BrainService {
 
     /// Commits one entry and pushes; records and answers the outcome.
     async fn attempt(&self, g: &VaultGuard<'_>, e: &QueueEntry) -> QueueState {
-        let attempts = self.ledger.queue_begin(e.id).unwrap_or(1);
+        let attempts = match self.ledger.queue_begin(e.id) {
+            Ok(n) => n,
+            Err(err) => {
+                // Without a count the attempt cap cannot work: do not try.
+                tracing::warn!(
+                    "2ndBrain queue entry {}: attempt not recorded: {err:#}",
+                    e.id
+                );
+                self.hold(e.id);
+                return QueueState::Queued;
+            }
+        };
         if attempts > MAX_ATTEMPTS {
             let msg = format!("gave up after {} attempts", attempts - 1);
             return self.fail(e.id, &msg);
@@ -884,30 +924,24 @@ impl BrainService {
         }
         match result {
             Ok(Some(sha)) => {
-                let _ = self
-                    .ledger
-                    .queue_set(e.id, QueueState::Committed, Some(&sha), None, None);
                 {
                     let mut rt = self.rt();
                     rt.sync_pending = true;
                     rt.last_change = Some(Instant::now());
                 }
-                let subject = e.message.lines().next().unwrap_or("");
-                let short = &sha[..sha.len().min(7)];
+                if !self.record(e.id, QueueState::Committed, Some(&sha), None, None) {
+                    // Found by its trailer on the next pass, then pushed.
+                    return QueueState::Queued;
+                }
                 self.announce();
-                self.reply(
-                    e.id,
-                    Response::Text {
-                        text: format!("committed {short}: {subject}"),
-                    },
-                );
+                self.reply(e.id, committed_text(&sha, &e.message));
                 self.push_and_record(g, Some(e.id)).await;
                 QueueState::Committed
             }
             Ok(None) => {
-                let _ = self
-                    .ledger
-                    .queue_set(e.id, QueueState::NothingToCommit, None, None, None);
+                if !self.record(e.id, QueueState::NothingToCommit, None, None, None) {
+                    return QueueState::Queued;
+                }
                 self.announce();
                 self.reply(
                     e.id,
@@ -919,14 +953,18 @@ impl BrainService {
             }
             Err(GitError::IndexLocked) if attempts < MAX_ATTEMPTS => {
                 let msg = GitError::IndexLocked.to_string();
-                let _ = self
-                    .ledger
-                    .queue_set(e.id, QueueState::Queued, None, None, Some(&msg));
                 self.rt().retry_at = Some(Instant::now() + self.opts.retry);
+                if !self.record(e.id, QueueState::Queued, None, None, Some(&msg)) {
+                    return QueueState::Queued;
+                }
                 self.announce();
                 self.reply(e.id, Response::Queued { message: msg });
                 QueueState::Queued
             }
+            Err(GitError::IndexLocked) => self.fail(
+                e.id,
+                &format!("index.lock still held after {attempts} attempts"),
+            ),
             Err(err) => {
                 let mut msg = err.to_string();
                 if let Ok(out) = self.git.run(g, &["ls-files", "-u"]).await {
@@ -941,10 +979,48 @@ impl BrainService {
         }
     }
 
-    fn fail(&self, id: i64, msg: &str) -> QueueState {
-        let _ = self
+    /// Writes an entry's state. On failure the entry is held: the queue
+    /// waits `retry` and then looks for its trailer before committing again,
+    /// so a commit the ledger missed is never made twice.
+    fn record(
+        &self,
+        id: i64,
+        state: QueueState,
+        sha: Option<&str>,
+        pushed: Option<bool>,
+        error: Option<&str>,
+    ) -> bool {
+        match self.ledger.queue_set(id, state, sha, pushed, error) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!("2ndBrain queue entry {id}: state {state:?} not recorded: {e:#}");
+                self.hold(id);
+                false
+            }
+        }
+    }
+
+    /// The push result of a committed entry. Its state is already recorded,
+    /// so a failed write only leaves the push column stale until the next push.
+    fn note_push(&self, id: i64, sha: Option<&str>, pushed: bool, error: Option<&str>) {
+        if let Err(e) = self
             .ledger
-            .queue_set(id, QueueState::Failed, None, None, Some(msg));
+            .queue_set(id, QueueState::Committed, sha, Some(pushed), error)
+        {
+            tracing::warn!("2ndBrain queue entry {id}: push result not recorded: {e:#}");
+        }
+    }
+
+    fn hold(&self, id: i64) {
+        let mut rt = self.rt();
+        rt.recovering.insert(id);
+        rt.retry_at = Some(Instant::now() + self.opts.retry);
+    }
+
+    fn fail(&self, id: i64, msg: &str) -> QueueState {
+        if !self.record(id, QueueState::Failed, None, None, Some(msg)) {
+            return QueueState::Queued;
+        }
         self.announce();
         self.reply(
             id,
@@ -973,22 +1049,10 @@ impl BrainService {
         match result {
             Ok(()) => {
                 if let Some(id) = id {
-                    let _ = self.ledger.queue_set(
-                        id,
-                        QueueState::Committed,
-                        head.as_deref(),
-                        Some(true),
-                        None,
-                    );
+                    self.note_push(id, head.as_deref(), true, None);
                 }
                 for e in self.ledger.queue_unpushed().unwrap_or_default() {
-                    let _ = self.ledger.queue_set(
-                        e.id,
-                        QueueState::Committed,
-                        e.commit.as_deref(),
-                        Some(true),
-                        None,
-                    );
+                    self.note_push(e.id, e.commit.as_deref(), true, None);
                 }
                 let had = self.rt().push_problem.take().is_some();
                 if had || id.is_none() {
@@ -1011,13 +1075,7 @@ impl BrainService {
                 };
                 tracing::warn!("{text}");
                 if let Some(id) = id {
-                    let _ = self.ledger.queue_set(
-                        id,
-                        QueueState::Committed,
-                        head.as_deref(),
-                        Some(false),
-                        Some(&line),
-                    );
+                    self.note_push(id, head.as_deref(), false, Some(&line));
                 }
                 let _ = self.ledger.set_brain_run("push", now, false, &text);
                 self.rt().push_problem = Some(text);
@@ -1058,7 +1116,9 @@ impl BrainService {
         let program = self.cfg.brain.join(first);
         if !program.is_file() {
             // Not set up on this machine.
-            self.rt().sync_pending = false;
+            let mut rt = self.rt();
+            rt.sync_pending = false;
+            rt.sync_held = false;
             return;
         }
         let ctx = self.context();
@@ -1077,6 +1137,7 @@ impl BrainService {
         });
         if held {
             tracing::info!("2ndBrain sync waits: a running slot has uncommitted changes");
+            self.rt().sync_held = true;
             return;
         }
         let r = run_program(&program, args, &self.cfg.brain, SYNC_TIMEOUT).await;
@@ -1086,7 +1147,16 @@ impl BrainService {
             Err(e) => (false, e),
         };
         let _ = self.ledger.set_brain_run("sync", unix_now(), ok, &detail);
-        self.rt().sync_pending = false;
+        let mut rt = self.rt();
+        rt.sync_pending = false;
+        rt.sync_held = false;
+    }
+}
+
+fn committed_text(sha: &str, message: &str) -> Response {
+    let subject = message.lines().next().unwrap_or("");
+    Response::Text {
+        text: format!("committed {}: {subject}", &sha[..sha.len().min(7)]),
     }
 }
 

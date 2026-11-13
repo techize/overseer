@@ -485,7 +485,16 @@ async fn current_session_symlinked_into_the_vault_is_still_current_session() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sync_runs_once_after_the_queue_drains() {
     let v = Vault::new("sync");
-    let svc = v.service(Arc::new(Ledger::in_memory()), v.options());
+    // Long enough that each commit and its push finish inside it under a
+    // loaded full-suite run.
+    let drain = Duration::from_millis(1500);
+    let svc = v.service(
+        Arc::new(Ledger::in_memory()),
+        BrainOptions {
+            drain,
+            ..v.options()
+        },
+    );
     let ctx = shared_context(&svc, BrainContext::default());
     for i in 0..3 {
         let rel = format!("free-{i}.md");
@@ -501,7 +510,7 @@ async fn sync_runs_once_after_the_queue_drains() {
         assert!(text(&r).contains("committed"), "{r:?}");
     }
     until("the sync", || v.log("sync.log").len() == 1).await;
-    sleep(DRAIN * 3).await;
+    sleep(drain * 3).await;
     assert_eq!(v.log("sync.log"), vec!["OVERSEER_COMMIT=1 --auto"]);
     until("the sync record", || svc.view().last_sync.is_some()).await;
     assert!(svc.view().last_sync.unwrap().1);
@@ -525,7 +534,7 @@ async fn sync_runs_once_after_the_queue_drains() {
         &Owners::default(),
     )
     .await;
-    sleep(DRAIN * 4).await;
+    sleep(drain * 4).await;
     assert_eq!(v.log("sync.log").len(), 1, "held back by S3");
 
     // Once that path is committed the next drain runs it.
@@ -788,6 +797,186 @@ async fn push_conflict_keeps_the_commit_and_tells_jonathan() {
         std::fs::read_to_string(v.vault.join("README.md")).unwrap(),
         "ours\n"
     );
+}
+
+/// A trigger on the file ledger that makes one kind of queue write fail,
+/// as a full disk or a locked database would.
+fn break_ledger(db: &Path, name: &str, when: &str) -> rusqlite::Connection {
+    let c = rusqlite::Connection::open(db).unwrap();
+    c.execute_batch(&format!(
+        "CREATE TRIGGER {name} BEFORE UPDATE OF {when} BEGIN SELECT RAISE(ABORT, 'injected'); END;"
+    ))
+    .unwrap();
+    c
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_state_write_after_a_commit_is_not_committed_twice() {
+    let v = Vault::new("ledgerfail");
+    let db = v.base.join("state/overseer.db");
+    let ledger = Arc::new(Ledger::open(&db).unwrap());
+    let opts = BrainOptions {
+        retry: Duration::from_millis(150),
+        ..v.options()
+    };
+    let svc = v.service(ledger, opts);
+    let c = break_ledger(
+        &db,
+        "no_commit",
+        "state ON brain_queue WHEN NEW.state = 'Committed'",
+    );
+    write(&v.vault.join("free.md"), "x\n");
+    let before = v.commits();
+    let caller = {
+        let svc = svc.clone();
+        tokio::spawn(async move {
+            svc.commit(
+                Sender::You,
+                vec!["free.md".into()],
+                "free".into(),
+                &Owners::default(),
+            )
+            .await
+        })
+    };
+    until("the commit", || v.commits() == before + 1).await;
+    // Several retries pass while the ledger cannot record it.
+    sleep(Duration::from_millis(800)).await;
+    assert_eq!(v.commits(), before + 1, "never committed twice");
+    assert_eq!(svc.view().entries[0].state, QueueState::Queued);
+    assert!(!caller.is_finished(), "the caller still waits");
+    c.execute_batch("DROP TRIGGER no_commit;").unwrap();
+    let r = tokio::time::timeout(WAIT, caller).await.unwrap().unwrap();
+    assert!(text(&r).contains("committed"), "{r:?}");
+    until("the push", || {
+        let e = &svc.view().entries[0];
+        e.state == QueueState::Committed && e.pushed == Some(true)
+    })
+    .await;
+    assert_eq!(v.commits(), before + 1);
+    let body = sh(&v.vault, &["log", "-1", "--format=%B"]);
+    assert!(body.contains("Overseer-Queue: 1"), "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_attempt_count_holds_the_commit_back() {
+    let v = Vault::new("beginfail");
+    let db = v.base.join("state/overseer.db");
+    let ledger = Arc::new(Ledger::open(&db).unwrap());
+    let opts = BrainOptions {
+        retry: Duration::from_millis(150),
+        ..v.options()
+    };
+    let svc = v.service(ledger, opts);
+    let c = break_ledger(&db, "no_attempts", "attempts ON brain_queue");
+    write(&v.vault.join("free.md"), "x\n");
+    let before = v.commits();
+    let caller = {
+        let svc = svc.clone();
+        tokio::spawn(async move {
+            svc.commit(
+                Sender::You,
+                vec!["free.md".into()],
+                "free".into(),
+                &Owners::default(),
+            )
+            .await
+        })
+    };
+    sleep(Duration::from_millis(800)).await;
+    assert_eq!(v.commits(), before, "no attempt without a count");
+    assert_eq!(svc.view().entries[0].state, QueueState::Queued);
+    c.execute_batch("DROP TRIGGER no_attempts;").unwrap();
+    let r = tokio::time::timeout(WAIT, caller).await.unwrap().unwrap();
+    assert!(text(&r).contains("committed"), "{r:?}");
+    assert_eq!(v.commits(), before + 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn index_lock_gives_up_after_four_attempts() {
+    let v = Vault::new("ilockfail");
+    let opts = BrainOptions {
+        retry: Duration::from_millis(50),
+        ..v.options()
+    };
+    let svc = v.service(Arc::new(Ledger::in_memory()), opts);
+    std::fs::write(v.vault.join(".git/index.lock"), "").unwrap();
+    write(&v.vault.join("free.md"), "x\n");
+    svc.commit(
+        Sender::You,
+        vec!["free.md".into()],
+        "free".into(),
+        &Owners::default(),
+    )
+    .await;
+    until("the last attempt", || {
+        svc.view().entries[0].state == QueueState::Failed
+    })
+    .await;
+    assert_eq!(
+        svc.view().entries[0].error.as_deref(),
+        Some("index.lock still held after 4 attempts")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn backup_tick_waits_the_drain_before_syncing() {
+    let v = Vault::new("backupsync");
+    let drain = Duration::from_millis(1500);
+    let opts = BrainOptions {
+        drain,
+        backup: Some(Duration::from_millis(300)),
+        ..v.options()
+    };
+    let svc = v.service(Arc::new(Ledger::in_memory()), opts);
+    write(&v.vault.join("free.md"), "x\n");
+    until("the backup commit", || {
+        sh(&v.vault, &["log", "-1", "--format=%s"]).starts_with("vault backup: ")
+    })
+    .await;
+    let committed = Instant::now();
+    sleep(Duration::from_millis(500)).await;
+    assert!(
+        v.log("sync.log").is_empty(),
+        "no sync before the quiet period"
+    );
+    until("the sync", || v.log("sync.log").len() == 1).await;
+    assert!(committed.elapsed() >= drain - Duration::from_millis(400));
+    drop(svc);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn backup_leaves_a_queued_entrys_paths_alone() {
+    let v = Vault::new("backupqueued");
+    let opts = BrainOptions {
+        retry: Duration::from_millis(1500),
+        ..v.options()
+    };
+    let svc = v.service(Arc::new(Ledger::in_memory()), opts);
+    let lock = v.vault.join(".git/index.lock");
+    std::fs::write(&lock, "").unwrap();
+    let r = svc
+        .append_journal(Sender::Slot { slot: 2 }, "Work Log", "- one")
+        .await;
+    assert_eq!(
+        r,
+        Response::Queued {
+            message: "index.lock held, will retry".into()
+        }
+    );
+    std::fs::remove_file(&lock).unwrap();
+    write(&v.vault.join("free.md"), "x\n");
+    svc.backup_now().await;
+    assert!(sh(&v.vault, &["log", "-1", "--format=%s"]).starts_with("vault backup: "));
+    let files = sh(&v.vault, &["show", "--name-only", "--format=", "HEAD"]);
+    assert_eq!(files.trim(), "free.md");
+    until("the journal commit", || {
+        sh(&v.vault, &["log", "-1", "--format=%s"]).trim() == "S2: journal, Work Log"
+    })
+    .await;
+    let rel = fill_template(&v.config().journal_path, now(), 0, "");
+    let files = sh(&v.vault, &["show", "--name-only", "--format=", "HEAD"]);
+    assert_eq!(files.trim(), rel);
 }
 
 // The daemon over its socket, with the writer off and on.
