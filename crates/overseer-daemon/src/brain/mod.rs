@@ -697,7 +697,11 @@ impl BrainService {
         };
         let next = current::set_section(&file, slot, label, text);
         if let Some(dir) = canon(cs).parent() {
-            let _ = std::fs::create_dir_all(dir);
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                return Response::Error {
+                    message: format!("cannot create the folder for CURRENT_SESSION.md: {e}"),
+                };
+            }
         }
         match shared::write_atomic(cs, &next) {
             Ok(()) => Response::Ok,

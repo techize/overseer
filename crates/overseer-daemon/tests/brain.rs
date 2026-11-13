@@ -442,6 +442,27 @@ async fn current_session_sections_are_written_and_cleared() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn current_session_folder_error_is_reported() {
+    let v = Vault::new("currentdir");
+    let svc = v.service(Arc::new(Ledger::in_memory()), v.options());
+    let cs = v.config().current_session;
+    // CURRENT_SESSION.md's folder is missing and cannot be made.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = cs.parent().unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+    let up = dir.parent().unwrap();
+    std::fs::create_dir_all(up).unwrap();
+    std::fs::set_permissions(up, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let r = svc.update_current_session(3, "demo lane", "x").await;
+    std::fs::set_permissions(up, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let said = error(&r);
+    assert!(
+        said.starts_with("cannot create the folder for CURRENT_SESSION.md: "),
+        "{said}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn current_session_symlinked_into_the_vault_is_still_current_session() {
     let v = Vault::new("cslink");
     let target_rel = "Claude/MEMORY/State/CURRENT_SESSION.md";
