@@ -1394,3 +1394,48 @@ async fn bd_lines_that_could_escape_the_vault_checks_are_denied() {
         );
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dev_dotdot_paths_reach_the_vault_checks() {
+    let (v, svc) = shared_vault("devdotdot");
+    let check = |c: &str| denied(svc.check_bash(&bash_check(&v, 1, c, &v.base), &owners()));
+    // `/dev/..` climbs to `/`, then down to the vault's journal.
+    let climb = format!("/dev/..{}/{JOURNAL}", v.vault.display());
+    for cmd in [
+        format!("echo x > {climb}"),
+        format!("echo x >> {climb}"),
+        format!("tee -a {climb}"),
+        format!("rm {climb}"),
+    ] {
+        let d = check(&cmd);
+        assert!(
+            d.as_deref()
+                .is_some_and(|d| d.contains("shared 2ndBrain file")),
+            "{cmd}: {d:?}"
+        );
+    }
+    // A bd write redirected that way is refused, not rewritten.
+    let r = svc.check_bash(
+        &bash_check(&v, 1, &format!("bd create x > {climb}"), &v.base),
+        &owners(),
+    );
+    assert!(matches!(
+        r,
+        Some(Response::Verdict {
+            deny: Some(_),
+            rewrite: None
+        })
+    ));
+    // Real device files stay exempt.
+    assert_eq!(check("echo x > /dev/null 2>&1"), None);
+    assert!(matches!(
+        svc.check_bash(
+            &bash_check(&v, 1, "bd close ov-3 2>/dev/null", &v.base),
+            &owners()
+        ),
+        Some(Response::Verdict {
+            deny: None,
+            rewrite: Some(_)
+        })
+    ));
+}

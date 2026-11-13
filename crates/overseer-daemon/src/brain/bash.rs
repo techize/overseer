@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use super::paths::locate;
-use crate::locks::targets::{write_segments, Segment};
+use crate::locks::targets::{literal_heredoc_bodies, write_segments, Segment};
 
 /// What a command line does with `bd`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -266,10 +266,25 @@ fn segment_writes(seg: &Segment) -> Vec<Write> {
 /// judged (other variables, substitutions, `/dev/*`, empty).
 fn fix(p: &str, cwd: &Path) -> Option<String> {
     let p = expand_home(p);
-    if p.is_empty() || p.contains('$') || p.contains('`') || p.starts_with("/dev/") {
+    if p.is_empty() || p.contains('$') || p.contains('`') {
         return None;
     }
-    Some(join(cwd, &p))
+    let p = join(cwd, &p);
+    (!is_dev(&p)).then_some(p)
+}
+
+/// Whether `p` is a device file: absolute and, with `.` and `..` folded
+/// and symlinks resolved where it exists, under `/dev/` (or `/proc/`, where
+/// Linux's `/dev/stdout` points). `/dev/../x` is not.
+fn is_dev(p: &str) -> bool {
+    if !p.starts_with('/') {
+        return false;
+    }
+    let folded = crate::locks::context::normalize(Path::new(p));
+    let real = std::fs::canonicalize(&folded).unwrap_or_else(|_| folded.clone());
+    let under =
+        |x: &Path| x.starts_with("/dev") && x != Path::new("/dev") || x.starts_with("/proc");
+    under(&folded) && under(&real)
 }
 
 /// The writes a command line makes (Ruling 11), paths as in `write_paths`.
@@ -568,21 +583,19 @@ fn bd_line_unsafe(command: &str, seg: &Segment) -> bool {
     if !plain_start {
         return true;
     }
-    if seg.redirects.iter().any(|r| !r.starts_with("/dev/")) {
+    if seg.redirects.iter().any(|r| !is_dev(r)) {
         return true;
     }
-    let heredoc = regex::Regex::new(r#"<<-?\s*(['"\\]?)\w+"#).expect("static regex");
-    let scanned = match heredoc.captures(command) {
-        // A quoted delimiter makes the body literal: only the lines up to
-        // the operator's line can substitute.
-        Some(c) if !c[1].is_empty() => {
-            let at = c.get(0).map_or(0, |m| m.end());
-            let end = command[at..].find('\n').map_or(command.len(), |n| at + n);
-            &command[..end]
-        }
-        _ => command,
-    };
-    scanned.contains("$(") || scanned.contains('`')
+    // Everything is scanned but the bodies of heredocs with a quoted
+    // delimiter, which the shell reads literally (`<<A <<'B'` scans A's).
+    let mut scanned = String::new();
+    let mut at = 0;
+    for r in literal_heredoc_bodies(command) {
+        scanned.push_str(&command[at..r.start]);
+        at = r.end;
+    }
+    scanned.push_str(&command[at..]);
+    scanned.contains("$(") || scanned.contains("${") || scanned.contains('`')
 }
 
 /// Single-quotes `w` for the shell unless it is plain.
@@ -869,5 +882,52 @@ mod tests {
         assert_eq!(g("a/.h*"), ["a/.hid.md"]);
         assert!(g("a/*.rs").is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn heredoc_bodies_are_exempt_only_when_really_quoted() {
+        let denied = |c: &str| assert_eq!(bd_call(c), BdCall::Compound, "{c}");
+        // A `<<'E'` inside a quoted string is not a heredoc.
+        denied("bd create \"x <<'E'\n$(evil)\"");
+        denied("bd create x <<< \"$(evil)\"");
+        denied("bd create 'x <<\"E\"' \"$(evil)\"");
+        // Two heredocs: the unquoted one's body expands.
+        denied("bd create x --body-file - <<'A' <<B\nliteral $(x)\nA\n$(x)\nB");
+        denied("bd create x --body-file - <<'A' <<B\nliteral\nA\n${HOME}\nB");
+        // Only quoted bodies are exempt, whatever else is on the line.
+        for ok in [
+            "bd create x --body-file - <<'EOF'\n$(x) `y` ${z}\nEOF",
+            "bd create x --body-file - <<'A' <<\"B\"\n$(x)\nA\n`y`\nB",
+            "bd create x --body-file - <<\\EOF\n$(x)\nEOF",
+        ] {
+            assert!(matches!(bd_call(ok), BdCall::Write(_)), "{ok}");
+        }
+        // ${...} outside a literal body is refused too.
+        denied("bd create \"x ${HOME}\"");
+    }
+
+    #[test]
+    fn dev_paths_are_exempt_only_when_they_stay_under_dev() {
+        assert!(is_dev("/dev/null"));
+        assert!(!is_dev("/dev/../Users/j/journal.md"));
+        assert!(!is_dev("/dev/./../etc/x"));
+        assert!(!is_dev("/dev"));
+        assert!(!is_dev("dev/null"));
+        let denied = |c: &str| assert_eq!(bd_call(c), BdCall::Compound, "{c}");
+        denied("bd create x > /dev/../vault/06-Daily/j.md");
+        denied("bd create x 2> /dev/../vault/j.md");
+        assert!(matches!(
+            bd_call("bd create x > /dev/null"),
+            BdCall::Write(_)
+        ));
+        // A non-bd write through `/dev/..` is judged, not skipped.
+        assert_eq!(w("echo x > /dev/../vault/j.md"), ["/dev/../vault/j.md"]);
+        assert_eq!(w("tee /dev/../vault/j.md"), ["/dev/../vault/j.md"]);
+        assert_eq!(
+            w("cd /dev && echo x > ../vault/j.md"),
+            ["/dev/../vault/j.md"]
+        );
+        assert!(w("echo x > /dev/null").is_empty());
+        assert!(w("cd /dev && echo x > null").is_empty());
     }
 }

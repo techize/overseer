@@ -218,6 +218,9 @@ struct Lexer<'a> {
     src: &'a str,
     chars: Vec<(usize, char)>,
     i: usize,
+    /// Byte ranges of heredoc bodies whose delimiter was quoted, so the
+    /// shell reads them literally.
+    literal_bodies: Vec<std::ops::Range<usize>>,
 }
 
 impl Lexer<'_> {
@@ -303,13 +306,13 @@ impl Lexer<'_> {
         l
     }
 
-    fn split(mut self) -> Vec<RawSegment> {
+    fn split(&mut self) -> Vec<RawSegment> {
         let mut out = Vec::new();
         let mut words: Vec<(String, usize)> = Vec::new();
         let mut redirects: Vec<String> = Vec::new();
         // End of the last word or redirection, so comments stay out of the text.
         let mut last_end = 0;
-        let mut heredocs: Vec<(String, bool)> = Vec::new();
+        let mut heredocs: Vec<(String, bool, bool)> = Vec::new();
         let mut end =
             |words: &mut Vec<(String, usize)>, redirects: &mut Vec<String>, last_end: usize| {
                 if !words.is_empty() || !redirects.is_empty() {
@@ -327,8 +330,11 @@ impl Lexer<'_> {
                 '\n' => {
                     end(&mut words, &mut redirects, last_end);
                     self.i += 1;
-                    for (delim, strip_tabs) in heredocs.drain(..) {
+                    for (delim, strip_tabs, quoted) in heredocs.drain(..) {
+                        let body_start = self.offset();
+                        let mut body_end = self.src.len();
                         while self.i < self.chars.len() {
+                            let line_at = self.offset();
                             let l = self.line();
                             let l = if strip_tabs {
                                 l.trim_start_matches('\t')
@@ -336,8 +342,12 @@ impl Lexer<'_> {
                                 &l
                             };
                             if l == delim {
+                                body_end = line_at;
                                 break;
                             }
+                        }
+                        if quoted {
+                            self.literal_bodies.push(body_start..body_end);
                         }
                     }
                 }
@@ -402,7 +412,7 @@ impl Lexer<'_> {
     /// A redirection at `<` or `>`. A heredoc is queued so its body is
     /// skipped at the next newline. Gives the target of an output
     /// redirection to a file (not `>&2`, not an input).
-    fn redirect(&mut self, heredocs: &mut Vec<(String, bool)>) -> Option<String> {
+    fn redirect(&mut self, heredocs: &mut Vec<(String, bool, bool)>) -> Option<String> {
         let c = self.peek(0);
         self.i += 1;
         if c == Some('<') && self.peek(0) == Some('<') {
@@ -415,9 +425,12 @@ impl Lexer<'_> {
                     self.i += 1;
                 }
                 self.skip_blanks();
+                let from = self.offset();
                 let delim = self.word();
+                // Any quoting of the delimiter makes the body literal.
+                let quoted = self.src[from..self.offset()].contains(['\'', '"', '\\']);
                 if !delim.is_empty() {
-                    heredocs.push((delim, strip_tabs));
+                    heredocs.push((delim, strip_tabs, quoted));
                 }
                 return None;
             }
@@ -515,13 +528,28 @@ pub fn segments(command: &str, cwd: &Path) -> Vec<Segment> {
         .collect()
 }
 
-/// `segments` that also keeps a command with no command word but a
-/// redirection (`> file`, `: > file`) and fills `Segment::redirects`.
-pub fn write_segments(command: &str, cwd: &Path) -> Vec<Segment> {
-    let lexer = Lexer {
+/// The byte ranges of `command` the shell reads literally: heredoc bodies
+/// whose delimiter is quoted. Real, unquoted `<<` operators only; `<<<` and
+/// `<<` inside quotes are not heredocs.
+pub fn literal_heredoc_bodies(command: &str) -> Vec<std::ops::Range<usize>> {
+    let mut lexer = Lexer {
         src: command,
         chars: command.char_indices().collect(),
         i: 0,
+        literal_bodies: Vec::new(),
+    };
+    lexer.split();
+    lexer.literal_bodies
+}
+
+/// `segments` that also keeps a command with no command word but a
+/// redirection (`> file`, `: > file`) and fills `Segment::redirects`.
+pub fn write_segments(command: &str, cwd: &Path) -> Vec<Segment> {
+    let mut lexer = Lexer {
+        src: command,
+        chars: command.char_indices().collect(),
+        i: 0,
+        literal_bodies: Vec::new(),
     };
     let mut cwd = cwd.to_path_buf();
     let mut out = Vec::new();
