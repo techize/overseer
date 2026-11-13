@@ -380,6 +380,11 @@ impl StartDialog {
         }
     }
 
+    /// The client to use from now on, after a reconnect.
+    pub fn set_client(&mut self, client: Arc<Client>) {
+        self.client = client;
+    }
+
     pub fn slot(&self) -> SlotId {
         self.slot
     }

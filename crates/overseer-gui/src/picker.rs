@@ -372,6 +372,11 @@ impl Picker {
         self.state.slot
     }
 
+    /// The client to use from now on, after a reconnect.
+    pub fn set_client(&mut self, client: Arc<Client>) {
+        self.client = client;
+    }
+
     /// A request is on its way; the app keeps a closed picker until it is
     /// answered.
     pub fn busy(&self) -> bool {

@@ -367,6 +367,8 @@ pub struct OverseerApp {
     _ticker: Option<Task<()>>,
     _events: Task<()>,
     _clicks: Task<()>,
+    /// A reconnect loop is running; see `connection_lost`.
+    reconnecting: bool,
 }
 
 impl OverseerApp {
@@ -376,23 +378,7 @@ impl OverseerApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let hub = cx.global::<FrameHub>().clone();
-        let mut frames = hub.take_events();
-        let events = cx.spawn_in(window, async move |this, cx| {
-            let Some(frames) = frames.as_mut() else {
-                return;
-            };
-            while let Some(frame) = frames.recv().await {
-                let alive = this.update_in(cx, |this, window, cx| this.on_frame(frame, window, cx));
-                if alive.is_err() {
-                    return;
-                }
-            }
-            let _ = this.update(cx, |this, cx| {
-                this.status = Some(crate::terminal_view::LOST_DAEMON.into());
-                cx.notify();
-            });
-        });
+        let events = Self::listen(window, cx);
         let mut clicks = crate::notify::clicks();
         let clicked = cx.spawn_in(window, async move |this, cx| {
             while let Some(click) = clicks.recv().await {
@@ -404,33 +390,7 @@ impl OverseerApp {
                 }
             }
         });
-        // The lists come back through the event stream (marked replies), so
-        // they are applied in order with the events around them.
-        let lister = client.clone();
-        cx.spawn(async move |this, cx| {
-            let mut result = lister.request_marked(Request::ListSlots, |_| true).await;
-            if result.is_ok() {
-                result = lister
-                    .request_marked(Request::ListWorkItems, |_| true)
-                    .await;
-            }
-            if result.is_ok() {
-                result = lister.request_marked(Request::ListLocks, |_| true).await;
-            }
-            if result.is_ok() {
-                result = lister.request_marked(Request::BrainStatus, |_| true).await;
-            }
-            if result.is_ok() {
-                result = lister.request_marked(Request::CoordStatus, |_| true).await;
-            }
-            if let Err(e) = result {
-                let _ = this.update(cx, |this, cx| {
-                    this.status = Some(format!("{} ({e:#})", crate::terminal_view::LOST_DAEMON));
-                    cx.notify();
-                });
-            }
-        })
-        .detach();
+        Self::ask_for_lists(client.clone(), cx);
         let board_focus = cx.focus_handle();
         window.focus(&board_focus);
         OverseerApp {
@@ -467,7 +427,120 @@ impl OverseerApp {
             _ticker: None,
             _events: events,
             _clicks: clicked,
+            reconnecting: false,
         }
+    }
+
+    /// Reads the current frame hub's events into `on_frame`. When they end
+    /// (the daemon went away) the app starts reconnecting.
+    fn listen(window: &mut Window, cx: &mut Context<Self>) -> Task<()> {
+        let mut frames = cx.global::<FrameHub>().take_events();
+        cx.spawn_in(window, async move |this, cx| {
+            let Some(frames) = frames.as_mut() else {
+                return;
+            };
+            while let Some(frame) = frames.recv().await {
+                let alive = this.update_in(cx, |this, window, cx| this.on_frame(frame, window, cx));
+                if alive.is_err() {
+                    return;
+                }
+            }
+            let _ = this.update_in(cx, |this, window, cx| this.connection_lost(window, cx));
+        })
+    }
+
+    /// Asks for every list. The answers come back through the event stream
+    /// (marked replies), so they are applied in order with the events around
+    /// them, and as a first sync: nothing in them notifies.
+    fn ask_for_lists(lister: Arc<Client>, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let mut result = lister.request_marked(Request::ListSlots, |_| true).await;
+            if result.is_ok() {
+                result = lister
+                    .request_marked(Request::ListWorkItems, |_| true)
+                    .await;
+            }
+            if result.is_ok() {
+                result = lister.request_marked(Request::ListLocks, |_| true).await;
+            }
+            if result.is_ok() {
+                result = lister.request_marked(Request::BrainStatus, |_| true).await;
+            }
+            if result.is_ok() {
+                result = lister.request_marked(Request::CoordStatus, |_| true).await;
+            }
+            if let Err(e) = result {
+                let _ = this.update(cx, |this, cx| {
+                    this.status = Some(format!("{} ({e:#})", crate::terminal_view::LOST_DAEMON));
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Shows that the daemon is gone and tries to reach it again, with a
+    /// growing pause, until it answers.
+    fn connection_lost(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.status = Some(crate::terminal_view::LOST_DAEMON.into());
+        cx.notify();
+        if self.reconnecting {
+            return;
+        }
+        self.reconnecting = true;
+        let runtime = cx.global::<FrameHub>().runtime().clone();
+        let socket = overseer_proto::paths::socket_path();
+        cx.spawn_in(window, async move |this, cx| {
+            let found = runtime.spawn(crate::reconnect::reconnect(socket)).await;
+            let _ = this.update_in(cx, |this, window, cx| match found {
+                Ok(client) => this.reconnected(Arc::new(client), runtime, window, cx),
+                // The runtime is shutting down with the app.
+                Err(_) => this.reconnecting = false,
+            });
+        })
+        .detach();
+    }
+
+    /// Starts over on a new connection: a new frame hub, every list asked
+    /// for again, new terminal views (the old ones read the dead
+    /// connection), and the open dialogs on the new client.
+    fn reconnected(
+        &mut self,
+        client: Arc<Client>,
+        runtime: tokio::runtime::Handle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.reconnecting = false;
+        cx.set_global(FrameHub::start(&client, runtime));
+        self.client = client.clone();
+        if let Some((d, _)) = &self.dialog {
+            d.update(cx, |d, _| d.set_client(client.clone()));
+        }
+        if let Some((p, _)) = &self.picker {
+            p.update(cx, |p, _| p.set_client(client.clone()));
+        }
+        if let Some((v, _)) = &self.plan_view {
+            v.update(cx, |v, _| v.set_client(client.clone()));
+        }
+        // Requests in flight on the old connection have failed.
+        self.restarts.clear();
+        self.kickoffs.clear();
+        let had_focus = self
+            .terminals
+            .values()
+            .any(|t| t.view.focus_handle(cx).contains_focused(window, cx));
+        self.terminals.clear();
+        if let (Screen::Session(id), true) = (self.screen, had_focus) {
+            self.focus_when_ready = Some(id);
+        }
+        let lost = crate::terminal_view::LOST_DAEMON;
+        if self.status.as_deref().is_some_and(|s| s.starts_with(lost)) {
+            self.status = None;
+        }
+        self._events = Self::listen(window, cx);
+        Self::ask_for_lists(client, cx);
+        cx.notify();
     }
 
     fn on_frame(&mut self, frame: Frame, window: &mut Window, cx: &mut Context<Self>) {

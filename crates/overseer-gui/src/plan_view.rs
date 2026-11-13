@@ -511,6 +511,11 @@ impl PlanView {
         self.editor.busy
     }
 
+    /// The client to use from now on, after a reconnect.
+    pub fn set_client(&mut self, client: Arc<Client>) {
+        self.client = client;
+    }
+
     /// Closes without cancelling a request in flight: the daemon has no
     /// timeout for it, so Close must not wait for the answer.
     fn close(&mut self, cx: &mut Context<Self>) {
