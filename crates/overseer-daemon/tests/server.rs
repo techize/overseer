@@ -3386,7 +3386,7 @@ const JOURNAL: &str = "06-Daily/2026/11-November/2026-11-13-journal.md";
 const JOURNAL_DENY: &str = "06-Daily/2026/11-November/2026-11-13-journal.md is a shared 2ndBrain file. Use append_journal for the journal or edit_shared_file for an exact replacement.";
 
 #[tokio::test]
-async fn shared_file_write_is_denied_with_the_tool_name() {
+async fn vault_write_checks_deny_shared_files_and_git_and_rewrite_bd() {
     let (d, vault) = brain_daemon(true).await;
     let mut c = Client::connect(&d.socket).await;
     for tool in ["Edit", "Write", "MultiEdit"] {
@@ -3432,7 +3432,7 @@ async fn shared_file_write_is_denied_with_the_tool_name() {
     );
     assert_eq!(
         deny.as_deref(),
-        Some("run bd on its own so Overseer can run it under the 2ndBrain lock")
+        Some("Overseer: run bd writes on their own, without $(...), backticks, redirects or env prefixes, so the daemon can run them under the vault lock")
     );
     assert_eq!(rewrite, None);
     assert_eq!(

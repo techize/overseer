@@ -129,13 +129,20 @@ pub fn deny_json(reason: &str) -> String {
 }
 
 /// Claude Code's decision JSON allowing a tool call with its Bash command
-/// replaced by `command`.
-pub fn rewrite_json(command: &str) -> String {
+/// replaced by `command`. `input` is the original `tool_input`: it is
+/// copied and only `command` replaced, so `timeout`, `description` and
+/// `run_in_background` survive whether Claude Code merges or replaces it.
+pub fn rewrite_json(command: &str, input: Option<&serde_json::Value>) -> String {
+    let mut updated = match input {
+        Some(serde_json::Value::Object(o)) => o.clone(),
+        _ => serde_json::Map::new(),
+    };
+    updated.insert("command".into(), command.into());
     serde_json::json!({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "permissionDecision": "allow",
-            "updatedInput": {"command": command},
+            "updatedInput": updated,
         }
     })
     .to_string()
@@ -143,7 +150,7 @@ pub fn rewrite_json(command: &str) -> String {
 
 /// What the hook prints for the daemon's answer: a deny wins over a
 /// rewrite; an allow prints nothing.
-pub fn decision_json(answer: &Response) -> Option<String> {
+pub fn decision_json(answer: &Response, input: Option<&serde_json::Value>) -> Option<String> {
     match answer {
         Response::Verdict {
             deny: Some(reason), ..
@@ -151,7 +158,7 @@ pub fn decision_json(answer: &Response) -> Option<String> {
         Response::Verdict {
             rewrite: Some(command),
             ..
-        } => Some(rewrite_json(command)),
+        } => Some(rewrite_json(command, input)),
         _ => None,
     }
 }
@@ -179,6 +186,9 @@ fn pre_tool_use(slot_env: &str) {
     let Some(check) = parse_pre_tool_use(slot_env, &stdin, |k| std::env::var(k).ok()) else {
         return;
     };
+    let input = serde_json::from_slice::<serde_json::Value>(&stdin)
+        .ok()
+        .and_then(|j| j.get("tool_input").cloned());
     let Some(rt) = runtime() else { return };
     let answer = rt.block_on(async {
         tokio::time::timeout(CHECK_WITHIN, async {
@@ -189,7 +199,10 @@ fn pre_tool_use(slot_env: &str) {
         .ok()
         .flatten()
     });
-    if let Some(out) = answer.as_ref().and_then(decision_json) {
+    if let Some(out) = answer
+        .as_ref()
+        .and_then(|a| decision_json(a, input.as_ref()))
+    {
         let mut stdout = std::io::stdout().lock();
         let _ = writeln!(stdout, "{out}");
         let _ = stdout.flush();
@@ -335,7 +348,7 @@ mod tests {
     #[test]
     fn rewrite_prints_updated_input() {
         let v: serde_json::Value =
-            serde_json::from_str(&rewrite_json("overseer ctl bd -- close ov-3")).unwrap();
+            serde_json::from_str(&rewrite_json("overseer ctl bd -- close ov-3", None)).unwrap();
         assert_eq!(
             v,
             serde_json::json!({"hookSpecificOutput": {
@@ -345,27 +358,58 @@ mod tests {
             }})
         );
         assert_eq!(
-            decision_json(&Response::Verdict {
-                deny: None,
-                rewrite: Some("x".into())
-            })
+            decision_json(
+                &Response::Verdict {
+                    deny: None,
+                    rewrite: Some("x".into())
+                },
+                None
+            )
             .as_deref(),
-            Some(rewrite_json("x").as_str())
+            Some(rewrite_json("x", None).as_str())
         );
         assert_eq!(
-            decision_json(&Response::Verdict {
-                deny: Some("no".into()),
-                rewrite: Some("x".into())
-            })
+            decision_json(
+                &Response::Verdict {
+                    deny: Some("no".into()),
+                    rewrite: Some("x".into())
+                },
+                None
+            )
             .as_deref(),
             Some(deny_json("no").as_str())
         );
         assert_eq!(
-            decision_json(&Response::Verdict {
-                deny: None,
-                rewrite: None
-            }),
+            decision_json(
+                &Response::Verdict {
+                    deny: None,
+                    rewrite: None
+                },
+                None
+            ),
             None
+        );
+    }
+
+    #[test]
+    fn rewrite_keeps_the_other_tool_input_fields() {
+        let input = serde_json::json!({
+            "command": "bd close ov-3",
+            "description": "close it",
+            "timeout": 5000,
+            "run_in_background": true
+        });
+        let v: serde_json::Value =
+            serde_json::from_str(&rewrite_json("overseer ctl bd -- close ov-3", Some(&input)))
+                .unwrap();
+        assert_eq!(
+            v["hookSpecificOutput"]["updatedInput"],
+            serde_json::json!({
+                "command": "overseer ctl bd -- close ov-3",
+                "description": "close it",
+                "timeout": 5000,
+                "run_in_background": true
+            })
         );
     }
 

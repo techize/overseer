@@ -355,14 +355,20 @@ fn pre_tool_use_prints_a_rewrite_as_updated_input() {
         rewrite: Some("overseer ctl bd -- close ov-3".into()),
     };
     let (_rx, t) = fake_daemon_with(&home, Some(answer), Duration::ZERO);
-    let (out, _) = run_pre_tool_use(&home, BASH);
+    let bd = br#"{"tool_name":"Bash","cwd":"/tmp","tool_input":{"command":"bd close ov-3","timeout":9000,"description":"close","run_in_background":false}}"#;
+    let (out, _) = run_pre_tool_use(&home, bd);
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(
         v,
         serde_json::json!({"hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "permissionDecision": "allow",
-            "updatedInput": {"command": "overseer ctl bd -- close ov-3"},
+            "updatedInput": {
+                "command": "overseer ctl bd -- close ov-3",
+                "timeout": 9000,
+                "description": "close",
+                "run_in_background": false
+            },
         }})
     );
     t.join().unwrap();

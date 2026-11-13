@@ -51,7 +51,7 @@ const BD_TIMEOUT: Duration = Duration::from_secs(120);
 const SYNC_TIMEOUT: Duration = Duration::from_secs(600);
 
 const GIT_DENY: &str = "use the commit_2ndbrain tool; Overseer commits and pushes 2ndBrain";
-const BD_COMPOUND_DENY: &str = "run bd on its own so Overseer can run it under the 2ndBrain lock";
+const BD_COMPOUND_DENY: &str = "Overseer: run bd writes on their own, without $(...), backticks, redirects or env prefixes, so the daemon can run them under the vault lock";
 
 fn deny_shared(rel: &str) -> String {
     format!("{rel} is a shared 2ndBrain file. Use append_journal for the journal or edit_shared_file for an exact replacement.")
@@ -456,21 +456,65 @@ impl BrainService {
         if bash::vault_git(&check.command, &cwd, &self.cfg.brain).is_some() {
             return verdict(Some(GIT_DENY.into()), None);
         }
-        let paths: Vec<PathBuf> = bash::write_paths(&check.command)
-            .into_iter()
-            .map(PathBuf::from)
-            .collect();
-        if paths.is_empty() {
-            return None;
+        for w in bash::writes(&check.command) {
+            if let Some(d) = self.deny_bash_write(&w, check.slot, owners, &cwd) {
+                return verdict(Some(d), None);
+            }
         }
-        let write = WriteCheck {
-            slot: check.slot,
-            tool: "Bash".into(),
-            paths,
-            cwd: Some(cwd),
-        };
-        self.check_write(&write, owners)
-            .and_then(|d| verdict(Some(d), None))
+        None
+    }
+
+    /// The paths a Bash word names: its glob matches against `cwd`, or the
+    /// word as written when it has none or matches nothing.
+    fn expand_word(&self, w: &str, cwd: &Path) -> Vec<PathBuf> {
+        if bash::has_glob(w) {
+            let hits = bash::glob(w, cwd, &self.opts.home);
+            if !hits.is_empty() {
+                return hits;
+            }
+        }
+        vec![PathBuf::from(w)]
+    }
+
+    fn is_vault_folder(&self, p: &Path, cwd: &Path) -> bool {
+        matches!(
+            locate(&self.cfg.brain, Some(cwd), p, &self.opts.home),
+            Ok((_, true))
+        )
+    }
+
+    /// Judges one write of a Bash command. Only a recursive delete is
+    /// judged as a folder; `cp` and `mv` into a folder are judged by the
+    /// files that land in it.
+    fn deny_bash_write(
+        &self,
+        w: &bash::Write,
+        slot: SlotId,
+        owners: &Owners,
+        cwd: &Path,
+    ) -> Option<String> {
+        use bash::Write;
+        let file = |p: &Path| self.deny_for(p, slot, owners, Some(cwd));
+        match w {
+            Write::File(p) | Write::Delete(p) => {
+                self.expand_word(p, cwd).iter().find_map(|p| file(p))
+            }
+            Write::DeleteTree(p) => self.expand_word(p, cwd).iter().find_map(|p| {
+                file(p).or_else(|| {
+                    let (rel, dir) = locate(&self.cfg.brain, Some(cwd), p, &self.opts.home).ok()?;
+                    dir.then(|| self.folder_deny(&rel, slot, owners)).flatten()
+                })
+            }),
+            Write::Copy { target, sources } => self.expand_word(target, cwd).iter().find_map(|t| {
+                if !self.is_vault_folder(t, cwd) {
+                    return file(t);
+                }
+                sources
+                    .iter()
+                    .flat_map(|s| self.expand_word(s, cwd))
+                    .find_map(|s| file(&t.join(s.file_name()?)))
+            }),
+        }
     }
 
     /// Queues a pathspec commit of `paths` and waits for it to be committed

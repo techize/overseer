@@ -77,22 +77,10 @@ fn positionals<'a>(words: &'a [String], value_opts: &[&str]) -> Vec<&'a str> {
     out
 }
 
-/// A short-option cluster's letters up to the first non-letter, e.g. `ni`
-/// for `-ni` and `i` for `-i.bak`. `None` for a long option or a word that
-/// is not an option.
-fn cluster(w: &str) -> Option<&str> {
-    let rest = w.strip_prefix('-')?;
-    if rest.starts_with('-') || rest.is_empty() {
-        return None;
-    }
-    let end = rest
-        .find(|c: char| !c.is_ascii_alphabetic())
-        .unwrap_or(rest.len());
-    Some(&rest[..end])
-}
-
-/// File arguments of `sed -i` or `perl -i`; empty without `-i`.
-fn in_place_files(words: &[String]) -> Vec<String> {
+/// File arguments of `sed -i` or `perl -i`; empty without `-i`. Only each
+/// tool's own forms count: perl's `-M`, `-m`, `-I` and `-x` take the rest
+/// of the word as a value, `-i` takes it as the backup suffix.
+fn in_place_files(words: &[String], perl: bool) -> Vec<String> {
     let mut in_place = false;
     let mut script_given = false;
     let mut files: Vec<&str> = Vec::new();
@@ -102,24 +90,43 @@ fn in_place_files(words: &[String]) -> Vec<String> {
         let w = words[i].as_str();
         if options && w == "--" {
             options = false;
-        } else if options && (w.starts_with("--in-place") || w == "--in-place") {
-            in_place = true;
-        } else if options && (w.starts_with("--expression=") || w.starts_with("--file=")) {
-            script_given = true;
-        } else if options && matches!(w, "--expression" | "--file") {
-            script_given = true;
-            i += 1;
+        } else if options && w.starts_with("--") {
+            if !perl && w.starts_with("--in-place") {
+                in_place = true;
+            } else if !perl && (w.starts_with("--expression=") || w.starts_with("--file=")) {
+                script_given = true;
+            } else if !perl && matches!(w, "--expression" | "--file") {
+                script_given = true;
+                i += 1;
+            }
         } else if options && is_option(w) {
-            if let Some(c) = cluster(w) {
-                if c.contains('i') {
-                    in_place = true;
+            let rest = &w[1..];
+            for (k, c) in rest.char_indices() {
+                let last = k + c.len_utf8() == rest.len();
+                if perl && matches!(c, 'M' | 'm' | 'I' | 'x') {
+                    break;
                 }
-                // `-e script` and `-f file` (and perl's `-pie script`).
-                if c.ends_with('e') || c.ends_with('f') {
-                    script_given = true;
-                    if w.len() == c.len() + 1 {
-                        i += 1;
+                match c {
+                    'i' => {
+                        in_place = true;
+                        break;
                     }
+                    'e' | 'E' if perl => {
+                        script_given = true;
+                        i += last as usize;
+                        break;
+                    }
+                    'e' | 'f' if !perl => {
+                        script_given = true;
+                        i += last as usize;
+                        break;
+                    }
+                    'l' if !perl => {
+                        i += last as usize;
+                        break;
+                    }
+                    c if c.is_ascii_alphabetic() => {}
+                    _ => break,
                 }
             }
         } else if w.is_empty() {
@@ -146,39 +153,145 @@ fn join(prefix: &Path, p: &str) -> String {
     }
 }
 
-fn segment_writes(seg: &Segment) -> Vec<String> {
-    let mut out: Vec<String> = seg.redirects.clone();
-    if let Some(cmd) = seg.words.first() {
-        let args = &seg.words[1..];
-        match base(cmd) {
-            "tee" => out.extend(positionals(args, &[]).into_iter().map(String::from)),
-            "sed" => out.extend(in_place_files(&seg.words)),
-            "perl" => out.extend(in_place_files(&seg.words)),
-            "cp" | "mv" => {
-                let target = args
-                    .iter()
-                    .position(|w| matches!(w.as_str(), "-t" | "--target-directory"))
-                    .and_then(|i| args.get(i + 1))
-                    .map(String::as_str)
-                    .or_else(|| {
-                        positionals(args, &["-t", "--target-directory", "-S", "--suffix"])
-                            .last()
-                            .copied()
-                    });
-                out.extend(target.map(String::from));
+/// One write a command line makes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Write {
+    /// Content written to, or created at, a file.
+    File(String),
+    /// A file removed or moved away.
+    Delete(String),
+    /// A recursive delete (`rm -r`, `rmdir`): everything under it goes.
+    DeleteTree(String),
+    /// `cp` or `mv` of `sources` to `target`, which is the destination file
+    /// or an existing folder the sources go into.
+    Copy {
+        target: String,
+        sources: Vec<String>,
+    },
+}
+
+fn recursive(args: &[String]) -> bool {
+    args.iter().take_while(|w| w.as_str() != "--").any(|w| {
+        w == "--recursive" || (is_option(w) && !w.starts_with("--") && w.contains(['r', 'R']))
+    })
+}
+
+fn copy_args(args: &[String]) -> Option<(String, Vec<String>)> {
+    let mut target: Option<String> = None;
+    let mut pos: Vec<String> = Vec::new();
+    let mut options = true;
+    let mut i = 0;
+    while i < args.len() {
+        let w = args[i].as_str();
+        if options && w == "--" {
+            options = false;
+        } else if options && matches!(w, "-t" | "--target-directory") {
+            target = args.get(i + 1).cloned();
+            i += 1;
+        } else if let Some(v) = w.strip_prefix("--target-directory=").filter(|_| options) {
+            target = Some(v.to_string());
+        } else if options && matches!(w, "-S" | "--suffix") {
+            i += 1;
+        } else if !(options && is_option(w)) {
+            pos.push(w.to_string());
+        }
+        i += 1;
+    }
+    let target = match target {
+        Some(t) => t,
+        None => pos.pop()?,
+    };
+    Some((target, pos))
+}
+
+fn segment_writes(seg: &Segment) -> Vec<Write> {
+    let mut out: Vec<Write> = seg.redirects.iter().cloned().map(Write::File).collect();
+    let Some(cmd) = seg.words.first() else {
+        return out;
+    };
+    let args = &seg.words[1..];
+    fn files(v: Vec<&str>) -> Vec<Write> {
+        v.into_iter().map(|p| Write::File(p.to_string())).collect()
+    }
+    match base(cmd) {
+        "tee" => out.extend(files(positionals(args, &[]))),
+        "sed" => out.extend(
+            in_place_files(&seg.words, false)
+                .into_iter()
+                .map(Write::File),
+        ),
+        "perl" => out.extend(
+            in_place_files(&seg.words, true)
+                .into_iter()
+                .map(Write::File),
+        ),
+        "cp" | "mv" => {
+            if let Some((target, sources)) = copy_args(args) {
+                if base(cmd) == "mv" {
+                    out.extend(sources.iter().cloned().map(Write::Delete));
+                }
+                out.push(Write::Copy { target, sources });
             }
-            "rm" => out.extend(positionals(args, &[]).into_iter().map(String::from)),
-            "touch" => out.extend(
-                positionals(args, &["-t", "-d", "-r", "--date", "--reference"])
-                    .into_iter()
-                    .map(String::from),
-            ),
-            "truncate" => out.extend(
-                positionals(args, &["-s", "-r", "--size", "--reference"])
-                    .into_iter()
-                    .map(String::from),
-            ),
-            _ => {}
+        }
+        "rm" => {
+            let tree = recursive(args);
+            out.extend(positionals(args, &[]).into_iter().map(|p| {
+                if tree {
+                    Write::DeleteTree(p.to_string())
+                } else {
+                    Write::Delete(p.to_string())
+                }
+            }));
+        }
+        "rmdir" => out.extend(
+            positionals(args, &[])
+                .into_iter()
+                .map(|p| Write::DeleteTree(p.to_string())),
+        ),
+        "touch" => out.extend(files(positionals(
+            args,
+            &["-t", "-d", "-r", "--date", "--reference"],
+        ))),
+        "truncate" => out.extend(files(positionals(
+            args,
+            &["-s", "-r", "--size", "--reference"],
+        ))),
+        _ => {}
+    }
+    out
+}
+
+/// A written path as the caller should resolve it: `$HOME` as `~`, joined
+/// to the folder of an earlier `cd`. `None` for a path that cannot be
+/// judged (other variables, substitutions, `/dev/*`, empty).
+fn fix(p: &str, cwd: &Path) -> Option<String> {
+    let p = expand_home(p);
+    if p.is_empty() || p.contains('$') || p.contains('`') || p.starts_with("/dev/") {
+        return None;
+    }
+    Some(join(cwd, &p))
+}
+
+/// The writes a command line makes (Ruling 11), paths as in `write_paths`.
+pub fn writes(command: &str) -> Vec<Write> {
+    let mut out: Vec<Write> = Vec::new();
+    for seg in write_segments(command, Path::new("")) {
+        for w in segment_writes(&seg) {
+            let c = &seg.cwd;
+            let w = match w {
+                Write::File(p) => fix(&p, c).map(Write::File),
+                Write::Delete(p) => fix(&p, c).map(Write::Delete),
+                Write::DeleteTree(p) => fix(&p, c).map(Write::DeleteTree),
+                Write::Copy { target, sources } => fix(&target, c).map(|target| Write::Copy {
+                    target,
+                    sources: sources.iter().filter_map(|s| fix(s, c)).collect(),
+                }),
+            };
+            if let Some(w) = w {
+                if !out.contains(&w) {
+                    out.push(w);
+                }
+            }
         }
     }
     out
@@ -186,25 +299,100 @@ fn segment_writes(seg: &Segment) -> Vec<String> {
 
 /// The paths a command line writes (Ruling 11): `>` and `>>` targets,
 /// `tee [-a]` files, `sed -i`/`perl -i` files, the last argument of `cp`
-/// and `mv`, every argument of `rm`, `touch` and `truncate`. Paths are as
-/// written, with `$HOME` as `~`, joined to the folder of an earlier `cd`;
-/// a relative one is left for the caller to resolve against the hook's
-/// cwd. Words with other variables or substitutions are dropped.
+/// and `mv` (and the sources of `mv`, which are removed), every argument of
+/// `rm`, `rmdir`, `touch` and `truncate`. Paths are as written, with
+/// `$HOME` as `~`, joined to the folder of an earlier `cd`; a relative one
+/// is left for the caller to resolve against the hook's cwd. Words with
+/// other variables or substitutions are dropped. Globs stay as written;
+/// the daemon expands them.
 pub fn write_paths(command: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for seg in write_segments(command, Path::new("")) {
-        for w in segment_writes(&seg) {
-            let w = expand_home(&w);
-            if w.is_empty() || w.contains('$') || w.contains('`') || w.starts_with("/dev/") {
-                continue;
-            }
-            let p = join(&seg.cwd, &w);
-            if !out.contains(&p) {
-                out.push(p);
-            }
+    for w in writes(command) {
+        let p = match w {
+            Write::File(p) | Write::Delete(p) | Write::DeleteTree(p) => p,
+            Write::Copy { target, .. } => target,
+        };
+        if !out.contains(&p) {
+            out.push(p);
         }
     }
     out
+}
+
+/// Whether `w` has a shell wildcard.
+pub fn has_glob(w: &str) -> bool {
+    w.contains(['*', '?', '['])
+}
+
+fn wild(pat: &[char], s: &[char]) -> bool {
+    match pat.first() {
+        None => s.is_empty(),
+        Some('*') => (0..=s.len()).any(|k| wild(&pat[1..], &s[k..])),
+        Some('?') => !s.is_empty() && wild(&pat[1..], &s[1..]),
+        Some('[') => {
+            let Some(end) = pat.iter().skip(2).position(|c| *c == ']').map(|e| e + 2) else {
+                return s.first() == Some(&'[') && wild(&pat[1..], &s[1..]);
+            };
+            let Some(&c) = s.first() else { return false };
+            let set = &pat[1..end];
+            let (neg, set) = match set.first() {
+                Some('!' | '^') => (true, &set[1..]),
+                _ => (false, set),
+            };
+            let mut hit = false;
+            let mut i = 0;
+            while i < set.len() {
+                if i + 2 < set.len() && set[i + 1] == '-' {
+                    hit |= set[i] <= c && c <= set[i + 2];
+                    i += 3;
+                } else {
+                    hit |= set[i] == c;
+                    i += 1;
+                }
+            }
+            hit != neg && wild(&pat[end + 1..], &s[1..])
+        }
+        Some(p) => s.first() == Some(p) && wild(&pat[1..], &s[1..]),
+    }
+}
+
+/// The paths a glob matches, one directory level per path component,
+/// resolved against `cwd` (`~` against `home`). Hidden names match only a
+/// pattern that starts with a dot. Empty when nothing matches.
+pub fn glob(pattern: &str, cwd: &Path, home: &Path) -> Vec<PathBuf> {
+    let full = match pattern.strip_prefix('~') {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => {
+            home.join(rest.trim_start_matches('/'))
+        }
+        _ => cwd.join(pattern),
+    };
+    let mut found = vec![PathBuf::new()];
+    for comp in full.components() {
+        let name = comp.as_os_str().to_string_lossy().into_owned();
+        let mut next = Vec::new();
+        if matches!(comp, std::path::Component::Normal(_)) && has_glob(&name) {
+            let pat: Vec<char> = name.chars().collect();
+            for dir in &found {
+                let Ok(rd) = std::fs::read_dir(dir) else {
+                    continue;
+                };
+                let mut names: Vec<String> = rd
+                    .flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| !n.starts_with('.') || name.starts_with('.'))
+                    .filter(|n| wild(&pat, &n.chars().collect::<Vec<_>>()))
+                    .collect();
+                names.sort();
+                next.extend(names.into_iter().map(|n| dir.join(n)));
+            }
+        } else {
+            next.extend(found.iter().map(|d| d.join(comp.as_os_str())));
+        }
+        found = next;
+        found.truncate(1000);
+    }
+    found.retain(|p| p.exists());
+    found
 }
 
 /// Subcommands of `git` that only read (Ruling 12).
@@ -361,11 +549,40 @@ pub fn bd_call(command: &str) -> BdCall {
         }
     }
     match write {
-        Some(args) if segs.len() == 1 => BdCall::Write(args),
+        Some(args) if segs.len() == 1 && !bd_line_unsafe(command, &segs[0]) => BdCall::Write(args),
         Some(_) => BdCall::Compound,
         None if found => BdCall::Read,
         None => BdCall::None,
     }
+}
+
+/// A single `bd` write line the rewrite cannot keep inside the vault
+/// checks: command substitution (anywhere, quoted or not, but not in the
+/// body of a quoted heredoc), a file redirect, or anything before the `bd`
+/// word (an env prefix, `command`, a path).
+fn bd_line_unsafe(command: &str, seg: &Segment) -> bool {
+    let t = command.trim_start();
+    let plain_start = t
+        .strip_prefix("bd")
+        .is_some_and(|r| r.starts_with([' ', '\t']));
+    if !plain_start {
+        return true;
+    }
+    if seg.redirects.iter().any(|r| !r.starts_with("/dev/")) {
+        return true;
+    }
+    let heredoc = regex::Regex::new(r#"<<-?\s*(['"\\]?)\w+"#).expect("static regex");
+    let scanned = match heredoc.captures(command) {
+        // A quoted delimiter makes the body literal: only the lines up to
+        // the operator's line can substitute.
+        Some(c) if !c[1].is_empty() => {
+            let at = c.get(0).map_or(0, |m| m.end());
+            let end = command[at..].find('\n').map_or(command.len(), |n| at + n);
+            &command[..end]
+        }
+        _ => command,
+    };
+    scanned.contains("$(") || scanned.contains('`')
 }
 
 /// Single-quotes `w` for the shell unless it is plain.
@@ -418,7 +635,8 @@ mod tests {
         assert_eq!(w("sed -n s/a/b/p f.md"), Vec::<String>::new());
         assert_eq!(w("perl -pi -e 's/a/b/' f.md"), ["f.md"]);
         assert_eq!(w("cp x.md Sessions/y.md"), ["Sessions/y.md"]);
-        assert_eq!(w("mv -f x.md y.md"), ["y.md"]);
+        assert_eq!(w("mv -f x.md y.md"), ["x.md", "y.md"]);
+        assert_eq!(w("cp --target-directory=Sessions x.md"), ["Sessions"]);
         assert_eq!(w("cp -t Sessions x.md"), ["Sessions"]);
         assert_eq!(w("rm -f a.md"), ["a.md"]);
         assert_eq!(w("rm -rf dir other.md"), ["dir", "other.md"]);
@@ -538,5 +756,118 @@ mod tests {
             bd_rewrite("FOO=1 bd close ov-3", &["close".into(), "ov 3".into()]),
             "overseer ctl bd -- close 'ov 3'"
         );
+    }
+
+    #[test]
+    fn only_recursive_deletes_are_trees() {
+        assert_eq!(writes("rm -rf d"), [Write::DeleteTree("d".into())]);
+        assert_eq!(writes("rm -R d"), [Write::DeleteTree("d".into())]);
+        assert_eq!(writes("rm --recursive d"), [Write::DeleteTree("d".into())]);
+        assert_eq!(writes("rmdir d"), [Write::DeleteTree("d".into())]);
+        assert_eq!(writes("rm -f a.md"), [Write::Delete("a.md".into())]);
+        assert_eq!(
+            writes("mv a.md dir/"),
+            [
+                Write::Delete("a.md".into()),
+                Write::Copy {
+                    target: "dir/".into(),
+                    sources: vec!["a.md".into()]
+                }
+            ]
+        );
+        assert_eq!(
+            writes("cp -r a.md b.md dir"),
+            [Write::Copy {
+                target: "dir".into(),
+                sources: vec!["a.md".into(), "b.md".into()]
+            }]
+        );
+    }
+
+    #[test]
+    fn option_clusters_only_count_for_their_own_tool() {
+        // perl -M and -I take the rest of the word; they are not -i.
+        assert!(w("perl -Mstrict -ne print 06-Daily/j.md").is_empty());
+        assert!(w("perl -MList::Util=sum -ne 'print' j.md").is_empty());
+        assert!(w("perl -I lib -mstrict -ne print j.md").is_empty());
+        assert_eq!(w("perl -Mstrict -pi -e 's/a/b/' j.md"), ["j.md"]);
+        assert_eq!(w("perl -pi.bak -e 's/a/b/' j.md"), ["j.md"]);
+        assert_eq!(w("perl -i s.pl j.md"), ["j.md"]);
+        // sed: -n and -E are not in-place; --in-place and -i are.
+        assert!(w("sed -nE s/a/b/p j.md").is_empty());
+        assert_eq!(w("sed --in-place s/a/b/ j.md"), ["j.md"]);
+        assert_eq!(w("sed -ni s/a/b/p j.md"), ["j.md"]);
+        assert_eq!(w("sed -E -i '' -e s/a/b/ j.md"), ["j.md"]);
+    }
+
+    #[test]
+    fn bd_writes_with_substitution_redirects_or_prefixes_are_refused() {
+        let denied = |c: &str| assert_eq!(bd_call(c), BdCall::Compound, "{c}");
+        denied("bd create \"x $(git -C ~/Repos/2ndBrain push)\"");
+        denied("bd create 'x $(echo)'");
+        denied("bd create \"x `date`\"");
+        denied("bd create x > 06-Daily/2026/11-November/2026-11-13-journal.md");
+        denied("bd create x >> j.md");
+        denied("FOO=1 bd create x");
+        denied("env X=y bd create x");
+        denied("command bd create x");
+        denied("/usr/local/bin/bd create x");
+        // /dev redirects, plain lines and heredocs with a quoted delimiter
+        // are rewritten.
+        for ok in [
+            "bd create x 2>/dev/null",
+            "bd create x --json",
+            "bd create x --body-file - <<'EOF'\nuses $(x) and `y` literally\nEOF",
+            "bd create x --body-file - <<\"EOF\"\n$(x)\nEOF",
+        ] {
+            assert!(matches!(bd_call(ok), BdCall::Write(_)), "{ok}");
+        }
+        // An unquoted delimiter expands its body.
+        denied("bd create x --body-file - <<EOF\n$(git push)\nEOF");
+        // Substitution on the operator's own line is still caught.
+        denied("bd create \"$(git push)\" --body-file - <<'EOF'\nbody\nEOF");
+        // Reads are not touched.
+        assert_eq!(bd_call("bd show \"$(echo ov-3)\""), BdCall::Read);
+    }
+
+    #[test]
+    fn vault_git_follows_cd_with_a_redirect_or_home_variable() {
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let brain = home.join("Repos/2ndBrain");
+        let other = home.join("Repos/other");
+        let v = |c: &str| vault_git_in(c, &other, &brain, &home);
+        assert_eq!(
+            v("cd ~/Repos/2ndBrain 2>/dev/null && git push").as_deref(),
+            Some("push")
+        );
+        assert_eq!(
+            v("cd $HOME/Repos/2ndBrain && git commit -m x").as_deref(),
+            Some("commit")
+        );
+        assert_eq!(v("cd ~/Repos/2ndBrain 2>/dev/null && git log"), None);
+    }
+
+    #[test]
+    fn globs_expand_one_level_per_component() {
+        let dir = std::env::temp_dir().join(format!("ov-glob-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("a/b")).unwrap();
+        for f in ["a/x1.md", "a/x2.md", "a/y.txt", "a/.hid.md", "a/b/z.md"] {
+            std::fs::write(dir.join(f), "").unwrap();
+        }
+        let g = |p: &str| -> Vec<String> {
+            glob(p, &dir, Path::new("/nohome"))
+                .iter()
+                .map(|p| p.strip_prefix(&dir).unwrap().display().to_string())
+                .collect()
+        };
+        assert_eq!(g("a/*.md"), ["a/x1.md", "a/x2.md"]);
+        assert_eq!(g("a/x?.md"), ["a/x1.md", "a/x2.md"]);
+        assert_eq!(g("a/x[1].md"), ["a/x1.md"]);
+        assert_eq!(g("a/x[!1].md"), ["a/x2.md"]);
+        assert_eq!(g("*/b/*.md"), ["a/b/z.md"]);
+        assert_eq!(g("a/.h*"), ["a/.hid.md"]);
+        assert!(g("a/*.rs").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -483,6 +483,18 @@ fn home() -> Option<PathBuf> {
 
 /// `dir` against `cwd`, with `~` expanded.
 fn resolve(cwd: &Path, dir: &str) -> PathBuf {
+    // `$HOME` and `${HOME}` prefixes mean the same as `~`.
+    let tilde;
+    let dir = match ["$HOME", "${HOME}"].iter().find_map(|v| {
+        dir.strip_prefix(v)
+            .filter(|r| r.is_empty() || r.starts_with('/'))
+    }) {
+        Some(rest) => {
+            tilde = format!("~{rest}");
+            tilde.as_str()
+        }
+        None => dir,
+    };
     let p = match dir.strip_prefix('~') {
         Some(rest) if rest.is_empty() || rest.starts_with('/') => match home() {
             Some(h) => h.join(rest.trim_start_matches('/')),
@@ -532,7 +544,7 @@ pub fn write_segments(command: &str, cwd: &Path) -> Vec<Segment> {
             .to_owned();
         let words: Vec<String> = raw.words[at..].iter().map(|(w, _)| w.clone()).collect();
         let here = cwd.clone();
-        if words[0] == "cd" && raw.redirects.is_empty() {
+        if words[0] == "cd" {
             let dir = words[1..]
                 .iter()
                 .find(|w| !w.starts_with('-') || w.as_str() == "-");
@@ -1161,6 +1173,31 @@ mod tests {
         assert_eq!(r[2], ["d.md"]);
         // `segments` still drops a redirect-only line.
         assert_eq!(segments("> a.md", &cwd()).len(), 0);
+    }
+
+    #[test]
+    fn cd_with_a_redirect_still_locks_the_repo_it_moved_to() {
+        assert_eq!(
+            targets("cd /w/other-repo 2>/dev/null && git push"),
+            ["repo:other-repo:feature-x"]
+        );
+        assert_eq!(
+            targets("cd /w/other-repo > /dev/null; git push"),
+            ["repo:other-repo:feature-x"]
+        );
+    }
+
+    #[test]
+    fn cd_with_a_redirect_or_home_variable_still_moves_the_folder() {
+        let home = home().unwrap();
+        let segs = segments("cd ~/Repos/x 2>/dev/null && git push", &cwd());
+        assert_eq!(segs[1].cwd, home.join("Repos/x"));
+        let segs = segments("cd $HOME/Repos/x && git push", &cwd());
+        assert_eq!(segs[1].cwd, home.join("Repos/x"));
+        let segs = segments("cd ${HOME}/Repos/x && git push", &cwd());
+        assert_eq!(segs[1].cwd, home.join("Repos/x"));
+        let segs = segments("cd \"$HOME\" && git push", &cwd());
+        assert_eq!(segs[1].cwd, home);
     }
 
     #[test]

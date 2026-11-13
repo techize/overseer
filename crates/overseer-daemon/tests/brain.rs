@@ -1213,3 +1213,184 @@ async fn current_session_symlink_is_judged_by_either_path() {
         None
     );
 }
+
+fn bash_check(v: &Vault, slot: u8, command: &str, cwd: &Path) -> overseer_proto::BashCheck {
+    let _ = v;
+    overseer_proto::BashCheck {
+        slot,
+        session_id: None,
+        tool_use_id: None,
+        command: command.into(),
+        cwd: Some(cwd.to_path_buf()),
+        env: vec![],
+    }
+}
+
+fn denied(r: Option<Response>) -> Option<String> {
+    match r {
+        Some(Response::Verdict { deny, .. }) => deny,
+        None => None,
+        other => panic!("{other:?}"),
+    }
+}
+
+const SHARED_DASH: &str = "Sprints/sprint-26-01/SPRINT-DASHBOARD.md";
+const JOURNAL: &str = "06-Daily/2026/11-November/2026-11-13-journal.md";
+
+fn shared_vault(tag: &str) -> (Vault, Arc<BrainService>) {
+    let v = Vault::new(tag);
+    for f in [
+        SHARED_DASH,
+        JOURNAL,
+        S2_NOTE,
+        "Sprints/sprint-26-01/sprint-plan.md",
+    ] {
+        write(&v.vault.join(f), "x\n");
+    }
+    std::fs::create_dir_all(v.vault.join(S2_FOLDER)).unwrap();
+    let svc = v.service(Arc::new(Ledger::in_memory()), v.options());
+    (v, svc)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bash_copies_into_a_folder_are_judged_by_the_file_that_lands() {
+    let (v, svc) = shared_vault("bashcp");
+    let elsewhere = v.base.clone();
+    let vault = v.vault.display().to_string();
+    let check = |c: &str, cwd: &Path| denied(svc.check_bash(&bash_check(&v, 1, c, cwd), &owners()));
+    for cmd in [
+        format!("cp notes.md {vault}/"),
+        format!("mv draft.md {vault}/06-Daily/2026/11-November/"),
+        format!("cp a.md {vault}/Sprints/sprint-26-01/"),
+        format!("cp -r dir {vault}/Sprints"),
+    ] {
+        assert_eq!(check(&cmd, &elsewhere), None, "{cmd}");
+    }
+    assert_eq!(check("cp x.md .", &v.vault), None);
+    assert_eq!(check("cp x.md ./Sprints", &v.vault), None);
+    // The same copy is denied when the file that lands is shared or owned.
+    let shared = format!("{SHARED_DASH} is a shared 2ndBrain file. Use append_journal for the journal or edit_shared_file for an exact replacement.");
+    assert_eq!(
+        check(
+            &format!("cp /tmp/SPRINT-DASHBOARD.md {vault}/Sprints/sprint-26-01/"),
+            &elsewhere
+        ),
+        Some(shared.clone())
+    );
+    assert_eq!(
+        check(
+            &format!("cp /tmp/{S2_NOTE_NAME} {vault}/Sessions/2026/11-November/"),
+            &elsewhere
+        )
+        .as_deref(),
+        Some(&*format!(
+            "{S2_NOTE} belongs to S2 (session note). Ask Jonathan before writing it."
+        ))
+    );
+    // Sources of a move are deleted: moving a shared file away is a write.
+    assert_eq!(
+        check(&format!("mv {vault}/{JOURNAL} /tmp/"), &elsewhere)
+            .map(|d| d.contains("shared 2ndBrain file")),
+        Some(true)
+    );
+    assert!(check(
+        "mv 06-Daily/2026/11-November/2026-11-13-journal.md /tmp/",
+        &v.vault
+    )
+    .is_some());
+}
+
+const S2_NOTE_NAME: &str = "2026-11-13-s2-demo.md";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bash_globs_are_expanded_and_each_match_judged() {
+    let (v, svc) = shared_vault("bashglob");
+    let check = |c: &str| denied(svc.check_bash(&bash_check(&v, 1, c, &v.vault), &owners()));
+    for cmd in [
+        "rm Sprints/sprint-26-01/*.md",
+        "sed -i '' s/a/b/ 06-Daily/2026/11-November/*.md",
+        "rm 06-Daily/*/*/*.md",
+        "echo x > 06-Daily/2026/11-November/2026-11-13-j?urnal.md",
+    ] {
+        let d = check(cmd);
+        assert!(
+            d.as_deref()
+                .is_some_and(|d| d.contains("shared 2ndBrain file")),
+            "{cmd}: {d:?}"
+        );
+    }
+    // A glob that matches nothing is judged as written, and free matches pass.
+    assert_eq!(check("rm 06-Daily/*/*/*.nothing"), None);
+    assert_eq!(check("rm Sprints/sprint-26-01/*.nothing"), None);
+    // A glob can reach another slot's folder.
+    let d = check("rm Sprints/sprint-26-01/DEMO-1*");
+    assert!(d.is_some_and(|d| d.contains("belongs to S2")));
+    std::fs::write(v.vault.join(S2_FOLDER).join("a.md"), "x").unwrap();
+    let d = check(&format!("rm {S2_FOLDER}/*.md"));
+    assert!(d.is_some_and(|d| d.contains("belongs to S2")));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn only_recursive_deletes_judge_a_folder_as_a_whole() {
+    let (v, svc) = shared_vault("bashrm");
+    let check = |c: &str| denied(svc.check_bash(&bash_check(&v, 1, c, &v.vault), &owners()));
+    assert!(check("rm -rf 06-Daily").is_some_and(|d| d.contains("holds shared 2ndBrain files")));
+    assert!(check("rm -r Sprints").is_some());
+    assert!(check("rmdir Sprints/sprint-26-01").is_some());
+    // A plain rm of a folder fails in the shell anyway; a free folder is fine.
+    assert_eq!(check("rm -rf Free"), None);
+    std::fs::create_dir_all(v.vault.join("Free")).unwrap();
+    assert_eq!(check("rm -rf Free"), None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bash_write_into_another_slots_path_is_denied_with_the_owned_text() {
+    let (v, svc) = shared_vault("bashowned");
+    let check =
+        |slot: u8, c: &str| denied(svc.check_bash(&bash_check(&v, slot, c, &v.vault), &owners()));
+    let owned = format!("{S2_NOTE} belongs to S2 (session note). Ask Jonathan before writing it.");
+    assert_eq!(
+        check(1, &format!("echo x >> {S2_NOTE}")),
+        Some(owned.clone())
+    );
+    assert_eq!(check(1, &format!("tee -a {S2_NOTE}")), Some(owned));
+    assert_eq!(check(2, &format!("echo x >> {S2_NOTE}")), None);
+    let folder =
+        format!("{S2_FOLDER}/a.md belongs to S2 (DEMO-12). Ask Jonathan before writing it.");
+    assert_eq!(check(1, &format!("touch {S2_FOLDER}/a.md")), Some(folder));
+    assert_eq!(check(2, &format!("touch {S2_FOLDER}/a.md")), None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bd_lines_that_could_escape_the_vault_checks_are_denied() {
+    let (v, svc) = shared_vault("bdescape");
+    let run = |c: &str| svc.check_bash(&bash_check(&v, 1, c, &v.vault), &owners());
+    let text = "Overseer: run bd writes on their own, without $(...), backticks, redirects or env prefixes, so the daemon can run them under the vault lock";
+    for cmd in [
+        "bd create \"x $(git -C ~/Repos/2ndBrain push)\"".to_string(),
+        "bd create \"x `date`\"".to_string(),
+        format!("bd create x > {JOURNAL}"),
+        "FOO=1 bd create x".to_string(),
+        "env X=y bd create x".to_string(),
+        "bd close ov-3 && git push".to_string(),
+    ] {
+        assert_eq!(denied(run(&cmd)).as_deref(), Some(text), "{cmd}");
+    }
+    // A plain write and a quoted heredoc are rewritten, not denied.
+    for (cmd, rewrite) in [
+        ("bd close ov-3", "overseer ctl bd -- close ov-3"),
+        (
+            "bd create x --body-file - <<'EOF'\n$(y)\nEOF",
+            "overseer ctl bd -- create x --body-file - <<'EOF'\n$(y)\nEOF",
+        ),
+    ] {
+        assert_eq!(
+            run(cmd),
+            Some(Response::Verdict {
+                deny: None,
+                rewrite: Some(rewrite.into())
+            }),
+            "{cmd}"
+        );
+    }
+}
