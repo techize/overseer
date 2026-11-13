@@ -445,14 +445,16 @@ pub fn vault_git(command: &str, cwd: &Path, brain: &Path) -> Option<String> {
 }
 
 pub(crate) fn vault_git_in(command: &str, cwd: &Path, brain: &Path, home: &Path) -> Option<String> {
+    // `GIT_DIR=x git ...`, `env GIT_DIR=x git` or an earlier `export`:
+    // anywhere on the line, as a best effort.
+    let env_git_dir = assigned(command, "GIT_DIR");
+    let env_work_tree = assigned(command, "GIT_WORK_TREE");
     for seg in write_segments(command, cwd) {
         if seg.words.first().map(|w| base(w)) != Some("git") {
             continue;
         }
         let words = &seg.words;
         let mut dir = seg.cwd.clone();
-        let mut git_dir: Option<PathBuf> = None;
-        let mut work_tree: Option<PathBuf> = None;
         let abs = |from: &Path, p: &str| -> PathBuf {
             let p = expand_home(p);
             let p = match p.strip_prefix('~') {
@@ -463,6 +465,8 @@ pub(crate) fn vault_git_in(command: &str, cwd: &Path, brain: &Path, home: &Path)
             };
             from.join(p)
         };
+        let mut git_dir: Option<PathBuf> = env_git_dir.as_deref().map(|v| abs(&dir, v));
+        let mut work_tree: Option<PathBuf> = env_work_tree.as_deref().map(|v| abs(&dir, v));
         let mut i = 1;
         let mut sub: Option<usize> = None;
         while i < words.len() {
@@ -749,6 +753,21 @@ mod tests {
         );
         assert_eq!(v("git -C Sprints pull", brain).as_deref(), Some("pull"));
         assert_eq!(v("ls && echo git push", brain), None);
+        // So do GIT_DIR and GIT_WORK_TREE in the environment.
+        assert_eq!(
+            v("GIT_DIR=/h/Repos/2ndBrain/.git git commit -m x", other).as_deref(),
+            Some("commit")
+        );
+        assert_eq!(
+            v("env GIT_DIR=~/Repos/2ndBrain/.git git push", other).as_deref(),
+            Some("push")
+        );
+        assert_eq!(
+            v("export GIT_WORK_TREE=/h/Repos/2ndBrain; git add -A", other).as_deref(),
+            Some("add")
+        );
+        assert_eq!(v("GIT_DIR=/h/Repos/2ndBrain/.git git log", other), None);
+        assert_eq!(v("GIT_DIR=/h/Repos/other/.git git push", brain), None);
     }
 
     #[test]
