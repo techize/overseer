@@ -57,7 +57,6 @@ pub struct VaultGit {
 
 struct Out {
     ok: bool,
-    code: Option<i32>,
     stdout: String,
     stderr: String,
 }
@@ -148,7 +147,6 @@ impl VaultGit {
         };
         Ok(Out {
             ok: out.status.success(),
-            code: out.status.code(),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         })
@@ -219,22 +217,47 @@ impl VaultGit {
             return Ok(None);
         }
         self.clear_index_lock().await?;
-        let mut add = vec!["add", "-A", "--"];
-        add.extend(paths.iter().map(String::as_str));
-        self.run_inner(&add).await?;
-
-        let mut diff = vec!["diff", "--cached", "--quiet", "--"];
-        diff.extend(paths.iter().map(String::as_str));
-        let d = self.exec(&diff).await?;
-        match d.code {
-            Some(0) => return Ok(None),
-            Some(1) => {}
-            _ => return Err(GitError::Failed(first_line(&d.stderr))),
+        // The paths go through a NUL-separated file: a first backup of a
+        // large vault would not fit on the command line.
+        let list = self.root.join(".git").join("overseer-pathspec");
+        let mut body = Vec::new();
+        for p in paths {
+            body.extend_from_slice(p.as_bytes());
+            body.push(0);
         }
+        std::fs::write(&list, body)
+            .map_err(|e| GitError::Failed(format!("cannot write the path list: {e}")))?;
+        let from = format!("--pathspec-from-file={}", list.display());
+        let result = self.commit_listed(&from, paths, message).await;
+        let _ = std::fs::remove_file(&list);
+        result
+    }
 
-        let mut commit = vec!["commit", "-m", message, "--"];
-        commit.extend(paths.iter().map(String::as_str));
-        self.run_inner(&commit).await?;
+    async fn commit_listed(
+        &self,
+        from: &str,
+        paths: &[String],
+        message: &str,
+    ) -> Result<Option<String>, GitError> {
+        self.run_inner(&["add", "-A", from, "--pathspec-file-nul"])
+            .await?;
+        // `git diff` takes no path file: list everything staged and match.
+        let staged = self
+            .run_inner(&["diff", "--cached", "--name-only", "--no-renames", "-z"])
+            .await?;
+        let ours = staged.split('\0').any(|s| {
+            !s.is_empty()
+                && paths.iter().any(|p| {
+                    s == p
+                        || s.strip_prefix(p.as_str())
+                            .is_some_and(|rest| rest.starts_with('/'))
+                })
+        });
+        if !ours {
+            return Ok(None);
+        }
+        self.run_inner(&["commit", "-m", message, from, "--pathspec-file-nul"])
+            .await?;
         let head = self.run_inner(&["rev-parse", "HEAD"]).await?;
         Ok(Some(head.trim().to_string()))
     }
@@ -683,6 +706,35 @@ mod tests {
         );
         let remote = sh(&v.remote, &["log", "--format=%s", "main"]);
         assert!(!remote.contains("S1: a"));
+    }
+
+    #[tokio::test]
+    async fn long_path_lists_fit_the_command_line() {
+        let v = TestVault::new("many");
+        // About 1.3 MB of path names: more than ARG_MAX on macOS.
+        let dir = v.vault.join("many");
+        std::fs::create_dir_all(&dir).unwrap();
+        let stem = "n".repeat(200);
+        let paths: Vec<String> = (0..6000)
+            .map(|i| {
+                let name = format!("{stem}-{i}.md");
+                std::fs::write(dir.join(&name), "x\n").unwrap();
+                format!("many/{name}")
+            })
+            .collect();
+        std::fs::write(v.vault.join("b.md"), "b\n").unwrap();
+        let g = v.git.lock().await;
+        let sha = v
+            .git
+            .commit_paths(&g, &paths, "vault backup")
+            .await
+            .unwrap();
+        assert!(sha.is_some());
+        let shown = sh(&v.vault, &["show", "--name-only", "--format=", "HEAD"]);
+        assert_eq!(shown.lines().count(), 6000);
+        assert!(!shown.contains("b.md"));
+        let again = v.git.commit_paths(&g, &paths, "vault backup").await;
+        assert_eq!(again, Ok(None));
     }
 
     #[tokio::test]
