@@ -598,6 +598,34 @@ fn bd_line_unsafe(command: &str, seg: &Segment) -> bool {
     scanned.contains("$(") || scanned.contains("${") || scanned.contains('`')
 }
 
+/// The value a command line gives `var` (`VAR=x cmd`, `export VAR=x`,
+/// `env VAR=x cmd`), quotes removed; the last one wins.
+pub fn assigned(command: &str, var: &str) -> Option<String> {
+    let re = regex::Regex::new(&format!(
+        r#"(?:^|[\s;&|(])(?:export\s+)?{}=("[^"]*"|'[^']*'|[^\s;&|)]*)"#,
+        regex::escape(var)
+    ))
+    .ok()?;
+    re.captures_iter(command)
+        .last()
+        .map(|c| c[1].trim_matches(|q| q == '"' || q == '\'').to_string())
+}
+
+/// The database a `bd` call names with `--db x` or `--db=x`, if any.
+pub fn bd_db(args: &[String]) -> Option<&str> {
+    let mut i = 0;
+    while i < args.len() && is_option(&args[i]) {
+        if let Some(v) = args[i].strip_prefix("--db=") {
+            return Some(v);
+        }
+        if args[i] == "--db" {
+            return args.get(i + 1).map(String::as_str);
+        }
+        i += BD_VALUE_FLAGS.contains(&args[i].as_str()) as usize + 1;
+    }
+    None
+}
+
 /// Single-quotes `w` for the shell unless it is plain.
 fn quote(w: &str) -> String {
     if !w.is_empty()
@@ -719,6 +747,29 @@ mod tests {
         );
         assert_eq!(v("git -C Sprints pull", brain).as_deref(), Some("pull"));
         assert_eq!(v("ls && echo git push", brain), None);
+    }
+
+    #[test]
+    fn beads_dir_assignments_and_db_flags_are_found() {
+        assert_eq!(
+            assigned("BEADS_DIR=/r/demo-api/.beads bd create x", "BEADS_DIR").as_deref(),
+            Some("/r/demo-api/.beads")
+        );
+        assert_eq!(
+            assigned("export BEADS_DIR='~/a b'; bd close DEMO-12", "BEADS_DIR").as_deref(),
+            Some("~/a b")
+        );
+        assert_eq!(
+            assigned("env BEADS_DIR=\"x\" bd sync", "BEADS_DIR").as_deref(),
+            Some("x")
+        );
+        assert_eq!(assigned("bd create MY_BEADS_DIR=x", "BEADS_DIR"), None);
+        assert_eq!(assigned("bd close DEMO-12", "BEADS_DIR"), None);
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(bd_db(&a(&["--db", "x.db", "create"])), Some("x.db"));
+        assert_eq!(bd_db(&a(&["--db=/y.db", "close"])), Some("/y.db"));
+        assert_eq!(bd_db(&a(&["--actor", "me", "close", "--db", "z"])), None);
+        assert_eq!(bd_db(&a(&["close", "DEMO-12"])), None);
     }
 
     #[test]

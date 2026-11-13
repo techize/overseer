@@ -451,6 +451,8 @@ impl BrainService {
             Some(Response::Verdict { deny, rewrite })
         };
         match bash::bd_call(&check.command) {
+            // Another repo's own beads: bd there is none of the vault's business (I1).
+            bash::BdCall::Write(_) | bash::BdCall::Compound if !self.bd_uses_beads_dir(check) => {}
             bash::BdCall::Write(args) => {
                 return verdict(None, Some(bash::bd_rewrite(&check.command, &args)));
             }
@@ -467,6 +469,67 @@ impl BrainService {
             }
         }
         None
+    }
+
+    /// Whether `bd`, run as this line from the session's cwd, would use
+    /// `beads_dir`: `BEADS_DIR` (in the line or the session's environment)
+    /// or `--db` names it, or the cwd is under it, or no other `.beads`
+    /// exists walking up from the cwd to the home folder or `/`. Without a
+    /// cwd it cannot be told, and the line is left alone.
+    fn bd_uses_beads_dir(&self, check: &BashCheck) -> bool {
+        let beads = canon(&self.cfg.beads);
+        let cwd = check.cwd.as_deref();
+        let resolve = |raw: &str| -> PathBuf {
+            let p = match raw.strip_prefix('~') {
+                Some(rest) if rest.is_empty() || rest.starts_with('/') => {
+                    self.opts.home.join(rest.trim_start_matches('/'))
+                }
+                _ => PathBuf::from(raw),
+            };
+            match cwd {
+                Some(c) if p.is_relative() => c.join(p),
+                _ => p,
+            }
+        };
+        let names_beads = |raw: &str| {
+            let p = canon(&resolve(raw));
+            p == beads || p.parent() == Some(beads.as_path())
+        };
+        if let Some(dir) = bash::assigned(&check.command, "BEADS_DIR") {
+            return names_beads(&dir);
+        }
+        if let Some((_, dir)) = check.env.iter().find(|(k, _)| k == "BEADS_DIR") {
+            return names_beads(dir);
+        }
+        if let bash::BdCall::Write(args) = bash::bd_call(&check.command) {
+            if let Some(db) = bash::bd_db(&args) {
+                // The rewrite runs bd in beads_dir, where a relative path
+                // means the same file only from beads_dir itself.
+                let same = db.starts_with('/')
+                    || db.starts_with('~')
+                    || cwd.is_some_and(|c| canon(c) == beads);
+                return same && canon(&resolve(db)).starts_with(&beads);
+            }
+        }
+        let Some(cwd) = cwd else {
+            return false;
+        };
+        let cwd = canon(cwd);
+        if cwd.starts_with(&beads) {
+            return true;
+        }
+        let home = canon(&self.opts.home);
+        let mut dir = Some(cwd.as_path());
+        while let Some(d) = dir {
+            if d.join(".beads").exists() {
+                return false;
+            }
+            if d == home {
+                break;
+            }
+            dir = d.parent();
+        }
+        true
     }
 
     /// The paths a Bash word names: its glob matches against `cwd`, or the

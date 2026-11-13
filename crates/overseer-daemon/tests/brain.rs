@@ -1555,6 +1555,82 @@ async fn bash_write_into_another_slots_path_is_denied_with_the_owned_text() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bd_in_a_repo_with_its_own_beads_is_left_alone() {
+    let (v, svc) = shared_vault("bdscope");
+    let home = v.base.join("home");
+    let demo = home.join("Repos/demo-api");
+    std::fs::create_dir_all(demo.join(".beads")).unwrap();
+    std::fs::create_dir_all(demo.join("src")).unwrap();
+    let plain = home.join("Repos/plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    std::fs::create_dir_all(v.vault.join("Sprints")).unwrap();
+    let check = |c: &str, cwd: &Path, env: Vec<(String, String)>| {
+        let mut b = bash_check(&v, 1, c, cwd);
+        b.env = env;
+        svc.check_bash(&b, &owners())
+    };
+    let rewritten = |c: &str| {
+        Some(Response::Verdict {
+            deny: None,
+            rewrite: Some(format!(
+                "overseer ctl bd -- {}",
+                c.strip_prefix("bd ").unwrap()
+            )),
+        })
+    };
+    // demo-api has its own beads: its writes stay its own, joined or not.
+    for cwd in [demo.clone(), demo.join("src")] {
+        assert_eq!(check("bd close DEMO-12", &cwd, vec![]), None);
+        assert_eq!(check("bd create 'demo task'", &cwd, vec![]), None);
+        assert_eq!(check("bd close DEMO-12 && git push", &cwd, vec![]), None);
+    }
+    // The vault, a folder under it, and a repo with no beads of its own
+    // all use beads_dir.
+    for cwd in [v.vault.clone(), v.vault.join("Sprints"), plain.clone()] {
+        assert_eq!(
+            check("bd close DEMO-12", &cwd, vec![]),
+            rewritten("bd close DEMO-12")
+        );
+    }
+    // BEADS_DIR decides, from the line or the session's environment.
+    let other = demo.join(".beads").to_string_lossy().into_owned();
+    assert_eq!(
+        check(
+            &format!("BEADS_DIR={other} bd close DEMO-12"),
+            &plain,
+            vec![]
+        ),
+        None
+    );
+    assert_eq!(
+        check(
+            "bd close DEMO-12",
+            &plain,
+            vec![("BEADS_DIR".into(), other.clone())]
+        ),
+        None
+    );
+    let vault_beads = v.vault.join(".beads").to_string_lossy().into_owned();
+    assert_eq!(
+        check(
+            "bd close DEMO-12",
+            &demo,
+            vec![("BEADS_DIR".into(), vault_beads)]
+        ),
+        rewritten("bd close DEMO-12")
+    );
+    // An explicit --db elsewhere is left alone.
+    assert_eq!(
+        check(
+            &format!("bd --db {other}/x.db close DEMO-12"),
+            &plain,
+            vec![]
+        ),
+        None
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bd_lines_that_could_escape_the_vault_checks_are_denied() {
     let (v, svc) = shared_vault("bdescape");
     let run = |c: &str| svc.check_bash(&bash_check(&v, 1, c, &v.vault), &owners());

@@ -295,12 +295,14 @@ impl LockView {
 }
 
 /// The variables `BashCheck::env` may carry: the ones a target lookup reads.
-pub const CHECK_ENV: [&str; 5] = [
+pub const CHECK_ENV: [&str; 6] = [
     "KUBECONFIG",
     "TF_WORKSPACE",
     "ARGOCD_SERVER",
     "ARGOCD_CONFIG",
     "HOME",
+    // Which beads database a `bd` write uses (the 2ndBrain writer).
+    "BEADS_DIR",
 ];
 
 /// A Bash command the `PreToolUse` hook asks the daemon to check.
@@ -310,7 +312,11 @@ pub struct BashCheck {
     pub session_id: Option<String>,
     pub tool_use_id: Option<String>,
     pub command: String,
+    /// The session's cwd, from the hook input. It decides which repo's
+    /// beads a `bd` write would use.
+    #[serde(default)]
     pub cwd: Option<PathBuf>,
+    #[serde(default)]
     pub env: Vec<(String, String)>,
 }
 
@@ -911,6 +917,17 @@ mod tests {
             serde_json::from_str(r#"{"kind":"Idle","since":5,"now_doing":null,"reason":null}"#)
                 .unwrap();
         assert!(!a.idle_wait);
+    }
+
+    #[test]
+    fn bash_check_without_cwd_or_env_parses() {
+        let c: BashCheck = serde_json::from_str(
+            r#"{"slot":1,"session_id":null,"tool_use_id":null,"command":"bd close DEMO-12"}"#,
+        )
+        .unwrap();
+        assert_eq!(c.cwd, None);
+        assert!(c.env.is_empty());
+        assert!(CHECK_ENV.contains(&"BEADS_DIR"));
     }
 
     #[test]
