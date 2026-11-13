@@ -943,7 +943,7 @@ mod tests {
             !role.contains("2ndBrain") && !role.contains("{brain}"),
             "{role}"
         );
-        assert!(role.contains("call `notify_session`"), "{role}");
+        assert!(role.contains("Call `notify_session`"), "{role}");
     }
 
     const PHASE_3_WORKER: &str = include_str!("../tests/fixtures/roles-phase3/worker.md");
