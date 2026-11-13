@@ -1,9 +1,10 @@
 //! The coordinator's side of the board: the summary S0 keeps, progress
 //! reports and status requests, and the state timeline of every slot.
 //!
-//! Plans join this service later. Every change is announced with
+//! Plans live in `plan`. Every change is announced with
 //! `Event::CoordChanged`.
 
+pub mod plan;
 pub mod worktree;
 
 use std::collections::HashMap;

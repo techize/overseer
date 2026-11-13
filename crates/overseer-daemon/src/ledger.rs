@@ -296,6 +296,13 @@ pub(crate) fn plans_on(conn: &Connection, limit: usize) -> Result<Vec<PlanRecord
     Ok(out)
 }
 
+/// Plan `id`, or `None` when there is no such (readable) plan.
+pub(crate) fn plan_on(conn: &Connection, id: i64) -> Result<Option<PlanRecord>> {
+    let mut stmt = conn.prepare(&format!("SELECT {PLAN_COLS} FROM plans WHERE id = ?1"))?;
+    let mut rows = stmt.query_map(rusqlite::params![id], plan_record)?;
+    Ok(rows.next().transpose()?.flatten())
+}
+
 /// Settles a pending plan as `state`, storing `plan` as the version that
 /// runs. False when plan `id` is not pending (decided already, or unknown).
 pub fn decide_plan_on(
@@ -727,6 +734,11 @@ impl Ledger {
     /// Up to `limit` plans: pending first, then newest first.
     pub fn plans(&self, limit: usize) -> Result<Vec<PlanRecord>> {
         plans_on(&self.conn(), limit)
+    }
+
+    /// Plan `id`, if there is one.
+    pub fn plan(&self, id: i64) -> Result<Option<PlanRecord>> {
+        plan_on(&self.conn(), id)
     }
 
     /// Stores what running an approved plan did, one line per step.

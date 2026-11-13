@@ -33,7 +33,9 @@ const PREVIOUS_COORDINATOR: &[u64] = &[
 ];
 const PREVIOUS_WORKER: &[u64] = &[0x215de771dfd84eb4, 0xbd3ab0020d4d25b1, 0xe8deae3b8fe65917];
 const PREVIOUS_KICKOFF: &[u64] = &[];
-const PREVIOUS_ASSIGNMENT: &[u64] = &[];
+const PREVIOUS_ASSIGNMENT: &[u64] = &[
+    0x7563493817edf95a, // phase 5
+];
 
 fn text_hash(text: &str) -> u64 {
     text.trim_end().bytes().fold(0xcbf29ce484222325, |h, b| {
@@ -1014,6 +1016,23 @@ mod tests {
         assert!(COORDINATOR_ROLE.contains("Before you propose work, read today's journal."));
         assert!(COORDINATOR_ROLE.contains("date '+%Y/%m-%B/%Y-%m-%d'"));
         assert!(COORDINATOR_ROLE.contains("06-Daily/"));
+    }
+
+    const PHASE_5_ASSIGNMENT: &str = include_str!("../tests/fixtures/roles-phase5/assignment.md");
+
+    #[test]
+    fn previous_assignment_hash_is_listed() {
+        assert!(PREVIOUS_ASSIGNMENT.contains(&text_hash(PHASE_5_ASSIGNMENT)));
+        // An unedited phase 5 file is upgraded in place.
+        let dir = temp("phase5assign");
+        let roles = dir.join("roles");
+        std::fs::create_dir_all(&roles).unwrap();
+        std::fs::write(roles.join("assignment.md"), PHASE_5_ASSIGNMENT).unwrap();
+        assert_eq!(
+            assignment_template(&dir).unwrap().trim_end(),
+            ASSIGNMENT.trim_end()
+        );
+        assert!(!roles.join("assignment.md.new").exists());
     }
 
     const PHASE_4_WORKER: &str = include_str!("../tests/fixtures/roles-phase4/worker.md");
