@@ -4,10 +4,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
+use overseer_daemon::locks::targets::{default_patterns, load_patterns, Pattern};
 use overseer_daemon::{run, DaemonConfig};
 use overseer_proto::{
-    read_frame, write_frame, Activity, ActivityKind, Event, Frame, HookEvent, HookKind, ItemKind,
-    Request, Response, SlotInfo, SlotState, SourceStatus, WorkItem, WorkView,
+    read_frame, write_frame, Activity, ActivityKind, BashCheck, ClaimKind, Event, Frame, HookEvent,
+    HookKind, ItemKind, LockView, RelayState, Request, Response, Sender, SlotInfo, SlotState,
+    SourceStatus, WorkItem, WorkView,
 };
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::UnixStream;
@@ -62,6 +64,15 @@ async fn start_daemon_cfg(
     env: overseer_daemon::EnvSource,
     settings: overseer_daemon::Config,
 ) -> Daemon {
+    start_daemon_full(socket, env, settings, default_patterns()).await
+}
+
+async fn start_daemon_full(
+    socket: PathBuf,
+    env: overseer_daemon::EnvSource,
+    settings: overseer_daemon::Config,
+    patterns: Vec<Pattern>,
+) -> Daemon {
     let state_dir = socket.parent().unwrap().join("state");
     let cfg = DaemonConfig {
         socket: socket.clone(),
@@ -70,6 +81,7 @@ async fn start_daemon_cfg(
         state_dir: state_dir.clone(),
         hook_program: PathBuf::from("/bin/true"),
         settings,
+        patterns,
     };
     let task = tokio::spawn(run(cfg));
     for _ in 0..100 {
@@ -418,6 +430,7 @@ async fn second_daemon_refused() {
         state_dir: d.state_dir.clone(),
         hook_program: PathBuf::from("/bin/true"),
         settings: offline_settings(),
+        patterns: default_patterns(),
     })
     .await
     .unwrap_err();
@@ -596,6 +609,8 @@ fn hook(slot: u8, event: HookKind) -> HookEvent {
         tool: None,
         detail: None,
         notification: None,
+        tool_use_id: None,
+        notification_type: None,
     }
 }
 
@@ -1069,7 +1084,7 @@ async fn restart_with_listed_command_does_not_double_the_flags() {
     let d = start_daemon().await;
     let mut c = Client::connect(&d.socket).await;
     let (line, info) = restart_with_listed_command(&mut c, &log, 2, base.clone(), &dir).await;
-    for flag in ["--session-id", "--name", "--settings"] {
+    for flag in ["--session-id", "--name", "--settings", "--mcp-config"] {
         assert_eq!(count_arg(&line, flag), 1, "{flag} in {line}");
     }
     assert_eq!(info.command, Some(base.clone()));
@@ -1092,7 +1107,7 @@ async fn s0_restart_with_listed_command_gets_one_kickoff() {
     assert!(line.ends_with(&format!(" -- {kickoff}")), "{line}");
     assert_eq!(count_arg(&line, "--"), 1, "{line}");
     assert_eq!(line.matches(kickoff.as_str()).count(), 1, "{line}");
-    for flag in ["--session-id", "--name", "--settings"] {
+    for flag in ["--session-id", "--name", "--settings", "--mcp-config"] {
         assert_eq!(count_arg(&line, flag), 1, "{flag} in {line}");
     }
     assert_eq!(info.command, Some(base.clone()));
@@ -1894,4 +1909,1381 @@ async fn shutdown_gives_up_on_a_hung_label() {
     let pids = std::fs::read_to_string(s.dir.join("pids")).unwrap();
     let running: Vec<_> = pids.lines().filter(|p| alive(p)).collect();
     assert!(running.is_empty(), "still running: {running:?}");
+}
+
+// ---- Locks ----
+
+/// The test patterns (plus the defaults): writes that need no lookups.
+const LOCK_TARGETS: &str = r#"
+[[pattern]]
+name = "demo deploy"
+command = '^demo-deploy\s+(?P<app>\S+)'
+target = "deploy:demo/{app}"
+
+[[pattern]]
+name = "demo push"
+command = '^demo-push\b'
+target = "repo:demo-api:main"
+"#;
+
+fn lock_patterns() -> Vec<Pattern> {
+    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("ovs-targets-{}-{n}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("targets.toml");
+    std::fs::write(&path, LOCK_TARGETS).unwrap();
+    let (patterns, err) = load_patterns(&path);
+    assert!(err.is_none(), "{err:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+    patterns
+}
+
+async fn lock_daemon() -> Daemon {
+    lock_daemon_at(temp_socket()).await
+}
+
+async fn lock_daemon_at(socket: PathBuf) -> Daemon {
+    start_daemon_full(
+        socket,
+        overseer_daemon::EnvSource::Inherit,
+        offline_settings(),
+        lock_patterns(),
+    )
+    .await
+}
+
+fn bash(slot: u8, tool_use_id: &str, command: &str) -> Request {
+    Request::CheckBash(BashCheck {
+        slot,
+        session_id: None,
+        tool_use_id: Some(tool_use_id.into()),
+        command: command.into(),
+        cwd: Some(PathBuf::from("/tmp")),
+        env: vec![("ARGOCD_SERVER".into(), "uat".into())],
+    })
+}
+
+fn post_tool_use(slot: u8, tool_use_id: &str) -> HookEvent {
+    HookEvent {
+        tool: Some("Bash".into()),
+        tool_use_id: Some(tool_use_id.into()),
+        ..hook(slot, HookKind::PostToolUse)
+    }
+}
+
+fn claim_target(slot: u8, target: &str, item: Option<&str>) -> Request {
+    Request::ClaimTarget {
+        slot,
+        target: target.into(),
+        reason: None,
+        item: item.map(String::from),
+    }
+}
+
+/// `(target, slot, kind)` of every claim, by target.
+fn holds(v: &LockView) -> Vec<(String, u8, ClaimKind)> {
+    v.claims
+        .iter()
+        .map(|c| (c.target.clone(), c.slot, c.kind))
+        .collect()
+}
+
+/// `(target, slot)` of every wait, in queue order.
+fn queued(v: &LockView) -> Vec<(String, u8)> {
+    v.waits.iter().map(|w| (w.target.clone(), w.slot)).collect()
+}
+
+fn pending(v: &LockView) -> Vec<(u8, String)> {
+    v.relays
+        .iter()
+        .filter(|r| r.state == RelayState::Pending)
+        .map(|r| (r.to, r.text.clone()))
+        .collect()
+}
+
+fn t(s: &str) -> String {
+    s.to_string()
+}
+
+impl Client {
+    /// The deny reason, if any.
+    async fn check(&mut self, slot: u8, tool_use_id: &str, command: &str) -> Option<String> {
+        match self.request(bash(slot, tool_use_id, command)).await {
+            Response::Verdict { deny } => deny,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    async fn locks(&mut self) -> LockView {
+        match self.request(Request::ListLocks).await {
+            Response::Locks(v) => v,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// Polls the lock view until `done` holds.
+    async fn locks_until(&mut self, done: impl Fn(&LockView) -> bool) -> LockView {
+        for _ in 0..250 {
+            let v = self.locks().await;
+            if done(&v) {
+                return v;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        panic!("locks never matched: {:?}", self.locks().await);
+    }
+}
+
+#[tokio::test]
+async fn check_bash_claims_a_free_target_and_post_tool_use_releases_it() {
+    let d = lock_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    assert_eq!(c.check(1, "tu-1", "demo-deploy api").await, None);
+    let v = c.locks().await;
+    assert_eq!(holds(&v), [(t("deploy:demo/api"), 1, ClaimKind::Command)]);
+    // Clients hear about it.
+    loop {
+        if let Frame::Event(Event::LocksChanged(v)) = c.recv().await.unwrap() {
+            if !v.claims.is_empty() {
+                break;
+            }
+        }
+    }
+    // Another command's PostToolUse leaves it; its own releases it.
+    c.hook(post_tool_use(1, "tu-other")).await;
+    assert_eq!(c.locks().await.claims.len(), 1);
+    c.hook(post_tool_use(1, "tu-1")).await;
+    assert!(c.locks().await.claims.is_empty());
+}
+
+#[tokio::test]
+async fn check_bash_denies_a_held_target_and_queues() {
+    let d = lock_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    let target = "repo:demo-api:main";
+    assert_eq!(
+        c.request(claim_target(1, target, Some("DEMO-33"))).await,
+        Response::Text {
+            text: t("You hold repo:demo-api:main.")
+        }
+    );
+    assert_eq!(
+        c.request(claim_target(1, target, None)).await,
+        Response::Text {
+            text: t("You already hold repo:demo-api:main.")
+        }
+    );
+    let since = c.locks().await.claims[0].since;
+    let at = overseer_daemon::locks::local_hhmm(since);
+    let deny = c.check(2, "tu-1", "demo-push").await;
+    assert_eq!(
+        deny,
+        Some(format!("Overseer: repo:demo-api:main is held by S1 since {at} for DEMO-33. You are in its queue and Overseer will tell you here when you hold it. Do not run this again until then."))
+    );
+    let v = c.locks().await;
+    assert_eq!(queued(&v), [(t(target), 2)]);
+    assert_eq!(holds(&v), [(t(target), 1, ClaimKind::Claim)]);
+    // A claim behind it is told its place.
+    assert_eq!(
+        c.request(claim_target(3, target, None)).await,
+        Response::Queued {
+            message: format!("repo:demo-api:main is held by S1 since {at} for DEMO-33. You are number 2 in the queue; Overseer will tell you here when you hold it.")
+        }
+    );
+    // Bad requests are refused.
+    assert!(matches!(
+        c.request(claim_target(1, "nonsense", None)).await,
+        Response::Error { .. }
+    ));
+    assert!(matches!(
+        c.request(claim_target(9, target, None)).await,
+        Response::Error { .. }
+    ));
+}
+
+#[tokio::test]
+async fn compound_command_with_one_held_target_claims_nothing() {
+    let d = lock_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    assert!(matches!(
+        c.request(claim_target(1, "deploy:demo/a", None)).await,
+        Response::Text { .. }
+    ));
+    let deny = c
+        .check(2, "tu-1", "demo-deploy b && demo-deploy a")
+        .await
+        .expect("denied");
+    assert!(deny.contains("deploy:demo/a is held by S1"), "{deny}");
+    let v = c.locks().await;
+    assert_eq!(holds(&v), [(t("deploy:demo/a"), 1, ClaimKind::Claim)]);
+    assert_eq!(queued(&v), [(t("deploy:demo/a"), 2)]);
+}
+
+#[tokio::test]
+async fn unmatched_command_is_allowed_without_records() {
+    let d = lock_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    for cmd in [
+        "git status; ls -la",
+        "argocd app get demo-api",
+        "git push --dry-run",
+    ] {
+        assert_eq!(c.check(1, "tu-1", cmd).await, None, "{cmd}");
+    }
+    let v = c.locks().await;
+    assert!(v.claims.is_empty() && v.waits.is_empty() && v.relays.is_empty());
+}
+
+#[tokio::test]
+async fn release_grants_the_waiter_and_queues_a_relay() {
+    let d = lock_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    assert_eq!(c.check(1, "tu-1", "demo-deploy api").await, None);
+    assert!(c.check(2, "tu-2", "demo-deploy api").await.is_some());
+    c.hook(post_tool_use(1, "tu-1")).await;
+    let v = c.locks().await;
+    assert_eq!(holds(&v), [(t("deploy:demo/api"), 2, ClaimKind::Grant)]);
+    assert!(v.waits.is_empty());
+    assert_eq!(
+        pending(&v),
+        [(2, t("S1 has released deploy:demo/api. You now hold it."))]
+    );
+    // The grant is used by S2's next matching command, then released.
+    assert_eq!(c.check(2, "tu-3", "demo-deploy api").await, None);
+    let v = c.locks().await;
+    assert_eq!(holds(&v), [(t("deploy:demo/api"), 2, ClaimKind::Command)]);
+    c.hook(post_tool_use(2, "tu-3")).await;
+    assert!(c.locks().await.claims.is_empty());
+
+    // An explicit release hands on too.
+    c.request(claim_target(1, "custom:z", None)).await;
+    c.request(claim_target(3, "custom:z", None)).await;
+    assert_eq!(
+        c.request(Request::ReleaseTarget {
+            slot: 1,
+            target: t("custom:z")
+        })
+        .await,
+        Response::Text {
+            text: t("Released custom:z. S3 holds it now.")
+        }
+    );
+    assert_eq!(
+        holds(&c.locks().await),
+        [(t("custom:z"), 3, ClaimKind::Claim)]
+    );
+    // Jonathan was shown S1 holding it; S3 holds it now, so nothing goes.
+    assert_eq!(
+        c.request(Request::ForceRelease {
+            target: t("custom:z"),
+            holder: Some(1),
+        })
+        .await,
+        Response::Error {
+            message: t("custom:z is now held by S3; nothing released.")
+        }
+    );
+    assert_eq!(
+        holds(&c.locks().await),
+        [(t("custom:z"), 3, ClaimKind::Claim)]
+    );
+    assert_eq!(
+        c.request(Request::ForceRelease {
+            target: t("custom:z"),
+            holder: Some(3),
+        })
+        .await,
+        Response::Text {
+            text: t("Released custom:z.")
+        }
+    );
+    assert_eq!(
+        c.request(Request::ForceRelease {
+            target: t("custom:z"),
+            holder: None,
+        })
+        .await,
+        Response::Error {
+            message: t("custom:z is not held")
+        }
+    );
+}
+
+#[tokio::test]
+async fn pin_survives_post_tool_use_and_unpin_releases_it() {
+    let d = lock_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    let app = "argo:uat/demo-api";
+    let pin = "argocd app set demo-api --revision abc123";
+    assert_eq!(c.check(1, "tu-1", pin).await, None);
+    c.hook(post_tool_use(1, "tu-1")).await;
+    let v = c.locks().await;
+    assert_eq!(holds(&v), [(t(app), 1, ClaimKind::Pin)]);
+    assert_eq!(v.claims[0].pin_revision.as_deref(), Some("abc123"));
+    // A sync by its holder keeps the pin.
+    assert_eq!(c.check(1, "tu-2", "argocd app sync demo-api").await, None);
+    c.hook(post_tool_use(1, "tu-2")).await;
+    assert_eq!(holds(&c.locks().await), [(t(app), 1, ClaimKind::Pin)]);
+    // Anyone else waits.
+    assert!(c
+        .check(2, "tu-3", "argocd app sync demo-api")
+        .await
+        .is_some());
+    // Setting it back to main ends the pin once that command is done.
+    let unpin = "argocd app set demo-api --revision main";
+    assert_eq!(c.check(1, "tu-4", unpin).await, None);
+    assert_eq!(holds(&c.locks().await), [(t(app), 1, ClaimKind::Command)]);
+    c.hook(post_tool_use(1, "tu-4")).await;
+    let v = c.locks().await;
+    assert_eq!(holds(&v), [(t(app), 2, ClaimKind::Grant)]);
+    assert_eq!(
+        pending(&v),
+        [(
+            2,
+            t("S1 has released argo:uat/demo-api (back on main). You now hold it.")
+        )]
+    );
+}
+
+#[tokio::test]
+async fn granted_pin_survives_post_tool_use_and_stop() {
+    let d = lock_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    let app = "argo:uat/demo-api";
+    let unpin = "argocd app set demo-api --revision main";
+    assert_eq!(
+        c.check(1, "tu-1", "argocd app set demo-api --revision abc123")
+            .await,
+        None
+    );
+    c.hook(post_tool_use(1, "tu-1")).await;
+    let pin = "argocd app set demo-api --revision def456";
+    assert!(c.check(2, "tu-2", pin).await.is_some());
+    assert_eq!(c.check(1, "tu-3", unpin).await, None);
+    c.hook(post_tool_use(1, "tu-3")).await;
+    assert_eq!(holds(&c.locks().await), [(t(app), 2, ClaimKind::Grant)]);
+
+    // The granted slot reruns its pin: the grant becomes that pin.
+    assert_eq!(c.check(2, "tu-4", pin).await, None);
+    c.hook(post_tool_use(2, "tu-4")).await;
+    c.hook(hook(2, HookKind::Stop)).await;
+    let v = c.locks().await;
+    assert_eq!(holds(&v), [(t(app), 2, ClaimKind::Pin)]);
+    assert_eq!(v.claims[0].pin_revision.as_deref(), Some("def456"));
+
+    // An unpin ends it and hands it on.
+    assert!(c
+        .check(3, "tu-5", "argocd app sync demo-api")
+        .await
+        .is_some());
+    assert_eq!(c.check(2, "tu-6", unpin).await, None);
+    c.hook(post_tool_use(2, "tu-6")).await;
+    let v = c.locks().await;
+    assert_eq!(holds(&v), [(t(app), 3, ClaimKind::Grant)]);
+    assert!(pending(&v).contains(&(
+        3,
+        t("S2 has released argo:uat/demo-api (back on main). You now hold it.")
+    )));
+}
+
+#[tokio::test]
+async fn held_claim_that_pins_records_the_revision_and_stays_a_claim() {
+    let d = lock_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    let app = "argo:uat/demo-api";
+    c.request(claim_target(1, app, None)).await;
+    let pin = "argocd app set demo-api --revision abc123";
+    assert_eq!(c.check(1, "tu-1", pin).await, None);
+    c.hook(post_tool_use(1, "tu-1")).await;
+    c.hook(hook(1, HookKind::Stop)).await;
+    let v = c.locks().await;
+    assert_eq!(holds(&v), [(t(app), 1, ClaimKind::Claim)]);
+    assert_eq!(v.claims[0].pin_revision.as_deref(), Some("abc123"));
+}
+
+#[tokio::test]
+async fn stop_releases_command_claims() {
+    let d = lock_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    assert_eq!(c.check(1, "tu-1", "demo-deploy api").await, None);
+    c.request(claim_target(1, "custom:kept", None)).await;
+    c.hook(hook(1, HookKind::Stop)).await;
+    assert_eq!(
+        holds(&c.locks().await),
+        [(t("custom:kept"), 1, ClaimKind::Claim)]
+    );
+}
+
+#[tokio::test]
+async fn holder_exit_hands_on_and_waiter_exit_leaves_the_queue() {
+    let d = lock_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    for id in [1, 2, 3] {
+        assert_eq!(c.start(id).await, Response::Ok);
+    }
+    let (cmd, app) = ("deploy:demo/api", "argo:uat/demo-api");
+    assert_eq!(c.check(1, "tu-1", "demo-deploy api").await, None);
+    let pin = "argocd app set demo-api --revision abc123";
+    assert_eq!(c.check(1, "tu-2", pin).await, None);
+    c.hook(post_tool_use(1, "tu-2")).await;
+    let both = "demo-deploy api && argocd app sync demo-api";
+    assert!(c.check(2, "tu-3", both).await.is_some());
+    assert!(c.check(3, "tu-4", "demo-deploy api").await.is_some());
+    assert_eq!(
+        queued(&c.locks().await),
+        [(t(cmd), 2), (t(app), 2), (t(cmd), 3)]
+    );
+
+    assert_eq!(c.request(Request::StopSlot { id: 3 }).await, Response::Ok);
+    let v = c.locks_until(|v| v.waiting_on(3).is_empty()).await;
+    assert_eq!(queued(&v), [(t(cmd), 2), (t(app), 2)]);
+    assert_eq!(
+        holds(&v),
+        [(t(app), 1, ClaimKind::Pin), (t(cmd), 1, ClaimKind::Command)]
+    );
+
+    assert_eq!(c.request(Request::StopSlot { id: 1 }).await, Response::Ok);
+    let v = c
+        .locks_until(|v| v.claims.iter().any(|c| c.slot == 2))
+        .await;
+    assert_eq!(
+        holds(&v),
+        [(t(app), 1, ClaimKind::Pin), (t(cmd), 2, ClaimKind::Grant)]
+    );
+    assert_eq!(queued(&v), [(t(app), 2)]);
+    assert!(v.waiting_on(3).is_empty());
+    assert_eq!(
+        pending(&v),
+        [(2, t("S1 has released deploy:demo/api. You now hold it."))]
+    );
+}
+
+#[tokio::test]
+async fn releasing_a_work_item_releases_its_claims() {
+    let s = stub_sources("lockitem", false);
+    let d = start_daemon_full(temp_socket(), s.env(), s.settings(), lock_patterns()).await;
+    let mut c = Client::connect(&d.socket).await;
+    c.refresh().await;
+    assert_eq!(c.assign("DEMO-12", 1, false, false).await, Response::Ok);
+    // S1 owns one item, so its claims are for it.
+    c.request(claim_target(1, "custom:x", None)).await;
+    assert_eq!(c.check(1, "tu-1", "demo-deploy api").await, None);
+    c.request(claim_target(2, "custom:x", None)).await;
+    let v = c.locks().await;
+    assert!(
+        v.claims
+            .iter()
+            .all(|c| c.item.as_deref() == Some("DEMO-12")),
+        "{v:?}"
+    );
+    assert_eq!(
+        c.request(Request::Release { key: t("DEMO-12") }).await,
+        Response::Ok
+    );
+    let v = c.locks().await;
+    assert_eq!(holds(&v), [(t("custom:x"), 2, ClaimKind::Claim)]);
+    assert_eq!(
+        pending(&v),
+        [(2, t("S1 has released custom:x. You now hold it."))]
+    );
+
+    // A move takes the item's claims away from the old owner.
+    assert_eq!(c.assign("DEMO-40", 3, false, false).await, Response::Ok);
+    c.request(claim_target(3, "custom:y", Some("DEMO-40")))
+        .await;
+    assert_eq!(c.assign("DEMO-40", 4, false, true).await, Response::Ok);
+    let v = c.locks().await;
+    assert!(v.claims.iter().all(|c| c.target != "custom:y"), "{v:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_claims_one_wins() {
+    let d = lock_daemon().await;
+    let mut a = Client::connect(&d.socket).await;
+    let mut b = Client::connect(&d.socket).await;
+    let (ra, rb) = tokio::join!(
+        a.request(claim_target(1, "custom:race", None)),
+        b.request(claim_target(2, "custom:race", None)),
+    );
+    let mut got = [ra, rb];
+    got.sort_by_key(|r| matches!(r, Response::Queued { .. }));
+    assert!(matches!(&got[0], Response::Text { text } if text == "You hold custom:race."));
+    assert!(matches!(&got[1], Response::Queued { .. }), "{got:?}");
+    let v = a.locks().await;
+    assert_eq!(v.claims.len(), 1);
+    assert_eq!(v.waits.len(), 1);
+    assert_ne!(v.claims[0].slot, v.waits[0].slot);
+}
+
+#[tokio::test]
+async fn locks_survive_restart() {
+    let stub = box_stub("locks-restart");
+    let socket = temp_socket();
+    let start = |socket| start_daemon_full(socket, stub.env(), offline_settings(), lock_patterns());
+    let d = start(socket).await;
+    let mut c = Client::connect(&d.socket).await;
+    // The shutdown kills S1's session; that exit must not drop its claim,
+    // its wait or its pending relay, since S1 can be resumed.
+    c.start_stub(1, &stub).await;
+    c.hook(hook(1, HookKind::UserPromptSubmit)).await;
+    assert_eq!(c.check(1, "tu-1", "demo-deploy api").await, None);
+    c.request(claim_target(2, "custom:a", Some("DEMO-12")))
+        .await;
+    c.request(claim_target(1, "custom:a", None)).await;
+    c.request(claim_target(1, "custom:b", None)).await;
+    c.request(claim_target(4, "custom:b", None)).await;
+    c.request(Request::ReleaseTarget {
+        slot: 1,
+        target: t("custom:b"),
+    })
+    .await;
+    assert_eq!(c.relay(None, 1, "hello").await, queued_for(1));
+    let before = c.locks().await;
+    assert_eq!(before.claims.len(), 3);
+    assert_eq!(before.waits.len(), 1);
+    assert_eq!(pending(&before).len(), 2);
+    drop(c);
+    let socket = shutdown(d).await;
+    let d = start(socket).await;
+    let mut c = Client::connect(&d.socket).await;
+    assert!(matches!(
+        c.list().await[1].state,
+        SlotState::Resumable { .. }
+    ));
+    let after = c.locks().await;
+    assert_eq!(after.claims, before.claims);
+    assert_eq!(after.waits, before.waits);
+    // S4 never ran, so the handoff relay to it is dropped at the restart.
+    assert_eq!(
+        relay_states(&after),
+        [
+            (1, t("hello"), RelayState::Pending),
+            (
+                4,
+                t("S1 has released custom:b. You now hold it."),
+                RelayState::Dropped
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn slow_resolution_allows_and_records_nothing() {
+    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("ovs-slowgit-{}-{n}", std::process::id()));
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let ran = dir.join("ran");
+    write_script(
+        &bin.join("git"),
+        &format!(": > '{}'\nexec sleep 5\n", ran.display()),
+    );
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let env = overseer_daemon::EnvSource::InheritWith(vec![("PATH".into(), path)]);
+    let d = start_daemon_full(temp_socket(), env, offline_settings(), lock_patterns()).await;
+    let mut c = Client::connect(&d.socket).await;
+    let start = std::time::Instant::now();
+    assert_eq!(c.check(1, "tu-1", "git push").await, None);
+    let took = start.elapsed();
+    assert!(took < Duration::from_secs(1), "took {took:?}");
+    assert!(ran.exists(), "the stub git was never asked");
+    let v = c.locks().await;
+    assert!(v.claims.is_empty() && v.waits.is_empty(), "{v:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+impl Client {
+    async fn relay(&mut self, from: Option<u8>, to: u8, text: &str) -> Response {
+        self.request(Request::SendRelay {
+            from,
+            to,
+            text: text.into(),
+        })
+        .await
+    }
+}
+
+fn queued_for(slot: u8) -> Response {
+    Response::Text {
+        text: format!("Queued for S{slot}. It will be typed in when S{slot} is idle."),
+    }
+}
+
+/// Marks every pending relay to `to` delivered, as the courier will.
+fn deliver_all(d: &Daemon, to: u8, v: &LockView) {
+    let ledger = overseer_daemon::ledger::Ledger::open(&d.state_dir.join("overseer.db")).unwrap();
+    let ids: Vec<i64> = v
+        .relays
+        .iter()
+        .filter(|r| r.to == to && r.state == RelayState::Pending)
+        .map(|r| r.id)
+        .collect();
+    ledger.mark_relays_delivered(&ids, 100).unwrap();
+}
+
+fn is_error(r: &Response, text: &str) -> bool {
+    matches!(r, Response::Error { message } if message == text)
+}
+
+#[tokio::test]
+async fn jonathan_and_s0_can_send_to_anyone() {
+    let d = lock_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    for id in [2, 3] {
+        assert_eq!(c.start(id).await, Response::Ok);
+    }
+    assert_eq!(c.relay(None, 3, "hello").await, queued_for(3));
+    assert_eq!(c.relay(Some(0), 2, "status?").await, queued_for(2));
+    let v = c.locks().await;
+    let mine: Vec<_> = v
+        .relays
+        .iter()
+        .map(|r| (r.from, r.to, r.text.as_str()))
+        .collect();
+    assert!(mine.contains(&(Sender::You, 3, "hello")), "{mine:?}");
+    assert!(
+        mine.contains(&(Sender::Slot { slot: 0 }, 2, "status?")),
+        "{mine:?}"
+    );
+    assert!(is_error(
+        &c.relay(None, 3, "  ").await,
+        "the message is empty"
+    ));
+    assert!(matches!(
+        c.relay(None, 3, &"x".repeat(4001)).await,
+        Response::Error { .. }
+    ));
+    assert!(matches!(
+        c.relay(None, 99, "hi").await,
+        Response::Error { .. }
+    ));
+}
+
+#[tokio::test]
+async fn worker_can_answer_s0_once() {
+    let d = lock_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    for id in [0, 2] {
+        assert_eq!(c.start(id).await, Response::Ok);
+    }
+    assert_eq!(c.relay(Some(0), 2, "status?").await, queued_for(2));
+    // Not delivered yet, so there is nothing to answer.
+    assert!(matches!(
+        c.relay(Some(2), 0, "early").await,
+        Response::Error { .. }
+    ));
+    let v = c.locks().await;
+    deliver_all(&d, 2, &v);
+    assert_eq!(c.relay(Some(2), 0, "on it").await, queued_for(0));
+    assert!(is_error(
+        &c.relay(Some(2), 0, "and another").await,
+        "S2 can message S0 only to answer a message from S0."
+    ));
+}
+
+#[tokio::test]
+async fn worker_cannot_start_a_conversation() {
+    let d = lock_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    for id in [0, 1, 2] {
+        assert_eq!(c.start(id).await, Response::Ok);
+    }
+    assert!(is_error(
+        &c.relay(Some(2), 1, "hi").await,
+        "S2 can message S1 only to answer a message from S1."
+    ));
+    assert!(is_error(
+        &c.relay(Some(2), 2, "hi").await,
+        "you cannot message yourself"
+    ));
+    // A relay from Jonathan is not a message from S0 to answer.
+    assert_eq!(c.relay(None, 2, "hello").await, queued_for(2));
+    let v = c.locks().await;
+    deliver_all(&d, 2, &v);
+    assert!(matches!(
+        c.relay(Some(2), 0, "hi").await,
+        Response::Error { .. }
+    ));
+    assert!(c
+        .locks()
+        .await
+        .relays
+        .iter()
+        .all(|r| r.from != Sender::Slot { slot: 2 }));
+}
+
+#[tokio::test]
+async fn move_notice_queues_a_relay() {
+    let s = stub_sources("move-relay", false);
+    let d = s.daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    c.refresh().await;
+    assert_eq!(c.start(1).await, Response::Ok);
+    assert_eq!(c.assign("DEMO-40", 1, false, false).await, Response::Ok);
+    assert_eq!(c.assign("DEMO-40", 2, false, true).await, Response::Ok);
+    let v = c.locks_until(|v| !pending(v).is_empty()).await;
+    assert_eq!(
+        pending(&v),
+        vec![(1, "DEMO-40 was moved to S2".to_string())]
+    );
+    assert_eq!(v.relays[0].from, Sender::Overseer);
+    // S2 has no session, so its notice is dropped, never delivered later.
+    assert_eq!(c.assign("DEMO-40", 3, false, true).await, Response::Ok);
+    let v = c.locks_until(|v| v.relays.len() == 2).await;
+    assert_eq!(
+        relay_states(&v)[0],
+        (2, t("DEMO-40 was moved to S3"), RelayState::Dropped)
+    );
+}
+
+#[tokio::test]
+async fn label_failure_queues_no_relay() {
+    let s = stub_sources("label-fail-relay", false);
+    write_script(
+        &s.dir.join("bin/bd"),
+        &format!(
+            "if [ \"$1\" = list ]; then cat '{FIXTURES}/bd-list.json'; exit 0; fi\n\
+             echo 'database is locked' >&2; exit 1\n"
+        ),
+    );
+    let d = s.daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    c.refresh().await;
+    assert_eq!(c.assign("ov-3", 2, false, false).await, Response::Ok);
+    for _ in 0..250 {
+        if c.work().await.notices.iter().any(|n| n.slot == 2) {
+            break;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    assert!(c.work().await.notices.iter().any(|n| n.slot == 2));
+    assert!(c.locks().await.relays.is_empty());
+}
+
+// ---- Courier ----
+
+/// A stub `claude` for the courier: it draws Claude Code's input box (empty,
+/// or holding the text in `box_file`), redraws on SIGUSR1, and logs every
+/// byte it reads from the PTY to `reads`.
+struct BoxStub {
+    dir: PathBuf,
+    bin: PathBuf,
+    reads: PathBuf,
+    box_file: PathBuf,
+    draws: PathBuf,
+}
+
+fn box_stub(name: &str) -> BoxStub {
+    box_stub_with(name, true)
+}
+
+/// `box_stub`, turning bracketed paste on only when `brackets` is set.
+fn box_stub_with(name: &str, brackets: bool) -> BoxStub {
+    let dir = std::env::temp_dir().join(format!("ovs-courier-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("work")).unwrap();
+    let stub = BoxStub {
+        bin: dir.join("claude"),
+        reads: dir.join("reads.log"),
+        box_file: dir.join("box.txt"),
+        draws: dir.join("draws.log"),
+        dir,
+    };
+    write_script(
+        &stub.bin,
+        &format!(
+            r#"if [ "$1" = --session-id ] && [ -n "$STUB_SAVES" ]; then
+  mkdir -p "$CLAUDE_CONFIG_DIR/projects/p" && : > "$CLAUDE_CONFIG_DIR/projects/p/$2.jsonl"
+fi
+stty raw -echo
+exec 3<&0
+cat <&3 >> '{reads}' &
+reader=$!
+draw() {{
+  cols=$(stty size | cut -d' ' -f2)
+  rule=$(awk -v n="$cols" 'BEGIN {{ for (i = 0; i < n; i++) printf "\342\224\200" }}')
+  printf '\033[2J\033[H{mode}Working on DEMO-12 in demo-api\r\n\r\n%s\r\n' "$rule"
+  if [ -s '{boxf}' ]; then
+    printf '\342\235\257 %s\r\n' "$(cat '{boxf}')"
+  else
+    printf '\342\235\257 \033[7mT\033[0m\033[2mry "fix the failing test"\033[0m\r\n'
+  fi
+  printf '%s\r\n  ? for shortcuts' "$rule"
+  echo drawn >> '{draws}'
+}}
+trap draw USR1
+draw
+i=0
+while [ $i -lt 600 ]; do sleep 0.1; i=$((i + 1)); done
+kill $reader
+"#,
+            reads = stub.reads.display(),
+            boxf = stub.box_file.display(),
+            draws = stub.draws.display(),
+            mode = if brackets { "\\033[?2004h" } else { "" },
+        ),
+    );
+    stub
+}
+
+impl BoxStub {
+    fn env(&self) -> overseer_daemon::EnvSource {
+        claude_env(&self.dir, true)
+    }
+
+    fn reads(&self) -> String {
+        String::from_utf8_lossy(&std::fs::read(&self.reads).unwrap_or_default()).into_owned()
+    }
+
+    fn draws(&self) -> usize {
+        std::fs::read_to_string(&self.draws)
+            .map(|s| s.lines().count())
+            .unwrap_or(0)
+    }
+
+    async fn drawn(&self, at_least: usize) {
+        for _ in 0..250 {
+            if self.draws() >= at_least {
+                return;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        panic!("stub never drew {at_least} times");
+    }
+
+    /// Waits for the PTY to have been sent `needle`; returns all it read.
+    async fn read_until(&self, needle: &str) -> String {
+        for _ in 0..250 {
+            let got = self.reads();
+            if got.contains(needle) {
+                return got;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        panic!("stub never read {needle:?}; read {:?}", self.reads());
+    }
+
+    /// Asserts nothing reaches the PTY for `secs`.
+    async fn reads_nothing_for(&self, secs: u64) {
+        sleep(Duration::from_secs(secs)).await;
+        assert_eq!(self.reads(), "", "typed into the session");
+    }
+
+    /// Sets the input box (`None` is empty) and has the stub redraw it.
+    async fn set_box(&self, text: Option<&str>, pid: u32) {
+        std::fs::write(&self.box_file, text.unwrap_or("")).unwrap();
+        let before = self.draws();
+        // SAFETY: a plain signal to the stub's own process.
+        assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGUSR1) }, 0);
+        self.drawn(before + 1).await;
+    }
+}
+
+impl Drop for BoxStub {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// The paste a relay of `text` arrives as, Return included.
+fn pasted(text: &str) -> String {
+    format!("\x1b[200~{}\x1b[201~\r", text.replace('\n', "\r"))
+}
+
+impl Client {
+    /// Starts `stub` in slot `id`, waits for its first screen and returns
+    /// its pid.
+    async fn start_stub(&mut self, id: u8, stub: &BoxStub) -> u32 {
+        let start = Request::StartSlot {
+            id,
+            label: format!("t{id}"),
+            cwd: stub.dir.join("work"),
+            command: Some(vec![stub.bin.to_string_lossy().into_owned()]),
+            prompt: None,
+        };
+        assert_eq!(self.request(start).await, Response::Ok);
+        stub.drawn(1).await;
+        match self.list().await[id as usize].state {
+            SlotState::Running { pid, .. } => pid,
+            ref other => panic!("not running: {other:?}"),
+        }
+    }
+
+    async fn notification(&mut self, slot: u8, kind: &str, message: &str) {
+        self.hook(HookEvent {
+            notification: Some(message.into()),
+            notification_type: Some(kind.into()),
+            ..hook(slot, HookKind::Notification)
+        })
+        .await;
+    }
+
+    /// Waits until `to` has a pending relay held for `reason`.
+    async fn held_for(&mut self, to: u8, reason: &str) {
+        self.locks_until(|v| {
+            v.relays.iter().any(|r| {
+                r.to == to && r.state == RelayState::Pending && r.held.as_deref() == Some(reason)
+            })
+        })
+        .await;
+    }
+
+    /// Waits until `to` has no pending relay left.
+    async fn all_delivered(&mut self, to: u8) -> LockView {
+        self.locks_until(|v| {
+            v.relays
+                .iter()
+                .filter(|r| r.to == to)
+                .all(|r| r.state == RelayState::Delivered && r.held.is_none())
+        })
+        .await
+    }
+}
+
+const HELLO: &str = "Message from Jonathan via Overseer: hello";
+
+#[tokio::test]
+async fn idle_slot_gets_the_relay_with_bracketed_paste_then_enter() {
+    let stub = box_stub("idle");
+    let d = start_daemon_with(temp_socket(), stub.env()).await;
+    let mut c = Client::connect(&d.socket).await;
+    c.start_stub(2, &stub).await;
+    c.hook(hook(2, HookKind::SessionStart)).await;
+    assert_eq!(c.relay(None, 2, "hello").await, queued_for(2));
+    let got = stub.read_until(&pasted(HELLO)).await;
+    assert_eq!(got, pasted(HELLO));
+    let v = c.all_delivered(2).await;
+    assert!(v.relays[0].delivered_at.is_some());
+    // Still idle, nothing more to send: nothing more is typed.
+    sleep(Duration::from_millis(1500)).await;
+    assert_eq!(stub.reads(), pasted(HELLO));
+}
+
+#[tokio::test]
+async fn working_slot_waits_until_stop() {
+    let stub = box_stub("working");
+    let d = start_daemon_with(temp_socket(), stub.env()).await;
+    let mut c = Client::connect(&d.socket).await;
+    c.start_stub(2, &stub).await;
+    // No hook yet: the courier cannot know the session is ready.
+    assert_eq!(c.relay(None, 2, "hello").await, queued_for(2));
+    c.held_for(2, "no activity reported yet").await;
+    c.hook(hook(2, HookKind::UserPromptSubmit)).await;
+    c.held_for(2, "session is working").await;
+    stub.reads_nothing_for(2).await;
+    c.hook(hook(2, HookKind::Stop)).await;
+    assert_eq!(stub.read_until(&pasted(HELLO)).await, pasted(HELLO));
+    c.all_delivered(2).await;
+}
+
+#[tokio::test]
+async fn permission_prompt_never_gets_a_relay() {
+    let stub = box_stub("permission");
+    let d = start_daemon_with(temp_socket(), stub.env()).await;
+    let mut c = Client::connect(&d.socket).await;
+    c.start_stub(2, &stub).await;
+    c.hook(hook(2, HookKind::UserPromptSubmit)).await;
+    c.notification(
+        2,
+        "permission_prompt",
+        "Claude needs your permission to use Bash",
+    )
+    .await;
+    assert_eq!(c.relay(None, 2, "hello").await, queued_for(2));
+    c.held_for(2, "waiting at a prompt for Jonathan").await;
+    stub.reads_nothing_for(3).await;
+    let v = c.locks().await;
+    assert_eq!(
+        v.relays[0].held.as_deref(),
+        Some("waiting at a prompt for Jonathan")
+    );
+    assert_eq!(v.relays[0].state, RelayState::Pending);
+    c.hook(hook(2, HookKind::Stop)).await;
+    assert_eq!(stub.read_until(&pasted(HELLO)).await, pasted(HELLO));
+    c.all_delivered(2).await;
+}
+
+#[tokio::test]
+async fn idle_input_wait_gets_the_relay() {
+    let stub = box_stub("idle-wait");
+    let d = start_daemon_with(temp_socket(), stub.env()).await;
+    let mut c = Client::connect(&d.socket).await;
+    c.start_stub(2, &stub).await;
+    c.hook(hook(2, HookKind::UserPromptSubmit)).await;
+    assert_eq!(c.relay(None, 2, "hello").await, queued_for(2));
+    c.held_for(2, "session is working").await;
+    c.notification(2, "idle_prompt", "Claude is waiting for your input")
+        .await;
+    assert_eq!(stub.read_until(&pasted(HELLO)).await, pasted(HELLO));
+    c.all_delivered(2).await;
+}
+
+#[tokio::test]
+async fn typed_input_box_waits_until_empty() {
+    let stub = box_stub("typed");
+    let d = start_daemon_with(temp_socket(), stub.env()).await;
+    let mut c = Client::connect(&d.socket).await;
+    let pid = c.start_stub(2, &stub).await;
+    stub.set_box(Some("half a draft for demo-api"), pid).await;
+    c.hook(hook(2, HookKind::Stop)).await;
+    assert_eq!(c.relay(None, 2, "hello").await, queued_for(2));
+    c.held_for(2, "input box has text").await;
+    stub.reads_nothing_for(2).await;
+    // Jonathan clears his draft; the next look finds the box empty.
+    stub.set_box(None, pid).await;
+    assert_eq!(stub.read_until(&pasted(HELLO)).await, pasted(HELLO));
+    c.all_delivered(2).await;
+}
+
+#[tokio::test]
+async fn two_pending_relays_go_in_one_paste() {
+    let stub = box_stub("two");
+    let d = start_daemon_with(temp_socket(), stub.env()).await;
+    let mut c = Client::connect(&d.socket).await;
+    c.start_stub(2, &stub).await;
+    c.hook(hook(2, HookKind::UserPromptSubmit)).await;
+    assert_eq!(c.relay(Some(0), 2, "status?").await, queued_for(2));
+    assert_eq!(c.relay(None, 2, "hello").await, queued_for(2));
+    c.locks_until(|v| {
+        v.relays
+            .iter()
+            .filter(|r| r.held.as_deref() == Some("session is working"))
+            .count()
+            == 2
+    })
+    .await;
+    c.hook(hook(2, HookKind::Stop)).await;
+    let both = format!(
+        "Message from S0 via Overseer: status?\n(You can answer once with notify_session.)\n\n{HELLO}"
+    );
+    assert_eq!(stub.read_until(&pasted(&both)).await, pasted(&both));
+    let v = c.all_delivered(2).await;
+    assert_eq!(v.relays.len(), 2);
+    // Delivered, so S2 may now answer S0 once.
+    assert_eq!(c.start(0).await, Response::Ok);
+    assert_eq!(c.relay(Some(2), 0, "on it").await, queued_for(0));
+}
+
+#[tokio::test]
+async fn pending_relay_delivers_after_restart_and_resume() {
+    let stub = box_stub("restart");
+    let d = start_daemon_with(temp_socket(), stub.env()).await;
+    let mut c = Client::connect(&d.socket).await;
+    c.start_stub(3, &stub).await;
+    c.hook(hook(3, HookKind::UserPromptSubmit)).await;
+    assert_eq!(c.relay(None, 3, "hello").await, queued_for(3));
+    c.held_for(3, "session is working").await;
+    drop(c);
+
+    let socket = shutdown(d).await;
+    let draws = stub.draws();
+    let d = start_daemon_with(socket, stub.env()).await;
+    let mut c = Client::connect(&d.socket).await;
+    assert!(matches!(
+        c.list().await[3].state,
+        SlotState::Resumable { .. }
+    ));
+    c.held_for(3, "slot is not running").await;
+    assert_eq!(c.request(Request::ResumeSlot { id: 3 }).await, Response::Ok);
+    stub.drawn(draws + 1).await;
+    c.held_for(3, "no activity reported yet").await;
+    c.hook(hook(3, HookKind::SessionStart)).await;
+    assert_eq!(stub.read_until(&pasted(HELLO)).await, pasted(HELLO));
+    c.all_delivered(3).await;
+}
+
+#[tokio::test]
+async fn multi_line_relay_waits_without_bracketed_paste() {
+    let stub = box_stub_with("no-brackets", false);
+    let d = start_daemon_with(temp_socket(), stub.env()).await;
+    let mut c = Client::connect(&d.socket).await;
+    c.start_stub(2, &stub).await;
+    c.hook(hook(2, HookKind::Stop)).await;
+    assert_eq!(
+        c.relay(None, 2, "first line\nsecond line").await,
+        queued_for(2)
+    );
+    c.held_for(2, "bracketed paste is off").await;
+    stub.reads_nothing_for(2).await;
+    let v = c.locks().await;
+    assert_eq!(v.relays[0].state, RelayState::Pending);
+    assert_eq!(v.relays[0].held.as_deref(), Some("bracketed paste is off"));
+}
+
+#[tokio::test]
+async fn one_line_relay_is_typed_without_bracketed_paste() {
+    let stub = box_stub_with("no-brackets-one", false);
+    let d = start_daemon_with(temp_socket(), stub.env()).await;
+    let mut c = Client::connect(&d.socket).await;
+    c.start_stub(2, &stub).await;
+    c.hook(hook(2, HookKind::Stop)).await;
+    // The escape is stripped, never typed as a key.
+    assert_eq!(c.relay(None, 2, "hel\x1blo").await, queued_for(2));
+    let want = format!("{HELLO}\r");
+    assert_eq!(stub.read_until(&want).await, want);
+    c.all_delivered(2).await;
+}
+
+// Session end: a slot's waits, unused grants and pending relays belong to
+// the session in it and go when that session ends, however it ends.
+
+/// `(to, text, state)` of every relay, newest first.
+fn relay_states(v: &LockView) -> Vec<(u8, String, RelayState)> {
+    v.relays
+        .iter()
+        .map(|r| (r.to, r.text.clone(), r.state))
+        .collect()
+}
+
+impl Client {
+    /// Waits until slot `id` reads as exited.
+    async fn exited(&mut self, id: u8) {
+        for _ in 0..250 {
+            if matches!(
+                self.list().await[id as usize].state,
+                SlotState::Exited { .. }
+            ) {
+                return;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        panic!("S{id} never exited");
+    }
+}
+
+#[tokio::test]
+async fn stop_then_start_at_once_starts_clean() {
+    let stub = box_stub("stop-start");
+    let d = start_daemon_full(
+        temp_socket(),
+        stub.env(),
+        offline_settings(),
+        lock_patterns(),
+    )
+    .await;
+    let mut c = Client::connect(&d.socket).await;
+    c.start_stub(3, &stub).await;
+    c.hook(hook(3, HookKind::UserPromptSubmit)).await;
+    c.request(claim_target(1, "custom:a", None)).await;
+    assert!(matches!(
+        c.request(claim_target(3, "custom:a", None)).await,
+        Response::Queued { .. }
+    ));
+    assert_eq!(c.relay(None, 3, "hello").await, queued_for(3));
+    c.held_for(3, "session is working").await;
+
+    assert_eq!(c.request(Request::StopSlot { id: 3 }).await, Response::Ok);
+    c.exited(3).await;
+    let draws = stub.draws();
+    let start = Request::StartSlot {
+        id: 3,
+        label: "t3".into(),
+        cwd: stub.dir.join("work"),
+        command: Some(vec![stub.bin.to_string_lossy().into_owned()]),
+        prompt: None,
+    };
+    assert_eq!(c.request(start).await, Response::Ok);
+    // Settled by the start itself, whatever the old exit event does.
+    let v = c.locks().await;
+    assert!(v.waits.is_empty(), "{v:?}");
+    assert_eq!(
+        relay_states(&v),
+        [(3, t("hello"), RelayState::Dropped)],
+        "{v:?}"
+    );
+    stub.drawn(draws + 1).await;
+    c.hook(hook(3, HookKind::SessionStart)).await;
+    // The new session is idle with an empty box, and S1's release finds no
+    // one waiting: nothing is typed in.
+    assert_eq!(
+        c.request(Request::ReleaseTarget {
+            slot: 1,
+            target: t("custom:a")
+        })
+        .await,
+        Response::Text {
+            text: t("Released custom:a.")
+        }
+    );
+    stub.reads_nothing_for(2).await;
+    assert!(pending(&c.locks().await).is_empty());
+}
+
+#[tokio::test]
+async fn declining_a_resumable_slot_hands_its_grant_on() {
+    let stub = box_stub("decline");
+    let socket = temp_socket();
+    let start = |socket| start_daemon_full(socket, stub.env(), offline_settings(), lock_patterns());
+    let d = start(socket).await;
+    let mut c = Client::connect(&d.socket).await;
+    c.start_stub(2, &stub).await;
+    c.hook(hook(2, HookKind::UserPromptSubmit)).await;
+    let api = "deploy:demo/api";
+    assert_eq!(c.check(1, "tu-1", "demo-deploy api").await, None);
+    assert!(c.check(2, "tu-2", "demo-deploy api").await.is_some());
+    c.request(claim_target(4, "custom:b", None)).await;
+    c.request(claim_target(2, "custom:b", None)).await;
+    c.hook(post_tool_use(1, "tu-1")).await;
+    assert_eq!(c.relay(None, 2, "hello").await, queued_for(2));
+    let v = c.locks().await;
+    assert_eq!(
+        holds(&v),
+        [
+            (t("custom:b"), 4, ClaimKind::Claim),
+            (t(api), 2, ClaimKind::Grant)
+        ]
+    );
+    assert_eq!(queued(&v), [(t("custom:b"), 2)]);
+    drop(c);
+
+    let socket = shutdown(d).await;
+    let d = start(socket).await;
+    let mut c = Client::connect(&d.socket).await;
+    assert!(matches!(
+        c.list().await[2].state,
+        SlotState::Resumable { .. }
+    ));
+    // The resumable session keeps all of it.
+    let v = c.locks().await;
+    assert_eq!(holds(&v)[1], (t(api), 2, ClaimKind::Grant));
+    assert_eq!(queued(&v), [(t("custom:b"), 2)]);
+    assert!(matches!(
+        c.request(claim_target(5, api, None)).await,
+        Response::Queued { .. }
+    ));
+
+    assert_eq!(c.request(Request::StopSlot { id: 2 }).await, Response::Ok);
+    let v = c.locks().await;
+    assert_eq!(
+        holds(&v),
+        [
+            (t("custom:b"), 4, ClaimKind::Claim),
+            (t(api), 5, ClaimKind::Claim)
+        ]
+    );
+    assert!(v.waits.is_empty(), "{v:?}");
+    let states = relay_states(&v);
+    assert!(
+        states.contains(&(
+            5,
+            t("S2 has released deploy:demo/api. You now hold it."),
+            RelayState::Pending
+        )),
+        "{states:?}"
+    );
+    assert!(
+        states.contains(&(2, t("hello"), RelayState::Dropped)),
+        "{states:?}"
+    );
+    assert!(
+        states.contains(&(
+            2,
+            t("S1 has released deploy:demo/api. You now hold it."),
+            RelayState::Dropped
+        )),
+        "{states:?}"
+    );
+}
+
+#[tokio::test]
+async fn restart_ends_the_sessions_that_cannot_resume() {
+    let socket = temp_socket();
+    let d = lock_daemon_at(socket).await;
+    let mut c = Client::connect(&d.socket).await;
+    // S1 runs a command that is not claude, so it cannot be resumed.
+    assert_eq!(c.start(1).await, Response::Ok);
+    assert_eq!(c.check(1, "tu-1", "demo-deploy api").await, None);
+    c.request(claim_target(1, "custom:a", None)).await;
+    c.request(claim_target(2, "custom:b", None)).await;
+    c.request(claim_target(1, "custom:b", None)).await;
+    drop(c);
+    let socket = shutdown(d).await;
+    let d = lock_daemon_at(socket).await;
+    let mut c = Client::connect(&d.socket).await;
+    assert!(matches!(c.list().await[1].state, SlotState::Exited { .. }));
+    let v = c.locks().await;
+    // The command claim and the wait went with the session; tool claims
+    // stay until released.
+    assert_eq!(
+        holds(&v),
+        [
+            (t("custom:a"), 1, ClaimKind::Claim),
+            (t("custom:b"), 2, ClaimKind::Claim)
+        ]
+    );
+    assert!(v.waits.is_empty(), "{v:?}");
+}
+
+#[tokio::test]
+async fn send_to_a_slot_with_no_session_is_refused() {
+    let d = lock_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    assert!(is_error(
+        &c.relay(None, 4, "hello").await,
+        "S4 has no session to message."
+    ));
+    assert!(is_error(
+        &c.relay(Some(0), 4, "status?").await,
+        "S4 has no session to message."
+    ));
+    assert_eq!(c.start(4).await, Response::Ok);
+    assert_eq!(c.relay(None, 4, "hello").await, queued_for(4));
+    assert_eq!(c.request(Request::StopSlot { id: 4 }).await, Response::Ok);
+    c.exited(4).await;
+    let v = c
+        .locks_until(|v| v.relays.iter().all(|r| r.state == RelayState::Dropped))
+        .await;
+    assert_eq!(relay_states(&v), [(4, t("hello"), RelayState::Dropped)]);
+    assert!(is_error(
+        &c.relay(None, 4, "again").await,
+        "S4 has no session to message."
+    ));
+}
+
+#[tokio::test]
+async fn notice_for_a_holder_with_no_session_is_queued_dropped() {
+    let d = lock_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    // S3 never ran; its tool claim stays until released.
+    c.request(claim_target(3, "custom:z", None)).await;
+    assert_eq!(
+        c.request(Request::ForceRelease {
+            target: t("custom:z"),
+            holder: None,
+        })
+        .await,
+        Response::Text {
+            text: t("Released custom:z.")
+        }
+    );
+    let v = c.locks().await;
+    assert_eq!(
+        relay_states(&v),
+        [(
+            3,
+            t("Jonathan released custom:z, which you held."),
+            RelayState::Dropped
+        )]
+    );
+    assert!(v.relays[0].dropped_at.is_some());
+}
+
+#[tokio::test]
+async fn relay_right_after_a_delivery_says_why_it_waits() {
+    let stub = box_stub("cooldown");
+    let d = start_daemon_with(temp_socket(), stub.env()).await;
+    let mut c = Client::connect(&d.socket).await;
+    c.start_stub(2, &stub).await;
+    c.hook(hook(2, HookKind::SessionStart)).await;
+    assert_eq!(c.relay(None, 2, "hello").await, queued_for(2));
+    stub.read_until(&pasted(HELLO)).await;
+    c.all_delivered(2).await;
+    // No hook since: the session has not reacted to the first paste yet.
+    assert_eq!(c.relay(None, 2, "and the tests").await, queued_for(2));
+    c.held_for(2, "just delivered, waiting for the session")
+        .await;
 }

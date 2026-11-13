@@ -8,7 +8,8 @@ pub mod paths;
 pub use client::Client;
 pub use frame::{read_frame, write_frame, Frame, MAX_FRAME};
 pub use msg::{
-    owned_by_message, owner_in_refusal, slot_name, Activity, ActivityKind, Event, HookEvent,
-    HookKind, ItemKind, Notice, Request, Response, SlotId, SlotInfo, SlotState, SourceStatus,
-    WorkItem, WorkView, JIRA_OFF,
+    owned_by_message, owner_in_refusal, slot_name, Activity, ActivityKind, BashCheck, Claim,
+    ClaimKind, Event, HookEvent, HookKind, ItemKind, LockView, Notice, Relay, RelayState, Request,
+    Response, Sender, SlotId, SlotInfo, SlotState, SourceStatus, Wait, WorkItem, WorkView,
+    CHECK_ENV, JIRA_OFF,
 };

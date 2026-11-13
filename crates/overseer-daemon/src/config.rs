@@ -14,6 +14,8 @@ pub struct Config {
     pub beads_poll_secs: u64,
     pub ticket_pattern: String,
     pub brain_dir: PathBuf,
+    /// Minutes a lock may go unused before the board flags it as long-held.
+    pub lock_idle_mins: u64,
 }
 
 impl Default for Config {
@@ -32,6 +34,7 @@ impl Default for Config {
             beads_poll_secs: 30,
             ticket_pattern: r"PLAT-\d+".to_string(),
             brain_dir: PathBuf::from("~/Repos/2ndBrain"),
+            lock_idle_mins: 60,
         }
     }
 }
@@ -103,14 +106,16 @@ mod tests {
         assert_eq!(c.jira_command[0], "acli");
         assert_eq!(c.beads_dir, PathBuf::from("/Users/me/Repos/2ndBrain"));
         assert_eq!(c.brain_dir, PathBuf::from("/Users/me/Repos/2ndBrain"));
+        assert_eq!(c.lock_idle_mins, 60);
     }
 
     #[test]
     fn partial_file_overrides_only_its_keys() {
-        let (_d, p) = write("jql = \"project = X\"\n");
+        let (_d, p) = write("jql = \"project = X\"\nlock_idle_mins = 15\n");
         let (c, err) = Config::load(&p, &home());
         assert!(err.is_none());
         assert_eq!(c.jql, "project = X");
+        assert_eq!(c.lock_idle_mins, 15);
         assert_eq!(c.jira_poll_secs, 300);
         assert_eq!(c.jira_command.len(), 9);
         assert_eq!(c.ticket_pattern, r"PLAT-\d+");

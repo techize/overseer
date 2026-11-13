@@ -8,8 +8,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::Result;
-use overseer_proto::msg::{Notice, SlotId};
+use overseer_proto::msg::{LockView, Notice, SlotId};
 use rusqlite::Connection;
+
+use crate::locks::table;
 
 /// What the ledger remembers about the session in a slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,18 +70,55 @@ CREATE TABLE IF NOT EXISTS notices (
     text TEXT
 )";
 
-const VERSION: i64 = 2;
+/// What version 3 adds: claims on write targets, the slots queued for
+/// them, and relays between sessions.
+const V3_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS claims (
+    target TEXT PRIMARY KEY,
+    slot INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    reason TEXT,
+    item TEXT,
+    tool_use_id TEXT,
+    pin_revision TEXT,
+    relay_id INTEGER,
+    back_on TEXT,
+    since INTEGER NOT NULL,
+    last_used INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS waits (
+    id INTEGER PRIMARY KEY,
+    target TEXT NOT NULL,
+    slot INTEGER NOT NULL,
+    via TEXT NOT NULL,
+    reason TEXT,
+    item TEXT,
+    at INTEGER NOT NULL,
+    UNIQUE(target, slot)
+);
+CREATE TABLE IF NOT EXISTS relays (
+    id INTEGER PRIMARY KEY,
+    at INTEGER NOT NULL,
+    sender TEXT NOT NULL,
+    from_slot INTEGER,
+    to_slot INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    reply_to INTEGER,
+    delivered_at INTEGER,
+    dropped_at INTEGER
+)";
 
-/// Creates any missing tables and brings the file up to [`VERSION`]. A
-/// version 1 file keeps its session rows; the new tables are added beside
-/// them. The tables and the version bump commit together.
+const VERSION: i64 = 3;
+
+/// Creates any missing tables and brings the file up to [`VERSION`]. An
+/// older file keeps its rows; the new tables are added beside them. The
+/// tables and the version bump commit together.
 fn migrate(conn: &Connection) -> Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version >= VERSION {
         return Ok(());
     }
     conn.execute_batch(&format!(
-        "BEGIN;\n{SESSIONS_SCHEMA};\n{V2_SCHEMA};\nPRAGMA user_version = {VERSION};\nCOMMIT;"
+        "BEGIN;\n{SESSIONS_SCHEMA};\n{V2_SCHEMA};\n{V3_SCHEMA};\nPRAGMA user_version = {VERSION};\nCOMMIT;"
     ))?;
     Ok(())
 }
@@ -250,6 +289,24 @@ impl Ledger {
         Ok(())
     }
 
+    /// Marks relays delivered at `now`.
+    pub fn mark_relays_delivered(&self, ids: &[i64], now: i64) -> Result<()> {
+        self.transaction(|c| table::mark_delivered_on(c, ids, now))
+    }
+
+    /// Every claim and wait, every pending relay and the `recent` most
+    /// recently delivered or dropped ones, read in one transaction.
+    pub fn lock_view(&self, recent: usize, flag_after_secs: i64) -> Result<LockView> {
+        self.transaction(|c| {
+            Ok(LockView {
+                claims: table::claims_on(c)?,
+                waits: table::waits_on(c)?,
+                relays: table::relays_on(c, recent)?,
+                flag_after_secs,
+            })
+        })
+    }
+
     /// Records a session starting in a slot, replacing whatever row the slot
     /// had (so `exited` and `exit_code` are cleared).
     pub fn record_start(&self, s: &SessionRow) -> Result<()> {
@@ -412,8 +469,19 @@ mod tests {
         assert_eq!(slots, vec![1, 5]);
     }
 
+    fn user_version(l: &Ledger) -> i64 {
+        l.conn()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn lock_tables_are_empty(l: &Ledger) {
+        let v = l.lock_view(50, 3600).unwrap();
+        assert!(v.claims.is_empty() && v.waits.is_empty() && v.relays.is_empty());
+    }
+
     #[test]
-    fn version_1_file_migrates_to_2_keeping_sessions() {
+    fn version_1_file_migrates_to_3() {
         let path = temp_db("migrate");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         {
@@ -434,11 +502,106 @@ mod tests {
         assert!(l.assignments().unwrap().is_empty());
         assert!(l.notices().unwrap().is_empty());
         l.log(1, "k", None, "e", "d").unwrap();
-        let v: i64 = l
-            .conn()
-            .query_row("PRAGMA user_version", [], |r| r.get(0))
+        lock_tables_are_empty(&l);
+        assert_eq!(user_version(&l), 3);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn version_2_file_migrates_to_3_keeping_assignments() {
+        let path = temp_db("migrate-v2");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SESSIONS_SCHEMA).unwrap();
+            conn.execute_batch(V2_SCHEMA).unwrap();
+            conn.execute_batch("PRAGMA user_version = 2").unwrap();
+            conn.execute(
+                "INSERT INTO assignments (key, slot, at) VALUES ('DEMO-12', 3, 100)",
+                [],
+            )
             .unwrap();
-        assert_eq!(v, 2);
+            conn.execute(
+                "INSERT INTO notices (slot, at, text) VALUES (3, 101, 'moved')",
+                [],
+            )
+            .unwrap();
+        }
+        let l = Ledger::open(&path).unwrap();
+        assert_eq!(user_version(&l), 3);
+        assert_eq!(l.assignments().unwrap(), vec![("DEMO-12".to_string(), 3)]);
+        assert_eq!(l.notices().unwrap()[0].text, "moved");
+        lock_tables_are_empty(&l);
+        drop(l);
+        // Opening a v3 file again changes nothing.
+        let l = Ledger::open(&path).unwrap();
+        assert_eq!(user_version(&l), 3);
+        assert_eq!(l.assignments().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn fresh_file_is_created_at_3() {
+        let path = temp_db("fresh");
+        let l = Ledger::open(&path).unwrap();
+        assert_eq!(user_version(&l), 3);
+        lock_tables_are_empty(&l);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn locks_waits_and_relays_survive_reopen() {
+        use crate::locks::table::{
+            claim_on, mark_delivered_on, queue_relay_on, ClaimOutcome, NewClaim, Via,
+        };
+        use overseer_proto::msg::{ClaimKind, RelayState, Sender};
+
+        let path = temp_db("locks-reopen");
+        let ask = |slot, via| NewClaim {
+            target: "argo:uat/root",
+            slot,
+            kind: ClaimKind::Command,
+            reason: Some("sync"),
+            item: Some("DEMO-12"),
+            tool_use_id: None,
+            pin_revision: None,
+            via,
+        };
+        {
+            let l = Ledger::open(&path).unwrap();
+            l.transaction(|c| {
+                assert_eq!(claim_on(c, &ask(1, Via::Tool), 10)?, ClaimOutcome::Granted);
+                claim_on(c, &ask(3, Via::Hook), 11)?;
+                claim_on(c, &ask(2, Via::Tool), 12)?;
+                let done = queue_relay_on(c, &Sender::You, 1, "seen", None, 13)?;
+                mark_delivered_on(c, &[done], 14)?;
+                queue_relay_on(c, &Sender::Slot { slot: 0 }, 2, "waiting", None, 15)?;
+                Ok(())
+            })
+            .unwrap();
+        }
+        let l = Ledger::open(&path).unwrap();
+        let v = l.lock_view(50, 600).unwrap();
+        assert_eq!(v.flag_after_secs, 600);
+        assert_eq!(v.claims.len(), 1);
+        assert_eq!(v.claims[0].slot, 1);
+        assert_eq!(v.claims[0].item.as_deref(), Some("DEMO-12"));
+        let waits: Vec<_> = v.waits.iter().map(|w| (w.slot, w.at)).collect();
+        assert_eq!(waits, vec![(3, 11), (2, 12)]);
+        let relays: Vec<_> = v
+            .relays
+            .iter()
+            .map(|r| (r.text.as_str(), r.state, r.from))
+            .collect();
+        assert_eq!(
+            relays,
+            vec![
+                ("waiting", RelayState::Pending, Sender::Slot { slot: 0 }),
+                ("seen", RelayState::Delivered, Sender::You),
+            ]
+        );
+        assert_eq!(v.pending_for(2), 1);
+        assert_eq!(v.waiting_on(3), vec!["argo:uat/root"]);
         let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
     }
 

@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 overseer-proto = { path = "../overseer-proto" }
+overseer-term = { path = "../overseer-term" }
 portable-pty.workspace = true
 tokio = { workspace = true, features = ["sync", "rt", "time", "macros", "net", "io-util", "process"] }
 regex.workspace = true
@@ -20,5 +21,4 @@ toml = "0.8"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-overseer-term = { path = "../overseer-term" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }

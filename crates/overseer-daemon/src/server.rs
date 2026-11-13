@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use anyhow::Context;
 use bytes::Bytes;
-use overseer_proto::{read_frame, slot_name, write_frame, Event, Frame, Request, Response, SlotId};
+use overseer_proto::{
+    read_frame, slot_name, write_frame, Event, Frame, Request, Response, SlotId, SlotState,
+};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc, watch, Notify};
@@ -15,7 +17,9 @@ use tokio::task::{JoinHandle, JoinSet};
 
 use crate::env::{BaseEnv, EnvSource};
 use crate::ledger::Ledger;
+use crate::locks::{owned_items, LockService};
 use crate::manager::{valid_id, Attachment, SlotManager};
+use crate::relay::courier::Courier;
 use crate::slot::CatchUp;
 use crate::work::store::unix_now;
 use crate::work::WorkStore;
@@ -39,6 +43,8 @@ pub struct DaemonConfig {
     pub hook_program: PathBuf,
     /// Settings from `config.toml`.
     pub settings: crate::config::Config,
+    /// Write target patterns, from `targets.toml` and the defaults.
+    pub patterns: Vec<crate::locks::targets::Pattern>,
 }
 
 /// `run` found another daemon serving the socket. Not a failure: the daemon
@@ -96,12 +102,46 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
     };
     let ledger = Arc::new(ledger);
     let store = WorkStore::new(&cfg.settings, ledger.clone(), events.clone(), env.clone());
+    let locks = LockService::new(
+        ledger.clone(),
+        cfg.patterns,
+        events.clone(),
+        env.clone(),
+        Duration::from_secs(cfg.settings.lock_idle_mins.saturating_mul(60)),
+    );
+    // Subscribed before any slot can start, so no exit is missed.
+    let exit_events = events.subscribe();
+    let courier_events = events.subscribe();
     let state_dir = cfg.state_dir.clone();
     let mut mgr = SlotManager::new(cfg.default_command, events)
         .with_env(env.clone())
-        .with_launch(cfg.state_dir, cfg.hook_program, ledger);
+        .with_launch(cfg.state_dir, cfg.hook_program, ledger.clone());
     mgr.restore();
+    // A session that did not survive the restart, or whose exit was never
+    // seen, has ended: only a resumable one keeps its waits and relays.
+    let ended = sessionless(&mgr.list());
+    locks.reconcile_exits(&ended, unix_now());
     let manager: Manager = Arc::new(Mutex::new(mgr));
+    locks.on_sessionless({
+        let manager = manager.clone();
+        move || sessionless(&manager.lock().unwrap().list())
+    });
+    let courier = Courier::spawn(ledger, manager.clone(), locks.clone(), courier_events);
+    store.on_relays_queued({
+        let (locks, courier) = (locks.clone(), courier.clone());
+        move || {
+            // A notice for a slot with no session is never delivered.
+            locks.drop_sessionless_relays(unix_now());
+            locks.announce();
+            courier.poke();
+        }
+    });
+    let exits = tokio::spawn(watch_exits(
+        exit_events,
+        locks.clone(),
+        manager.clone(),
+        courier.clone(),
+    ));
     store.start_polling();
     let shutdown = Arc::new(Notify::new());
     let mut conns = JoinSet::new();
@@ -112,9 +152,13 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
                 Ok((stream, _)) => {
                     conns.spawn(handle_conn(
                         stream,
-                        manager.clone(),
-                        store.clone(),
-                        state_dir.clone(),
+                        Services {
+                            manager: manager.clone(),
+                            store: store.clone(),
+                            locks: locks.clone(),
+                            courier: courier.clone(),
+                            state_dir: state_dir.clone(),
+                        },
                         shutdown.clone(),
                         env.clone(),
                     ));
@@ -127,6 +171,8 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
     }
 
     store.shutdown();
+    // The sessions are killed next; they keep their locks for the restart.
+    locks.shutdown();
     manager.lock().unwrap().shutdown_all();
     // A label change just before a restart should still reach the bead.
     store.drain_labels(crate::work::store::LABEL_DRAIN).await;
@@ -134,7 +180,51 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
     tokio::time::sleep(SHUTDOWN_GRACE).await;
     // Dropping `conns` aborts every connection task, closing the sockets.
     drop(conns);
+    exits.abort();
     Ok(())
+}
+
+/// The slots in `infos` with no session: empty or exited. A resumable
+/// slot still has one, waiting to be resumed.
+fn sessionless(infos: &[overseer_proto::SlotInfo]) -> Vec<SlotId> {
+    infos
+        .iter()
+        .filter(|i| matches!(i.state, SlotState::Empty | SlotState::Exited { .. }))
+        .map(|i| i.id)
+        .collect()
+}
+
+/// Ends the locks of each slot whose session exits. After a lag, which
+/// may have lost exit events, every slot with no session is reconciled.
+async fn watch_exits(
+    mut events: broadcast::Receiver<Event>,
+    locks: Arc<LockService>,
+    manager: Manager,
+    courier: Arc<Courier>,
+) {
+    loop {
+        match events.recv().await {
+            Ok(Event::SlotChanged(info)) if matches!(info.state, SlotState::Exited { .. }) => {
+                // A start may have replaced the session since this was
+                // sent, and the start already ended the old one.
+                let ended = sessionless(&manager.lock().unwrap().list());
+                if !ended.contains(&info.id) {
+                    continue;
+                }
+                locks.on_session_ended(info.id, unix_now());
+                // A handoff may have queued a relay.
+                courier.poke();
+            }
+            Ok(_) => {}
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!("lock exit watcher lagged by {n} events; reconciling");
+                let ended = sessionless(&manager.lock().unwrap().list());
+                locks.reconcile_exits(&ended, unix_now());
+                courier.poke();
+            }
+            Err(broadcast::error::RecvError::Closed) => return,
+        }
+    }
 }
 
 /// Bounded outbound queue for one connection. Sending never waits: if the
@@ -240,14 +330,28 @@ impl Streams {
     }
 }
 
-async fn handle_conn(
-    stream: UnixStream,
+/// What every connection serves requests from.
+struct Services {
     manager: Manager,
     store: Arc<WorkStore>,
+    locks: Arc<LockService>,
+    courier: Arc<Courier>,
     state_dir: PathBuf,
+}
+
+async fn handle_conn(
+    stream: UnixStream,
+    services: Services,
     shutdown: Arc<Notify>,
     mut env: BaseEnv,
 ) {
+    let Services {
+        manager,
+        store,
+        locks,
+        courier,
+        state_dir,
+    } = services;
     let (mut rd, mut wr) = stream.into_split();
     let (out_tx, mut out_rx) = mpsc::channel::<Frame>(OUTBOUND_QUEUE);
     let (dead_tx, mut dead_rx) = watch::channel(false);
@@ -307,7 +411,14 @@ async fn handle_conn(
                     ) {
                         env.wait().await;
                     }
-                    handle_frame(f, &manager, &store, &state_dir, &outbox, &shutdown, &mut streams)
+                    let ctx = Ctx {
+                        manager: &manager,
+                        store: &store,
+                        locks: &locks,
+                        courier: &courier,
+                        state_dir: &state_dir,
+                    };
+                    handle_frame(f, &ctx, &outbox, &shutdown, &mut streams)
                 }
                 None => break, // client hung up
             },
@@ -329,15 +440,23 @@ async fn handle_conn(
     writer.abort();
 }
 
+/// What a request handler works with.
+struct Ctx<'a> {
+    manager: &'a Manager,
+    store: &'a Arc<WorkStore>,
+    locks: &'a Arc<LockService>,
+    courier: &'a Arc<Courier>,
+    state_dir: &'a Path,
+}
+
 fn handle_frame(
     frame: Frame,
-    manager: &Manager,
-    store: &Arc<WorkStore>,
-    state_dir: &Path,
+    ctx: &Ctx,
     outbox: &Outbox,
     shutdown: &Notify,
     streams: &mut Streams,
 ) {
+    let (manager, store) = (ctx.manager, ctx.store);
     match frame {
         // Runs the sources, which can take up to their timeout, so it is
         // answered from a task of its own and the connection keeps serving.
@@ -355,10 +474,40 @@ fn handle_frame(
                 });
             });
         }
+        // Resolving targets can run git or kubectl (bounded by
+        // `RESOLVE_WITHIN`), so it too is answered from a task.
+        Frame::Request {
+            seq,
+            req: Request::CheckBash(check),
+        } => {
+            let owned = owned_items(&store.view(), check.slot);
+            let locks = ctx.locks.clone();
+            let outbox = outbox.clone();
+            store.spawn(async move {
+                let resp = locks.check_bash(check, owned).await;
+                outbox.send(Frame::Response { seq, resp });
+            });
+        }
         Frame::Request { seq, req } => {
             let is_shutdown = matches!(req, Request::Shutdown);
+            // Each of these can queue a relay or make one deliverable.
+            let pokes = matches!(
+                req,
+                Request::SendRelay { .. }
+                    | Request::ClaimTarget { .. }
+                    | Request::ReleaseTarget { .. }
+                    | Request::ForceRelease { .. }
+                    | Request::Release { .. }
+                    | Request::Assign { .. }
+                    | Request::StartSlot { .. }
+                    | Request::StopSlot { .. }
+                    | Request::Hook(_)
+            );
             let mut pending_attach = None;
-            let resp = handle_request(req, manager, store, state_dir, streams, &mut pending_attach);
+            let resp = handle_request(req, ctx, streams, &mut pending_attach);
+            if pokes {
+                ctx.courier.poke();
+            }
             // A re-attach ends the earlier stream before its Ok is queued.
             let gate = pending_attach.as_ref().map(|(id, _)| streams.cut(*id));
             outbox.send(Frame::Response { seq, resp });
@@ -394,12 +543,11 @@ fn handle_frame(
 
 fn handle_request(
     req: Request,
-    manager: &Manager,
-    store: &Arc<WorkStore>,
-    state_dir: &Path,
+    ctx: &Ctx,
     streams: &mut Streams,
     pending_attach: &mut Option<(SlotId, Attachment)>,
 ) -> Response {
+    let (manager, store, locks, state_dir) = (ctx.manager, ctx.store, ctx.locks, ctx.state_dir);
     let err = |message: String| Response::Error { message };
     match req {
         Request::Hello { client } => {
@@ -415,9 +563,59 @@ fn handle_request(
             slot,
             confirm,
             move_owner,
-        } => store.assign(&key, slot, confirm, move_owner, unix_now()),
-        Request::Release { key } => store.release(&key, unix_now()),
+        } => {
+            let owner = |v: overseer_proto::WorkView| {
+                v.items.iter().find(|i| i.key == key).and_then(|i| i.owner)
+            };
+            let before = owner(store.view());
+            let now = unix_now();
+            let resp = store.assign(&key, slot, confirm, move_owner, now);
+            // A move: the targets claimed for the item go with the old owner.
+            if resp == Response::Ok && before.is_some_and(|b| b != slot) {
+                locks.on_item_released(&key, now);
+            }
+            resp
+        }
+        Request::Release { key } => {
+            let now = unix_now();
+            let resp = store.release(&key, now);
+            if resp == Response::Ok {
+                locks.on_item_released(&key, now);
+            }
+            resp
+        }
         Request::ClearNotices { slot } => store.clear_notices(slot),
+        Request::ListLocks => Response::Locks(locks.view()),
+        Request::ClaimTarget {
+            slot,
+            target,
+            reason,
+            item,
+        } => locks.claim(
+            slot,
+            &target,
+            reason.as_deref(),
+            item.as_deref(),
+            &owned_items(&store.view(), slot),
+            unix_now(),
+        ),
+        Request::ReleaseTarget { slot, target } => locks.release(slot, &target, unix_now()),
+        Request::ForceRelease { target, holder } => {
+            locks.force_release(&target, holder, unix_now())
+        }
+        Request::SendRelay { from, to, text } => {
+            // An empty or exited slot has no session to type into; a
+            // resumable one gets it once resumed.
+            let live = valid_id(to)
+                && !matches!(
+                    manager.lock().unwrap().list()[to as usize].state,
+                    SlotState::Empty | SlotState::Exited { .. }
+                );
+            crate::relay::send(locks, from, to, &text, live, unix_now())
+        }
+        // Answered in `handle_frame` from a task; this arm only keeps the
+        // match whole.
+        Request::CheckBash(_) => Response::Verdict { deny: None },
         Request::Kickoff { slot } if !valid_id(slot) => err(format!("invalid slot id {slot}")),
         Request::Kickoff { slot } => {
             let items = store.view().items;
@@ -439,18 +637,39 @@ fn handle_request(
             cwd,
             command,
             prompt,
-        } => match manager
-            .lock()
-            .unwrap()
-            .start(id, label, &cwd, command, prompt)
-        {
-            Ok(()) => Response::Ok,
-            Err(m) => err(m),
-        },
-        Request::StopSlot { id } => match manager.lock().unwrap().stop(id) {
-            Ok(()) => Response::Ok,
-            Err(m) => err(m),
-        },
+        } => {
+            // Held across both, so no other start or stop comes between.
+            let mut m = manager.lock().unwrap();
+            // A fresh start replaces whatever session the slot had (an
+            // exited one, perhaps not announced yet, or a resumable one):
+            // its waits, unused grants and pending relays are not the new
+            // session's. A resume keeps them.
+            let running =
+                valid_id(id) && matches!(m.list()[id as usize].state, SlotState::Running { .. });
+            if !running {
+                locks.on_session_ended(id, unix_now());
+            }
+            match m.start(id, label, &cwd, command, prompt) {
+                Ok(()) => Response::Ok,
+                Err(e) => err(e),
+            }
+        }
+        Request::StopSlot { id } => {
+            let mut m = manager.lock().unwrap();
+            // Stopping a resumable slot declines it: that session has ended
+            // and no exit event will say so.
+            let declined =
+                valid_id(id) && matches!(m.list()[id as usize].state, SlotState::Resumable { .. });
+            match m.stop(id) {
+                Ok(()) => {
+                    if declined {
+                        locks.on_session_ended(id, unix_now());
+                    }
+                    Response::Ok
+                }
+                Err(e) => err(e),
+            }
+        }
         Request::ResumeSlot { id } => match manager.lock().unwrap().resume(id) {
             Ok(()) => Response::Ok,
             Err(m) => err(m),
@@ -483,6 +702,7 @@ fn handle_request(
         // because of the daemon's state.
         Request::Hook(ev) => {
             manager.lock().unwrap().hook(&ev);
+            locks.on_hook(&ev, unix_now());
             Response::Ok
         }
     }

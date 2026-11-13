@@ -60,6 +60,7 @@ fn silent_and_fast_with_a_daemon() {
         state_dir: home.join("state"),
         hook_program: std::path::PathBuf::from("/bin/true"),
         // No real beads or Jira.
+        patterns: overseer_daemon::locks::targets::default_patterns(),
         settings: overseer_daemon::Config {
             beads_dir: "/nonexistent/overseer-test-beads".into(),
             brain_dir: "/nonexistent/overseer-test-brain".into(),
@@ -95,10 +96,23 @@ fn bare_hook_without_event_is_silent_and_exits_zero() {
 
 /// A listener at `home/overseer.sock` that reads one frame, hands it to the
 /// returned channel and, if `reply`, answers Ok. Otherwise it stays silent
-/// and holds the connection open.
+/// and holds the connection open for 500 ms.
 fn fake_daemon(
     home: &std::path::Path,
     reply: bool,
+) -> (
+    std::sync::mpsc::Receiver<Frame>,
+    std::thread::JoinHandle<()>,
+) {
+    let answer = reply.then_some(Response::Ok);
+    fake_daemon_with(home, answer, Duration::from_millis(500))
+}
+
+/// `fake_daemon` answering `answer`, or silent for `hold` when `None`.
+fn fake_daemon_with(
+    home: &std::path::Path,
+    answer: Option<Response>,
+    hold: Duration,
 ) -> (
     std::sync::mpsc::Receiver<Frame>,
     std::thread::JoinHandle<()>,
@@ -120,18 +134,11 @@ fn fake_daemon(
                 _ => 0,
             };
             tx.send(f).unwrap();
-            if reply {
-                write_frame(
-                    &mut s,
-                    &Frame::Response {
-                        seq,
-                        resp: Response::Ok,
-                    },
-                )
-                .await
-                .unwrap();
-            } else {
-                tokio::time::sleep(Duration::from_millis(500)).await;
+            match answer {
+                Some(resp) => write_frame(&mut s, &Frame::Response { seq, resp })
+                    .await
+                    .unwrap(),
+                None => tokio::time::sleep(hold).await,
             }
         });
     });
@@ -173,5 +180,136 @@ fn a_listener_that_never_replies_does_not_hold_the_hook() {
         }
     ));
     t.join().unwrap();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+const BASH: &[u8] = br#"{"session_id":"abc","hook_event_name":"PreToolUse","tool_name":"Bash","tool_use_id":"tu-1","cwd":"/tmp","tool_input":{"command":"git push"}}"#;
+
+/// Runs `overseer hook PreToolUse` with `stdin`; checks it exits 0 with no
+/// stderr and returns stdout and how long it took.
+fn run_pre_tool_use(home: &std::path::Path, stdin: &[u8]) -> (String, Duration) {
+    let _ = Command::new(env!("CARGO_BIN_EXE_overseer"))
+        .arg("hook")
+        .stdin(Stdio::null())
+        .output();
+    let start = Instant::now();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_overseer"))
+        .args(["hook", "PreToolUse"])
+        .env("OVERSEER_HOME", home)
+        .env("OVERSEER_SLOT", "S1")
+        .env("ARGOCD_SERVER", "uat")
+        .env("NOT_ALLOWED", "x")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(stdin).unwrap();
+    let out = child.wait_with_output().unwrap();
+    let took = start.elapsed();
+    assert!(out.status.success(), "status {:?}", out.status);
+    assert!(out.stderr.is_empty(), "stderr: {:?}", out.stderr);
+    (String::from_utf8(out.stdout).unwrap(), took)
+}
+
+fn temp_home(tag: &str) -> std::path::PathBuf {
+    let home = std::env::temp_dir().join(format!("ovhook-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    home
+}
+
+#[test]
+fn pre_tool_use_allows_silently_without_a_daemon() {
+    let home = temp_home("pnod");
+    let (out, took) = run_pre_tool_use(&home, BASH);
+    assert!(out.is_empty(), "stdout: {out:?}");
+    assert!(took < Duration::from_millis(1500), "took {took:?}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn pre_tool_use_allows_when_the_daemon_never_answers() {
+    let home = temp_home("psil");
+    let (rx, t) = fake_daemon_with(&home, None, Duration::from_secs(3));
+    let (out, took) = run_pre_tool_use(&home, BASH);
+    assert!(out.is_empty(), "stdout: {out:?}");
+    assert!(took < Duration::from_millis(1500), "took {took:?}");
+    assert!(matches!(
+        rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        Frame::Request {
+            req: Request::CheckBash(_),
+            ..
+        }
+    ));
+    t.join().unwrap();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn pre_tool_use_prints_the_deny() {
+    let home = temp_home("pdeny");
+    let reason = "Overseer: repo:demo-api:main is held by S2. Wait.";
+    let answer = Response::Verdict {
+        deny: Some(reason.into()),
+    };
+    let (rx, t) = fake_daemon_with(&home, Some(answer), Duration::ZERO);
+    let (out, _) = run_pre_tool_use(&home, BASH);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        v,
+        serde_json::json!({"hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }})
+    );
+    let Frame::Request {
+        req: Request::CheckBash(check),
+        ..
+    } = rx.recv_timeout(Duration::from_secs(2)).unwrap()
+    else {
+        panic!("not a bash check");
+    };
+    assert_eq!(check.slot, 1);
+    assert_eq!(check.command, "git push");
+    assert_eq!(check.session_id.as_deref(), Some("abc"));
+    assert_eq!(check.tool_use_id.as_deref(), Some("tu-1"));
+    assert_eq!(check.cwd.as_deref(), Some(std::path::Path::new("/tmp")));
+    // Only the allowlisted variables go.
+    assert!(check.env.contains(&("ARGOCD_SERVER".into(), "uat".into())));
+    assert!(check.env.iter().all(|(k, _)| k != "NOT_ALLOWED"));
+    t.join().unwrap();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn pre_tool_use_allows_when_the_daemon_allows() {
+    let home = temp_home("pallow");
+    let (rx, t) = fake_daemon_with(
+        &home,
+        Some(Response::Verdict { deny: None }),
+        Duration::ZERO,
+    );
+    let (out, _) = run_pre_tool_use(&home, BASH);
+    assert!(out.is_empty(), "stdout: {out:?}");
+    rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    t.join().unwrap();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn pre_tool_use_ignores_other_tools() {
+    let home = temp_home("pother");
+    let answer = Response::Verdict {
+        deny: Some("no".into()),
+    };
+    // Never joined: it waits for a connection that must not come.
+    let (rx, _t) = fake_daemon_with(&home, Some(answer), Duration::ZERO);
+    let edit = br#"{"tool_name":"Edit","tool_use_id":"tu-2","tool_input":{"file_path":"/a"}}"#;
+    let (out, took) = run_pre_tool_use(&home, edit);
+    assert!(out.is_empty(), "stdout: {out:?}");
+    assert!(took < Duration::from_millis(200), "took {took:?}");
+    assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
     let _ = std::fs::remove_dir_all(&home);
 }

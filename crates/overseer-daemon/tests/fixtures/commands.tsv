@@ -1,0 +1,58 @@
+# Expected targets (comma separated, or -) TAB command. Invented names only.
+# Checked with the fake context: cwd /work/demo-api, repo = folder name,
+# branch feature-x, argo context uat, kube context staging-eu, workspace default.
+# \n in a command is a newline.
+repo:demo-api:feature-x	git push
+repo:demo-api:feature-x	git push -u origin HEAD
+repo:demo-api:main	git push origin HEAD:main
+repo:demo-api:main,repo:demo-api:feature-y	git push origin +main feature-y
+repo:demo-api:release-2	git push origin refs/heads/release-2
+repo:demo-api:*	git push --all origin
+repo:demo-web:feature-x	cd ../demo-web && git push
+repo:demo-web:main	git -C ../demo-web push origin HEAD:main
+repo:demo-api:feature-x	git push 2>&1 | tail -n 5
+repo:demo-api:feature-x	git status && git push # then -n is only a comment
+-	git push --dry-run
+-	git push -n origin main
+-	git log --oneline -5
+-	git commit -m "then git push"
+-	git commit -m 'git push origin main' && git log
+argo:uat/demo-api	argocd app sync demo-api
+argo:uat/demo-api	argocd app set demo-api --helm-set image.tag=v2
+argo:uat/demo-api	argocd app set demo-api --revision abc123
+argo:uat/demo-api	argocd app set demo-api --revision=main
+argo:uat-two/demo-api	argocd app sync demo-api --argocd-context uat-two
+-	argocd app get demo-api
+-	argocd app sync demo-api --dry-run
+-	echo 'argocd app sync demo-api'
+deploy:trigger.dev/prod	npx trigger.dev@latest deploy
+deploy:trigger.dev/staging	npx trigger.dev@4.0.1 deploy --env staging
+deploy:trigger.dev/staging	pnpm dlx trigger.dev deploy -e staging
+deploy:trigger.dev/prod	bunx trigger.dev deploy
+-	npx trigger.dev@latest dev
+tf:default	terraform apply -auto-approve
+tf:default	FOO=1 tofu destroy
+tf:default	env TF_LOG=debug terraform -chdir=../infra apply
+-	terraform plan
+-	grep "terraform apply" notes.md
+kube:staging-eu/default	kubectl apply -f deploy.yaml
+kube:staging-eu/demo	kubectl -n demo delete pod demo-api-0
+kube:staging-eu/demo	kubectl patch deploy demo-api --namespace=demo -p '{"spec":{}}'
+kube:uat-eu/demo	kubectl --context uat-eu -n demo apply -f x.yaml
+-	kubectl apply --dry-run=client -f x.yaml
+-	kubectl apply -f x.yaml --dry-run=server
+-	kubectl get pods
+-	cat <<EOF\nkubectl apply -f x\nEOF
+-	cat <<'EOF' > notes.md\ngit push origin main\nEOF
+kube:staging-eu/default	cat <<EOF | kubectl apply -f -\nkind: ConfigMap\nEOF
+repo:demo-api:feature-x,tf:default	make build && git push; terraform apply
+# Known limits (docs/acceptance/phase-4.md, L8 and L9). These pin what happens
+# today, not what is right. --kubeconfig is ignored, so the context is the
+# current one and two kubeconfigs share a target.
+kube:staging-eu/default	kubectl --kubeconfig other.yaml apply -f x.yaml
+kube:staging-eu/demo	kubectl --kubeconfig=other.yaml -n demo delete pod x
+# A variable is not expanded: the folder name is taken as written.
+repo:$DIR:feature-x	cd "$DIR" && git push
+# A flag before the app name hides the write (fails open).
+-	argocd app sync --grpc-web demo-api
+-	argocd --grpc-web app sync demo-api

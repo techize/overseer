@@ -25,6 +25,7 @@ async fn burst(tag: &str, command: Option<Vec<String>>, input: &[u8], end: &str)
         state_dir: dir.join("state"),
         hook_program: std::path::PathBuf::from("/bin/true"),
         // No real beads or Jira.
+        patterns: overseer_daemon::locks::targets::default_patterns(),
         settings: overseer_daemon::Config {
             beads_dir: "/nonexistent/overseer-test-beads".into(),
             brain_dir: "/nonexistent/overseer-test-brain".into(),

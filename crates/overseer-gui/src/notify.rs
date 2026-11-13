@@ -11,7 +11,7 @@
 
 use std::sync::Mutex;
 
-use overseer_proto::{slot_name, ActivityKind, SlotId, SlotInfo};
+use overseer_proto::{slot_name, ActivityKind, LockView, SlotId, SlotInfo};
 use tokio::sync::mpsc;
 
 /// Whether `next` should raise a notification. Only a change into NeedsYou
@@ -57,6 +57,34 @@ pub fn note_for(info: &SlotInfo) -> Note {
         title: format!("{name} needs you"),
         body,
     }
+}
+
+/// A notification for each wait in `next` that `prev` did not have (same
+/// slot, same target): `S2 blocked: repo:demo-api:main is held by S1`. A
+/// wait on a target nobody holds has nothing to name and is skipped.
+pub fn new_waits(prev: &LockView, next: &LockView) -> Vec<Note> {
+    next.waits
+        .iter()
+        .filter(|w| {
+            !prev
+                .waits
+                .iter()
+                .any(|p| p.slot == w.slot && p.target == w.target)
+        })
+        .filter_map(|w| {
+            let holder = next.claims.iter().find(|c| c.target == w.target)?;
+            Some(Note {
+                slot: w.slot,
+                title: format!(
+                    "{} blocked: {} is held by {}",
+                    slot_name(w.slot),
+                    w.target,
+                    slot_name(holder.slot)
+                ),
+                body: w.reason.clone().unwrap_or_default(),
+            })
+        })
+        .collect()
 }
 
 const ID_PREFIX: &str = "overseer-slot-";
@@ -328,6 +356,7 @@ mod tests {
                 since: 5,
                 now_doing: None,
                 reason: reason.map(String::from),
+                idle_wait: false,
             }),
         }
     }
@@ -412,5 +441,64 @@ mod tests {
         assert_eq!(slot_from_identifier("overseer-slot-x-1"), None);
         assert_eq!(slot_from_identifier("overseer-slot-9"), None);
         assert_eq!(slot_from_identifier("something-else"), None);
+    }
+
+    #[test]
+    fn new_wait_notifies_once() {
+        use overseer_proto::{Claim, ClaimKind, Wait};
+        let claim = Claim {
+            target: "repo:demo-api:main".into(),
+            slot: 1,
+            kind: ClaimKind::Command,
+            reason: None,
+            item: None,
+            since: 0,
+            last_used: 0,
+            pin_revision: None,
+        };
+        let wait = |slot, target: &str| Wait {
+            target: target.into(),
+            slot,
+            at: 0,
+            reason: None,
+        };
+        let view = |waits| LockView {
+            claims: vec![claim.clone()],
+            waits,
+            relays: vec![],
+            flag_after_secs: 3600,
+        };
+        let none = view(vec![]);
+        let one = view(vec![wait(2, "repo:demo-api:main")]);
+        let notes = new_waits(&none, &one);
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].slot, 2);
+        assert_eq!(
+            notes[0].title,
+            "S2 blocked: repo:demo-api:main is held by S1"
+        );
+        // The same wait again, or one that merely stays, is not new.
+        assert!(new_waits(&one, &one).is_empty());
+        // A second wait notifies for itself only.
+        let two = view(vec![
+            wait(2, "repo:demo-api:main"),
+            wait(3, "repo:demo-api:main"),
+        ]);
+        let notes = new_waits(&one, &two);
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].slot, 3);
+        // Waiting on a second target is new for that target.
+        let other = view(vec![wait(2, "repo:demo-api:main"), wait(2, "tf:demo")]);
+        let mut held = other.clone();
+        held.claims.push(Claim {
+            target: "tf:demo".into(),
+            slot: 4,
+            ..claim.clone()
+        });
+        let notes = new_waits(&one, &held);
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].title.ends_with("tf:demo is held by S4"));
+        // The wait going away notifies nothing.
+        assert!(new_waits(&two, &none).is_empty());
     }
 }

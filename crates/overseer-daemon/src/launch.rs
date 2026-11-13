@@ -24,8 +24,9 @@ const PREVIOUS_COORDINATOR: &[u64] = &[
     0x2053126dcf7ec248,
     0xfb1eff022d50a360,
     0x4baeb879ce73cf13,
+    0x7ddaa223f4bdd1f6,
 ];
-const PREVIOUS_WORKER: &[u64] = &[0x215de771dfd84eb4];
+const PREVIOUS_WORKER: &[u64] = &[0x215de771dfd84eb4, 0xbd3ab0020d4d25b1];
 const PREVIOUS_KICKOFF: &[u64] = &[];
 const PREVIOUS_ASSIGNMENT: &[u64] = &[];
 
@@ -151,12 +152,32 @@ pub fn first_prompt(
 }
 
 /// The hook events Overseer listens to.
-const HOOK_EVENTS: [&str; 5] = [
+const HOOK_EVENTS: [&str; 6] = [
     "SessionStart",
     "UserPromptSubmit",
     "Notification",
     "Stop",
     "PostToolUse",
+    "PreToolUse",
+];
+
+/// The tool matcher and timeout (seconds) of each hook. `PreToolUse` is the
+/// lock check, which may take up to 1 s, so it gets more room; it only runs
+/// for Bash.
+fn hook_shape(event: &str) -> (Option<&'static str>, u64) {
+    match event {
+        "PostToolUse" => (Some("*"), 2),
+        "PreToolUse" => (Some("Bash"), 5),
+        _ => (None, 2),
+    }
+}
+
+/// The Overseer MCP tools a session may use without being asked.
+const ALLOWED_TOOLS: [&str; 4] = [
+    "mcp__overseer__claim_target",
+    "mcp__overseer__release_target",
+    "mcp__overseer__notify_session",
+    "mcp__overseer__list_targets",
 ];
 
 /// Files generated for one slot's start.
@@ -164,6 +185,8 @@ const HOOK_EVENTS: [&str; 5] = [
 pub struct LaunchFiles {
     pub settings: PathBuf,
     pub role: PathBuf,
+    /// The MCP config naming `overseer mcp` for this slot.
+    pub mcp: PathBuf,
 }
 
 /// How the session id is given to claude.
@@ -217,26 +240,45 @@ fn settings_json(overseer_bin: &Path) -> String {
     let bin = shell_quote(&overseer_bin.to_string_lossy());
     let mut hooks = serde_json::Map::new();
     for event in HOOK_EVENTS {
+        let (matcher, timeout) = hook_shape(event);
         let mut entry = serde_json::Map::new();
-        if event == "PostToolUse" {
-            entry.insert("matcher".into(), "*".into());
+        if let Some(m) = matcher {
+            entry.insert("matcher".into(), m.into());
         }
         entry.insert(
             "hooks".into(),
             serde_json::json!([{
                 "type": "command",
                 "command": format!("{bin} hook {event}"),
-                "timeout": 2,
+                "timeout": timeout,
             }]),
         );
         hooks.insert(event.into(), serde_json::json!([entry]));
     }
-    serde_json::to_string_pretty(&serde_json::json!({ "hooks": hooks }))
-        .expect("settings serialise")
+    serde_json::to_string_pretty(&serde_json::json!({
+        "hooks": hooks,
+        "permissions": { "allow": ALLOWED_TOOLS },
+    }))
+    .expect("settings serialise")
 }
 
-/// Writes `slots/S<n>/settings.json` and `role.md` under `state_dir`,
-/// replacing both on every start. The role is copied from
+/// The slot's MCP config: `overseer mcp` over stdio, told its slot.
+fn mcp_json(overseer_bin: &Path, slot: SlotId) -> String {
+    serde_json::to_string_pretty(&serde_json::json!({
+        "mcpServers": {
+            "overseer": {
+                "type": "stdio",
+                "command": overseer_bin.to_string_lossy(),
+                "args": ["mcp"],
+                "env": { "OVERSEER_SLOT": slot_name(slot) },
+            }
+        }
+    }))
+    .expect("mcp config serialises")
+}
+
+/// Writes `slots/S<n>/settings.json`, `mcp.json` and `role.md` under
+/// `state_dir`, replacing them on every start. The role is copied from
 /// `roles/coordinator.md` for S0 and `roles/worker.md` otherwise (created from the compiled-in default if missing;
 /// an unedited older default is upgraded, an edited file is kept) with `{slot}`, `{label}` and `{overseer}` filled in.
 pub fn write_slot_files(
@@ -269,8 +311,10 @@ pub fn write_slot_files(
     let files = LaunchFiles {
         settings: dir.join("settings.json"),
         role: dir.join("role.md"),
+        mcp: dir.join("mcp.json"),
     };
     std::fs::write(&files.settings, settings_json(overseer_bin))?;
+    std::fs::write(&files.mcp, mcp_json(overseer_bin, slot))?;
     std::fs::write(&files.role, role_text)?;
     Ok(files)
 }
@@ -300,6 +344,8 @@ pub fn claude_argv(
             .to_string(),
         "--settings".into(),
         files.settings.to_string_lossy().into_owned(),
+        "--mcp-config".into(),
+        files.mcp.to_string_lossy().into_owned(),
         "--append-system-prompt-file".into(),
         files.role.to_string_lossy().into_owned(),
     ]);
@@ -350,6 +396,7 @@ mod tests {
         LaunchFiles {
             settings: "/st/slots/S2/settings.json".into(),
             role: "/st/slots/S2/role.md".into(),
+            mcp: "/st/slots/S2/mcp.json".into(),
         }
     }
 
@@ -378,6 +425,8 @@ mod tests {
                 "S2 api",
                 "--settings",
                 "/st/slots/S2/settings.json",
+                "--mcp-config",
+                "/st/slots/S2/mcp.json",
                 "--append-system-prompt-file",
                 "/st/slots/S2/role.md",
             ])[..]
@@ -399,34 +448,94 @@ mod tests {
         assert_eq!(argv[i + 1], "uuid-9");
     }
 
+    fn json(path: &Path) -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
     #[test]
-    fn settings_file_has_five_hooks_pointing_at_the_binary() {
+    fn settings_file_has_six_hooks() {
         let dir = temp("settings");
         let bin = Path::new("/Applications/My App/overseer");
         let f = write_slot_files(&dir, 3, "api", bin).unwrap();
-        let v: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&f.settings).unwrap()).unwrap();
+        let v = json(&f.settings);
         let hooks = v["hooks"].as_object().unwrap();
-        assert_eq!(hooks.len(), 5);
+        assert_eq!(hooks.len(), 6);
         for ev in HOOK_EVENTS {
             let entry = &hooks[ev][0];
             let h = &entry["hooks"][0];
             assert_eq!(h["type"], "command");
-            assert_eq!(h["timeout"], 2);
             assert_eq!(
                 h["command"],
                 format!("'/Applications/My App/overseer' hook {ev}")
             );
-            if ev == "PostToolUse" {
-                assert_eq!(entry["matcher"], "*");
-            } else {
-                assert!(entry.get("matcher").is_none(), "{ev}");
+            match ev {
+                "PostToolUse" => {
+                    assert_eq!(entry["matcher"], "*");
+                    assert_eq!(h["timeout"], 2);
+                }
+                "PreToolUse" => {
+                    assert_eq!(entry["matcher"], "Bash");
+                    assert_eq!(h["timeout"], 5);
+                }
+                _ => {
+                    assert!(entry.get("matcher").is_none(), "{ev}");
+                    assert_eq!(h["timeout"], 2);
+                }
             }
         }
         let role = std::fs::read_to_string(&f.role).unwrap();
         assert!(role.contains("You are S3 of an Overseer team"), "{role}");
         assert!(role.contains("working on api."), "{role}");
         assert!(f.settings.ends_with("slots/S3/settings.json"));
+    }
+
+    #[test]
+    fn settings_allow_the_overseer_tools() {
+        let dir = temp("allow");
+        let f = write_slot_files(&dir, 2, "api", Path::new("/o")).unwrap();
+        let v = json(&f.settings);
+        assert_eq!(
+            v["permissions"]["allow"],
+            serde_json::json!([
+                "mcp__overseer__claim_target",
+                "mcp__overseer__release_target",
+                "mcp__overseer__notify_session",
+                "mcp__overseer__list_targets",
+            ])
+        );
+    }
+
+    #[test]
+    fn mcp_file_names_the_slot() {
+        let dir = temp("mcp");
+        let bin = Path::new("/Applications/My App/overseer");
+        let f = write_slot_files(&dir, 4, "api", bin).unwrap();
+        assert!(f.mcp.ends_with("slots/S4/mcp.json"));
+        assert_eq!(
+            json(&f.mcp),
+            serde_json::json!({"mcpServers": {"overseer": {
+                "type": "stdio",
+                "command": "/Applications/My App/overseer",
+                "args": ["mcp"],
+                "env": {"OVERSEER_SLOT": "S4"},
+            }}})
+        );
+    }
+
+    #[test]
+    fn argv_passes_mcp_config() {
+        let argv = claude_argv(
+            &s(&["claude"]),
+            2,
+            "api",
+            &files(),
+            Start::Resume("u".into()),
+            None,
+        );
+        let i = argv.iter().position(|a| a == "--mcp-config").unwrap();
+        assert_eq!(argv[i + 1], "/st/slots/S2/mcp.json");
+        assert_eq!(argv[i - 2], "--settings");
+        assert_eq!(argv.iter().filter(|a| *a == "--mcp-config").count(), 1);
     }
 
     #[test]
@@ -682,7 +791,68 @@ mod tests {
             "{role}"
         );
         assert!(role.contains("ctl send <n> '<text>'"), "{role}");
+        assert!(role.contains("ctl send 0 --raw"), "{role}");
+        assert!(role.contains("call `notify_session`"), "{role}");
+        assert!(
+            role.contains("Never claim targets on a worker's behalf."),
+            "{role}"
+        );
         assert!(role.contains("'\\''"), "{role}");
         assert!(!role.contains("--prompt \""), "{role}");
+    }
+
+    const PHASE_3_WORKER: &str = include_str!("../tests/fixtures/roles-phase3/worker.md");
+    const PHASE_3_COORDINATOR: &str = include_str!("../tests/fixtures/roles-phase3/coordinator.md");
+
+    #[test]
+    fn phase_3_roles_upgrade() {
+        assert_eq!(text_hash(PHASE_3_WORKER), 0xbd3ab0020d4d25b1);
+        assert_eq!(text_hash(PHASE_3_COORDINATOR), 0x7ddaa223f4bdd1f6);
+        assert!(PREVIOUS_WORKER.contains(&text_hash(PHASE_3_WORKER)));
+        assert!(PREVIOUS_COORDINATOR.contains(&text_hash(PHASE_3_COORDINATOR)));
+        let dir = temp("phase3");
+        let roles = dir.join("roles");
+        std::fs::create_dir_all(&roles).unwrap();
+        std::fs::write(roles.join("worker.md"), PHASE_3_WORKER).unwrap();
+        std::fs::write(roles.join("coordinator.md"), PHASE_3_COORDINATOR).unwrap();
+        write_slot_files(&dir, 1, "lbl", Path::new("/Apps/overseer")).unwrap();
+        write_slot_files(&dir, 0, "lbl", Path::new("/Apps/overseer")).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(roles.join("worker.md")).unwrap(),
+            WORKER_ROLE
+        );
+        assert_eq!(
+            std::fs::read_to_string(roles.join("coordinator.md")).unwrap(),
+            COORDINATOR_ROLE
+        );
+        assert!(!roles.join("worker.md.new").exists());
+        assert!(!roles.join("coordinator.md.new").exists());
+    }
+
+    #[test]
+    fn worker_role_names_the_tools() {
+        let dir = temp("workertools");
+        let f = write_slot_files(&dir, 2, "lbl", Path::new("/Apps/overseer")).unwrap();
+        let role = std::fs::read_to_string(f.role).unwrap();
+        for t in [
+            "claim_target",
+            "release_target",
+            "notify_session",
+            "list_targets",
+        ] {
+            assert!(role.contains(&format!("`{t}`")), "{t}: {role}");
+        }
+        assert!(
+            role.contains("Overseer locks shared write targets"),
+            "{role}"
+        );
+        assert!(!role.contains('\u{2014}'), "no em dashes");
+    }
+
+    #[test]
+    fn coordinator_role_reads_the_journal() {
+        assert!(COORDINATOR_ROLE.contains("Before you propose work, read today's journal."));
+        assert!(COORDINATOR_ROLE.contains("date '+%Y/%m-%B/%Y-%m-%d'"));
+        assert!(COORDINATOR_ROLE.contains("06-Daily/"));
     }
 }

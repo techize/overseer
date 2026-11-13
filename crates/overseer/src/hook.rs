@@ -1,17 +1,24 @@
 //! `overseer hook <Event>`: relays one Claude Code hook event to the daemon.
 //!
 //! Claude runs this on every hook, so it must be fast and silent. Stdout of
-//! some hook events is fed back into the conversation, so nothing is ever
-//! printed. Every failure exits 0 so a hook problem never disturbs a session.
+//! some hook events is fed back into the conversation, so nothing is
+//! printed, except the deny decision of `PreToolUse`. Every failure exits 0
+//! so a hook problem never disturbs a session.
 
-use std::io::{IsTerminal, Read};
+use std::io::{IsTerminal, Read, Write};
+use std::path::PathBuf;
 use std::time::Duration;
 
-use overseer_proto::{paths, Client, HookEvent, HookKind, Request, SlotId};
+use overseer_proto::{
+    paths, BashCheck, Client, HookEvent, HookKind, Request, Response, SlotId, CHECK_ENV,
+};
 
 /// Total budget for connect plus the round trip. A hook that waits longer
 /// would slow Claude down, and a missed event is cheaper than a slow session.
 const DELIVER_WITHIN: Duration = Duration::from_millis(50);
+/// Budget for the `PreToolUse` lock check, connect included. Past it the
+/// command is allowed: a slow daemon never stops work.
+const CHECK_WITHIN: Duration = Duration::from_secs(1);
 const DETAIL_MAX: usize = 80;
 /// Slots are S0 to S6; the daemon's manager owns the same bound.
 const SLOT_COUNT: SlotId = 7;
@@ -28,7 +35,7 @@ fn kind(name: &str) -> Option<HookKind> {
 }
 
 /// `OVERSEER_SLOT` is `S<n>`; anything else is not one of our slots.
-fn slot(env: &str) -> Option<SlotId> {
+pub(crate) fn slot(env: &str) -> Option<SlotId> {
     let n: SlotId = env.strip_prefix('S')?.parse().ok()?;
     (n < SLOT_COUNT).then_some(n)
 }
@@ -61,26 +68,107 @@ pub fn parse_hook(event: &str, slot_env: &str, stdin: &[u8]) -> Option<HookEvent
         tool: text("tool_name"),
         detail: json.get("tool_input").and_then(detail),
         notification: text("message"),
+        tool_use_id: text("tool_use_id"),
+        notification_type: text("notification_type"),
     })
 }
 
-/// Runs the hook. Prints nothing and always returns, so the caller exits 0.
-pub fn run(event: &str) {
-    let Ok(slot_env) = std::env::var("OVERSEER_SLOT") else {
-        return;
-    };
+/// The lock check for a `PreToolUse` event, or `None` when the daemon need
+/// not be asked. Only Bash is checked; this is the one place that decides
+/// which tools are.
+pub fn parse_pre_tool_use(
+    slot_env: &str,
+    stdin: &[u8],
+    env: impl Fn(&str) -> Option<String>,
+) -> Option<BashCheck> {
+    let slot = slot(slot_env)?;
+    let json: serde_json::Value = serde_json::from_slice(stdin).ok()?;
+    let text = |k: &str| json.get(k)?.as_str().map(String::from);
+    if text("tool_name").as_deref() != Some("Bash") {
+        return None;
+    }
+    let command = json.get("tool_input")?.get("command")?.as_str()?.to_owned();
+    Some(BashCheck {
+        slot,
+        session_id: text("session_id"),
+        tool_use_id: text("tool_use_id"),
+        command,
+        cwd: text("cwd").map(PathBuf::from),
+        env: CHECK_ENV
+            .iter()
+            .filter_map(|k| Some((k.to_string(), env(k)?)))
+            .collect(),
+    })
+}
+
+/// Claude Code's decision JSON denying a tool call, with `reason` shown to
+/// the session.
+pub fn deny_json(reason: &str) -> String {
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }
+    })
+    .to_string()
+}
+
+fn read_stdin() -> Vec<u8> {
     let mut stdin = Vec::new();
     // A terminal would block forever waiting for EOF.
     if !std::io::stdin().is_terminal() {
         let _ = std::io::stdin().read_to_end(&mut stdin);
     }
+    stdin
+}
+
+fn runtime() -> Option<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()
+}
+
+/// Asks the daemon about a Bash command and prints the deny decision if it
+/// gives one. A missing, slow or confused daemon means allow.
+fn pre_tool_use(slot_env: &str) {
+    let stdin = read_stdin();
+    let Some(check) = parse_pre_tool_use(slot_env, &stdin, |k| std::env::var(k).ok()) else {
+        return;
+    };
+    let Some(rt) = runtime() else { return };
+    let answer = rt.block_on(async {
+        tokio::time::timeout(CHECK_WITHIN, async {
+            let client = Client::connect(paths::socket_path()).await.ok()?;
+            client.request(Request::CheckBash(check)).await.ok()
+        })
+        .await
+        .ok()
+        .flatten()
+    });
+    if let Some(Response::Verdict { deny: Some(reason) }) = answer {
+        let mut out = std::io::stdout().lock();
+        let _ = writeln!(out, "{}", deny_json(&reason));
+        let _ = out.flush();
+    }
+}
+
+/// Runs the hook. Prints nothing (but a `PreToolUse` deny) and always
+/// returns, so the caller exits 0.
+pub fn run(event: &str) {
+    let Ok(slot_env) = std::env::var("OVERSEER_SLOT") else {
+        return;
+    };
+    if event == "PreToolUse" {
+        pre_tool_use(&slot_env);
+        return;
+    }
+    let stdin = read_stdin();
     let Some(ev) = parse_hook(event, &slot_env, &stdin) else {
         return;
     };
-    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    else {
+    let Some(rt) = runtime() else {
         return;
     };
     // Plain connect: a hook must never start a daemon.
@@ -140,6 +228,48 @@ mod tests {
         assert_eq!(
             ev.notification.as_deref(),
             Some("Claude needs your permission")
+        );
+    }
+
+    #[test]
+    fn parse_hook_fills_tool_use_id_and_notification_type() {
+        let post = br#"{"tool_name":"Bash","tool_use_id":"tu-9","tool_input":{"command":"ls"}}"#;
+        let ev = parse_hook("PostToolUse", "S1", post).unwrap();
+        assert_eq!(ev.tool_use_id.as_deref(), Some("tu-9"));
+        assert_eq!(ev.notification_type, None);
+        let note = br#"{"message":"waiting","notification_type":"idle_prompt"}"#;
+        let ev = parse_hook("Notification", "S1", note).unwrap();
+        assert_eq!(ev.notification_type.as_deref(), Some("idle_prompt"));
+        assert_eq!(ev.tool_use_id, None);
+    }
+
+    #[test]
+    fn pre_tool_use_reads_bash_only() {
+        let env = |k: &str| (k == "KUBECONFIG").then(|| "/k".to_string());
+        let bash = br#"{"session_id":"s","tool_name":"Bash","tool_use_id":"tu-1","cwd":"/w","tool_input":{"command":"git push"}}"#;
+        let c = parse_pre_tool_use("S3", bash, env).unwrap();
+        assert_eq!(c.slot, 3);
+        assert_eq!(c.command, "git push");
+        assert_eq!(c.tool_use_id.as_deref(), Some("tu-1"));
+        assert_eq!(c.session_id.as_deref(), Some("s"));
+        assert_eq!(c.cwd, Some(PathBuf::from("/w")));
+        assert_eq!(c.env, [("KUBECONFIG".to_string(), "/k".to_string())]);
+        let edit = br#"{"tool_name":"Edit","tool_input":{"file_path":"/a"}}"#;
+        assert!(parse_pre_tool_use("S3", edit, env).is_none());
+        let no_command = br#"{"tool_name":"Bash","tool_input":{}}"#;
+        assert!(parse_pre_tool_use("S3", no_command, env).is_none());
+        assert!(parse_pre_tool_use("S9", bash, env).is_none());
+        assert!(parse_pre_tool_use("S3", b"junk", env).is_none());
+    }
+
+    #[test]
+    fn deny_json_is_claude_codes_shape() {
+        let v: serde_json::Value = serde_json::from_str(&deny_json("held \"x\"")).unwrap();
+        assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+        assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert_eq!(
+            v["hookSpecificOutput"]["permissionDecisionReason"],
+            "held \"x\""
         );
     }
 

@@ -10,7 +10,8 @@ use anyhow::{bail, Context};
 use clap::Subcommand;
 use overseer_proto::paths::{log_dir, socket_path};
 use overseer_proto::{
-    slot_name, Client, ItemKind, Request, Response, SlotId, SlotInfo, SlotState, WorkItem, WorkView,
+    slot_name, ClaimKind, Client, ItemKind, LockView, RelayState, Request, Response, SlotId,
+    SlotInfo, SlotState, WorkItem, WorkView,
 };
 
 #[derive(Subcommand)]
@@ -35,8 +36,29 @@ pub enum CtlCmd {
     Stop { n: SlotId },
     /// Continue a session that was running when the daemon stopped.
     Resume { n: SlotId },
-    /// Type text into a slot, followed by Enter.
-    Send { n: SlotId, text: String },
+    /// Queue a message for a slot's session. It is typed in when the session
+    /// is idle, as `$OVERSEER_SLOT` when set and as you otherwise.
+    Send {
+        n: SlotId,
+        text: String,
+        /// Type the text in at once, followed by Enter, without queueing.
+        #[arg(long)]
+        raw: bool,
+    },
+    /// List held targets, who waits for them and pending relays.
+    Locks {
+        /// Print the raw LockView as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Claim a write target for a slot, queueing it if another slot holds it.
+    Claim {
+        slot: SlotId,
+        target: String,
+        reason: Option<String>,
+    },
+    /// Take a slot's hold on a target away and grant it to the next waiter.
+    ForceRelease { target: String },
     /// List work items with owners, source health and notices.
     Items {
         /// Print the raw WorkView as JSON.
@@ -55,8 +77,12 @@ pub enum CtlCmd {
         #[arg(long = "move")]
         move_owner: bool,
     },
-    /// Free a work item.
-    Release { key: String },
+    /// Free a work item (`release <key>`) or a claimed target (`release
+    /// <slot> <target>`).
+    Release {
+        first: String,
+        target: Option<String>,
+    },
     /// Re-read the work sources now.
     Refresh,
     /// Print the kickoff text for a slot's assigned items.
@@ -152,7 +178,7 @@ fn expect_ok(resp: Response) -> anyhow::Result<()> {
 }
 
 /// Unix seconds as local HH:MM.
-fn local_hhmm(at: i64) -> String {
+pub(crate) fn local_hhmm(at: i64) -> String {
     let t = at as libc::time_t;
     // SAFETY: localtime_r writes only into the zeroed tm we pass.
     let tm = unsafe {
@@ -163,6 +189,114 @@ fn local_hhmm(at: i64) -> String {
         tm
     };
     format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
+}
+
+/// A slot given as `3` or `S3`.
+fn parse_slot(text: &str) -> anyhow::Result<SlotId> {
+    let name = if text.starts_with('S') {
+        text.to_string()
+    } else {
+        format!("S{text}")
+    };
+    crate::hook::slot(&name).with_context(|| format!("not a slot: {text}"))
+}
+
+/// Cut to `max` chars on one line, with `...` when cut.
+fn cut(text: &str, max: usize) -> String {
+    let line = text.lines().next().unwrap_or("");
+    if line.chars().count() > max || text.lines().count() > 1 {
+        let head: String = line.chars().take(max.saturating_sub(3)).collect();
+        format!("{head}...")
+    } else {
+        line.to_string()
+    }
+}
+
+/// One line per claim (`repo:demo-api:main  S1  command  since 08:40  for
+/// DEMO-33`, plus `  at <rev>` for a pin and `  held long` when flagged)
+/// with its waiters beneath, then pending and dropped relays. Waits on a
+/// target nobody holds follow the claims.
+pub fn format_locks(v: &LockView, now: i64) -> Vec<String> {
+    let kind = |k: &ClaimKind| match k {
+        ClaimKind::Command => "command",
+        ClaimKind::Grant => "grant",
+        ClaimKind::Claim => "claim",
+        ClaimKind::Pin => "pin",
+    };
+    let waiting = |w: &overseer_proto::Wait| {
+        format!(
+            "  waiting: {} since {}",
+            slot_name(w.slot),
+            local_hhmm(w.at)
+        )
+    };
+    let mut out = Vec::new();
+    for c in &v.claims {
+        let mut line = format!(
+            "{}  {}  {}  since {}",
+            c.target,
+            slot_name(c.slot),
+            kind(&c.kind),
+            local_hhmm(c.since)
+        );
+        if let Some(why) = c.item.as_deref().or(c.reason.as_deref()) {
+            line.push_str(&format!("  for {why}"));
+        }
+        if let Some(rev) = &c.pin_revision {
+            line.push_str(&format!("  at {rev}"));
+        }
+        if v.flagged(c, now) {
+            line.push_str("  held long");
+        }
+        out.push(line);
+        out.extend(v.waits.iter().filter(|w| w.target == c.target).map(waiting));
+    }
+    for w in v
+        .waits
+        .iter()
+        .filter(|w| !v.claims.iter().any(|c| c.target == w.target))
+    {
+        out.push(w.target.clone());
+        out.push(waiting(w));
+    }
+    for r in &v.relays {
+        let state = match (r.state, r.held.as_deref()) {
+            (RelayState::Delivered, _) => continue,
+            (RelayState::Dropped, _) => "dropped: session ended".to_string(),
+            // No reason from the courier yet: it simply has not been delivered.
+            (RelayState::Pending, None) => "pending".to_string(),
+            (RelayState::Pending, Some(why)) => format!("pending ({why})"),
+        };
+        out.push(format!(
+            "relay  {}  {state}  {}",
+            slot_name(r.to),
+            cut(&r.text, 80)
+        ));
+    }
+    out
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Prints a `Text` reply; `Queued` prints its message and exits 2.
+fn print_text_or_queued(resp: Response) -> anyhow::Result<()> {
+    match resp {
+        Response::Text { text } => {
+            println!("{text}");
+            Ok(())
+        }
+        Response::Queued { message } => {
+            println!("{message}");
+            std::process::exit(2);
+        }
+        Response::Error { message } => bail!("{message}"),
+        other => bail!("unexpected reply: {other:?}"),
+    }
 }
 
 fn item_line(v: &WorkView, i: &WorkItem, indent: &str) -> String {
@@ -260,7 +394,7 @@ pub async fn run(cmd: CtlCmd) -> anyhow::Result<()> {
         }
         CtlCmd::Stop { n } => expect_ok(client.request(Request::StopSlot { id: n }).await?),
         CtlCmd::Resume { n } => expect_ok(client.request(Request::ResumeSlot { id: n }).await?),
-        CtlCmd::Send { n, text } => {
+        CtlCmd::Send { n, text, raw: true } => {
             client.send_input(n, format!("{text}\r").as_bytes()).await?;
             // Input is fire-and-forget; a round trip proves the daemon read it
             // (it handles frames in order) before this process exits.
@@ -272,6 +406,56 @@ pub async fn run(cmd: CtlCmd) -> anyhow::Result<()> {
                     .await?,
             )
         }
+        CtlCmd::Send {
+            n,
+            text,
+            raw: false,
+        } => {
+            let from = std::env::var("OVERSEER_SLOT")
+                .ok()
+                .and_then(|s| crate::hook::slot(&s));
+            print_text_or_queued(
+                client
+                    .request(Request::SendRelay { from, to: n, text })
+                    .await?,
+            )
+        }
+        CtlCmd::Locks { json } => match client.request(Request::ListLocks).await? {
+            Response::Locks(v) => {
+                if json {
+                    println!("{}", serde_json::to_string(&v)?);
+                } else {
+                    for l in format_locks(&v, now_secs()) {
+                        println!("{l}");
+                    }
+                }
+                Ok(())
+            }
+            Response::Error { message } => bail!("{message}"),
+            other => bail!("unexpected reply: {other:?}"),
+        },
+        CtlCmd::Claim {
+            slot,
+            target,
+            reason,
+        } => print_text_or_queued(
+            client
+                .request(Request::ClaimTarget {
+                    slot,
+                    target,
+                    reason,
+                    item: None,
+                })
+                .await?,
+        ),
+        CtlCmd::ForceRelease { target } => print_text_or_queued(
+            client
+                .request(Request::ForceRelease {
+                    target,
+                    holder: None,
+                })
+                .await?,
+        ),
         CtlCmd::Items { json } => match client.request(Request::ListWorkItems).await? {
             Response::Work(v) => {
                 if json {
@@ -306,7 +490,21 @@ pub async fn run(cmd: CtlCmd) -> anyhow::Result<()> {
             }
             other => expect_ok(other),
         },
-        CtlCmd::Release { key } => expect_ok(client.request(Request::Release { key }).await?),
+        CtlCmd::Release {
+            first,
+            target: None,
+        } => expect_ok(client.request(Request::Release { key: first }).await?),
+        CtlCmd::Release {
+            first,
+            target: Some(target),
+        } => print_text_or_queued(
+            client
+                .request(Request::ReleaseTarget {
+                    slot: parse_slot(&first)?,
+                    target,
+                })
+                .await?,
+        ),
         CtlCmd::Refresh => match client.request(Request::RefreshWorkItems).await? {
             Response::Work(v) => {
                 for l in format_sources(&v) {
@@ -337,6 +535,58 @@ mod tests {
     struct Cli {
         #[command(subcommand)]
         cmd: CtlCmd,
+    }
+
+    #[test]
+    fn locks_lines_show_pins_and_relay_states() {
+        use overseer_proto::{Claim, Relay, Sender};
+        let relay = |id, to, state, held: Option<&str>, text: &str| Relay {
+            id,
+            at: 0,
+            from: Sender::You,
+            to,
+            text: text.into(),
+            state,
+            delivered_at: None,
+            dropped_at: (state == RelayState::Dropped).then_some(5),
+            held: held.map(Into::into),
+        };
+        let v = LockView {
+            claims: vec![Claim {
+                target: "argo:uat/demo-api".into(),
+                slot: 1,
+                kind: ClaimKind::Pin,
+                reason: None,
+                item: Some("DEMO-12".into()),
+                since: 0,
+                last_used: 0,
+                pin_revision: Some("abc123".into()),
+            }],
+            waits: vec![],
+            relays: vec![
+                relay(4, 3, RelayState::Dropped, None, "status?"),
+                relay(
+                    3,
+                    2,
+                    RelayState::Pending,
+                    Some("session is working"),
+                    "hello",
+                ),
+                relay(2, 2, RelayState::Pending, None, "again"),
+                relay(1, 2, RelayState::Delivered, None, "seen"),
+            ],
+            flag_after_secs: 3600,
+        };
+        let at = local_hhmm(0);
+        assert_eq!(
+            format_locks(&v, 0),
+            vec![
+                format!("argo:uat/demo-api  S1  pin  since {at}  for DEMO-12  at abc123"),
+                "relay  S3  dropped: session ended  status?".to_string(),
+                "relay  S2  pending (session is working)  hello".to_string(),
+                "relay  S2  pending  again".to_string(),
+            ]
+        );
     }
 
     #[test]

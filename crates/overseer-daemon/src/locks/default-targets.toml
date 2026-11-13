@@ -1,0 +1,45 @@
+# Compiled-in write target patterns. A targets.toml in the same format is
+# checked first; `replace_defaults = true` there drops these.
+#
+# Each pattern's `command` regex runs against one command of a Bash line,
+# starting at the command word. The first pattern that matches (and whose
+# `skip` does not) gives the targets for that command.
+
+[[pattern]]
+name = "git push"
+command = '^git\s+(?:-C\s+(?P<dir>\S+)\s+)?push\b'
+skip = '\s(?:--dry-run|-n)(?:\s|$)'
+target = "repo:{repo}:{branch}"
+
+[[pattern]]
+name = "argocd pin"
+command = '^argocd\s+app\s+set\s+(?P<app>[^\s-]\S*).*--revision[=\s]+(?P<revision>\S+)'
+kind = "pin"
+unpin = ["main", "master", "HEAD"]
+target = "argo:{argo_ctx}/{app}"
+
+[[pattern]]
+name = "argocd set or sync"
+command = '^argocd\s+app\s+(?:set|sync)\s+(?P<app>[^\s-]\S*)'
+skip = '\s--dry-run(?:[=\s]|$)'
+target = "argo:{argo_ctx}/{app}"
+
+[[pattern]]
+name = "trigger.dev deploy"
+command = '^(?:npx|bunx|pnpm\s+dlx)\s+(?:(?:-y|--yes)\s+)?trigger\.dev(?:@\S+)?\s+deploy\b'
+fields = { env = '\s(?:--env|-e)[=\s]+(\S+)' }
+defaults = { env = "prod" }
+target = "deploy:trigger.dev/{env}"
+
+[[pattern]]
+name = "terraform apply or destroy"
+command = '^(?:terraform|tofu)\s+(?:-chdir=(?P<dir>\S+)\s+)?(?:apply|destroy)\b'
+target = "tf:{tf_workspace}"
+
+[[pattern]]
+name = "kubectl apply, delete or patch"
+command = '^kubectl\s+(?:(?:--context|--namespace|--kubeconfig|-n)(?:=|\s+)\S+\s+)*(?:apply|delete|patch)\b'
+skip = '\s--dry-run(?:(?:=|\s+)(?:client|server))?(?:\s|$)'
+fields = { namespace = '\s(?:-n|--namespace)(?:=|\s+)(\S+)' }
+defaults = { namespace = "default" }
+target = "kube:{kube_ctx}/{namespace}"
