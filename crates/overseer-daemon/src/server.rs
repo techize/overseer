@@ -16,6 +16,7 @@ use tokio::sync::{broadcast, mpsc, watch, Notify};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::env::{BaseEnv, EnvSource};
+use crate::launch::RoleDirs;
 use crate::ledger::Ledger;
 use crate::locks::{owned_items, LockService};
 use crate::manager::{valid_id, Attachment, SlotManager};
@@ -115,7 +116,15 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
     let state_dir = cfg.state_dir.clone();
     let mut mgr = SlotManager::new(cfg.default_command, events)
         .with_env(env.clone())
-        .with_launch(cfg.state_dir, cfg.hook_program, ledger.clone());
+        .with_launch(
+            cfg.state_dir,
+            cfg.hook_program,
+            ledger.clone(),
+            RoleDirs {
+                brain: cfg.settings.brain_dir.clone(),
+                beads: cfg.settings.beads_dir.clone(),
+            },
+        );
     mgr.restore();
     // A session that did not survive the restart, or whose exit was never
     // seen, has ended: only a resumable one keeps its waits and relays.
