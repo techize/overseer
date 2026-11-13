@@ -111,6 +111,18 @@ pub fn input_box(snap: &Snapshot) -> InputBox {
     }
 }
 
+/// Claude Code's working line ends with this while a turn runs.
+const WORKING_HINT: &str = "esc to interrupt";
+
+/// Whether `snap` shows Claude Code's working line anywhere, so a turn is
+/// running even if no hook has said so yet.
+pub fn shows_working(snap: &Snapshot) -> bool {
+    (0..snap.rows).any(|row| {
+        let line: String = row_cells(snap, row).iter().map(|c| c.ch).collect();
+        line.contains(WORKING_HINT)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,6 +216,21 @@ mod tests {
             COLS as usize,
         );
         assert_eq!(classify(&bytes, COLS), InputBox::Empty);
+    }
+
+    #[test]
+    fn the_working_line_shows_a_running_turn() {
+        let mut lines = vec![
+            "\u{273B} Pondering\u{2026} (3s \u{00B7} esc to interrupt)".to_string(),
+            String::new(),
+        ];
+        lines.push(rule(COLS as usize));
+        lines.push("\u{276F} ".to_string());
+        lines.push(rule(COLS as usize));
+        let (snap, _) = screen_of(&draw(&lines), COLS, ROWS);
+        assert!(shows_working(&snap));
+        let (snap, _) = screen_of(&box_with(&["\u{276F} "], COLS as usize), COLS, ROWS);
+        assert!(!shows_working(&snap));
     }
 
     #[test]

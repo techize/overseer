@@ -6,6 +6,11 @@
 //! works, at a permission or question prompt, while Jonathan has text in
 //! the box, and whenever the box cannot be found. Every pending relay for a
 //! slot goes in one paste, then Return.
+//!
+//! Answering a permission prompt with No ends the turn without a `Stop`
+//! hook, so the slot still reads as needing Jonathan. A relay goes anyway
+//! once the screen has shown the empty box, with no working line, on two
+//! looks in a row.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -16,7 +21,7 @@ use overseer_term::encode_paste;
 use tokio::sync::{broadcast, Notify};
 use tokio::time::Instant;
 
-use super::screen::{input_box, screen_of, InputBox};
+use super::screen::{input_box, screen_of, shows_working, InputBox};
 use crate::ledger::Ledger;
 use crate::locks::table::{mark_delivered_on, pending_relays_on};
 use crate::locks::LockService;
@@ -32,6 +37,7 @@ const RETURN_DELAY: Duration = Duration::from_millis(100);
 const COOLDOWN: Duration = Duration::from_secs(10);
 
 const NOT_RUNNING: &str = "slot is not running";
+const AT_PROMPT: &str = "waiting at a prompt for Jonathan";
 const TYPED: &str = "input box has text";
 const NO_BOX: &str = "input box not found";
 /// Inside the cooldown after a delivery.
@@ -50,7 +56,7 @@ pub fn ready(state: &SlotState, activity: Option<&Activity>) -> Result<(), &'sta
     match a.kind {
         ActivityKind::Idle => Ok(()),
         ActivityKind::NeedsYou if a.idle_wait => Ok(()),
-        ActivityKind::NeedsYou => Err("waiting at a prompt for Jonathan"),
+        ActivityKind::NeedsYou => Err(AT_PROMPT),
         ActivityKind::Working => Err("session is working"),
     }
 }
@@ -131,8 +137,9 @@ impl Courier {
 
     async fn run(self: Arc<Self>, mut events: broadcast::Receiver<Event>) {
         let mut sent: [Option<Sent>; SLOT_COUNT] = Default::default();
+        let mut answered: [Option<Activity>; SLOT_COUNT] = Default::default();
         loop {
-            let pending = self.round(&mut sent).await;
+            let pending = self.round(&mut sent, &mut answered).await;
             let tick = async {
                 if pending {
                     tokio::time::sleep(TICK).await;
@@ -157,7 +164,13 @@ impl Courier {
     }
 
     /// One look at every slot. Returns whether any relay is still pending.
-    async fn round(&self, sent: &mut [Option<Sent>; SLOT_COUNT]) -> bool {
+    /// `answered` holds, per slot, the activity in which a prompt was last
+    /// seen answered (see `deliver`).
+    async fn round(
+        &self,
+        sent: &mut [Option<Sent>; SLOT_COUNT],
+        answered: &mut [Option<Activity>; SLOT_COUNT],
+    ) -> bool {
         let infos = self.manager.lock().unwrap().list();
         let mut pending = false;
         for info in infos {
@@ -171,6 +184,7 @@ impl Courier {
                 }
             };
             if relays.is_empty() {
+                answered[id as usize] = None;
                 self.locks.set_held(id, None);
                 continue;
             }
@@ -182,7 +196,10 @@ impl Courier {
                 }
             }
             sent[id as usize] = None;
-            match self.deliver(&info, &relays).await {
+            match self
+                .deliver(&info, &relays, &mut answered[id as usize])
+                .await
+            {
                 Ok(()) => {
                     sent[id as usize] = Some(Sent {
                         activity: info.activity.clone(),
@@ -197,9 +214,29 @@ impl Courier {
 
     /// Types `relays` into the slot `info` describes if it is ready, and
     /// marks them delivered. Otherwise the reason they wait.
-    async fn deliver(&self, info: &SlotInfo, relays: &[Relay]) -> Result<(), &'static str> {
+    ///
+    /// A slot waiting at a prompt is ready once the prompt is answered: the
+    /// screen shows the empty box and no working line on this look and on
+    /// the one before, in the same activity. `answered` carries that
+    /// activity between looks.
+    async fn deliver(
+        &self,
+        info: &SlotInfo,
+        relays: &[Relay],
+        answered: &mut Option<Activity>,
+    ) -> Result<(), &'static str> {
         let id = info.id;
-        ready(&info.state, info.activity.as_ref())?;
+        let at_prompt = match ready(&info.state, info.activity.as_ref()) {
+            Ok(()) => false,
+            Err(AT_PROMPT) => true,
+            Err(why) => {
+                *answered = None;
+                return Err(why);
+            }
+        };
+        if !at_prompt {
+            *answered = None;
+        }
         let slot = self.manager.lock().unwrap().slot(id).ok_or(NOT_RUNNING)?;
         let (cols, rows) = (info.cols, info.rows);
         // The ring with its mode preamble, as a client attaching would see it.
@@ -207,13 +244,24 @@ impl Courier {
         let screen = tokio::task::spawn_blocking(move || {
             let (bytes, _) = reader.attach();
             let (snap, modes) = screen_of(&bytes, cols, rows);
-            (input_box(&snap), modes)
+            (input_box(&snap), shows_working(&snap), modes)
         })
         .await;
+        if at_prompt {
+            if !matches!(screen, Ok((InputBox::Empty, false, _))) {
+                *answered = None;
+                return Err(AT_PROMPT);
+            }
+            if *answered != info.activity {
+                // Seen once; deliver if the next look agrees.
+                *answered = info.activity.clone();
+                return Err(AT_PROMPT);
+            }
+        }
         let modes = match screen {
-            Ok((InputBox::Empty, modes)) => modes,
-            Ok((InputBox::Typed, _)) => return Err(TYPED),
-            Ok((InputBox::NotFound, _)) | Err(_) => return Err(NO_BOX),
+            Ok((InputBox::Empty, _, modes)) => modes,
+            Ok((InputBox::Typed, _, _)) => return Err(TYPED),
+            Ok((InputBox::NotFound, _, _)) | Err(_) => return Err(NO_BOX),
         };
         // A hook may have come in while the screen was read.
         let text = strip_controls(&compose(relays, id));
@@ -221,7 +269,11 @@ impl Courier {
             return Err(NO_BRACKETS);
         }
         let latest = self.manager.lock().unwrap().list().swap_remove(id as usize);
-        ready(&latest.state, latest.activity.as_ref())?;
+        match ready(&latest.state, latest.activity.as_ref()) {
+            Err(AT_PROMPT) if at_prompt && latest.activity == info.activity => {}
+            other => other?,
+        }
+        *answered = None;
         self.locks.set_held(id, None);
         let paste = encode_paste(&text, &modes);
         let writer = slot.clone();
