@@ -89,6 +89,9 @@ pub struct SlotManager {
     /// process. Only ever set for a slot with no entry in `slots`; a start
     /// or resume replaces it.
     restored: [Option<Restored>; SLOT_COUNT],
+    /// `session_note` from the config: a fresh start fixes the slot's note
+    /// from it in the ledger; a resume keeps the one it had.
+    session_note: Option<String>,
 }
 
 /// A slot as the ledger left it: no process, but remembered.
@@ -134,6 +137,7 @@ impl SlotManager {
             launch: None,
             shutting_down: Default::default(),
             restored: Default::default(),
+            session_note: None,
         }
     }
 
@@ -203,6 +207,13 @@ impl SlotManager {
             ledger,
             dirs,
         });
+        self
+    }
+
+    /// Fixes each fresh session's note path from `template` (vault-relative,
+    /// see `brain::paths::fill_template`).
+    pub fn with_session_note(mut self, template: String) -> Self {
+        self.session_note = Some(template);
         self
     }
 
@@ -360,6 +371,11 @@ impl SlotManager {
             };
             if let Err(e) = launch.ledger.record_start(&row) {
                 tracing::warn!("{} ledger start not recorded: {e:#}", slot_name(id));
+            } else if let Some(t) = &self.session_note {
+                let note = crate::brain::paths::fill_template(t, row.started, id, &row.label);
+                if let Err(e) = launch.ledger.set_session_note(id, &note) {
+                    tracing::warn!("{} session note not recorded: {e:#}", slot_name(id));
+                }
             }
         }
         let _ = self.events.send(Event::SlotChanged(started));
@@ -664,6 +680,42 @@ mod restore_tests {
             ledger,
             RoleDirs::default(),
         )
+    }
+
+    #[tokio::test]
+    async fn a_fresh_start_fixes_the_session_note() {
+        let ledger = Arc::new(Ledger::in_memory());
+        let mut m = manager(ledger.clone()).with_session_note("Sessions/{slot}-{label}.md".into());
+        let sleep = Some(vec!["/bin/sleep".to_string(), "30".to_string()]);
+        m.start(
+            3,
+            "Demo Lane".into(),
+            Path::new("/tmp"),
+            sleep.clone(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            ledger.session_note(3).unwrap().as_deref(),
+            Some("Sessions/s3-demo-lane.md")
+        );
+        // A resume keeps the row, note included.
+        ledger.mark_resumed(3).unwrap();
+        assert!(ledger.session_note(3).unwrap().is_some());
+        m.stop(3).unwrap();
+        for _ in 0..100 {
+            if !matches!(m.list()[3].state, SlotState::Running { .. }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        m.start(3, "other".into(), Path::new("/tmp"), sleep, None)
+            .unwrap();
+        assert_eq!(
+            ledger.session_note(3).unwrap().as_deref(),
+            Some("Sessions/s3-other.md")
+        );
+        m.shutdown_all();
     }
 
     #[test]

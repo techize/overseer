@@ -127,7 +127,7 @@ fn resolve(brain: &Path, cwd: Option<&Path>, p: &Path, home: &Path) -> Option<Pa
 }
 
 /// The vault-relative form of `p`, with whether it is a folder.
-fn locate(
+pub(crate) fn locate(
     brain: &Path,
     cwd: Option<&Path>,
     p: &Path,

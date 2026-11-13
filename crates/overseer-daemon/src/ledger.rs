@@ -146,30 +146,67 @@ fn migrate(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn queue_entry(r: &rusqlite::Row) -> rusqlite::Result<QueueEntry> {
+/// A queue row, or `None` (logged) when its sender or state cannot be read:
+/// a row nobody can attribute is left out rather than shown as Jonathan's.
+fn queue_entry(r: &rusqlite::Row) -> rusqlite::Result<Option<QueueEntry>> {
+    let id: i64 = r.get(0)?;
     let sender: String = r.get(2)?;
     let paths: String = r.get(3)?;
     let state: String = r.get(5)?;
-    Ok(QueueEntry {
-        id: r.get(0)?,
+    let Ok(from) = serde_json::from_str::<Sender>(&sender) else {
+        tracing::warn!("2ndBrain queue entry {id}: unreadable sender {sender:?}, skipped");
+        return Ok(None);
+    };
+    let Some(state) = state_from_name(&state) else {
+        tracing::warn!("2ndBrain queue entry {id}: unknown state {state:?}, skipped");
+        return Ok(None);
+    };
+    let Ok(paths) = serde_json::from_str::<Vec<String>>(&paths) else {
+        tracing::warn!("2ndBrain queue entry {id}: unreadable paths, skipped");
+        return Ok(None);
+    };
+    Ok(Some(QueueEntry {
+        id,
         at: r.get(1)?,
-        from: serde_json::from_str(&sender).unwrap_or(Sender::You),
-        paths: serde_json::from_str(&paths).unwrap_or_default(),
+        from,
+        paths,
         message: r.get(4)?,
-        state: serde_json::from_str(&format!("\"{state}\"")).unwrap_or(QueueState::Failed),
+        state,
         commit: r.get(6)?,
         pushed: r.get::<_, Option<i64>>(7)?.map(|p| p != 0),
         error: r.get(8)?,
-    })
+    }))
 }
 
 const QUEUE_COLS: &str = "id, at, sender, paths, message, state, commit_sha, pushed, error";
 
+/// The name a state is stored under; every query binds it rather than
+/// spelling the literal.
 fn state_name(state: QueueState) -> String {
     serde_json::to_string(&state)
         .unwrap_or_default()
         .trim_matches('"')
         .to_string()
+}
+
+fn state_from_name(name: &str) -> Option<QueueState> {
+    serde_json::from_str(&format!("\"{name}\"")).ok()
+}
+
+fn queue_rows(
+    conn: &Connection,
+    sql: &str,
+    params: impl rusqlite::Params,
+) -> Result<Vec<QueueEntry>> {
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(params, queue_entry)?;
+    let mut out = Vec::new();
+    for r in rows {
+        if let Some(e) = r? {
+            out.push(e);
+        }
+    }
+    Ok(out)
 }
 
 /// Adds a queued commit, returning its id.
@@ -181,27 +218,30 @@ pub(crate) fn queue_push_on(
     message: &str,
 ) -> Result<i64> {
     conn.execute(
-        "INSERT INTO brain_queue (at, sender, paths, message, state) VALUES (?1, ?2, ?3, ?4, 'Queued')",
+        "INSERT INTO brain_queue (at, sender, paths, message, state) VALUES (?1, ?2, ?3, ?4, ?5)",
         rusqlite::params![
             at,
             serde_json::to_string(from)?,
             serde_json::to_string(paths)?,
-            message
+            message,
+            state_name(QueueState::Queued)
         ],
     )?;
     Ok(conn.last_insert_rowid())
 }
 
-/// The oldest entry still queued.
+/// The oldest readable entry still queued.
 pub(crate) fn queue_next_on(conn: &Connection) -> Result<Option<QueueEntry>> {
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {QUEUE_COLS} FROM brain_queue WHERE state = 'Queued' ORDER BY id LIMIT 1"
-    ))?;
-    let mut rows = stmt.query_map([], queue_entry)?;
-    Ok(rows.next().transpose()?)
+    Ok(queue_rows(
+        conn,
+        &format!("SELECT {QUEUE_COLS} FROM brain_queue WHERE state = ?1 ORDER BY id"),
+        rusqlite::params![state_name(QueueState::Queued)],
+    )?
+    .into_iter()
+    .next())
 }
 
-/// Records where an entry got to.
+/// Records where an entry got to. Does not count as an attempt.
 pub(crate) fn queue_set_on(
     conn: &Connection,
     id: i64,
@@ -211,34 +251,60 @@ pub(crate) fn queue_set_on(
     error: Option<&str>,
 ) -> Result<()> {
     conn.execute(
-        "UPDATE brain_queue SET state = ?2, commit_sha = ?3, pushed = ?4, error = ?5,
-             attempts = attempts + 1 WHERE id = ?1",
+        "UPDATE brain_queue SET state = ?2, commit_sha = ?3, pushed = ?4, error = ?5 WHERE id = ?1",
         rusqlite::params![id, state_name(state), sha, pushed, error],
     )?;
     Ok(())
 }
 
+/// Counts a real commit attempt for an entry and returns how many it has had.
+pub(crate) fn queue_begin_on(conn: &Connection, id: i64) -> Result<i64> {
+    conn.execute(
+        "UPDATE brain_queue SET attempts = attempts + 1 WHERE id = ?1",
+        rusqlite::params![id],
+    )?;
+    Ok(conn.query_row(
+        "SELECT attempts FROM brain_queue WHERE id = ?1",
+        rusqlite::params![id],
+        |r| r.get(0),
+    )?)
+}
+
+/// How many commit attempts an entry has had.
+pub(crate) fn queue_attempts_on(conn: &Connection, id: i64) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT attempts FROM brain_queue WHERE id = ?1",
+        rusqlite::params![id],
+        |r| r.get(0),
+    )?)
+}
+
 /// Committed entries whose push has not succeeded, oldest first.
 pub(crate) fn queue_unpushed_on(conn: &Connection) -> Result<Vec<QueueEntry>> {
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {QUEUE_COLS} FROM brain_queue
-         WHERE state = 'Committed' AND pushed = 0 ORDER BY id"
-    ))?;
-    let rows = stmt.query_map([], queue_entry)?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    queue_rows(
+        conn,
+        &format!(
+            "SELECT {QUEUE_COLS} FROM brain_queue
+             WHERE state = ?1 AND (pushed = 0 OR pushed IS NULL) AND commit_sha IS NOT NULL
+             ORDER BY id"
+        ),
+        rusqlite::params![state_name(QueueState::Committed)],
+    )
 }
 
 /// Every queued entry plus the `n` most recent others, newest first.
 pub(crate) fn queue_recent_on(conn: &Connection, n: usize) -> Result<Vec<QueueEntry>> {
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {QUEUE_COLS} FROM brain_queue WHERE state = 'Queued'
-         UNION ALL
-         SELECT {QUEUE_COLS} FROM (SELECT * FROM brain_queue WHERE state <> 'Queued'
-                                   ORDER BY id DESC LIMIT ?1)
-         ORDER BY id DESC"
-    ))?;
-    let rows = stmt.query_map(rusqlite::params![n as i64], queue_entry)?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    queue_rows(
+        conn,
+        &format!(
+            "SELECT {QUEUE_COLS} FROM brain_queue WHERE state = ?2
+             UNION ALL
+             SELECT {QUEUE_COLS} FROM (SELECT * FROM brain_queue WHERE state <> ?2
+                                       ORDER BY id DESC LIMIT ?1)
+             ORDER BY id DESC"
+        ),
+        rusqlite::params![n as i64, state_name(QueueState::Queued)],
+    )
 }
 
 // Connection-level forms of the work-item calls, for use inside
@@ -441,7 +507,16 @@ impl Ledger {
         queue_next_on(&self.conn())
     }
 
-    /// Records where a queue entry got to.
+    /// Counts a real commit attempt for an entry; returns its attempts so far.
+    pub fn queue_begin(&self, id: i64) -> Result<i64> {
+        queue_begin_on(&self.conn(), id)
+    }
+
+    pub fn queue_attempts(&self, id: i64) -> Result<i64> {
+        queue_attempts_on(&self.conn(), id)
+    }
+
+    /// Records where a queue entry got to. Not an attempt: see `queue_begin`.
     pub fn queue_set(
         &self,
         id: i64,
@@ -869,6 +944,44 @@ mod tests {
             .unwrap();
         let un = l.queue_unpushed().unwrap();
         assert_eq!(un.iter().map(|e| e.id).collect::<Vec<_>>(), vec![b]);
+    }
+
+    #[test]
+    fn attempts_count_only_real_attempts() {
+        use overseer_proto::msg::{QueueState, Sender};
+        let l = Ledger::in_memory();
+        let a = l.queue_push(1, &Sender::You, &[], "a").unwrap();
+        assert_eq!(l.queue_attempts(a).unwrap(), 0);
+        l.queue_set(a, QueueState::Queued, None, None, Some("index.lock held"))
+            .unwrap();
+        l.queue_set(a, QueueState::Queued, None, None, None)
+            .unwrap();
+        assert_eq!(l.queue_attempts(a).unwrap(), 0);
+        assert_eq!(l.queue_begin(a).unwrap(), 1);
+        assert_eq!(l.queue_begin(a).unwrap(), 2);
+        l.queue_set(a, QueueState::Committed, Some("1"), Some(true), None)
+            .unwrap();
+        assert_eq!(l.queue_attempts(a).unwrap(), 2);
+    }
+
+    #[test]
+    fn unreadable_sender_is_skipped_not_jonathan() {
+        use overseer_proto::msg::Sender;
+        let l = Ledger::in_memory();
+        let bad = l.queue_push(1, &Sender::You, &[], "bad").unwrap();
+        let good = l
+            .queue_push(2, &Sender::Slot { slot: 2 }, &[], "good")
+            .unwrap();
+        l.conn()
+            .execute(
+                "UPDATE brain_queue SET sender = 'garbage' WHERE id = ?1",
+                rusqlite::params![bad],
+            )
+            .unwrap();
+        let next = l.queue_next().unwrap().unwrap();
+        assert_eq!(next.id, good);
+        let ids: Vec<i64> = l.queue_recent(10).unwrap().iter().map(|e| e.id).collect();
+        assert_eq!(ids, vec![good]);
     }
 
     #[test]
