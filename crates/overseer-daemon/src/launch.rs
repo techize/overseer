@@ -12,6 +12,9 @@ use overseer_proto::msg::{slot_name, SlotId};
 /// worker role, and kickoff.md is the first prompt S0 starts with.
 const WORKER_ROLE: &str = include_str!("roles/worker.md");
 const COORDINATOR_ROLE: &str = include_str!("roles/coordinator.md");
+/// What `{brain_rules}` expands to while the 2ndBrain writer is on.
+const BRAIN_RULES_WORKER: &str = include_str!("roles/brain_worker.md");
+const BRAIN_RULES_COORDINATOR: &str = include_str!("roles/brain_coordinator.md");
 const KICKOFF: &str = include_str!("roles/kickoff.md");
 /// The prompt built from a slot's assigned work items.
 pub const ASSIGNMENT: &str = include_str!("roles/assignment.md");
@@ -26,8 +29,9 @@ const PREVIOUS_COORDINATOR: &[u64] = &[
     0x4baeb879ce73cf13,
     0x7ddaa223f4bdd1f6,
     0xf98858507513ed2d,
+    0x551d58f77936ffa0, // phase 4
 ];
-const PREVIOUS_WORKER: &[u64] = &[0x215de771dfd84eb4, 0xbd3ab0020d4d25b1];
+const PREVIOUS_WORKER: &[u64] = &[0x215de771dfd84eb4, 0xbd3ab0020d4d25b1, 0xe8deae3b8fe65917];
 const PREVIOUS_KICKOFF: &[u64] = &[];
 const PREVIOUS_ASSIGNMENT: &[u64] = &[];
 
@@ -284,11 +288,16 @@ fn mcp_json(overseer_bin: &Path, slot: SlotId) -> String {
 
 /// The folders a role names, from the daemon's config: `{brain}` is the
 /// 2ndBrain folder S0 works in and reads the journal from, `{beads}` where
-/// it runs `bd`.
+/// it runs `bd`. The rest is the 2ndBrain writer's: whether it is on (so
+/// `{brain_rules}` has content), the session note template and the
+/// `CURRENT_SESSION.md` path the rules name.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RoleDirs {
     pub brain: PathBuf,
     pub beads: PathBuf,
+    pub brain_writer: bool,
+    pub session_note: String,
+    pub current_session: PathBuf,
 }
 
 impl Default for RoleDirs {
@@ -297,6 +306,9 @@ impl Default for RoleDirs {
         RoleDirs {
             brain: PathBuf::from("~/Repos/2ndBrain"),
             beads: PathBuf::from("~/Repos/2ndBrain"),
+            brain_writer: false,
+            session_note: "Sessions/{yyyy}/{mm}-{Month}/{yyyy}-{mm}-{dd}-{slot}-{label}.md".into(),
+            current_session: PathBuf::from("~/.claude/CURRENT_SESSION.md"),
         }
     }
 }
@@ -305,7 +317,8 @@ impl Default for RoleDirs {
 /// `state_dir`, replacing them on every start. The role is copied from
 /// `roles/coordinator.md` for S0 and `roles/worker.md` otherwise (created from the compiled-in default if missing;
 /// an unedited older default is upgraded, an edited file is kept) with `{slot}`, `{label}`, `{overseer}`,
-/// `{brain}` and `{beads}` filled in.
+/// `{brain}`, `{beads}`, `{session_note}` and `{current_session}` filled in,
+/// and `{brain_rules}` expanded when the 2ndBrain writer is on.
 pub fn write_slot_files(
     state_dir: &Path,
     slot: SlotId,
@@ -326,8 +339,30 @@ pub fn write_slot_files(
     ensure_template(&roles, "assignment.md", ASSIGNMENT, PREVIOUS_ASSIGNMENT)?;
     let template_path = if slot == 0 { coordinator } else { worker };
     let template = std::fs::read_to_string(&template_path)?;
+    // `{brain_rules}` goes first: its text holds more placeholders. Off, it
+    // leaves nothing behind, not even its line break.
+    let template = if dirs.brain_writer {
+        let rules = if slot == 0 {
+            BRAIN_RULES_COORDINATOR
+        } else {
+            BRAIN_RULES_WORKER
+        };
+        template.replace("{brain_rules}", &format!("\n{}", rules.trim_end()))
+    } else if template.contains("\n{brain_rules}") {
+        template.replace("\n{brain_rules}", "")
+    } else {
+        template.replace("{brain_rules}", "")
+    };
+    let note = Path::new(&dirs.brain).join(crate::brain::paths::fill_template(
+        &dirs.session_note,
+        crate::work::store::unix_now(),
+        slot,
+        label,
+    ));
     // The label goes in last so braces inside it are not expanded again.
     let role_text = template
+        .replace("{session_note}", &note.to_string_lossy())
+        .replace("{current_session}", &dirs.current_session.to_string_lossy())
         .replace("{slot}", &slot_name(slot))
         .replace("{overseer}", &overseer_bin.to_string_lossy())
         .replace("{brain}", &dirs.brain.to_string_lossy())
@@ -838,6 +873,7 @@ mod tests {
         let dirs = RoleDirs {
             brain: PathBuf::from("/tmp/demo-brain"),
             beads: PathBuf::from("/tmp/demo-beads"),
+            ..RoleDirs::default()
         };
         let f = write_slot_files(&dir, 0, "lbl", Path::new("/Apps/overseer"), &dirs).unwrap();
         let role = std::fs::read_to_string(f.role).unwrap();
@@ -943,5 +979,114 @@ mod tests {
         assert!(COORDINATOR_ROLE.contains("Before you propose work, read today's journal."));
         assert!(COORDINATOR_ROLE.contains("date '+%Y/%m-%B/%Y-%m-%d'"));
         assert!(COORDINATOR_ROLE.contains("06-Daily/"));
+    }
+
+    const PHASE_4_WORKER: &str = include_str!("../tests/fixtures/roles-phase4/worker.md");
+    const PHASE_4_COORDINATOR: &str = include_str!("../tests/fixtures/roles-phase4/coordinator.md");
+
+    #[test]
+    fn phase_4_roles_upgrade() {
+        assert!(PREVIOUS_WORKER.contains(&text_hash(PHASE_4_WORKER)));
+        assert!(PREVIOUS_COORDINATOR.contains(&text_hash(PHASE_4_COORDINATOR)));
+        let dir = temp("phase4");
+        let roles = dir.join("roles");
+        std::fs::create_dir_all(&roles).unwrap();
+        std::fs::write(roles.join("worker.md"), PHASE_4_WORKER).unwrap();
+        std::fs::write(roles.join("coordinator.md"), PHASE_4_COORDINATOR).unwrap();
+        for slot in [1, 0] {
+            write_slot_files(&dir, slot, "lbl", Path::new("/o"), &RoleDirs::default()).unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string(roles.join("worker.md")).unwrap(),
+            WORKER_ROLE
+        );
+        assert_eq!(
+            std::fs::read_to_string(roles.join("coordinator.md")).unwrap(),
+            COORDINATOR_ROLE
+        );
+        assert!(!roles.join("worker.md.new").exists());
+        // An edited phase 4 file is kept and the new default lands beside it.
+        let edited = format!("{PHASE_4_WORKER}\nMy own rule.\n");
+        std::fs::write(roles.join("worker.md"), &edited).unwrap();
+        write_slot_files(&dir, 1, "lbl", Path::new("/o"), &RoleDirs::default()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(roles.join("worker.md")).unwrap(),
+            edited
+        );
+        assert_eq!(
+            std::fs::read_to_string(roles.join("worker.md.new")).unwrap(),
+            WORKER_ROLE
+        );
+    }
+
+    fn brain_dirs(on: bool) -> RoleDirs {
+        RoleDirs {
+            brain: PathBuf::from("/tmp/demo-brain"),
+            beads: PathBuf::from("/tmp/demo-brain"),
+            brain_writer: on,
+            session_note: "Sessions/{yyyy}/{mm}-{Month}/{yyyy}-{mm}-{dd}-{slot}-{label}.md".into(),
+            current_session: PathBuf::from("/tmp/demo-home/CURRENT_SESSION.md"),
+        }
+    }
+
+    #[test]
+    fn worker_role_names_the_brain_tools() {
+        let tools = [
+            "commit_2ndbrain",
+            "append_journal",
+            "edit_shared_file",
+            "update_current_session",
+        ];
+        let dir = temp("brainon");
+        let f = write_slot_files(&dir, 3, "Demo Lane", Path::new("/o"), &brain_dirs(true)).unwrap();
+        let role = std::fs::read_to_string(f.role).unwrap();
+        for t in tools {
+            assert!(role.contains(&format!("`{t}`")), "{t}: {role}");
+        }
+        let note = role
+            .lines()
+            .find_map(|l| l.split("session note is ").nth(1))
+            .expect("session note line");
+        assert!(note.starts_with("/tmp/demo-brain/Sessions/20"), "{note}");
+        assert!(note.contains("-s3-demo-lane.md"), "{note}");
+        assert!(role.contains("/tmp/demo-home/CURRENT_SESSION.md"), "{role}");
+        assert!(role.contains("Never `git commit`"), "{role}");
+        assert!(!role.contains("{brain_rules}") && !role.contains("{session_note}"));
+        assert!(!role.contains("{current_session}"), "{role}");
+        assert!(!role.contains('\u{2014}'), "no em dashes");
+        // Off: none of it, and no blank lines left behind.
+        let f =
+            write_slot_files(&dir, 3, "Demo Lane", Path::new("/o"), &brain_dirs(false)).unwrap();
+        let off = std::fs::read_to_string(f.role).unwrap();
+        for t in tools {
+            assert!(!off.contains(t), "{t}: {off}");
+        }
+        assert!(
+            !off.contains("{brain_rules}") && !off.contains("Sessions/"),
+            "{off}"
+        );
+        assert!(off.ends_with("what.\n"), "{off:?}");
+        assert!(!off.contains("\n\n\n"), "{off:?}");
+    }
+
+    #[test]
+    fn coordinator_role_gets_the_shared_file_rules_only() {
+        let dir = temp("coordbrain");
+        let f = write_slot_files(&dir, 0, "x", Path::new("/o"), &brain_dirs(true)).unwrap();
+        let role = std::fs::read_to_string(f.role).unwrap();
+        for t in ["commit_2ndbrain", "append_journal", "edit_shared_file"] {
+            assert!(role.contains(&format!("`{t}`")), "{t}: {role}");
+        }
+        assert!(!role.contains("update_current_session"), "{role}");
+        assert!(!role.contains("session note"), "{role}");
+        assert!(!role.contains("{brain_rules}"), "{role}");
+        assert!(!role.contains('\u{2014}'), "no em dashes");
+        let f = write_slot_files(&dir, 0, "x", Path::new("/o"), &brain_dirs(false)).unwrap();
+        let off = std::fs::read_to_string(f.role).unwrap();
+        assert!(
+            !off.contains("append_journal") && !off.contains("{brain_rules}"),
+            "{off}"
+        );
+        assert!(off.ends_with("\"Run another round\"`.\n"), "{off:?}");
     }
 }

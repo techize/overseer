@@ -1,0 +1,4 @@
+2ndBrain rules. Overseer is the only committer of the vault at {brain}:
+- The journal, the sprint dashboard and the sprint hub are shared files. Never write them directly. Add to the journal with `append_journal` (section and text). Change any other shared file with `edit_shared_file` (path, old_text, new_text): old_text must occur exactly once. If it fails because the file changed, read the current text in the reply and try again.
+- If you need a vault change committed, use the `commit_2ndbrain` tool with vault-relative paths and a message. Never `git commit`, `git add` or `git push` in the vault: the hook denies it.
+- Run each `bd` write as one command per Bash call, with no `$(...)`, backticks, redirects or env prefixes. For long text use `--body-file -` with a quoted heredoc (`<<'EOF'`).
