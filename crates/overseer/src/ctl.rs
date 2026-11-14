@@ -11,8 +11,8 @@ use clap::Subcommand;
 use overseer_proto::paths::{log_dir, socket_path};
 use overseer_proto::{
     slot_name, ActivityKind, BoardView, BrainRun, BrainView, ClaimKind, Client, ItemKind, LockView,
-    Plan, PlanDecision, PlanRecord, PlanState, QueueState, RelayState, ReportKind, Request,
-    Response, SlotId, SlotInfo, SlotState, WorkItem, WorkView,
+    Plan, PlanDecision, PlanRecord, PlanState, QueueState, RelayState, Request, Response, SlotId,
+    SlotInfo, SlotState, WorkItem, WorkView,
 };
 
 #[derive(Subcommand)]
@@ -1081,6 +1081,7 @@ pub async fn run(cmd: CtlCmd) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use overseer_proto::ReportKind;
 
     #[derive(clap::Parser)]
     struct Cli {
