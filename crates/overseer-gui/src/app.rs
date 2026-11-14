@@ -36,12 +36,13 @@ use overseer_proto::{
 };
 
 use crate::board::Dir;
+use crate::daemon_info::DaemonKnown;
 use crate::locks_view::LocksState;
 use crate::picker::{Picker, PickerEvent};
 use crate::plan_view::{PlanEvent, PlanView};
 use crate::session::{incarnation, keep_view, restart_begin, restart_on_change, Incarnation};
 use crate::session::{reply_note, EntryAction, EntryKind, PanelEntry, RestartPlan};
-use crate::settings_view::{DaemonKnown, SettingsEvent, SettingsPanel};
+use crate::settings_view::{SettingsEvent, SettingsPanel};
 use crate::start_dialog::{DialogEvent, Prefill, StartDialog};
 use crate::{FrameHub, TerminalView, Theme};
 
@@ -314,6 +315,25 @@ pub(crate) fn test_plan(id: i64, state: overseer_proto::PlanState) -> overseer_p
     }
 }
 
+/// `slots` when a list reply on this connection filled them, else `None`:
+/// the empty slots the app starts with, or stale ones after a lost
+/// connection, would claim no session is running.
+fn known_slots(known: bool, slots: &[SlotInfo]) -> Option<&[SlotInfo]> {
+    known.then_some(slots)
+}
+
+/// The terminal theme and editor in the config file at `path`. A missing
+/// file gives the defaults.
+fn app_settings(path: &std::path::Path) -> Result<(Theme, String), String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+    };
+    let theme = Theme::from_toml(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok((theme, crate::terminal_view::editor_from_toml(&text)))
+}
+
 fn empty_slots() -> Vec<SlotInfo> {
     (0..7)
         .map(|id| SlotInfo {
@@ -379,6 +399,9 @@ pub struct OverseerApp {
     pub(crate) daemon: DaemonKnown,
     /// A `ctl restart --yes` from Settings is running.
     restarting_daemon: bool,
+    /// The slots came from a list reply on this connection. Until then,
+    /// and after the connection is lost, `slots` may hide running sessions.
+    slots_known: bool,
     /// Pickers closed with an assign on its way; see `PickerEvent::Late`.
     leaving: Vec<(Entity<Picker>, Subscription)>,
     restarts: HashMap<SlotId, RestartPlan>,
@@ -450,6 +473,7 @@ impl OverseerApp {
             settings_leaving: Vec::new(),
             daemon: DaemonKnown::Unknown,
             restarting_daemon: false,
+            slots_known: false,
             leaving: Vec::new(),
             restarts: HashMap::new(),
             kickoffs: HashSet::new(),
@@ -523,7 +547,7 @@ impl OverseerApp {
         let socket = overseer_proto::paths::socket_path();
         cx.spawn(async move |this, cx| {
             let Ok(known) = runtime
-                .spawn(crate::settings_view::probe_daemon(socket))
+                .spawn(crate::daemon_info::probe_daemon(socket))
                 .await
             else {
                 return;
@@ -538,7 +562,7 @@ impl OverseerApp {
             DaemonKnown::Info(info) => {
                 overseer_proto::build_notice(overseer_proto::current_build(), &info.build)
             }
-            DaemonKnown::Old => Some(crate::settings_view::OLD_DAEMON_NOTICE.to_string()),
+            DaemonKnown::Old => Some(crate::daemon_info::OLD_DAEMON_NOTICE.to_string()),
             DaemonKnown::Unknown => None,
         };
         if notice.is_some() {
@@ -555,6 +579,8 @@ impl OverseerApp {
     /// growing pause, until it answers.
     fn connection_lost(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.status = Some(crate::terminal_view::LOST_DAEMON.into());
+        self.slots_known = false;
+        self.forward_slots(cx);
         cx.notify();
         if self.reconnecting {
             return;
@@ -630,9 +656,11 @@ impl OverseerApp {
                 resp: Response::Slots(list),
                 ..
             } => {
+                self.slots_known = true;
                 for info in list {
                     self.apply_info(info, true, window, cx);
                 }
+                self.forward_slots(cx);
             }
             // The list asked for on connecting is not news, so it never
             // notifies; a change does.
@@ -720,10 +748,7 @@ impl OverseerApp {
             }
         }
         self.slots[id as usize] = info;
-        if let Some((s, _)) = &self.settings {
-            let slots = &self.slots;
-            s.update(cx, |s, _| s.set_slots(slots));
-        }
+        self.forward_slots(cx);
         if self.screen == Screen::Session(id) && !self.modal_open() {
             if let Some(view) = self.ensure_terminal(id, window, cx) {
                 // The old terminal had focus, or the user is waiting for
@@ -1042,6 +1067,19 @@ impl OverseerApp {
             || self.settings.is_some()
     }
 
+    /// The slots for the Settings view's restart question, or `None` when
+    /// this connection has not listed them.
+    fn known_slots(&self) -> Option<&[SlotInfo]> {
+        known_slots(self.slots_known, &self.slots)
+    }
+
+    fn forward_slots(&mut self, cx: &mut Context<Self>) {
+        if let Some((s, _)) = &self.settings {
+            let slots = known_slots(self.slots_known, &self.slots);
+            s.update(cx, |s, cx| s.set_slots(slots, cx));
+        }
+    }
+
     /// `Cmd+,` and the app menu: the Settings view. With a daemon that
     /// predates Settings it opens without asking, since such a daemon hangs
     /// up on a request it does not know.
@@ -1051,7 +1089,7 @@ impl OverseerApp {
         }
         self.status = None;
         let client = self.client.clone();
-        let slots = self.slots.clone();
+        let slots = self.known_slots().map(<[SlotInfo]>::to_vec);
         let old = self.daemon == DaemonKnown::Old;
         let panel = cx.new(|cx| SettingsPanel::new(client, slots, old, cx));
         let sub = cx.subscribe_in(
@@ -1063,7 +1101,8 @@ impl OverseerApp {
                         this.settings_leaving.retain(|(p, _)| p != panel);
                         this.status = Some(text.clone());
                         if *app_changed {
-                            this.reload_theme(cx);
+                            let path = panel.read(cx).config_path();
+                            this.reload_theme(path, cx);
                         }
                     }
                     SettingsEvent::Closed => {
@@ -1097,9 +1136,19 @@ impl OverseerApp {
 
     /// Terminal or editor settings were saved: every terminal view takes
     /// them up at once (Decision 9), and new ones start with them.
-    fn reload_theme(&mut self, cx: &mut Context<Self>) {
-        let theme = Theme::load();
-        let editor = crate::terminal_view::load_editor();
+    /// The file is the one the view saved to; a broken one leaves the
+    /// terminals as they are and says why on the status line.
+    fn reload_theme(&mut self, path: Option<PathBuf>, cx: &mut Context<Self>) {
+        let Some(path) = path.or_else(Theme::config_path) else {
+            return;
+        };
+        let (theme, editor) = match app_settings(&path) {
+            Ok(both) => both,
+            Err(e) => {
+                self.status = Some(format!("Saved, but the terminals kept their settings: {e}"));
+                return;
+            }
+        };
         self.theme = theme.clone();
         for t in self.terminals.values() {
             t.view.update(cx, |v, cx| {
@@ -1114,6 +1163,7 @@ impl OverseerApp {
     /// back on the new daemon by itself.
     fn restart_daemon(&mut self, cx: &mut Context<Self>) {
         if self.restarting_daemon {
+            self.status = Some("The daemon is already restarting.".to_string());
             return;
         }
         self.restarting_daemon = true;
@@ -1122,7 +1172,7 @@ impl OverseerApp {
         cx.spawn(async move |this, cx| {
             let text = cx
                 .background_executor()
-                .spawn(async move { crate::settings_view::run_restart(exe) })
+                .spawn(async move { crate::daemon_info::run_restart(exe) })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.restarting_daemon = false;
@@ -1517,6 +1567,32 @@ pub fn install(cx: &mut App) {
 mod tests {
     use super::*;
     use gpui::{KeyContext, Keymap, Keystroke};
+
+    #[test]
+    fn slots_before_the_first_list_are_unknown() {
+        let start = empty_slots();
+        assert_eq!(known_slots(false, &start), None);
+        assert_eq!(
+            crate::settings_view::restart_confirm(known_slots(false, &start)),
+            crate::settings_view::RESTART_UNLISTED
+        );
+        assert_eq!(known_slots(true, &start).map(<[SlotInfo]>::len), Some(7));
+    }
+
+    #[test]
+    fn saved_app_settings_reload_from_the_saved_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        // Missing: the defaults.
+        let (theme, _) = app_settings(&path).unwrap();
+        assert_eq!(theme.font_size, Theme::default().font_size);
+        std::fs::write(&path, "[terminal]\nfont_size = 17.0\n").unwrap();
+        let (theme, _) = app_settings(&path).unwrap();
+        assert_eq!(theme.font_size, 17.0);
+        std::fs::write(&path, "[terminal\n").unwrap();
+        let e = app_settings(&path).unwrap_err();
+        assert!(e.contains("config.toml"), "{e}");
+    }
 
     /// The action GPUI's keymap picks for `key` with focus inside
     /// `contexts` (outermost first), or None when the key goes on to the

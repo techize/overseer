@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod board;
+pub mod daemon_info;
 pub mod locks_view;
 pub mod notify;
 pub mod picker;

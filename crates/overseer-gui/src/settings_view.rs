@@ -8,7 +8,6 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use gpui::{
     div, prelude::*, px, rgb, rgba, Context, EventEmitter, FocusHandle, Focusable, FontWeight,
@@ -21,6 +20,7 @@ use overseer_proto::{
 };
 
 use crate::app::colors;
+use crate::daemon_info::DaemonKnown;
 use crate::start_dialog::{edit_key, DialogKey, TextField};
 
 // ---------------------------------------------------------------------------
@@ -233,8 +233,17 @@ pub fn saved_text(after: &SettingsView, edited: &[String]) -> String {
     )
 }
 
+/// The question Restart the daemon asks when the app does not know the
+/// sessions (before the first list, or while the connection is lost).
+pub const RESTART_UNLISTED: &str = "Restart the daemon? Its sessions could not be listed, so some may be running. Each one that is ends and comes back as resumable.";
+
 /// The question Restart the daemon asks first (Decision 4's warning).
-pub fn restart_confirm(slots: &[SlotInfo]) -> String {
+/// `None` is a session list the app does not have, which may hide running
+/// sessions.
+pub fn restart_confirm(slots: Option<&[SlotInfo]>) -> String {
+    let Some(slots) = slots else {
+        return RESTART_UNLISTED.to_string();
+    };
     let running: Vec<&SlotInfo> = slots
         .iter()
         .filter(|s| matches!(s.state, SlotState::Running { .. }))
@@ -283,120 +292,43 @@ pub fn about_lines(app_build: &str, daemon: Option<&DaemonInfo>) -> Vec<String> 
     lines
 }
 
-/// What the app runs, as its own binary, to restart the daemon (Decision 9).
-pub const RESTART_ARGS: [&str; 3] = ["ctl", "restart", "--yes"];
-
-fn last_line(text: &str) -> Option<&str> {
-    text.lines().map(str::trim).rfind(|l| !l.is_empty())
-}
-
-/// The status line once `ctl restart --yes` has exited: what it printed,
-/// or the last line of its error.
-pub fn restart_outcome(success: bool, stdout: &str, stderr: &str) -> String {
-    if success {
-        return last_line(stdout)
-            .unwrap_or("Restarted the daemon.")
-            .to_string();
-    }
-    match last_line(stderr) {
-        Some(why) => format!("The daemon did not restart: {why}"),
-        None => "The daemon did not restart, and said nothing about why. See gui.log.".to_string(),
+/// An open restart question says it again for `slots` as they are now,
+/// so it never asks about sessions that have since started or ended.
+pub fn reword(confirm: &mut Option<String>, slots: Option<&[SlotInfo]>) {
+    if let Some(q) = confirm.as_mut() {
+        *q = restart_confirm(slots);
     }
 }
-
-/// Runs `<exe> ctl restart --yes` with the app's environment, waits for it,
-/// logs what it printed to `gui.log` and returns the status line. Blocks.
-pub fn run_restart(exe: std::io::Result<PathBuf>) -> String {
-    let exe = match exe {
-        Ok(exe) => exe,
-        Err(e) => {
-            return format!("The daemon did not restart: cannot find this app's binary ({e})")
-        }
-    };
-    let out = std::process::Command::new(&exe)
-        .args(RESTART_ARGS)
-        .stdin(std::process::Stdio::null())
-        .output();
-    match out {
-        Ok(out) => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            if !stdout.trim().is_empty() {
-                tracing::info!("ctl restart: {}", stdout.trim());
-            }
-            if !stderr.trim().is_empty() {
-                tracing::warn!("ctl restart ({}): {}", out.status, stderr.trim());
-            }
-            restart_outcome(out.status.success(), &stdout, &stderr)
-        }
-        Err(e) => format!(
-            "The daemon did not restart: cannot run {} ({e})",
-            exe.display()
-        ),
-    }
-}
-
-/// What the app knows about the daemon it is connected to.
-#[derive(Debug, Clone, PartialEq)]
-pub enum DaemonKnown {
-    /// Not asked yet, or it did not answer.
-    Unknown,
-    Info(DaemonInfo),
-    /// It answers but predates `DaemonInfo` (it hangs up on the request).
-    Old,
-}
-
-/// How long asking the daemon about itself may take.
-const PROBE_WAIT: Duration = Duration::from_secs(2);
-
-/// Asks the daemon on `socket` about itself on a connection of its own: an
-/// old daemon hangs up on a request it does not know, and that must not
-/// take the app's connection down with it. Needs a tokio runtime.
-pub async fn probe_daemon(socket: PathBuf) -> DaemonKnown {
-    let ask = async {
-        let client = Client::connect(&socket).await.ok()?;
-        Some(match client.request(Request::DaemonInfo).await {
-            Ok(Response::DaemonInfo(info)) => DaemonKnown::Info(info),
-            Ok(Response::Error { .. }) | Err(_) => DaemonKnown::Old,
-            Ok(_) => DaemonKnown::Unknown,
-        })
-    };
-    tokio::time::timeout(PROBE_WAIT, ask)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or(DaemonKnown::Unknown)
-}
-
-/// The status line for a daemon that predates `DaemonInfo`.
-pub const OLD_DAEMON_NOTICE: &str = "The daemon runs a build older than this app. Restart the daemon to finish the upgrade (overseer ctl restart, or Settings).";
 
 /// Decision 13's first Esc with unsaved edits.
 pub const ESC_AGAIN: &str = "Esc again closes without saving";
+/// The same for a click on Close.
+pub const CLOSE_AGAIN: &str = "Close again closes without saving";
 
-/// Whether Esc closes the view now.
+/// Whether Esc or Close closes the view now.
 #[derive(Debug, Default)]
-pub struct EscGuard {
-    warned: bool,
+pub struct CloseGuard {
+    warned: Option<&'static str>,
 }
 
-impl EscGuard {
-    /// True to close. With unsaved edits the first press only warns.
-    pub fn press(&mut self, draft: &SettingsDraft) -> bool {
-        if !draft.dirty() || self.warned {
+impl CloseGuard {
+    /// True to close. With unsaved edits the first Esc or Close only warns
+    /// with `again`; the next one closes.
+    pub fn press(&mut self, draft: &SettingsDraft, again: &'static str) -> bool {
+        if !draft.dirty() || self.warned.is_some() {
             return true;
         }
-        self.warned = true;
+        self.warned = Some(again);
         false
     }
 
-    /// Any other key takes the warning back.
+    /// Any other key or click takes the warning back.
     pub fn clear(&mut self) {
-        self.warned = false;
+        self.warned = None;
     }
 
     pub fn note(&self) -> Option<&'static str> {
-        self.warned.then_some(ESC_AGAIN)
+        self.warned
     }
 }
 
@@ -429,7 +361,8 @@ enum Mode {
 pub struct SettingsPanel {
     client: Arc<Client>,
     mode: Mode,
-    slots: Vec<SlotInfo>,
+    /// `None` until the app has the session list.
+    slots: Option<Vec<SlotInfo>>,
     /// The row being edited, and its text while it is a text row.
     active: Option<String>,
     field: TextField,
@@ -437,7 +370,7 @@ pub struct SettingsPanel {
     error: Option<String>,
     /// The last save's or restart's line.
     note: Option<String>,
-    esc: EscGuard,
+    esc: CloseGuard,
     /// The open restart question.
     confirm: Option<String>,
     busy: bool,
@@ -462,7 +395,7 @@ impl SettingsPanel {
     /// The view, reading the settings from the daemon unless it is `old`.
     pub fn new(
         client: Arc<Client>,
-        slots: Vec<SlotInfo>,
+        slots: Option<Vec<SlotInfo>>,
         old: bool,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -474,7 +407,7 @@ impl SettingsPanel {
             field: TextField::default(),
             error: None,
             note: None,
-            esc: EscGuard::default(),
+            esc: CloseGuard::default(),
             confirm: None,
             busy: false,
             closed: false,
@@ -492,9 +425,19 @@ impl SettingsPanel {
         self.client = client;
     }
 
-    /// The slots as they are now, for the restart question.
-    pub fn set_slots(&mut self, slots: &[SlotInfo]) {
-        self.slots = slots.to_vec();
+    /// The slots as they are now (`None` when the app does not know
+    /// them), for the restart question, which an open one says again.
+    pub fn set_slots(&mut self, slots: Option<&[SlotInfo]>, cx: &mut Context<Self>) {
+        self.slots = slots.map(<[SlotInfo]>::to_vec);
+        if self.confirm.is_some() {
+            reword(&mut self.confirm, self.slots.as_deref());
+            cx.notify();
+        }
+    }
+
+    /// The file the view shows, once read.
+    pub fn config_path(&self) -> Option<PathBuf> {
+        self.draft().map(|d| d.view().config_path.clone())
     }
 
     /// A save is on its way; the app keeps a closed view until it is answered.
@@ -534,6 +477,9 @@ impl SettingsPanel {
             let reply = client.request_marked(Request::GetSettings, |_| true).await;
             let _ = this.update(cx, |this, cx| {
                 match reply {
+                    // Edits typed while it was on its way stay; the next
+                    // reopen shows the new view.
+                    Ok(Response::Settings(_)) if this.draft().is_some_and(|d| d.dirty()) => {}
                     Ok(Response::Settings(view)) => this.show(view),
                     Ok(Response::Error { message }) => this.mode = Mode::Failed(message),
                     Ok(other) => this.mode = Mode::Failed(format!("Unexpected reply: {other:?}")),
@@ -564,7 +510,12 @@ impl SettingsPanel {
         }
     }
 
+    /// None while a save is on its way: its answer replaces the draft, so
+    /// an edit made now would be lost without a word.
     fn draft_mut(&mut self) -> Option<&mut SettingsDraft> {
+        if self.busy {
+            return None;
+        }
         match &mut self.mode {
             Mode::Ready(d) => Some(d),
             _ => None,
@@ -709,13 +660,25 @@ impl SettingsPanel {
         cx.notify();
     }
 
+    /// Esc or Close: with unsaved edits the first one only warns.
+    fn try_close(&mut self, again: &'static str, cx: &mut Context<Self>) {
+        let close = match &self.mode {
+            Mode::Ready(d) => self.esc.press(d, again),
+            _ => true,
+        };
+        if close {
+            self.close(cx);
+        }
+        cx.notify();
+    }
+
     fn close(&mut self, cx: &mut Context<Self>) {
         self.closed = true;
         cx.emit(SettingsEvent::Closed);
     }
 
     fn ask_restart(&mut self, cx: &mut Context<Self>) {
-        self.confirm = Some(restart_confirm(&self.slots));
+        self.confirm = Some(restart_confirm(self.slots.as_deref()));
         cx.notify();
     }
 
@@ -747,14 +710,7 @@ impl SettingsPanel {
             return;
         }
         if ks.key == "escape" && plain {
-            let close = match &self.mode {
-                Mode::Ready(d) => self.esc.press(d),
-                _ => true,
-            };
-            if close {
-                self.close(cx);
-            }
-            cx.notify();
+            self.try_close(ESC_AGAIN, cx);
             return;
         }
         self.esc.clear();
@@ -775,6 +731,11 @@ impl SettingsPanel {
             } else if ks.key == "enter" {
                 self.save(cx);
             }
+            cx.notify();
+            return;
+        }
+        // The field stays as saved until the answer comes.
+        if self.busy {
             cx.notify();
             return;
         }
@@ -803,18 +764,18 @@ impl SettingsPanel {
     }
 }
 
-/// Opens `path` in the default text editor, off the UI thread.
-fn open_in_editor(path: PathBuf) {
-    std::thread::spawn(move || {
-        match std::process::Command::new("open")
-            .arg("-t")
-            .arg(&path)
-            .status()
-        {
-            Ok(_) => {}
-            Err(e) => tracing::warn!("could not open {}: {e}", path.display()),
-        }
-    });
+/// Opens `path` in the default text editor. Runs off the UI thread; the
+/// error names the file.
+fn open_in_editor(path: &Path) -> Result<(), String> {
+    match std::process::Command::new("open")
+        .arg("-t")
+        .arg(path)
+        .status()
+    {
+        Ok(st) if st.success() => Ok(()),
+        Ok(st) => Err(format!("Could not open {} ({st})", path.display())),
+        Err(e) => Err(format!("Could not open {}: {e}", path.display())),
+    }
 }
 
 fn button(id: &'static str, text: &str, primary: bool, enabled: bool) -> gpui::Stateful<gpui::Div> {
@@ -988,6 +949,23 @@ impl SettingsPanel {
             .into_any_element()
     }
 
+    /// Open beside a file: a failure shows where errors do.
+    fn open_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { open_in_editor(&path) })
+                .await;
+            if let Err(e) = result {
+                let _ = this.update(cx, |this, cx| {
+                    this.error = Some(e);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
     fn render_files(&self, view: &SettingsView, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
         let mut out = vec![heading("Files").into_any_element()];
         let file = |id: &'static str, label: &str, path: &Path, cx: &mut Context<Self>| {
@@ -1006,7 +984,7 @@ impl SettingsPanel {
                 )
                 .children(path.exists().then(|| {
                     button(id, "Open", false, true)
-                        .on_click(cx.listener(move |_, _, _, _| open_in_editor(p.clone())))
+                        .on_click(cx.listener(move |this, _, _, cx| this.open_file(p.clone(), cx)))
                 }))
                 .into_any_element()
         };
@@ -1162,15 +1140,18 @@ impl Render for SettingsPanel {
                                 false,
                                 self.confirm.is_none(),
                             )
-                            .on_click(cx.listener(|this, _, _, cx| this.ask_restart(cx))),
+                            .when(self.confirm.is_none(), |b| {
+                                b.on_click(cx.listener(|this, _, _, cx| this.ask_restart(cx)))
+                            }),
                         )
-                        .child(
-                            button("settings-close", "Close", false, true)
-                                .on_click(cx.listener(|this, _, _, cx| this.close(cx))),
-                        )
+                        .child(button("settings-close", "Close", false, true).on_click(
+                            cx.listener(|this, _, _, cx| this.try_close(CLOSE_AGAIN, cx)),
+                        ))
                         .child(
                             button("settings-save", "Save", true, ready && !self.busy)
-                                .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
+                                .when(ready && !self.busy, |b| {
+                                    b.on_click(cx.listener(|this, _, _, cx| this.save(cx)))
+                                }),
                         ),
                 );
         div()
@@ -1451,16 +1432,59 @@ mod tests {
             slot(3, "docs", true),
         ];
         assert_eq!(
-            restart_confirm(&slots),
+            restart_confirm(Some(&slots)),
             "Restart the daemon? 2 running sessions end and come back as resumable: S1 demo lane, S3 docs."
         );
         assert_eq!(
-            restart_confirm(&slots[..2]),
+            restart_confirm(Some(&slots[..2])),
             "Restart the daemon? 1 running session ends and comes back as resumable: S1 demo lane."
         );
         assert_eq!(
-            restart_confirm(&[slot(1, "x", false)]),
+            restart_confirm(Some(&[slot(1, "x", false)])),
             "Restart the daemon? No session is running."
+        );
+    }
+
+    #[test]
+    fn unknown_sessions_are_not_called_none() {
+        // Before the first list, or after the connection is lost, the app
+        // does not know which sessions run: the question says so and warns
+        // that some may end, never "No session is running."
+        let q = restart_confirm(None);
+        assert_eq!(q, RESTART_UNLISTED);
+        assert!(q.contains("could not be listed"));
+        assert!(q.contains("ends and comes back as resumable"));
+        assert!(!q.contains("No session is running"));
+    }
+
+    #[test]
+    fn an_open_restart_question_follows_the_sessions() {
+        // Nothing open: nothing to say again.
+        let mut confirm = None;
+        reword(&mut confirm, Some(&[slot(1, "demo lane", true)]));
+        assert_eq!(confirm, None);
+
+        let mut confirm = Some(restart_confirm(Some(&[slot(1, "demo lane", false)])));
+        assert_eq!(
+            confirm.as_deref(),
+            Some("Restart the daemon? No session is running.")
+        );
+        // A session starts while the question is open.
+        reword(&mut confirm, Some(&[slot(1, "demo lane", true)]));
+        assert_eq!(
+            confirm.as_deref(),
+            Some(
+                "Restart the daemon? 1 running session ends and comes back as resumable: S1 demo lane."
+            )
+        );
+        // The connection is lost while it is open.
+        reword(&mut confirm, None);
+        assert_eq!(confirm.as_deref(), Some(RESTART_UNLISTED));
+        // The list comes back with the session ended.
+        reword(&mut confirm, Some(&[slot(1, "demo lane", false)]));
+        assert_eq!(
+            confirm.as_deref(),
+            Some("Restart the daemon? No session is running.")
         );
     }
 
@@ -1508,82 +1532,36 @@ mod tests {
     }
 
     #[test]
-    fn restart_outcome_reports_the_result_or_the_error() {
-        assert_eq!(RESTART_ARGS, ["ctl", "restart", "--yes"]);
-        assert_eq!(
-            restart_outcome(true, "Restarted the daemon (build b1 to b2).\n", ""),
-            "Restarted the daemon (build b1 to b2)."
-        );
-        assert_eq!(restart_outcome(true, "", ""), "Restarted the daemon.");
-        assert_eq!(
-            restart_outcome(
-                false,
-                "",
-                "warning\nError: launchctl kickstart -k demo failed\n\n"
-            ),
-            "The daemon did not restart: Error: launchctl kickstart -k demo failed"
-        );
-        assert_eq!(
-            restart_outcome(false, "", ""),
-            "The daemon did not restart, and said nothing about why. See gui.log."
-        );
+    fn first_escape_with_edits_warns() {
+        let mut d = SettingsDraft::new(view());
+        let mut esc = CloseGuard::default();
+        assert!(esc.press(&d, ESC_AGAIN), "clean: closes at once");
+        d.set_text("jql", "x");
+        let mut esc = CloseGuard::default();
+        assert!(!esc.press(&d, ESC_AGAIN));
+        assert_eq!(esc.note(), Some(ESC_AGAIN));
+        assert!(esc.press(&d, ESC_AGAIN));
+        // Any other key clears the warning.
+        let mut esc = CloseGuard::default();
+        esc.press(&d, ESC_AGAIN);
+        esc.clear();
+        assert!(!esc.press(&d, ESC_AGAIN));
     }
 
     #[test]
-    fn first_escape_with_edits_warns() {
+    fn close_with_edits_asks_as_escape_does() {
         let mut d = SettingsDraft::new(view());
-        let mut esc = EscGuard::default();
-        assert!(esc.press(&d), "clean: closes at once");
-        d.set_text("jql", "x");
-        let mut esc = EscGuard::default();
-        assert!(!esc.press(&d));
-        assert_eq!(esc.note(), Some(ESC_AGAIN));
-        assert!(esc.press(&d));
-        // Any other key clears the warning.
-        let mut esc = EscGuard::default();
-        esc.press(&d);
-        esc.clear();
-        assert!(!esc.press(&d));
-    }
-
-    /// A fake daemon on a temp socket: answers each request with `reply`,
-    /// or hangs up on it when `reply` is None, as a daemon that predates
-    /// `DaemonInfo` does.
-    async fn fake_daemon(socket: PathBuf, reply: Option<Response>) {
-        use overseer_proto::{read_frame, write_frame, Frame};
-        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
-        tokio::spawn(async move {
-            let Ok((stream, _)) = listener.accept().await else {
-                return;
-            };
-            let (mut rd, mut wr) = stream.into_split();
-            if let Ok(Some(Frame::Request { seq, .. })) = read_frame(&mut rd).await {
-                if let Some(resp) = reply {
-                    let _ = write_frame(&mut wr, &Frame::Response { seq, resp }).await;
-                }
-            }
-        });
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn probe_tells_a_known_daemon_from_an_old_one() {
-        let dir = tempfile::tempdir().unwrap();
-        let info = view().daemon;
-        let new = dir.path().join("new.sock");
-        fake_daemon(new.clone(), Some(Response::DaemonInfo(info.clone()))).await;
-        assert_eq!(probe_daemon(new).await, DaemonKnown::Info(info));
-        let old = dir.path().join("old.sock");
-        fake_daemon(old.clone(), None).await;
-        assert_eq!(probe_daemon(old).await, DaemonKnown::Old);
-        let refusing = dir.path().join("refusing.sock");
-        let error = Response::Error {
-            message: "unknown request".into(),
-        };
-        fake_daemon(refusing.clone(), Some(error)).await;
-        assert_eq!(probe_daemon(refusing).await, DaemonKnown::Old);
-        assert_eq!(
-            probe_daemon(dir.path().join("none.sock")).await,
-            DaemonKnown::Unknown
-        );
+        let mut guard = CloseGuard::default();
+        assert!(guard.press(&d, CLOSE_AGAIN), "clean: Close closes at once");
+        d.toggle("push");
+        assert!(d.dirty());
+        let mut guard = CloseGuard::default();
+        assert!(!guard.press(&d, CLOSE_AGAIN), "first Close only warns");
+        assert_eq!(guard.note(), Some(CLOSE_AGAIN));
+        assert!(guard.press(&d, CLOSE_AGAIN), "second Close closes");
+        // Esc after a Close warning closes too: one warning is enough.
+        let mut guard = CloseGuard::default();
+        guard.press(&d, CLOSE_AGAIN);
+        assert!(guard.press(&d, ESC_AGAIN));
     }
 }
