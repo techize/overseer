@@ -9,6 +9,7 @@ use std::process::{Command, Stdio};
 use anyhow::{bail, Context};
 use clap::Subcommand;
 use overseer_proto::paths::{log_dir, socket_path};
+use overseer_proto::settings::{parse_text, Applies, SettingEdit, SettingsView};
 use overseer_proto::{
     build_notice, local_hhmm, slot_name, ActivityKind, BoardView, BrainRun, BrainView, ClaimKind,
     Client, DaemonInfo, ItemKind, LockView, Plan, PlanDecision, PlanRecord, PlanState, QueueState,
@@ -161,6 +162,27 @@ pub enum CtlCmd {
         #[arg(long)]
         yes: bool,
     },
+    /// Show config.toml as Settings sees it, or change one key.
+    Settings {
+        /// Print the raw SettingsView as JSON.
+        #[arg(long)]
+        json: bool,
+        #[command(subcommand)]
+        action: Option<SettingsCmd>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SettingsCmd {
+    /// Set a key in config.toml: a number, `true` or `false`, text, or a
+    /// list as a JSON array.
+    Set {
+        key: String,
+        #[arg(allow_hyphen_values = true)]
+        value: String,
+    },
+    /// Remove a key from config.toml, so its default applies.
+    Reset { key: String },
 }
 
 #[derive(Subcommand)]
@@ -698,6 +720,92 @@ pub fn format_plan(rec: &PlanRecord) -> String {
     out.join("\n")
 }
 
+/// `config.toml: <path>`, each group with its keys, then `targets.toml`
+/// and any error lines.
+pub fn format_settings(v: &SettingsView) -> Vec<String> {
+    let mut out = vec![format!("config.toml: {}", v.config_path.display())];
+    let mut group = None;
+    for s in &v.settings {
+        if group != Some(&s.group) {
+            out.push(s.group.clone());
+            group = Some(&s.group);
+        }
+        let from = if s.in_file {
+            "from the file"
+        } else {
+            "default"
+        };
+        let mut line = format!("  {} = {}  ({from})", s.key, s.value);
+        if s.restart_needed {
+            line.push_str("  restart needed");
+        }
+        if s.applies == Applies::ReadOnly {
+            line.push_str("  read-only");
+        }
+        out.push(line);
+    }
+    out.push(format!("targets.toml: {}", v.targets_note));
+    if let Some(e) = &v.load_error {
+        out.push(format!("config.toml error: {e}"));
+    }
+    if let Some(e) = &v.targets_error {
+        out.push(format!("targets.toml error: {e}"));
+    }
+    out
+}
+
+async fn get_settings(client: &Client) -> anyhow::Result<SettingsView> {
+    match client.request(Request::GetSettings).await? {
+        Response::Settings(v) => Ok(v),
+        Response::Error { message } => bail!("{message}"),
+        other => bail!("unexpected reply: {other:?}"),
+    }
+}
+
+async fn run_settings(
+    client: &Client,
+    json: bool,
+    action: Option<SettingsCmd>,
+) -> anyhow::Result<()> {
+    let view = get_settings(client).await?;
+    let edit = match action {
+        None => None,
+        Some(SettingsCmd::Set { key, value }) => {
+            let Some(s) = view.settings.iter().find(|s| s.key == key) else {
+                bail!("no setting {key}");
+            };
+            if s.applies == Applies::ReadOnly {
+                bail!("{key} is read-only here; edit config.toml");
+            }
+            let value = parse_text(&s.kind, &key, &value).map_err(|e| anyhow::anyhow!(e))?;
+            Some(SettingEdit::Set { key, value })
+        }
+        Some(SettingsCmd::Reset { key }) => Some(SettingEdit::Reset { key }),
+    };
+    let view = match edit {
+        None => view,
+        Some(edit) => match client
+            .request(Request::SaveSettings {
+                base_hash: view.file_hash,
+                edits: vec![edit],
+            })
+            .await?
+        {
+            Response::Settings(v) => v,
+            Response::Error { message } => bail!("{message}"),
+            other => bail!("unexpected reply: {other:?}"),
+        },
+    };
+    if json {
+        println!("{}", serde_json::to_string(&view)?);
+    } else {
+        for l in format_settings(&view) {
+            println!("{l}");
+        }
+    }
+    Ok(())
+}
+
 /// The pending plan, then the newest five others.
 fn plans_to_list(plans: &[PlanRecord]) -> Vec<&PlanRecord> {
     let pending = plans.iter().filter(|p| p.state == PlanState::Pending);
@@ -1095,6 +1203,7 @@ pub async fn run(cmd: CtlCmd) -> anyhow::Result<()> {
             other => bail!("unexpected reply: {other:?}"),
         },
         CtlCmd::Plan { json, action } => run_plan(&client, json, action).await,
+        CtlCmd::Settings { json, action } => run_settings(&client, json, action).await,
         CtlCmd::Summary { text } => print_brain_text(
             client
                 .request(Request::SetBoardSummary {
@@ -1131,6 +1240,57 @@ pub async fn run(cmd: CtlCmd) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_lines_group_keys_and_show_errors() {
+        use overseer_proto::settings::{Setting, SettingKind, SettingValue};
+        let row =
+            |key: &str, group: &str, applies: Applies, in_file: bool, restart: bool| Setting {
+                key: key.into(),
+                group: group.into(),
+                kind: SettingKind::List,
+                applies,
+                value: SettingValue::List(vec!["a.md".into()]),
+                default: SettingValue::List(vec![]),
+                in_file,
+                restart_needed: restart,
+                note: None,
+            };
+        let v = SettingsView {
+            config_path: "/tmp/demo/config.toml".into(),
+            file_hash: String::new(),
+            load_error: Some("bad line 3".into()),
+            settings: vec![
+                row("shared_files", "2ndBrain", Applies::Restart, true, true),
+                row("jira_command", "Commands", Applies::ReadOnly, false, false),
+                row("bd_command", "Commands", Applies::ReadOnly, true, false),
+            ],
+            targets_path: "/tmp/demo/targets.toml".into(),
+            targets_note: "3 built-in patterns; /tmp/demo/targets.toml does not exist".into(),
+            targets_error: Some("broken".into()),
+            daemon: DaemonInfo {
+                version: "0.1.0".into(),
+                build: "dev".into(),
+                pid: 1,
+                started_at: 0,
+                exe: "/tmp/demo/overseer".into(),
+            },
+        };
+        assert_eq!(
+            format_settings(&v),
+            vec![
+                "config.toml: /tmp/demo/config.toml",
+                "2ndBrain",
+                r#"  shared_files = ["a.md"]  (from the file)  restart needed"#,
+                "Commands",
+                r#"  jira_command = ["a.md"]  (default)  read-only"#,
+                r#"  bd_command = ["a.md"]  (from the file)  read-only"#,
+                "targets.toml: 3 built-in patterns; /tmp/demo/targets.toml does not exist",
+                "config.toml error: bad line 3",
+                "targets.toml error: broken",
+            ]
+        );
+    }
 
     #[test]
     fn version_lines_show_both_builds_and_the_notice() {

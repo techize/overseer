@@ -63,6 +63,7 @@ fn silent_and_fast_with_a_daemon() {
         default_command: vec!["/bin/cat".to_string()],
         env: overseer_daemon::EnvSource::Inherit,
         state_dir: home.join("state"),
+        files: overseer_daemon::SettingsFiles::in_dir(&home),
         hook_program: std::path::PathBuf::from("/bin/true"),
         // No real beads or Jira.
         patterns: overseer_daemon::locks::targets::default_patterns(),

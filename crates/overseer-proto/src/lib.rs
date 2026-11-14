@@ -5,6 +5,7 @@ pub mod client;
 pub mod frame;
 pub mod msg;
 pub mod paths;
+pub mod settings;
 
 pub use build::{
     build_from_plist, build_notice, build_of_exe, current_build, local_hhmm, DEV_BUILD,

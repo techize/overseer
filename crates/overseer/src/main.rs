@@ -98,17 +98,24 @@ fn main() {
             let home = std::env::var_os("HOME")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| std::path::PathBuf::from("/"));
-            let (settings, config_err) =
-                overseer_daemon::Config::load(&overseer_proto::paths::config_path(), &home);
-            if let Some(e) = config_err {
+            let config = overseer_proto::paths::config_path();
+            let (settings, config_error) = overseer_daemon::Config::load(&config, &home);
+            if let Some(e) = &config_error {
                 tracing::warn!("config not loaded, using defaults: {e}");
             }
-            let (patterns, targets_err) = overseer_daemon::locks::targets::load_patterns(
-                &overseer_proto::paths::targets_path(),
-            );
-            if let Some(e) = targets_err {
+            let targets = overseer_proto::paths::targets_path();
+            let (patterns, targets_error) =
+                overseer_daemon::locks::targets::load_patterns(&targets);
+            if let Some(e) = &targets_error {
                 tracing::warn!("targets not loaded, using the defaults: {e}");
             }
+            let files = overseer_daemon::SettingsFiles {
+                targets_note: overseer_daemon::settings::targets_note(patterns.len(), &targets),
+                config,
+                config_error,
+                targets,
+                targets_error,
+            };
             let result = runtime().and_then(|rt| {
                 rt.block_on(overseer_daemon::run(DaemonConfig {
                     socket,
@@ -118,6 +125,7 @@ fn main() {
                     hook_program: std::env::current_exe()?,
                     settings,
                     patterns,
+                    files,
                 }))
             });
             match &result {

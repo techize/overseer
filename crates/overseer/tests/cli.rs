@@ -295,6 +295,88 @@ fn ctl_version_survives_a_daemon_that_predates_daemon_info() {
 }
 
 #[test]
+fn ctl_settings_set_and_reset() {
+    let env = Env::new();
+    let config = env.home.join("config.toml");
+    let out = stdout_of(&mut env.ctl(&["settings"]));
+    assert!(
+        out.starts_with(&format!("config.toml: {}\n", config.display())),
+        "{out}"
+    );
+    assert!(out.contains("\nLocks and worktrees\n"), "{out}");
+    assert!(
+        out.contains("\n  lock_idle_mins = 60  (default)\n"),
+        "{out}"
+    );
+    assert!(
+        out.contains("\n  brain_writer = false  (default)  read-only\n"),
+        "{out}"
+    );
+    assert!(out.contains("\ntargets.toml: "), "{out}");
+    let out = stdout_of(&mut env.ctl(&["settings", "set", "lock_idle_mins", "15"]));
+    assert!(
+        out.contains("\n  lock_idle_mins = 15  (from the file)  restart needed\n"),
+        "{out}"
+    );
+    let text = std::fs::read_to_string(&config).unwrap();
+    assert!(text.ends_with("lock_idle_mins = 15\n"), "{text}");
+    // The keys `Env` wrote stay.
+    assert!(text.contains("jira_command = []"), "{text}");
+    let out = stdout_of(&mut env.ctl(&["settings", "reset", "lock_idle_mins"]));
+    assert!(
+        out.contains("\n  lock_idle_mins = 60  (default)\n"),
+        "{out}"
+    );
+    assert!(!std::fs::read_to_string(&config)
+        .unwrap()
+        .contains("lock_idle_mins"));
+    let json = stdout_of(&mut env.ctl(&["settings", "--json"]));
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(v["config_path"], config.display().to_string());
+}
+
+#[test]
+fn ctl_settings_refuses_a_bad_value() {
+    let env = Env::new();
+    let config = env.home.join("config.toml");
+    let before = std::fs::read(&config).unwrap();
+    let out = env
+        .ctl(&["settings", "set", "lock_idle_mins", "0"])
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("lock_idle_mins must be a whole number from 1 to 10080"),
+        "{err}"
+    );
+    env.ctl(&["settings", "set", "shared_files", r#"["a.md","b/*.md"]"#])
+        .assert()
+        .success();
+    let text = std::fs::read_to_string(&config).unwrap();
+    assert!(
+        text.contains(r#"shared_files = ["a.md", "b/*.md"]"#),
+        "{text}"
+    );
+    let out = env
+        .ctl(&["settings", "set", "brain_writer", "true"])
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("brain_writer is read-only here; edit config.toml"),
+        "{err}"
+    );
+    assert_ne!(std::fs::read(&config).unwrap(), before);
+    assert!(!std::fs::read_to_string(&config)
+        .unwrap()
+        .contains("brain_writer"));
+}
+
+#[test]
 fn ctl_start_send_status() {
     let env = Env::new();
     env.ctl(&["start", "2", "--cwd", "/tmp", "--label", "demo"])

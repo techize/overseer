@@ -8,8 +8,8 @@ use std::time::Duration;
 use anyhow::Context;
 use bytes::Bytes;
 use overseer_proto::{
-    read_frame, slot_name, write_frame, BoardView, DaemonInfo, Event, Frame, Request, Response,
-    SlotId, SlotState,
+    read_frame, settings::SettingEdit, slot_name, write_frame, BoardView, DaemonInfo, Event, Frame,
+    Request, Response, SlotId, SlotState,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
@@ -25,6 +25,7 @@ use crate::ledger::Ledger;
 use crate::locks::{owned_items, LockService};
 use crate::manager::{valid_id, Attachment, SlotManager};
 use crate::relay::courier::Courier;
+use crate::settings::SettingsFiles;
 use crate::slot::CatchUp;
 use crate::work::store::{unix_now, KickoffFacts};
 use crate::work::WorkStore;
@@ -50,6 +51,36 @@ pub struct DaemonConfig {
     pub settings: crate::config::Config,
     /// Write target patterns, from `targets.toml` and the defaults.
     pub patterns: Vec<crate::locks::targets::Pattern>,
+    /// The files the Settings view reads and saves.
+    pub files: SettingsFiles,
+}
+
+/// What `GetSettings` and `SaveSettings` work with. `running` is the
+/// config this daemon started with; saves are one at a time.
+struct SettingsCtx {
+    files: SettingsFiles,
+    running: crate::config::Config,
+    home: PathBuf,
+    save: Mutex<()>,
+}
+
+impl SettingsCtx {
+    fn view(&self, info: &DaemonInfo) -> Response {
+        Response::Settings(crate::settings::read(
+            &self.files,
+            &self.running,
+            &self.home,
+            info.clone(),
+        ))
+    }
+
+    fn save(&self, info: &DaemonInfo, base_hash: &str, edits: &[SettingEdit]) -> Response {
+        let _one = self.save.lock().unwrap();
+        match crate::settings::save(&self.files, &self.home, base_hash, edits) {
+            Ok(()) => self.view(info),
+            Err(message) => Response::Error { message },
+        }
+    }
 }
 
 /// `run` found another daemon serving the socket. Not a failure: the daemon
@@ -99,6 +130,15 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
         pid: std::process::id(),
         started_at: unix_now(),
         exe: std::env::current_exe().unwrap_or_default(),
+    });
+    let settings = Arc::new(SettingsCtx {
+        files: cfg.files,
+        running: cfg.settings.clone(),
+        // The same home `main` expands `config.toml` against.
+        home: std::env::var_os("HOME")
+            .filter(|h| !h.is_empty())
+            .map_or_else(|| PathBuf::from("/"), PathBuf::from),
+        save: Mutex::new(()),
     });
     // Resolved in the background so clients can connect at once; a
     // StartSlot waits for it.
@@ -227,6 +267,7 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
                             state_dir: state_dir.clone(),
                             brain: brain.clone(),
                             info: info.clone(),
+                            settings: settings.clone(),
                         },
                         shutdown.clone(),
                         env.clone(),
@@ -457,6 +498,7 @@ struct Services {
     state_dir: PathBuf,
     brain: Option<Arc<BrainService>>,
     info: Arc<DaemonInfo>,
+    settings: Arc<SettingsCtx>,
 }
 
 async fn handle_conn(
@@ -475,6 +517,7 @@ async fn handle_conn(
         state_dir,
         brain,
         info,
+        settings,
     } = services;
     let (mut rd, mut wr) = stream.into_split();
     let (out_tx, mut out_rx) = mpsc::channel::<Frame>(OUTBOUND_QUEUE);
@@ -566,6 +609,7 @@ async fn handle_conn(
                         state_dir: &state_dir,
                         brain: brain.as_ref(),
                         info: &info,
+                        settings: &settings,
                     };
                     handle_frame(f, &ctx, &outbox, &shutdown, &mut streams)
                 }
@@ -600,6 +644,7 @@ struct Ctx<'a> {
     state_dir: &'a Path,
     brain: Option<&'a Arc<BrainService>>,
     info: &'a DaemonInfo,
+    settings: &'a SettingsCtx,
 }
 
 fn handle_frame(
@@ -814,6 +859,10 @@ fn handle_request(
         }
         Request::ListSlots => Response::Slots(manager.lock().unwrap().list()),
         Request::DaemonInfo => Response::DaemonInfo(ctx.info.clone()),
+        Request::GetSettings => ctx.settings.view(ctx.info),
+        Request::SaveSettings { base_hash, edits } => {
+            ctx.settings.save(ctx.info, &base_hash, &edits)
+        }
         // RefreshWorkItems is answered in `handle_frame` once the sources
         // have run; this arm only keeps the match whole.
         Request::ListWorkItems | Request::RefreshWorkItems => Response::Work(store.view()),

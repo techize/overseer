@@ -30,6 +30,7 @@ impl TempDaemon {
             default_command: vec!["/bin/cat".to_string()],
             env: overseer_daemon::EnvSource::Inherit,
             state_dir: home.join("state"),
+            files: overseer_daemon::SettingsFiles::in_dir(&home),
             hook_program: std::path::PathBuf::from("/bin/true"),
             patterns: overseer_daemon::locks::targets::default_patterns(),
             // No real beads or Jira.

@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::settings::{SettingEdit, SettingsView};
+
 /// Slot index, `0..=6`.
 pub type SlotId = u8;
 
@@ -527,6 +529,14 @@ pub enum Request {
     },
     /// Ask the daemon which build it runs.
     DaemonInfo,
+    /// `Response::Settings`: `config.toml` as Settings shows it.
+    GetSettings,
+    /// Apply `edits` to `config.toml` when its hash is still `base_hash`;
+    /// answers the new `Response::Settings` or the refusal.
+    SaveSettings {
+        base_hash: String,
+        edits: Vec<SettingEdit>,
+    },
 }
 
 /// One write target a plan has a slot claim.
@@ -830,6 +840,7 @@ pub enum Response {
         refusal: Option<String>,
     },
     DaemonInfo(DaemonInfo),
+    Settings(SettingsView),
 }
 
 // Adjacent tagging because `SlotChanged` is a tuple variant.
@@ -1360,6 +1371,56 @@ mod tests {
             pid: 42,
             started_at: 1_700_000_000,
             exe: "/Applications/Overseer.app/Contents/MacOS/overseer".into(),
+        });
+        let back: Response = serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
+        assert_eq!(back, resp);
+    }
+
+    #[test]
+    fn settings_messages_round_trip() {
+        use crate::settings::{Applies, Setting, SettingKind, SettingValue};
+        for req in [
+            Request::GetSettings,
+            Request::SaveSettings {
+                base_hash: "0123456789abcdef".into(),
+                edits: vec![
+                    SettingEdit::Set {
+                        key: "terminal.font_size".into(),
+                        value: SettingValue::Float(14.0),
+                    },
+                    SettingEdit::Reset { key: "jql".into() },
+                ],
+            },
+        ] {
+            let back: Request =
+                serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+            assert_eq!(back, req);
+        }
+        let resp = Response::Settings(SettingsView {
+            config_path: "/tmp/demo/config.toml".into(),
+            file_hash: String::new(),
+            load_error: None,
+            settings: vec![Setting {
+                key: "shared_files".into(),
+                group: "2ndBrain".into(),
+                kind: SettingKind::List,
+                applies: Applies::Restart,
+                value: SettingValue::List(vec!["a.md".into()]),
+                default: SettingValue::List(vec![]),
+                in_file: true,
+                restart_needed: true,
+                note: None,
+            }],
+            targets_path: "/tmp/demo/targets.toml".into(),
+            targets_note: "3 built-in patterns; /tmp/demo/targets.toml does not exist".into(),
+            targets_error: None,
+            daemon: DaemonInfo {
+                version: "0.1.0".into(),
+                build: "dev".into(),
+                pid: 1,
+                started_at: 0,
+                exe: "/tmp/demo/overseer".into(),
+            },
         });
         let back: Response = serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
         assert_eq!(back, resp);

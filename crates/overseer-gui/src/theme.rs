@@ -16,8 +16,7 @@ use std::path::PathBuf;
 use overseer_term::{Palette, Rgb};
 use serde::Deserialize;
 
-pub const DEFAULT_FONT_FAMILY: &str = "Menlo";
-pub const DEFAULT_FONT_SIZE: f32 = 13.0;
+pub use overseer_proto::settings::{DEFAULT_FONT_FAMILY, DEFAULT_FONT_SIZE};
 
 #[derive(Debug, Clone)]
 pub struct Theme {

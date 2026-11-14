@@ -6,50 +6,16 @@
 
 use std::path::Path;
 
+/// The settings check reads `sprint_start` with the same parser.
+pub use overseer_proto::settings::{parse_ymd, Ymd};
+
 /// The sprint length when `sprint_days` is 0 (a hand-edited config).
 pub const DEFAULT_DAYS: u32 = 10;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Ymd {
-    pub y: i32,
-    pub m: u32,
-    pub d: u32,
-}
 
 const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
 const WEEKDAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-
-fn is_leap(y: i32) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
-}
-
-fn days_in_month(y: i32, m: u32) -> u32 {
-    match m {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        _ if is_leap(y) => 29,
-        _ => 28,
-    }
-}
-
-/// `YYYY-MM-DD`, a real calendar date.
-pub fn parse_ymd(s: &str) -> Option<Ymd> {
-    let mut parts = s.trim().split('-');
-    let (y, m, d) = (parts.next()?, parts.next()?, parts.next()?);
-    if parts.next().is_some() || y.len() != 4 || m.len() != 2 || d.len() != 2 {
-        return None;
-    }
-    if ![y, m, d]
-        .iter()
-        .all(|p| p.bytes().all(|b| b.is_ascii_digit()))
-    {
-        return None;
-    }
-    let (y, m, d): (i32, u32, u32) = (y.parse().ok()?, m.parse().ok()?, d.parse().ok()?);
-    ((1..=12).contains(&m) && d >= 1 && d <= days_in_month(y, m)).then_some(Ymd { y, m, d })
-}
 
 /// Days since 1970-01-01 (civil-from-days, Howard Hinnant's algorithm).
 fn to_days(t: Ymd) -> i64 {

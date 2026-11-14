@@ -944,7 +944,7 @@ impl FindBar {
 }
 
 /// Editor for Cmd+click on a path when the config does not name one.
-pub const DEFAULT_EDITOR: &str = "Visual Studio Code";
+pub use overseer_proto::settings::DEFAULT_EDITOR;
 
 #[derive(Deserialize, Default)]
 struct EditorConfig {
