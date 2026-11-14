@@ -1,5 +1,8 @@
 use std::process::Command;
 
+/// Stands in for launchctl: every call fails, so nothing reaches launchd.
+const NO_LAUNCHCTL: &str = "/usr/bin/false";
+
 #[test]
 fn bundle_writes_the_build_id_and_signs() {
     let tmp = tempfile::tempdir().unwrap();
@@ -16,6 +19,7 @@ fn bundle_writes_the_build_id_and_signs() {
         .env("HOME", &home)
         .env("OVERSEER_HOME", tmp.path().join("overseer"))
         .env("OVERSEER_BUILD", "test-7")
+        .env("OVERSEER_LAUNCHCTL", NO_LAUNCHCTL)
         .output()
         .unwrap();
     assert!(
@@ -39,6 +43,7 @@ fn bundle_writes_the_build_id_and_signs() {
         .args(["ctl", "version"])
         .env("HOME", &home)
         .env("OVERSEER_HOME", tmp.path().join("overseer"))
+        .env("OVERSEER_LAUNCHCTL", NO_LAUNCHCTL)
         .output()
         .unwrap();
     let text = String::from_utf8_lossy(&ver.stdout);

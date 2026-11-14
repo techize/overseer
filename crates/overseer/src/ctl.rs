@@ -154,6 +154,13 @@ pub enum CtlCmd {
     },
     /// Stop the daemon and every session.
     Shutdown,
+    /// Restart the daemon. Running sessions end and come back as
+    /// resumable; you are asked first when any are running.
+    Restart {
+        /// Restart without asking, even with sessions running.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -848,6 +855,7 @@ pub async fn run(cmd: CtlCmd) -> anyhow::Result<()> {
     let client = connect().await?;
     match cmd {
         CtlCmd::Version => unreachable!("handled before connecting"),
+        CtlCmd::Restart { .. } => unreachable!("handled by agent::restart"),
         CtlCmd::Status => match client.request(Request::ListSlots).await? {
             Response::Slots(slots) => {
                 for s in &slots {

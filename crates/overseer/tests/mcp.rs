@@ -8,6 +8,9 @@ use overseer_daemon::{run, DaemonConfig};
 use overseer_proto::Client;
 use serde_json::{json, Value};
 
+/// Stands in for launchctl: every call fails, so nothing reaches launchd.
+const NO_LAUNCHCTL: &str = "/usr/bin/false";
+
 /// A temp home under /tmp (socket paths are length-limited) holding a
 /// daemon that runs on the returned runtime until the guard drops.
 struct TempDaemon {
@@ -76,6 +79,7 @@ struct Mcp {
 impl Mcp {
     fn start(home: &std::path::Path, slot: &str) -> Mcp {
         let mut child = Command::new(env!("CARGO_BIN_EXE_overseer"))
+            .env("OVERSEER_LAUNCHCTL", NO_LAUNCHCTL)
             .arg("mcp")
             .env("OVERSEER_HOME", home)
             .env("OVERSEER_SLOT", slot)

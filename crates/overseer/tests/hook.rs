@@ -8,6 +8,9 @@ use overseer_daemon::{run, DaemonConfig};
 use overseer_proto::{read_frame, write_frame, Client, Frame, HookKind, Request, Response};
 use tokio::net::UnixListener;
 
+/// Stands in for launchctl: every call fails, so nothing reaches launchd.
+const NO_LAUNCHCTL: &str = "/usr/bin/false";
+
 const STOP: &[u8] = br#"{"session_id":"abc","hook_event_name":"Stop"}"#;
 
 fn run_hook(home: &std::path::Path) {
@@ -16,12 +19,14 @@ fn run_hook(home: &std::path::Path) {
     static WARM: std::sync::Once = std::sync::Once::new();
     WARM.call_once(|| {
         let _ = Command::new(env!("CARGO_BIN_EXE_overseer"))
+            .env("OVERSEER_LAUNCHCTL", NO_LAUNCHCTL)
             .arg("hook")
             .stdin(Stdio::null())
             .output();
     });
     let start = Instant::now();
     let mut child = Command::new(env!("CARGO_BIN_EXE_overseer"))
+        .env("OVERSEER_LAUNCHCTL", NO_LAUNCHCTL)
         .args(["hook", "Stop"])
         .env("OVERSEER_HOME", home)
         .env("OVERSEER_SLOT", "S1")
@@ -84,6 +89,7 @@ fn silent_and_fast_with_a_daemon() {
 #[test]
 fn bare_hook_without_event_is_silent_and_exits_zero() {
     let out = Command::new(env!("CARGO_BIN_EXE_overseer"))
+        .env("OVERSEER_LAUNCHCTL", NO_LAUNCHCTL)
         .arg("hook")
         .env("OVERSEER_SLOT", "S1")
         .stdin(Stdio::null())
@@ -189,11 +195,13 @@ const BASH: &[u8] = br#"{"session_id":"abc","hook_event_name":"PreToolUse","tool
 /// stderr and returns stdout and how long it took.
 fn run_pre_tool_use(home: &std::path::Path, stdin: &[u8]) -> (String, Duration) {
     let _ = Command::new(env!("CARGO_BIN_EXE_overseer"))
+        .env("OVERSEER_LAUNCHCTL", NO_LAUNCHCTL)
         .arg("hook")
         .stdin(Stdio::null())
         .output();
     let start = Instant::now();
     let mut child = Command::new(env!("CARGO_BIN_EXE_overseer"))
+        .env("OVERSEER_LAUNCHCTL", NO_LAUNCHCTL)
         .args(["hook", "PreToolUse"])
         .env("OVERSEER_HOME", home)
         .env("OVERSEER_SLOT", "S1")

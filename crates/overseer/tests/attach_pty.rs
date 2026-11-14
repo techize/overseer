@@ -11,6 +11,8 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
 const SCRIPT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fake-claude.sh");
 const RESTORE: &str = "\x1b[?25h";
+/// Stands in for launchctl: every call fails, so an autostart spawns.
+const NO_LAUNCHCTL: &str = "/usr/bin/false";
 
 struct Home(PathBuf);
 
@@ -27,6 +29,7 @@ impl Home {
             .env("OVERSEER_HOME", &self.0)
             .env("OVERSEER_CONFIG", self.0.join("config.toml"))
             .env("OVERSEER_DEFAULT_COMMAND", SCRIPT)
+            .env("OVERSEER_LAUNCHCTL", NO_LAUNCHCTL)
             .arg("ctl")
             .args(args)
             .output()
@@ -65,6 +68,7 @@ impl Attached {
         cmd.args(["attach", "1"]);
         cmd.env("OVERSEER_HOME", &home.0);
         cmd.env("OVERSEER_CONFIG", home.0.join("config.toml"));
+        cmd.env("OVERSEER_LAUNCHCTL", NO_LAUNCHCTL);
         let child = pair.slave.spawn_command(cmd).unwrap();
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader().unwrap();

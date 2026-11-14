@@ -10,6 +10,28 @@ pub fn slot_name(id: SlotId) -> String {
     format!("S{id}")
 }
 
+/// `1 running session` or `<n> running sessions`.
+pub fn running_sessions_count(n: usize) -> String {
+    match n {
+        1 => "1 running session".to_string(),
+        n => format!("{n} running sessions"),
+    }
+}
+
+/// Running sessions by slot and label, comma separated, as the restart
+/// warnings name them: `S1 demo lane, S3 docs`. A slot with no label is just
+/// `S4`. Each caller wraps it in its own sentence.
+pub fn running_sessions_text<'a>(running: impl IntoIterator<Item = (SlotId, &'a str)>) -> String {
+    running
+        .into_iter()
+        .map(|(id, label)| match label.trim() {
+            "" => slot_name(id),
+            l => format!("{} {l}", slot_name(id)),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Lifecycle state of a slot. Timestamps are unix seconds.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -1046,6 +1068,17 @@ mod tests {
     #[test]
     fn names() {
         assert_eq!(slot_name(3), "S3");
+    }
+
+    #[test]
+    fn running_sessions_are_named_with_their_labels() {
+        assert_eq!(
+            running_sessions_text([(1, "demo lane"), (3, "docs"), (4, "")]),
+            "S1 demo lane, S3 docs, S4"
+        );
+        assert_eq!(running_sessions_text([]), "");
+        assert_eq!(running_sessions_count(1), "1 running session");
+        assert_eq!(running_sessions_count(2), "2 running sessions");
     }
 
     #[test]

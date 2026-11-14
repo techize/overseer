@@ -82,11 +82,9 @@ fn main() {
         }
         // No logger: stdout carries the protocol, nothing else may use it.
         Cmd::Mcp => mcp::run(),
-        // The flags take effect in a later change; parsed now so scripts can pass them.
-        Cmd::InstallAgent {
-            yes: _,
-            no_restart: _,
-        } => agent::install(),
+        Cmd::InstallAgent { yes, no_restart } => {
+            agent::install(agent::RestartOpts::from_flags(yes, no_restart))
+        }
         Cmd::UninstallAgent => agent::uninstall(),
         Cmd::Daemon { foreground: _ } => {
             init_logging("daemon.log");
@@ -139,6 +137,10 @@ fn main() {
             result
         }
         Cmd::Attach { n } => runtime().and_then(|rt| rt.block_on(attach::run(n))),
+        // Synchronous, like install-agent: it makes its own runtimes.
+        Cmd::Ctl {
+            cmd: ctl::CtlCmd::Restart { yes },
+        } => agent::restart(agent::RestartOpts::from_flags(yes, false)),
         Cmd::Ctl { cmd } => runtime().and_then(|rt| rt.block_on(ctl::run(cmd))),
     };
     if let Err(e) = result {
