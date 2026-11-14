@@ -186,8 +186,13 @@ pub fn check(key: &str, kind: &SettingKind, value: &SettingValue) -> Result<(), 
             }
             regex::Regex::new(s).map(|_| ()).map_err(|e| {
                 let text = e.to_string();
-                let first = text.lines().next().unwrap_or_default().to_string();
-                format!("{key} is not a valid pattern: {first}")
+                // The last line says what is wrong; the first is only
+                // `regex parse error:`.
+                let last = text.lines().rev().find(|l| !l.trim().is_empty());
+                format!(
+                    "{key} is not a valid pattern: {}",
+                    last.unwrap_or_default().trim()
+                )
             })
         }
         (SettingKind::Date, SettingValue::Text(s)) => {
@@ -368,7 +373,7 @@ mod tests {
         assert_eq!(t(&SettingKind::Pattern, r"DEMO-\d+"), Ok(()));
         assert_eq!(
             t(&SettingKind::Pattern, "("),
-            Err("k is not a valid pattern: regex parse error:".to_string())
+            Err("k is not a valid pattern: error: unclosed group".to_string())
         );
     }
 

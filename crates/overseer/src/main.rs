@@ -95,9 +95,7 @@ fn main() {
                 std::process::id(),
                 socket.display()
             );
-            let home = std::env::var_os("HOME")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| std::path::PathBuf::from("/"));
+            let home = overseer_daemon::config::home_from_env();
             let config = overseer_proto::paths::config_path();
             let (settings, config_error) = overseer_daemon::Config::load(&config, &home);
             if let Some(e) = &config_error {

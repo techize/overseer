@@ -16,7 +16,7 @@ use toml_edit::{DocumentMut, Item, Value};
 use crate::config::Config;
 
 /// The files Settings shows, and what the daemon found in them at start.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct SettingsFiles {
     pub config: PathBuf,
     /// Why `config` did not load at daemon start.
@@ -32,8 +32,10 @@ impl SettingsFiles {
     pub fn in_dir(dir: &Path) -> SettingsFiles {
         SettingsFiles {
             config: dir.join("config.toml"),
+            config_error: None,
             targets: dir.join("targets.toml"),
-            ..SettingsFiles::default()
+            targets_note: String::new(),
+            targets_error: None,
         }
     }
 }
@@ -443,7 +445,8 @@ fn comment_above(decor: &toml_edit::Decor) -> Option<String> {
 
 /// Removes `key`. Comments written above it move to whatever now comes
 /// next (the next key, the next table header or the end of the file), so a
-/// reset never drops your notes.
+/// reset never drops your notes. A comment after the value on the same
+/// line goes with the key.
 fn remove(doc: &mut DocumentMut, key: &str) {
     let (table, k) = split(key);
     let tbl: &mut dyn toml_edit::TableLike = match table {
@@ -507,6 +510,8 @@ fn remove(doc: &mut DocumentMut, key: &str) {
 /// Every edit is checked and the result must load as a `Config` before
 /// anything is written. Values are written as given (`~` unexpanded), so
 /// `home` is not needed here; it keeps the arguments in step with `read`.
+/// A hand edit landing between the hash check and the rename (a window of
+/// microseconds) is lost; one made any earlier is refused as stale.
 pub fn save(
     files: &SettingsFiles,
     _home: &Path,
@@ -543,20 +548,36 @@ pub fn save(
         .map_err(|e| format!("cannot write {}: {e}", files.config.display()))
 }
 
-/// Writes through a symlink: the temp file goes beside the link's target
-/// and is renamed over it, so the link stays a link.
-fn write_atomic(p: &Path, text: &str) -> std::io::Result<()> {
-    let target = match std::fs::symlink_metadata(p) {
-        Ok(m) if m.file_type().is_symlink() => match std::fs::canonicalize(p) {
-            Ok(t) => t,
-            // A dangling link: create the file it names.
-            Err(_) => {
-                let to = std::fs::read_link(p)?;
-                p.parent().unwrap_or(Path::new("/")).join(to)
+/// The file a write to `p` should replace: `p`, or the end of its chain
+/// of symlinks, even when that end does not exist yet.
+fn write_target(p: &Path) -> std::io::Result<PathBuf> {
+    if let Ok(t) = std::fs::canonicalize(p) {
+        return Ok(t);
+    }
+    // A dangling chain: follow it link by link to the missing file.
+    let mut at = p.to_path_buf();
+    for _ in 0..40 {
+        match std::fs::symlink_metadata(&at) {
+            Ok(m) if m.file_type().is_symlink() => {
+                let to = std::fs::read_link(&at)?;
+                at = at.parent().unwrap_or(Path::new("/")).join(to);
             }
-        },
-        _ => p.to_path_buf(),
-    };
+            _ => return Ok(at),
+        }
+    }
+    Err(std::io::Error::other(format!(
+        "too many symlinks at {}",
+        p.display()
+    )))
+}
+
+/// Writes through a symlink: the temp file goes beside the link's target
+/// and is renamed over it, so the link stays a link. The data and the
+/// rename are synced, so a crash leaves the old file or the new one,
+/// never a truncated one.
+fn write_atomic(p: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let target = write_target(p)?;
     let dir = target.parent().unwrap_or(Path::new("/"));
     std::fs::create_dir_all(dir)?;
     let name = target
@@ -564,12 +585,25 @@ fn write_atomic(p: &Path, text: &str) -> std::io::Result<()> {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "config.toml".to_string());
     let tmp = dir.join(format!(".{name}.tmp-{}", std::process::id()));
+    // A stale temp file from a crashed save; `create_new` below also
+    // refuses a link planted at this name.
+    let _ = std::fs::remove_file(&tmp);
     let result = (|| {
-        std::fs::write(&tmp, text)?;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
         if let Ok(m) = std::fs::metadata(&target) {
-            std::fs::set_permissions(&tmp, m.permissions())?;
+            f.set_permissions(m.permissions())?;
         }
-        std::fs::rename(&tmp, &target)
+        drop(f);
+        std::fs::rename(&tmp, &target)?;
+        // The new file is in place; a folder that cannot be synced does not
+        // undo the save.
+        let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
+        Ok(())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
@@ -809,6 +843,48 @@ mod tests {
     }
 
     #[test]
+    fn save_follows_a_dangling_chain_of_links_to_its_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = SettingsFiles::in_dir(dir.path());
+        std::os::unix::fs::symlink("a.toml", &files.config).unwrap();
+        std::os::unix::fs::symlink("dots/real.toml", dir.path().join("a.toml")).unwrap();
+        save(
+            &files,
+            &home(),
+            "",
+            &[put("lock_idle_mins", SettingValue::Int(15))],
+        )
+        .unwrap();
+        for link in [&files.config, &dir.path().join("a.toml")] {
+            assert!(std::fs::symlink_metadata(link)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("dots/real.toml")).unwrap(),
+            "lock_idle_mins = 15\n"
+        );
+    }
+
+    #[test]
+    fn save_replaces_a_stale_temp_file() {
+        let rig = Rig::new(Some("jql = \"project = DEMO\"\n"));
+        let tmp = rig
+            .files
+            .config
+            .with_file_name(format!(".config.toml.tmp-{}", std::process::id()));
+        std::fs::write(&tmp, "left by a crash").unwrap();
+        rig.save(&[put("lock_idle_mins", SettingValue::Int(15))])
+            .unwrap();
+        assert!(!tmp.exists());
+        assert_eq!(
+            rig.text(),
+            "jql = \"project = DEMO\"\nlock_idle_mins = 15\n"
+        );
+    }
+
+    #[test]
     fn save_refuses_when_the_file_changed_since_read() {
         let rig = Rig::new(Some("jql = \"project = DEMO\"\n"));
         let hash = rig.hash();
@@ -849,7 +925,7 @@ mod tests {
             ),
             (
                 put("ticket_pattern", SettingValue::Text("(".into())),
-                "ticket_pattern is not a valid pattern: regex parse error:",
+                "ticket_pattern is not a valid pattern: error: unclosed group",
             ),
             (
                 put("jql", SettingValue::Text(String::new())),

@@ -135,9 +135,7 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
         files: cfg.files,
         running: cfg.settings.clone(),
         // The same home `main` expands `config.toml` against.
-        home: std::env::var_os("HOME")
-            .filter(|h| !h.is_empty())
-            .map_or_else(|| PathBuf::from("/"), PathBuf::from),
+        home: crate::config::home_from_env(),
         save: Mutex::new(()),
     });
     // Resolved in the background so clients can connect at once; a

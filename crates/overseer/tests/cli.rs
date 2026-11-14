@@ -351,6 +351,7 @@ fn ctl_settings_refuses_a_bad_value() {
         err.contains("lock_idle_mins must be a whole number from 1 to 10080"),
         "{err}"
     );
+    assert_eq!(std::fs::read(&config).unwrap(), before);
     env.ctl(&["settings", "set", "shared_files", r#"["a.md","b/*.md"]"#])
         .assert()
         .success();

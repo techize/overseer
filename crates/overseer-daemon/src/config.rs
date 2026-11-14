@@ -90,6 +90,13 @@ impl Default for Config {
     }
 }
 
+/// `$HOME`, or `/` when it is unset or empty: the home `~/` expands against.
+pub fn home_from_env() -> PathBuf {
+    std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map_or_else(|| PathBuf::from("/"), PathBuf::from)
+}
+
 impl Config {
     /// A missing file gives the defaults and `None`; an unreadable or invalid
     /// file gives the defaults and the error text. `~/` is expanded against `home`.
