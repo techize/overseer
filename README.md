@@ -80,6 +80,11 @@ for the app and the link, with or without `OVERSEER_HOME`. Run such an app with
 `OVERSEER_HOME` set, as the summary shows; opening it from Finder would start
 it without, against the default home. Its agent is not loaded at login.
 
+Only the install is kept apart. With `OVERSEER_HOME` set and `OVERSEER_CONFIG`
+unset, the daemon reads the default config file, `~/.config/overseer/config.toml`,
+and Settings writes to it, so that is your real config. Set `OVERSEER_CONFIG`
+(and `OVERSEER_TARGETS`) as well for a fully isolated home.
+
 ## Upgrade
 
 ```

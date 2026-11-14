@@ -26,6 +26,8 @@ pub struct LockRow {
     pub kind: &'static str,
     /// `since 08:40 (2h 5m)`; empty when nobody holds it.
     pub since: String,
+    /// The claim's start time, which tells a renewed claim from the same one.
+    pub claimed_at: Option<i64>,
     /// `for DEMO-33`: the claim's work item, else its reason.
     pub why: Option<String>,
     /// `at <revision>` for a pin.
@@ -103,6 +105,7 @@ pub fn lock_rows(
             holder_text: holder_text(c.slot, slots),
             kind: kind_name(c.kind),
             since: format!("since {} ({})", clock(c.since), age_text(now - c.since)),
+            claimed_at: Some(c.since),
             why: c
                 .item
                 .as_deref()
@@ -127,6 +130,7 @@ pub fn lock_rows(
         holder_text: "nobody".into(),
         kind: "",
         since: String::new(),
+        claimed_at: None,
         why: None,
         pin: None,
         long_held: false,
@@ -163,10 +167,11 @@ pub enum LocksAction {
     Ignored,
 }
 
-/// An open force-release confirm: the holder it showed.
+/// An open force-release confirm: the claim it showed, by holder and start.
 struct Confirm {
     target: String,
     holder: SlotId,
+    claimed_at: Option<i64>,
     prompt: String,
 }
 
@@ -186,6 +191,7 @@ impl Confirm {
         Some(Confirm {
             target: row.target.clone(),
             holder,
+            claimed_at: row.claimed_at,
             prompt,
         })
     }
@@ -249,8 +255,8 @@ impl LocksState {
     }
 
     /// After the daemon's view changed: keeps the selection on its target,
-    /// and closes an open confirm whose target now has another holder or
-    /// none, saying so.
+    /// and closes an open confirm whose target now has another holder, a
+    /// renewed claim by the same one, or none, saying so.
     pub fn on_change(&mut self, rows: &[LockRow]) -> Option<String> {
         if let Some(i) = self.selected(rows) {
             self.select(i, rows);
@@ -261,7 +267,7 @@ impl LocksState {
             .find(|r| r.target == open.target)
             .and_then(Confirm::for_row);
         match fresh {
-            Some(c) if c.holder == open.holder => {
+            Some(c) if c.holder == open.holder && c.claimed_at == open.claimed_at => {
                 self.confirm = Some(c);
                 None
             }
@@ -524,6 +530,7 @@ mod tests {
                 holder_text: "S1 demo lane".into(),
                 kind: "claim",
                 since: "since 08:40 (2h 5m)".into(),
+                claimed_at: Some(at(8, 40)),
                 why: Some("for DEMO-33".into()),
                 pin: None,
                 long_held: false,
@@ -694,6 +701,23 @@ mod tests {
             s.prompt().as_deref(),
             Some("Release S1's argo:uat/root? Nobody is waiting. Enter / Esc")
         );
+    }
+
+    #[test]
+    fn confirm_drops_when_the_same_slot_renews_the_claim() {
+        let mut s = LocksState::default();
+        s.key("enter", &rows(&demo()));
+        assert_eq!(s.prompt().as_deref(), Some(PROMPT));
+        // S1 released and took the target again: same slot, new since.
+        let mut v = demo();
+        v.claims[1].since = at(10, 30);
+        let after = rows(&v);
+        assert_eq!(
+            s.on_change(&after).as_deref(),
+            Some("argo:uat/root changed hands; look again")
+        );
+        assert_eq!(s.prompt(), None);
+        assert_eq!(s.key("enter", &after), LocksAction::Redraw, "nothing sent");
     }
 
     #[test]
