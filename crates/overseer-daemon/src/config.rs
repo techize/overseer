@@ -37,6 +37,12 @@ pub struct Config {
     pub bd_command: Vec<String>,
     /// Where plans put their git worktrees: `<worktree_root>/<repo>-<ticket>`.
     pub worktree_root: PathBuf,
+    /// The board header's sprint name; empty means the newest `Sprints/sprint-*` folder.
+    pub sprint_name: String,
+    /// `YYYY-MM-DD`, the sprint's first day; empty shows the name alone.
+    pub sprint_start: String,
+    /// Weekdays in the sprint; 0 counts as 10.
+    pub sprint_days: u32,
 }
 
 impl Default for Config {
@@ -77,6 +83,9 @@ impl Default for Config {
                 .collect(),
             bd_command: vec!["bd".to_string()],
             worktree_root: PathBuf::from("~/Repos/.worktrees"),
+            sprint_name: String::new(),
+            sprint_start: String::new(),
+            sprint_days: 10,
         }
     }
 }
@@ -233,5 +242,20 @@ mod tests {
         let (_d, p) = write("worktree_root = \"/abs/wt\"\n");
         let (c, _) = Config::load(&p, &home());
         assert_eq!(c.worktree_root, PathBuf::from("/abs/wt"));
+    }
+
+    #[test]
+    fn sprint_keys_default_and_load() {
+        let (c, _) = Config::load(Path::new("/nonexistent/config.toml"), &home());
+        assert_eq!(c.sprint_name, "");
+        assert_eq!(c.sprint_start, "");
+        assert_eq!(c.sprint_days, 10);
+        let (_d, p) =
+            write("sprint_name = \"Demo\"\nsprint_start = \"2026-11-09\"\nsprint_days = 5\n");
+        let (c, err) = Config::load(&p, &home());
+        assert!(err.is_none());
+        assert_eq!(c.sprint_name, "Demo");
+        assert_eq!(c.sprint_start, "2026-11-09");
+        assert_eq!(c.sprint_days, 5);
     }
 }

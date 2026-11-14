@@ -23,7 +23,9 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
 
 use super::ownership::{decide, promotions, Decision};
+use super::sprint::{newest_sprint_folder, parse_ymd, sprint_label, Ymd};
 use super::{compile_pattern, group, parse_beads, parse_jira, run_source, Bead, Ticket};
+use crate::brain::paths::local_date;
 use crate::config::Config;
 use crate::env::BaseEnv;
 use crate::ledger::{self, Ledger};
@@ -74,6 +76,8 @@ struct Cache {
     /// Ticket folders under `<brain_dir>/Sprints/*/`, as (name, path),
     /// sorted by path. Listed again on every refresh.
     folders: Vec<(String, PathBuf)>,
+    /// The newest `Sprints/sprint-*` folder at the last scan.
+    sprint_folder: Option<String>,
 }
 
 /// A label change to make on a bead with `bd update`.
@@ -99,6 +103,10 @@ pub struct WorkStore {
     /// Set when the 2ndBrain writer is on: label writes go through it.
     label_writer: OnceLock<LabelWriter>,
     brain_dir: PathBuf,
+    /// The configured sprint name; empty means use the folder found by the scan.
+    sprint_name: String,
+    sprint_start: Option<Ymd>,
+    sprint_days: u32,
     /// `None` when the configured command is empty: Jira is off.
     jira_command: Option<Vec<String>>,
     jql: String,
@@ -219,11 +227,26 @@ impl WorkStore {
                 JIRA_OFF.into()
             }),
         );
+        let sprint_start = match cfg.sprint_start.trim() {
+            "" => None,
+            text => {
+                let parsed = parse_ymd(text);
+                if parsed.is_none() {
+                    tracing::warn!(
+                        "bad sprint_start {text:?}: want YYYY-MM-DD; the header shows the sprint name alone"
+                    );
+                }
+                parsed
+            }
+        };
         Arc::new(WorkStore {
             beads_dir: cfg.beads_dir.clone(),
             bd_command: cfg.bd_command.clone(),
             label_writer: OnceLock::new(),
             brain_dir: cfg.brain_dir.clone(),
+            sprint_name: cfg.sprint_name.clone(),
+            sprint_start,
+            sprint_days: cfg.sprint_days,
             jira_command,
             jql: cfg.jql.clone(),
             beads_poll: Duration::from_secs(cfg.beads_poll_secs.max(1)),
@@ -240,6 +263,7 @@ impl WorkStore {
                 beads_status: status("beads", Some("not read yet".into())),
                 jira_status,
                 folders: Vec::new(),
+                sprint_folder: newest_sprint_folder(&cfg.brain_dir),
             }),
             beads_turn: tokio::sync::Mutex::new(()),
             jira_turn: tokio::sync::Mutex::new(()),
@@ -313,7 +337,25 @@ impl WorkStore {
             items,
             sources: vec![cache.beads_status.clone(), cache.jira_status.clone()],
             notices,
+            sprint: self.sprint_text(&cache),
         }
+    }
+
+    /// The header's sprint text: the configured name, else the folder found
+    /// at the last scan, with the day counted from the real clock.
+    fn sprint_text(&self, cache: &Cache) -> Option<String> {
+        let name = if self.sprint_name.is_empty() {
+            cache.sprint_folder.as_deref().unwrap_or("")
+        } else {
+            &self.sprint_name
+        };
+        let today = local_date(unix_now());
+        let today = Ymd {
+            y: today.year,
+            m: today.month,
+            d: today.day,
+        };
+        sprint_label(name, self.sprint_start, self.sprint_days, today)
     }
 
     /// A key not in the cache is a ticket when the whole key matches the
@@ -434,6 +476,7 @@ impl WorkStore {
     fn regroup(&self, now: i64) {
         let folders = list_folders(&self.brain_dir);
         let mut folders = Some(folders);
+        let sprint_folder = newest_sprint_folder(&self.brain_dir);
         let mut told = false;
         let done = self.ledger.transaction(|conn| {
             let owners: HashMap<String, SlotId> =
@@ -460,6 +503,7 @@ impl WorkStore {
             if let Some(f) = folders.take() {
                 cache.folders = f;
             }
+            cache.sprint_folder = sprint_folder.clone();
             Ok(())
         });
         if told && done.is_ok() {
@@ -473,6 +517,7 @@ impl WorkStore {
             if let Some(f) = folders.take() {
                 cache.folders = f;
             }
+            cache.sprint_folder = sprint_folder;
         }
     }
 
@@ -1000,6 +1045,38 @@ mod tests {
             jira.message.as_deref(),
             Some("jira_command is empty; Jira is off")
         );
+    }
+
+    #[test]
+    fn view_names_the_sprint_from_the_folder_or_the_config() {
+        let dir = std::env::temp_dir().join(format!("ovs-store-sprint-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("Sprints/sprint-26-01")).unwrap();
+        let make = |name: &str| {
+            let cfg = Config {
+                brain_dir: dir.clone(),
+                jira_command: vec![],
+                sprint_name: name.into(),
+                ..Config::default()
+            };
+            let (events, _) = broadcast::channel(4);
+            WorkStore::new(
+                &cfg,
+                Arc::new(Ledger::in_memory()),
+                events,
+                BaseEnv::ready(vec![]),
+            )
+        };
+        let s = make("");
+        assert_eq!(s.view().sprint.as_deref(), Some("sprint-26-01"));
+        // A later scan sees a newer folder.
+        std::fs::create_dir_all(dir.join("Sprints/sprint-26-02")).unwrap();
+        s.regroup(1);
+        assert_eq!(s.view().sprint.as_deref(), Some("sprint-26-02"));
+        assert_eq!(
+            make("Demo sprint").view().sprint.as_deref(),
+            Some("Demo sprint")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

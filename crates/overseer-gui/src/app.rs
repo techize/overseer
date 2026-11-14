@@ -243,6 +243,7 @@ pub fn empty_work() -> WorkView {
         items: Vec::new(),
         sources: Vec::new(),
         notices: Vec::new(),
+        sprint: None,
     }
 }
 

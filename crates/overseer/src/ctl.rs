@@ -1284,6 +1284,7 @@ mod tests {
                 },
             ],
             notices: vec![],
+            sprint: None,
         }
     }
 

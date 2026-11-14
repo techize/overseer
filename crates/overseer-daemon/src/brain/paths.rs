@@ -339,6 +339,7 @@ mod tests {
             items,
             sources: vec![],
             notices: vec![],
+            sprint: None,
         }
     }
 

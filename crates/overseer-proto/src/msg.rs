@@ -180,6 +180,9 @@ pub struct WorkView {
     pub items: Vec<WorkItem>,
     pub sources: Vec<SourceStatus>,
     pub notices: Vec<Notice>,
+    /// The sprint name and day for the board header, when there is a sprint.
+    #[serde(default)]
+    pub sprint: Option<String>,
 }
 
 /// The Jira source's message while `jira_command` is empty. Jira is then
@@ -1052,6 +1055,7 @@ mod tests {
                 items: vec![],
                 sources: vec![],
                 notices: vec![],
+                sprint: None,
             },
             locks: LockView {
                 claims: vec![],
@@ -1153,6 +1157,7 @@ mod tests {
                 at: 50,
                 text: "left the list".into(),
             }],
+            sprint: None,
         }
     }
 

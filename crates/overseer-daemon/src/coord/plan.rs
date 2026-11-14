@@ -662,6 +662,7 @@ mod tests {
                     ],
                     sources: vec![],
                     notices: vec![],
+                    sprint: None,
                 },
                 locks: LockView {
                     claims: vec![],

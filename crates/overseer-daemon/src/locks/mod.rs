@@ -726,6 +726,7 @@ mod tests {
             ],
             sources: Vec::new(),
             notices: Vec::new(),
+            sprint: None,
         };
         assert_eq!(owned_items(&view, 1), ["DEMO-12", "ov-3"]);
         assert_eq!(owned_items(&view, 2), ["ov-4"]);

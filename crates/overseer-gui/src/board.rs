@@ -107,6 +107,11 @@ pub fn pills(items: &[&WorkItem]) -> Vec<String> {
     keys
 }
 
+/// The sprint text shown muted after `Overseer`: name and day, or `None`.
+pub fn header_title(work: &WorkView) -> Option<String> {
+    work.sprint.clone().filter(|s| !s.is_empty())
+}
+
 /// The header's source health: `jira 12 · beads 133 · 14:05`, or
 /// `jira: acli not found · beads 133 · 14:05` when a source failed. Jira
 /// leads; the time is the newest successful read, through `clock`.
@@ -890,9 +895,21 @@ impl OverseerApp {
                     .items_center()
                     .child(
                         div()
-                            .text_lg()
-                            .font_weight(FontWeight::BOLD)
-                            .child("Overseer"),
+                            .flex()
+                            .items_baseline()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .text_lg()
+                                    .font_weight(FontWeight::BOLD)
+                                    .child("Overseer"),
+                            )
+                            .children(header_title(&self.work).map(|t| {
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(colors::MUTED))
+                                    .child(t)
+                            })),
                     )
                     .child(
                         div()
@@ -1069,7 +1086,21 @@ mod tests {
             items: vec![],
             sources: vec![],
             notices: vec![],
+            sprint: None,
         }
+    }
+
+    #[test]
+    fn header_title_is_the_sprint_text() {
+        let mut w = no_work();
+        assert_eq!(header_title(&w), None);
+        w.sprint = Some("sprint-26-01, day 4 of 10".into());
+        assert_eq!(
+            header_title(&w).as_deref(),
+            Some("sprint-26-01, day 4 of 10")
+        );
+        w.sprint = Some(String::new());
+        assert_eq!(header_title(&w), None);
     }
 
     fn no_locks() -> LockView {
