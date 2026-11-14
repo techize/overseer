@@ -1547,6 +1547,7 @@ mod tests {
                     text: "other".into(),
                 },
             ],
+            sprint: None,
         };
         let rows = owns_rows(&view, 2);
         assert_eq!(
@@ -1585,6 +1586,7 @@ mod tests {
                 message: Some("not read yet".into()),
             }],
             notices: vec![],
+            sprint: None,
         };
         let rows = owns_rows(&view, 2);
         assert!(rows[0].gone && rows[0].not_read_yet, "{rows:?}");

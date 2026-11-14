@@ -80,6 +80,7 @@ async fn start_daemon_full(
         default_command: vec![SCRIPT.to_string()],
         env,
         state_dir: state_dir.clone(),
+        files: overseer_daemon::SettingsFiles::in_dir(&state_dir),
         hook_program: PathBuf::from("/bin/true"),
         settings,
         patterns,
@@ -221,6 +222,65 @@ async fn start_list_stop() {
     assert_eq!(c.request(Request::StopSlot { id: 1 }).await, Response::Ok);
     let info = c.exited_event(1).await;
     assert!(matches!(info.state, SlotState::Exited { .. }));
+}
+
+#[tokio::test]
+async fn daemon_info_reports_pid_and_start() {
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    let Response::DaemonInfo(info) = c.request(Request::DaemonInfo).await else {
+        panic!("not a DaemonInfo reply");
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    assert_eq!(info.pid, std::process::id());
+    assert_eq!(info.build, "dev");
+    assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
+    assert!((now - info.started_at).abs() <= 5, "{}", info.started_at);
+}
+
+#[tokio::test]
+async fn settings_round_trip_over_the_socket() {
+    use overseer_proto::settings::{SettingEdit, SettingValue};
+    let d = start_daemon().await;
+    // `start_daemon_full` names `config.toml` in this temp folder.
+    let config = d.state_dir.join("config.toml");
+    let mut c = Client::connect(&d.socket).await;
+    let Response::Settings(v) = c.request(Request::GetSettings).await else {
+        panic!("not a Settings reply");
+    };
+    assert_eq!(v.config_path, config);
+    assert_eq!(v.file_hash, "");
+    assert_eq!(v.daemon.pid, std::process::id());
+    let save = |base_hash: String| Request::SaveSettings {
+        base_hash,
+        edits: vec![SettingEdit::Set {
+            key: "jql".into(),
+            value: SettingValue::Text("project = DEMO".into()),
+        }],
+    };
+    let Response::Settings(after) = c.request(save(v.file_hash.clone())).await else {
+        panic!("not a Settings reply");
+    };
+    let jql = after.settings.iter().find(|s| s.key == "jql").unwrap();
+    assert!(jql.in_file);
+    assert!(jql.restart_needed);
+    assert_eq!(jql.value, SettingValue::Text("project = DEMO".into()));
+    assert_ne!(after.file_hash, v.file_hash);
+    assert_eq!(
+        std::fs::read_to_string(&config).unwrap(),
+        "jql = \"project = DEMO\"\n"
+    );
+    // The first view's hash is stale now.
+    let Response::Error { message } = c.request(save(v.file_hash)).await else {
+        panic!("a stale save was not refused");
+    };
+    assert_eq!(
+        message,
+        "config.toml changed on disk since Settings read it. Close and reopen Settings to see the new text."
+    );
 }
 
 #[tokio::test]
@@ -429,6 +489,7 @@ async fn second_daemon_refused() {
         default_command: vec![SCRIPT.to_string()],
         env: overseer_daemon::EnvSource::Inherit,
         state_dir: d.state_dir.clone(),
+        files: overseer_daemon::SettingsFiles::in_dir(&d.state_dir),
         hook_program: PathBuf::from("/bin/true"),
         settings: offline_settings(),
         patterns: default_patterns(),
@@ -3814,6 +3875,7 @@ impl PlanRig {
             default_command: vec![self.bin.to_string_lossy().into_owned()],
             env: self.s.env(),
             state_dir: state_dir.clone(),
+            files: overseer_daemon::SettingsFiles::in_dir(&state_dir),
             hook_program: PathBuf::from("/bin/true"),
             settings,
             patterns: default_patterns(),

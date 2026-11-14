@@ -1,16 +1,128 @@
 //! LaunchAgent plist generation and install/uninstall.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
+use std::io::{BufRead, IsTerminal, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context};
 use overseer_proto::paths::{log_dir, socket_path, AGENT_LABEL};
-use overseer_proto::{Client, Request};
+use overseer_proto::{
+    current_build, running_sessions_count, running_sessions_text, Client, Request, Response,
+    SlotId, SlotState,
+};
 
 /// How long to wait for launchd to finish removing a booted-out agent.
 const BOOTOUT_WAIT: Duration = Duration::from_secs(10);
+
+/// How long asking a running daemon about itself may take in all.
+const QUERY_WAIT: Duration = Duration::from_secs(2);
+
+/// Variables an isolated home's agent carries from the installing shell, so
+/// its daemon sees the same home, config and Claude setup (after `PATH`).
+pub const AGENT_ENV: [&str; 7] = [
+    "HOME",
+    "SHELL",
+    "OVERSEER_HOME",
+    "OVERSEER_CONFIG",
+    "OVERSEER_TARGETS",
+    "CLAUDE_CONFIG_DIR",
+    "OVERSEER_DEFAULT_COMMAND",
+];
+
+fn custom_home(overseer_home: Option<&OsStr>) -> Option<&OsStr> {
+    overseer_home.filter(|h| !h.is_empty())
+}
+
+/// FNV-1a, 32 bit.
+fn fnv1a32(bytes: &[u8]) -> u32 {
+    bytes.iter().fold(0x811c9dc5u32, |h, &b| {
+        (h ^ u32::from(b)).wrapping_mul(0x01000193)
+    })
+}
+
+/// The agent's label: the real one for the default home, and
+/// `uk.co.techize.overseer-home-<8 hex>` for an `OVERSEER_HOME`, so an
+/// isolated home can never name the real agent. Empty counts as unset.
+pub fn agent_label(overseer_home: Option<&OsStr>) -> String {
+    match custom_home(overseer_home) {
+        Some(h) => format!("{AGENT_LABEL}-home-{:08x}", fnv1a32(h.as_bytes())),
+        None => AGENT_LABEL.to_string(),
+    }
+}
+
+/// Where the plist goes: `~/Library/LaunchAgents` for the default home,
+/// `$OVERSEER_HOME/agent` otherwise (launchd does not load it at login).
+pub fn plist_path_for(overseer_home: Option<&OsStr>, home: &Path) -> PathBuf {
+    let label = agent_label(overseer_home);
+    match custom_home(overseer_home) {
+        Some(h) => Path::new(h).join("agent"),
+        None => home.join("Library/LaunchAgents"),
+    }
+    .join(format!("{label}.plist"))
+}
+
+/// The isolating environment for a custom home's agent: each set, non-empty
+/// variable of `AGENT_ENV`, in that order. Empty for the default home.
+pub fn agent_env(
+    custom_home: bool,
+    get: impl Fn(&str) -> Option<OsString>,
+) -> Vec<(String, String)> {
+    if !custom_home {
+        return Vec::new();
+    }
+    AGENT_ENV
+        .iter()
+        .filter_map(|&k| {
+            get(k)
+                .filter(|v| !v.is_empty())
+                .map(|v| (k.to_string(), v.to_string_lossy().into_owned()))
+        })
+        .collect()
+}
+
+/// `OVERSEER_HOME` as an absolute path with no trailing slash, `.`, `..`
+/// or doubled slash, so one home always hashes to one label. `..` is folded
+/// by name and symlinks are left as they are.
+fn canonical_home(h: &OsStr) -> OsString {
+    use std::path::Component;
+    let p = Path::new(h);
+    let abs = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+    let mut out = PathBuf::new();
+    for c in abs.components() {
+        match c {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            c => out.push(c),
+        }
+    }
+    out.into_os_string()
+}
+
+fn this_home() -> Option<OsString> {
+    std::env::var_os("OVERSEER_HOME")
+        .filter(|h| !h.is_empty())
+        .map(|h| canonical_home(&h))
+}
+
+fn this_label() -> String {
+    agent_label(this_home().as_deref())
+}
+
+fn launchctl_program_from(over: Option<OsString>) -> OsString {
+    over.filter(|p| !p.is_empty())
+        .unwrap_or_else(|| OsString::from("launchctl"))
+}
+
+/// `$OVERSEER_LAUNCHCTL`, or `launchctl`. Every launchctl call goes
+/// through this, so tests can point it at a stub.
+fn launchctl_program() -> OsString {
+    launchctl_program_from(std::env::var_os("OVERSEER_LAUNCHCTL"))
+}
 
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -48,18 +160,35 @@ pub fn agent_path(path: Option<OsString>, home: Option<OsString>) -> String {
 /// KeepAlive only restarts the daemon when it did not exit cleanly, so
 /// `overseer ctl shutdown` (exit 0) keeps it down until the next client
 /// kickstarts it, while a crash is respawned.
-pub fn plist_xml(exe: &Path, log_dir: &Path, path_env: &str) -> String {
+pub fn plist_xml(
+    label: &str,
+    exe: &Path,
+    log_dir: &Path,
+    path_env: &str,
+    extra_env: &[(String, String)],
+) -> String {
+    let label = xml_escape(label);
     let exe = xml_escape(&exe.display().to_string());
     let out = xml_escape(&log_dir.join("daemon.out.log").display().to_string());
     let err = xml_escape(&log_dir.join("daemon.err.log").display().to_string());
     let path_env = xml_escape(path_env);
+    let extra: String = extra_env
+        .iter()
+        .map(|(k, v)| {
+            format!(
+                "\n        <key>{}</key>\n        <string>{}</string>",
+                xml_escape(k),
+                xml_escape(v)
+            )
+        })
+        .collect();
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>{AGENT_LABEL}</string>
+    <string>{label}</string>
     <key>ProgramArguments</key>
     <array>
         <string>{exe}</string>
@@ -69,7 +198,7 @@ pub fn plist_xml(exe: &Path, log_dir: &Path, path_env: &str) -> String {
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>{path_env}</string>
+        <string>{path_env}</string>{extra}
     </dict>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key>
@@ -86,11 +215,14 @@ pub fn plist_xml(exe: &Path, log_dir: &Path, path_env: &str) -> String {
     )
 }
 
+/// This process's plist: `plist_path_for` with the environment.
 pub fn plist_path() -> anyhow::Result<PathBuf> {
-    let home = std::env::var_os("HOME").context("HOME is not set")?;
-    Ok(PathBuf::from(home)
-        .join("Library/LaunchAgents")
-        .join(format!("{AGENT_LABEL}.plist")))
+    let over = this_home();
+    let home = match &over {
+        Some(_) => std::env::var_os("HOME").unwrap_or_default(),
+        None => std::env::var_os("HOME").context("HOME is not set")?,
+    };
+    Ok(plist_path_for(over.as_deref(), Path::new(&home)))
 }
 
 fn domain() -> String {
@@ -99,11 +231,11 @@ fn domain() -> String {
 }
 
 fn service() -> String {
-    format!("{}/{AGENT_LABEL}", domain())
+    format!("{}/{}", domain(), this_label())
 }
 
 fn launchctl(args: &[&str]) -> anyhow::Result<std::process::ExitStatus> {
-    Command::new("launchctl")
+    Command::new(launchctl_program())
         .args(args)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -155,7 +287,225 @@ fn shutdown_running_daemon() -> anyhow::Result<()> {
     })
 }
 
-pub fn install() -> anyhow::Result<()> {
+/// The daemon answering on the socket: its build and its running sessions.
+pub struct RunningDaemon {
+    pub build: String,
+    /// Slot and label of each `Running` slot.
+    pub running: Vec<(SlotId, String)>,
+    /// False when the daemon answered the connection but its sessions could
+    /// not be listed; `running` is then empty and means nothing.
+    pub listed: bool,
+}
+
+impl RunningDaemon {
+    /// Whether restarting could end a session: some run, or nobody knows.
+    pub fn may_end_sessions(&self) -> bool {
+        !self.listed || !self.running.is_empty()
+    }
+}
+
+/// `install-agent`'s and `ctl restart`'s flags, and whether stdin is a terminal.
+#[derive(Clone, Copy)]
+pub struct RestartOpts {
+    pub yes: bool,
+    pub no_restart: bool,
+    pub tty: bool,
+}
+
+impl RestartOpts {
+    /// The flags, with `tty` from this process's stdin.
+    pub fn from_flags(yes: bool, no_restart: bool) -> RestartOpts {
+        RestartOpts {
+            yes,
+            no_restart,
+            tty: std::io::stdin().is_terminal(),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum RestartChoice {
+    /// No daemon answers: start one.
+    Start,
+    /// Same build and plist: leave the daemon alone.
+    Nothing,
+    Restart,
+    /// Ask on the terminal.
+    Ask,
+    /// Leave the old daemon and its sessions running.
+    Keep,
+}
+
+/// The restart rules, in order: no daemon starts one; `--no-restart` keeps a
+/// running daemon, sessions or not (it wins over `--yes`); an unchanged build
+/// and plist restarts nothing; no running session restarts without asking;
+/// with running sessions, or sessions that could not be listed, `--yes`
+/// restarts, a terminal is asked and anything else keeps. `ctl restart`
+/// passes `unchanged = false`.
+pub fn restart_choice(
+    daemon: Option<&RunningDaemon>,
+    unchanged: bool,
+    opts: RestartOpts,
+) -> RestartChoice {
+    let Some(d) = daemon else {
+        return RestartChoice::Start;
+    };
+    if opts.no_restart {
+        RestartChoice::Keep
+    } else if unchanged {
+        RestartChoice::Nothing
+    } else if !d.may_end_sessions() || opts.yes {
+        RestartChoice::Restart
+    } else if opts.tty {
+        RestartChoice::Ask
+    } else {
+        RestartChoice::Keep
+    }
+}
+
+/// What a restart would end, said before it happens.
+pub fn restart_warning(d: &RunningDaemon) -> String {
+    if !d.listed {
+        return format!(
+            "The daemon (build {}) did not list its sessions, so some may be running. Restarting it ends any that are; each comes back as resumable, and r on its card resumes it.",
+            d.build
+        );
+    }
+    format!(
+        "The daemon (build {}) has {}: {}. Restarting it ends them; each comes back as resumable, and r on its card resumes it.",
+        d.build,
+        running_sessions_count(d.running.len()),
+        running_sessions_text(d.running.iter().map(|(id, l)| (*id, l.as_str()))),
+    )
+}
+
+pub const RESTART_PROMPT: &str = "Restart the daemon now? [y/N] ";
+
+pub fn keep_text(build: &str) -> String {
+    format!(
+        "The daemon keeps running build {build}. Run overseer ctl restart when you are ready to finish the upgrade."
+    )
+}
+
+pub fn nothing_text(build: &str) -> String {
+    format!("The daemon already runs build {build}; nothing to restart.")
+}
+
+/// `ctl restart`'s answer when it keeps the daemon for its running sessions.
+pub fn restart_kept_text(d: &RunningDaemon) -> String {
+    if !d.listed {
+        return format!(
+            "Kept the daemon (build {}) because its sessions could not be listed. Run overseer ctl restart --yes to restart it anyway.",
+            d.build
+        );
+    }
+    format!(
+        "Kept the daemon (build {}) because {} would end: {}. Run overseer ctl restart --yes to restart it anyway.",
+        d.build,
+        running_sessions_count(d.running.len()),
+        running_sessions_text(d.running.iter().map(|(id, l)| (*id, l.as_str()))),
+    )
+}
+
+fn restarted_text(old: &str, new: &str) -> String {
+    format!("Restarted the daemon (build {old} to {new}).")
+}
+
+fn started_text(build: &str) -> String {
+    format!("Started the daemon (build {build}).")
+}
+
+/// Only `y` or `yes`, in any case, restarts.
+fn answer_is_yes(line: &str) -> bool {
+    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+/// The build and running sessions of the daemon on `socket`, without
+/// starting one, in at most 2 s. `None` only when nothing accepts the
+/// connection. A daemon that accepts but does not answer `DaemonInfo` in
+/// time (or predates it) reports build `unknown`; one whose `ListSlots`
+/// fails, errs or times out is `listed: false`, never "no sessions".
+fn query_daemon(socket: &Path) -> Option<RunningDaemon> {
+    let rt = tokio::runtime::Runtime::new().ok()?;
+    rt.block_on(async {
+        use tokio::time::timeout_at;
+        let deadline = tokio::time::Instant::now() + QUERY_WAIT;
+        let unknown = || RunningDaemon {
+            build: "unknown".to_string(),
+            running: Vec::new(),
+            listed: false,
+        };
+        let client = match timeout_at(deadline, Client::connect(socket)).await {
+            Ok(Ok(c)) => c,
+            Ok(Err(_)) => return None,
+            // Something holds the socket but will not even accept.
+            Err(_) => return Some(unknown()),
+        };
+        let build = match timeout_at(deadline, client.request(Request::DaemonInfo)).await {
+            Ok(Ok(Response::DaemonInfo(info))) => info.build,
+            _ => "unknown".to_string(),
+        };
+        // A fresh connection: an old daemon hangs up on DaemonInfo.
+        let listed = async {
+            let client = Client::connect(socket).await.ok()?;
+            match client.request(Request::ListSlots).await {
+                Ok(Response::Slots(slots)) => Some(slots),
+                _ => None,
+            }
+        };
+        let running = match timeout_at(deadline, listed).await {
+            Ok(Some(slots)) => slots,
+            _ => return Some(RunningDaemon { build, ..unknown() }),
+        };
+        let running = running
+            .into_iter()
+            .filter(|s| matches!(s.state, SlotState::Running { .. }))
+            .map(|s| (s.id, s.label))
+            .collect();
+        Some(RunningDaemon {
+            build,
+            running,
+            listed: true,
+        })
+    })
+}
+
+/// Settles `Ask` by prompting on the terminal; other choices pass through.
+fn settle(choice: RestartChoice) -> anyhow::Result<RestartChoice> {
+    if choice != RestartChoice::Ask {
+        return Ok(choice);
+    }
+    print!("{RESTART_PROMPT}");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    Ok(if answer_is_yes(&line) {
+        RestartChoice::Restart
+    } else {
+        RestartChoice::Keep
+    })
+}
+
+/// Prints the warning when the choice could end running sessions, then
+/// settles `Ask`. Returns the choice to act on.
+fn warn_and_settle(
+    daemon: Option<&RunningDaemon>,
+    choice: RestartChoice,
+) -> anyhow::Result<RestartChoice> {
+    if let Some(d) = daemon.filter(|d| d.may_end_sessions()) {
+        if matches!(
+            choice,
+            RestartChoice::Restart | RestartChoice::Ask | RestartChoice::Keep
+        ) {
+            println!("{}", restart_warning(d));
+        }
+    }
+    settle(choice)
+}
+
+/// Writes this home's plist, then starts, restarts or keeps the daemon by
+/// the restart rules. `Keep` and `Nothing` leave launchd alone.
+pub fn install(opts: RestartOpts) -> anyhow::Result<()> {
     let exe = std::env::current_exe().context("locate current executable")?;
     // Through a symlink such as ~/.local/bin/overseer, point the agent at
     // the real binary inside the app bundle.
@@ -163,21 +513,96 @@ pub fn install() -> anyhow::Result<()> {
     let logs = log_dir();
     std::fs::create_dir_all(&logs).context("create log dir")?;
     let path = plist_path()?;
-    std::fs::create_dir_all(path.parent().unwrap()).context("create LaunchAgents dir")?;
+    // For a custom home this is $OVERSEER_HOME/agent.
+    std::fs::create_dir_all(path.parent().unwrap()).context("create the plist folder")?;
     let path_env = agent_path(std::env::var_os("PATH"), std::env::var_os("HOME"));
+    let label = this_label();
+    let home = this_home();
+    let extra = agent_env(home.is_some(), |k| match k {
+        "OVERSEER_HOME" => home.clone(),
+        _ => std::env::var_os(k),
+    });
+    let xml = plist_xml(&label, &exe, &logs, &path_env, &extra);
 
-    bootout()?;
-    shutdown_running_daemon()?;
-    std::fs::write(&path, plist_xml(&exe, &logs, &path_env)).context("write plist")?;
-    let status = Command::new("launchctl")
-        .args(["bootstrap", &domain()])
-        .arg(&path)
-        .status()
-        .context("run launchctl")?;
-    if !status.success() {
-        bail!("launchctl bootstrap failed ({status})");
+    let daemon = query_daemon(&socket_path());
+    let unchanged = std::fs::read_to_string(&path).is_ok_and(|old| old == xml)
+        && daemon.as_ref().is_some_and(|d| d.build == current_build());
+    let choice = restart_choice(daemon.as_ref(), unchanged, opts);
+
+    std::fs::write(&path, &xml).context("write plist")?;
+    println!(
+        "installed {} as {label} (runs {})",
+        path.display(),
+        exe.display()
+    );
+    match warn_and_settle(daemon.as_ref(), choice)? {
+        RestartChoice::Nothing => {
+            let build = daemon
+                .as_ref()
+                .map_or(current_build(), |d| d.build.as_str());
+            println!("{}", nothing_text(build));
+        }
+        RestartChoice::Keep | RestartChoice::Ask => {
+            let build = daemon.as_ref().map_or("unknown", |d| d.build.as_str());
+            println!("{}", keep_text(build));
+        }
+        how @ (RestartChoice::Start | RestartChoice::Restart) => {
+            bootout()?;
+            shutdown_running_daemon()?;
+            let status = Command::new(launchctl_program())
+                .args(["bootstrap", &domain()])
+                .arg(&path)
+                .status()
+                .context("run launchctl")?;
+            if !status.success() {
+                bail!("launchctl bootstrap failed ({status})");
+            }
+            match (how, &daemon) {
+                (RestartChoice::Restart, Some(d)) => {
+                    println!("{}", restarted_text(&d.build, current_build()))
+                }
+                _ => println!("{}", started_text(current_build())),
+            }
+        }
     }
-    println!("installed {} (runs {})", path.display(), exe.display());
+    Ok(())
+}
+
+/// `ctl restart`: the restart rules with `unchanged = false`. Under this
+/// home's agent it kickstarts the agent with `-k`; otherwise it asks the
+/// daemon to shut down, waits for the socket to go and autostarts it again.
+pub fn restart(opts: RestartOpts) -> anyhow::Result<()> {
+    let daemon = query_daemon(&socket_path());
+    let choice = restart_choice(daemon.as_ref(), false, opts);
+    match warn_and_settle(daemon.as_ref(), choice)? {
+        RestartChoice::Keep | RestartChoice::Ask | RestartChoice::Nothing => {
+            // Only sessions that may be running keep it: ctl restart has no
+            // --no-restart.
+            if let Some(d) = &daemon {
+                println!("{}", restart_kept_text(d));
+            }
+            return Ok(());
+        }
+        RestartChoice::Start | RestartChoice::Restart => {}
+    }
+    let under_launchd = plist_path().is_ok_and(|p| p.exists()) && agent_loaded();
+    if daemon.is_some() {
+        if under_launchd {
+            let status = launchctl(&["kickstart", "-k", &service()])?;
+            if !status.success() {
+                bail!("launchctl kickstart -k {} failed ({status})", service());
+            }
+        } else {
+            shutdown_running_daemon()?;
+        }
+    }
+    // Wait for the daemon to answer again, starting it if nobody does.
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(crate::ctl::connect())?;
+    match &daemon {
+        Some(d) => println!("{}", restarted_text(&d.build, current_build())),
+        None => println!("{}", started_text(current_build())),
+    }
     Ok(())
 }
 
@@ -195,11 +620,11 @@ pub fn uninstall() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Whether autostart should go through launchd: only for the default state
-/// dir (the agent's daemon serves that socket) and only once the agent is
-/// installed.
-pub fn use_launchd(overseer_home: Option<OsString>, plist_exists: bool) -> bool {
-    overseer_home.is_none_or(|h| h.is_empty()) && plist_exists
+/// Whether autostart should go through launchd. The plist looked for is
+/// this home's own (its agent serves this home's socket), so whenever it
+/// exists the agent is kickstarted.
+pub fn use_launchd(plist_exists: bool) -> bool {
+    plist_exists
 }
 
 /// Starts the installed agent's daemon. Returns false when launchd could not.
@@ -214,9 +639,11 @@ mod tests {
     #[test]
     fn agent_plist_contents() {
         let xml = plist_xml(
+            AGENT_LABEL,
             Path::new("/opt/o verseer&co/overseer"),
             Path::new("/tmp/logs"),
             "/opt/homebrew/bin:/usr/bin",
+            &[],
         );
         assert!(xml.contains("<string>daemon</string>"));
         assert!(xml.contains("<string>--foreground</string>"));
@@ -229,7 +656,13 @@ mod tests {
 
     #[test]
     fn agent_restarts_only_after_a_crash() {
-        let xml = plist_xml(Path::new("/x"), Path::new("/l"), "/usr/bin");
+        let xml = plist_xml(
+            AGENT_LABEL,
+            Path::new("/x"),
+            Path::new("/l"),
+            "/usr/bin",
+            &[],
+        );
         let compact: String = xml.split_whitespace().collect();
         assert!(
             compact.contains("<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>"),
@@ -240,12 +673,130 @@ mod tests {
 
     #[test]
     fn agent_plist_sets_path() {
-        let xml = plist_xml(Path::new("/x"), Path::new("/l"), "/opt/homebrew/bin:/a&b");
+        let xml = plist_xml(
+            AGENT_LABEL,
+            Path::new("/x"),
+            Path::new("/l"),
+            "/opt/homebrew/bin:/a&b",
+            &[],
+        );
         let compact: String = xml.split_whitespace().collect();
         assert!(compact.contains(
             "<key>EnvironmentVariables</key><dict><key>PATH</key>\
              <string>/opt/homebrew/bin:/a&amp;b</string></dict>"
         ));
+    }
+
+    /// The text between `<key>EnvironmentVariables</key><dict>` and its `</dict>`.
+    fn env_block(xml: &str) -> String {
+        let compact: String = xml.split_whitespace().collect();
+        let start = compact
+            .find("<key>EnvironmentVariables</key><dict>")
+            .unwrap()
+            + "<key>EnvironmentVariables</key><dict>".len();
+        let len = compact[start..].find("</dict>").unwrap();
+        compact[start..start + len].to_string()
+    }
+
+    #[test]
+    fn default_home_plist_is_unchanged() {
+        assert_eq!(agent_label(None), "uk.co.techize.overseer");
+        assert_eq!(
+            plist_path_for(None, Path::new("/Users/me")),
+            Path::new("/Users/me/Library/LaunchAgents/uk.co.techize.overseer.plist")
+        );
+        let xml = plist_xml(
+            &agent_label(None),
+            Path::new("/x"),
+            Path::new("/l"),
+            "/usr/bin",
+            &[],
+        );
+        let block = env_block(&xml);
+        assert_eq!(block.matches("<key>").count(), 1, "{block}");
+        assert!(block.starts_with("<key>PATH</key>"), "{block}");
+    }
+
+    #[test]
+    fn custom_home_gets_its_own_label_and_place() {
+        let a = agent_label(Some(OsStr::new("/tmp/ov-a")));
+        let hex = a
+            .strip_prefix("uk.co.techize.overseer-home-")
+            .unwrap_or_else(|| panic!("{a}"));
+        assert_eq!(hex.len(), 8, "{a}");
+        assert!(
+            hex.chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+            "{a}"
+        );
+        assert_eq!(a, agent_label(Some(OsStr::new("/tmp/ov-a"))));
+        assert_ne!(a, agent_label(Some(OsStr::new("/tmp/ov-b"))));
+        assert_ne!(a, AGENT_LABEL);
+        assert_eq!(agent_label(Some(OsStr::new(""))), AGENT_LABEL);
+        assert_eq!(
+            plist_path_for(Some(OsStr::new("/tmp/ov-a")), Path::new("/Users/me")),
+            PathBuf::from(format!("/tmp/ov-a/agent/{a}.plist"))
+        );
+        assert_eq!(
+            plist_path_for(Some(OsStr::new("")), Path::new("/Users/me")),
+            Path::new("/Users/me/Library/LaunchAgents/uk.co.techize.overseer.plist")
+        );
+    }
+
+    #[test]
+    fn custom_home_plist_carries_the_isolating_env() {
+        let env = vec![
+            ("HOME".to_string(), "/tmp/ov-a/home".to_string()),
+            ("SHELL".to_string(), "/bin/sh".to_string()),
+            ("OVERSEER_HOME".to_string(), "/tmp/ov-a&b<c>".to_string()),
+        ];
+        let label = agent_label(Some(OsStr::new("/tmp/ov-a&b<c>")));
+        let xml = plist_xml(&label, Path::new("/x"), Path::new("/l"), "/usr/bin", &env);
+        let block = env_block(&xml);
+        assert!(
+            block.starts_with("<key>PATH</key><string>/usr/bin</string>"),
+            "{block}"
+        );
+        assert!(
+            block.contains("<key>HOME</key><string>/tmp/ov-a/home</string>"),
+            "{block}"
+        );
+        assert!(
+            block.contains("<key>SHELL</key><string>/bin/sh</string>"),
+            "{block}"
+        );
+        assert!(
+            block.contains("<key>OVERSEER_HOME</key><string>/tmp/ov-a&amp;b&lt;c&gt;</string>"),
+            "{block}"
+        );
+        assert!(xml.contains(&format!("<string>{label}</string>")));
+    }
+
+    #[test]
+    fn agent_env_skips_unset_and_empty() {
+        let get = |k: &str| match k {
+            "HOME" => Some(OsString::from("/h")),
+            "SHELL" => Some(OsString::from("")),
+            "OVERSEER_HOME" => Some(OsString::from("/o")),
+            "CLAUDE_CONFIG_DIR" => Some(OsString::from("/c")),
+            "OVERSEER_CONFIG" => Some(OsString::from("/o/config.toml")),
+            _ => None,
+        };
+        assert!(agent_env(false, get).is_empty());
+        let pairs = |v: &[(&str, &str)]| -> Vec<(String, String)> {
+            v.iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect()
+        };
+        assert_eq!(
+            agent_env(true, get),
+            pairs(&[
+                ("HOME", "/h"),
+                ("OVERSEER_HOME", "/o"),
+                ("OVERSEER_CONFIG", "/o/config.toml"),
+                ("CLAUDE_CONFIG_DIR", "/c"),
+            ])
+        );
     }
 
     #[test]
@@ -273,10 +824,227 @@ mod tests {
     }
 
     #[test]
-    fn autostart_uses_launchd_only_for_the_default_home_with_an_agent() {
-        assert!(use_launchd(None, true));
-        assert!(use_launchd(Some("".into()), true));
-        assert!(!use_launchd(None, false));
-        assert!(!use_launchd(Some("/tmp/x".into()), true));
+    fn launchctl_is_the_override_when_set() {
+        assert_eq!(launchctl_program_from(None), "launchctl");
+        assert_eq!(launchctl_program_from(Some("".into())), "launchctl");
+        assert_eq!(
+            launchctl_program_from(Some("/tmp/stub".into())),
+            "/tmp/stub"
+        );
+    }
+
+    fn daemon(running: &[(SlotId, &str)]) -> RunningDaemon {
+        RunningDaemon {
+            build: "b1".to_string(),
+            running: running.iter().map(|(i, l)| (*i, l.to_string())).collect(),
+            listed: true,
+        }
+    }
+
+    fn unlisted() -> RunningDaemon {
+        RunningDaemon {
+            build: "b1".to_string(),
+            running: Vec::new(),
+            listed: false,
+        }
+    }
+
+    #[test]
+    fn unlisted_sessions_count_as_running() {
+        let d = unlisted();
+        assert_eq!(
+            restart_choice(Some(&d), false, opts(false, false, false)),
+            RestartChoice::Keep
+        );
+        assert_eq!(
+            restart_choice(Some(&d), false, opts(false, false, true)),
+            RestartChoice::Ask
+        );
+        assert_eq!(
+            restart_choice(Some(&d), false, opts(true, false, false)),
+            RestartChoice::Restart
+        );
+        assert_eq!(
+            restart_choice(Some(&d), false, opts(true, true, true)),
+            RestartChoice::Keep
+        );
+    }
+
+    #[test]
+    fn unlisted_sessions_are_said_to_be_unknown() {
+        assert_eq!(
+            restart_warning(&unlisted()),
+            "The daemon (build b1) did not list its sessions, so some may be running. \
+             Restarting it ends any that are; each comes back as resumable, and r on its card resumes it."
+        );
+        assert_eq!(
+            restart_kept_text(&unlisted()),
+            "Kept the daemon (build b1) because its sessions could not be listed. \
+             Run overseer ctl restart --yes to restart it anyway."
+        );
+    }
+
+    fn opts(yes: bool, no_restart: bool, tty: bool) -> RestartOpts {
+        RestartOpts {
+            yes,
+            no_restart,
+            tty,
+        }
+    }
+
+    #[test]
+    fn no_daemon_starts() {
+        for o in [opts(false, false, true), opts(true, true, false)] {
+            assert_eq!(restart_choice(None, false, o), RestartChoice::Start);
+            assert_eq!(restart_choice(None, true, o), RestartChoice::Start);
+        }
+    }
+
+    #[test]
+    fn same_build_and_plist_restarts_nothing() {
+        let d = daemon(&[(1, "demo lane")]);
+        assert_eq!(
+            restart_choice(Some(&d), true, opts(true, false, true)),
+            RestartChoice::Nothing
+        );
+        assert_eq!(
+            restart_choice(Some(&daemon(&[])), true, opts(false, false, false)),
+            RestartChoice::Nothing
+        );
+    }
+
+    #[test]
+    fn no_running_session_restarts_without_asking() {
+        let d = daemon(&[]);
+        assert_eq!(
+            restart_choice(Some(&d), false, opts(false, false, true)),
+            RestartChoice::Restart
+        );
+        assert_eq!(
+            restart_choice(Some(&d), false, opts(false, false, false)),
+            RestartChoice::Restart
+        );
+    }
+
+    #[test]
+    fn running_sessions_ask_on_a_terminal() {
+        let d = daemon(&[(1, "demo lane")]);
+        assert_eq!(
+            restart_choice(Some(&d), false, opts(false, false, true)),
+            RestartChoice::Ask
+        );
+    }
+
+    #[test]
+    fn running_sessions_without_a_terminal_are_kept() {
+        let d = daemon(&[(1, "demo lane")]);
+        assert_eq!(
+            restart_choice(Some(&d), false, opts(false, false, false)),
+            RestartChoice::Keep
+        );
+    }
+
+    #[test]
+    fn yes_restarts_and_no_restart_keeps() {
+        let d = daemon(&[(1, "demo lane")]);
+        assert_eq!(
+            restart_choice(Some(&d), false, opts(true, false, false)),
+            RestartChoice::Restart
+        );
+        assert_eq!(
+            restart_choice(Some(&d), false, opts(false, true, true)),
+            RestartChoice::Keep
+        );
+        // --no-restart wins over --yes.
+        assert_eq!(
+            restart_choice(Some(&d), false, opts(true, true, true)),
+            RestartChoice::Keep
+        );
+    }
+
+    #[test]
+    fn no_restart_keeps_even_with_no_running_session() {
+        let idle = daemon(&[]);
+        for o in [opts(false, true, false), opts(true, true, true)] {
+            assert_eq!(restart_choice(Some(&idle), false, o), RestartChoice::Keep);
+            assert_eq!(restart_choice(Some(&idle), true, o), RestartChoice::Keep);
+        }
+    }
+
+    #[test]
+    fn kept_by_ctl_restart_says_how_to_restart_anyway() {
+        let text = restart_kept_text(&daemon(&[(1, "demo lane"), (3, "docs")]));
+        assert_eq!(
+            text,
+            "Kept the daemon (build b1) because 2 running sessions would end: S1 demo lane, S3 docs. \
+             Run overseer ctl restart --yes to restart it anyway."
+        );
+        assert!(!text.contains("ctl restart when"), "{text}");
+    }
+
+    #[test]
+    fn warning_names_each_running_session() {
+        assert_eq!(
+            restart_warning(&daemon(&[(1, "demo lane"), (3, "docs")])),
+            "The daemon (build b1) has 2 running sessions: S1 demo lane, S3 docs. \
+             Restarting it ends them; each comes back as resumable, and r on its card resumes it."
+        );
+        let one = restart_warning(&daemon(&[(4, "")]));
+        assert!(
+            one.starts_with("The daemon (build b1) has 1 running session: S4. Restarting"),
+            "{one}"
+        );
+    }
+
+    #[test]
+    fn outcome_texts() {
+        assert_eq!(
+            keep_text("b1"),
+            "The daemon keeps running build b1. Run overseer ctl restart when you are ready to finish the upgrade."
+        );
+        assert_eq!(
+            nothing_text("b1"),
+            "The daemon already runs build b1; nothing to restart."
+        );
+        assert_eq!(
+            restarted_text("b1", "b2"),
+            "Restarted the daemon (build b1 to b2)."
+        );
+        assert_eq!(started_text("b2"), "Started the daemon (build b2).");
+        assert_eq!(RESTART_PROMPT, "Restart the daemon now? [y/N] ");
+    }
+
+    #[test]
+    fn only_y_or_yes_restarts() {
+        for a in ["y", "Y", "yes", " YES \n"] {
+            assert!(answer_is_yes(a), "{a:?}");
+        }
+        for a in ["", "\n", "n", "no", "yep", "y es"] {
+            assert!(!answer_is_yes(a), "{a:?}");
+        }
+    }
+
+    #[test]
+    fn overseer_home_is_absolute_without_a_trailing_slash() {
+        assert_eq!(canonical_home(OsStr::new("/tmp/ov-a/")), "/tmp/ov-a");
+        assert_eq!(canonical_home(OsStr::new("/tmp//ov-a/./")), "/tmp/ov-a");
+        assert_eq!(canonical_home(OsStr::new("/tmp/ov-a")), "/tmp/ov-a");
+        assert_eq!(canonical_home(OsStr::new("/tmp/x/../ov-a")), "/tmp/ov-a");
+        assert_eq!(canonical_home(OsStr::new("/../tmp/ov-a")), "/tmp/ov-a");
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            canonical_home(OsStr::new("ov-a/")),
+            cwd.join("ov-a").into_os_string()
+        );
+        assert_eq!(
+            agent_label(Some(&canonical_home(OsStr::new("/tmp/ov-a/")))),
+            agent_label(Some(OsStr::new("/tmp/ov-a")))
+        );
+    }
+
+    #[test]
+    fn autostart_uses_this_homes_agent_when_its_plist_exists() {
+        assert!(use_launchd(true));
+        assert!(!use_launchd(false));
     }
 }

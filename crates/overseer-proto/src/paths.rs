@@ -31,7 +31,10 @@ fn log_dir_from(over: Option<OsString>, home: Option<OsString>) -> PathBuf {
     }
 }
 
-fn config_path_from(over: Option<OsString>, home: Option<OsString>) -> PathBuf {
+/// `over` when set and non-empty, else `<home>/.config/overseer/config.toml`:
+/// `config_path` with its inputs passed in, so the app can be tested
+/// against the same rule the daemon uses.
+pub fn config_path_from(over: Option<OsString>, home: Option<OsString>) -> PathBuf {
     non_empty(over).unwrap_or_else(|| home_dir(home).join(".config/overseer/config.toml"))
 }
 

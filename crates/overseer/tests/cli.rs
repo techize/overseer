@@ -23,7 +23,10 @@ impl Env {
         std::fs::create_dir_all(&home).unwrap();
         // Keep the daemon off the real beads and Jira.
         std::fs::write(home.join("config.toml"), "beads_dir = \"/nonexistent/overseer-test-beads\"\nbrain_dir = \"/nonexistent/overseer-test-brain\"\njira_command = []\n").unwrap();
-        Env { home, bin: None }
+        let env = Env { home, bin: None };
+        // Every spawn names the stub, so an autostart never reaches launchd.
+        env.write_launchctl_stub();
+        env
     }
 
     /// Daemon sources pointed at stub `bd` and Jira scripts.
@@ -125,10 +128,89 @@ EOF
         env
     }
 
+    /// The launchctl stub every test uses: it logs its arguments to
+    /// `launchctl.log`, exits 0 for `bootstrap` and `bootout`, and 1 for
+    /// `print` and `kickstart`, so autostart falls back to spawning.
+    fn launchctl_stub(&self) -> PathBuf {
+        self.home.join("launchctl-stub.sh")
+    }
+
+    fn write_launchctl_stub(&self) {
+        self.write_launchctl_stub_failing("print|kickstart");
+    }
+
+    /// The stub, exiting 1 for the subcommands in `failing` (a `case`
+    /// pattern) and 0 for the rest.
+    fn write_launchctl_stub_failing(&self, failing: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let stub = self.launchctl_stub();
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> '{log}'\ncase \"$1\" in {failing}) exit 1;; esac\nexit 0\n",
+                log = self.home.join("launchctl.log").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// `overseer <args>` for the agent commands: `HOME` is `<home>/home`,
+    /// `OVERSEER_HOME` this home and launchctl the stub, so nothing reaches
+    /// the real LaunchAgents folder or launchd.
+    fn agent(&self, args: &[&str]) -> Command {
+        self.write_launchctl_stub();
+        let shell_home = self.home.join("home");
+        std::fs::create_dir_all(&shell_home).unwrap();
+        let mut c = Command::cargo_bin("overseer").unwrap();
+        c.env("HOME", shell_home)
+            .env("SHELL", "/bin/sh")
+            .env("OVERSEER_HOME", &self.home)
+            .env("OVERSEER_CONFIG", self.home.join("config.toml"))
+            .env("OVERSEER_LAUNCHCTL", self.launchctl_stub())
+            .env_remove("OVERSEER_TARGETS")
+            .env_remove("CLAUDE_CONFIG_DIR")
+            .env_remove("OVERSEER_DEFAULT_COMMAND")
+            .args(args)
+            .timeout(Duration::from_secs(20));
+        c
+    }
+
+    /// A `claude` that only sleeps, so its sessions get a session id and
+    /// come back resumable after a restart.
+    fn claude_stub(&self) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = self.home.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let stub = bin.join("claude");
+        std::fs::write(&stub, "#!/bin/sh\nexec sleep 3600\n").unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        stub
+    }
+
+    /// `agent(args)` with the sleeping `claude` as the default command.
+    fn agent_claude(&self, args: &[&str]) -> Command {
+        let mut c = self.agent(args);
+        c.env("OVERSEER_DEFAULT_COMMAND", self.claude_stub());
+        c
+    }
+
+    /// `ctl(args)` with the sleeping `claude` as the default command.
+    fn ctl_claude(&self, args: &[&str]) -> Command {
+        let mut c = self.ctl(args);
+        c.env("OVERSEER_DEFAULT_COMMAND", self.claude_stub());
+        c
+    }
+
+    fn launchctl_log(&self) -> String {
+        std::fs::read_to_string(self.home.join("launchctl.log")).unwrap_or_default()
+    }
+
     fn ctl(&self, args: &[&str]) -> Command {
         let mut c = Command::cargo_bin("overseer").unwrap();
         c.env("OVERSEER_HOME", &self.home)
             .env("OVERSEER_CONFIG", self.home.join("config.toml"))
+            .env("OVERSEER_LAUNCHCTL", self.launchctl_stub())
             .env("OVERSEER_DEFAULT_COMMAND", SCRIPT)
             // Run from inside a session, these would be that slot's writes.
             .env_remove("OVERSEER_SLOT");
@@ -146,6 +228,7 @@ impl Drop for Env {
         let _ = StdCommand::new(assert_cmd::cargo::cargo_bin("overseer"))
             .env("OVERSEER_HOME", &self.home)
             .env("OVERSEER_CONFIG", self.home.join("config.toml"))
+            .env("OVERSEER_LAUNCHCTL", self.launchctl_stub())
             .args(["ctl", "shutdown"])
             .output();
         std::thread::sleep(Duration::from_millis(200));
@@ -167,6 +250,131 @@ fn ctl_status_autostarts_daemon() {
     for (i, l) in lines.iter().enumerate() {
         assert_eq!(*l, format!("S{i}  empty"));
     }
+}
+
+#[test]
+fn ctl_version_without_a_daemon_does_not_start_one() {
+    let env = Env::new();
+    let out = stdout_of(&mut env.ctl(&["version"]));
+    assert!(out.lines().any(|l| l == "daemon  not running"), "{out}");
+    assert!(out.starts_with("app     0.1.0 build dev"), "{out}");
+    assert!(!env.home.join("overseer.sock").exists());
+}
+
+#[test]
+fn ctl_version_names_the_running_daemon() {
+    let env = Env::new();
+    env.ctl(&["status"]).assert().success();
+    let out = stdout_of(&mut env.ctl(&["version"]));
+    assert!(
+        out.lines()
+            .any(|l| l.starts_with("daemon  0.1.0 build dev  pid ")),
+        "{out}"
+    );
+}
+
+#[test]
+fn ctl_version_survives_a_daemon_that_predates_daemon_info() {
+    let env = Env::new();
+    // An old daemon reads the unknown request and hangs up.
+    let listener = std::os::unix::net::UnixListener::bind(env.home.join("overseer.sock")).unwrap();
+    let old = std::thread::spawn(move || {
+        for stream in listener.incoming().take(1) {
+            let mut stream = stream.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = std::io::Read::read(&mut stream, &mut buf);
+        }
+    });
+    let out = stdout_of(&mut env.ctl(&["version"]));
+    old.join().unwrap();
+    assert!(
+        out.contains("daemon  running, build unknown (older than this app)"),
+        "{out}"
+    );
+    assert!(out.contains("Restart the daemon"), "{out}");
+}
+
+#[test]
+fn ctl_settings_set_and_reset() {
+    let env = Env::new();
+    let config = env.home.join("config.toml");
+    let out = stdout_of(&mut env.ctl(&["settings"]));
+    assert!(
+        out.starts_with(&format!("config.toml: {}\n", config.display())),
+        "{out}"
+    );
+    assert!(out.contains("\nLocks and worktrees\n"), "{out}");
+    assert!(
+        out.contains("\n  lock_idle_mins = 60  (default)\n"),
+        "{out}"
+    );
+    assert!(
+        out.contains("\n  brain_writer = false  (default)  read-only\n"),
+        "{out}"
+    );
+    assert!(out.contains("\ntargets.toml: "), "{out}");
+    let out = stdout_of(&mut env.ctl(&["settings", "set", "lock_idle_mins", "15"]));
+    assert!(
+        out.contains("\n  lock_idle_mins = 15  (from the file)  restart needed\n"),
+        "{out}"
+    );
+    let text = std::fs::read_to_string(&config).unwrap();
+    assert!(text.ends_with("lock_idle_mins = 15\n"), "{text}");
+    // The keys `Env` wrote stay.
+    assert!(text.contains("jira_command = []"), "{text}");
+    let out = stdout_of(&mut env.ctl(&["settings", "reset", "lock_idle_mins"]));
+    assert!(
+        out.contains("\n  lock_idle_mins = 60  (default)\n"),
+        "{out}"
+    );
+    assert!(!std::fs::read_to_string(&config)
+        .unwrap()
+        .contains("lock_idle_mins"));
+    let json = stdout_of(&mut env.ctl(&["settings", "--json"]));
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(v["config_path"], config.display().to_string());
+}
+
+#[test]
+fn ctl_settings_refuses_a_bad_value() {
+    let env = Env::new();
+    let config = env.home.join("config.toml");
+    let before = std::fs::read(&config).unwrap();
+    let out = env
+        .ctl(&["settings", "set", "lock_idle_mins", "0"])
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("lock_idle_mins must be a whole number from 1 to 10080"),
+        "{err}"
+    );
+    assert_eq!(std::fs::read(&config).unwrap(), before);
+    env.ctl(&["settings", "set", "shared_files", r#"["a.md","b/*.md"]"#])
+        .assert()
+        .success();
+    let text = std::fs::read_to_string(&config).unwrap();
+    assert!(
+        text.contains(r#"shared_files = ["a.md", "b/*.md"]"#),
+        "{text}"
+    );
+    let out = env
+        .ctl(&["settings", "set", "brain_writer", "true"])
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("brain_writer is read-only here; edit config.toml"),
+        "{err}"
+    );
+    assert_ne!(std::fs::read(&config).unwrap(), before);
+    assert!(!std::fs::read_to_string(&config)
+        .unwrap()
+        .contains("brain_writer"));
 }
 
 #[test]
@@ -205,6 +413,7 @@ fn attach_empty_slot_message() {
     let out = c
         .env("OVERSEER_HOME", &env.home)
         .env("OVERSEER_CONFIG", env.home.join("config.toml"))
+        .env("OVERSEER_LAUNCHCTL", env.launchctl_stub())
         .env("OVERSEER_DEFAULT_COMMAND", SCRIPT)
         .args(["attach", "3"])
         .timeout(Duration::from_secs(10))
@@ -578,6 +787,7 @@ fn ctl_bd_without_a_dash_never_reads_stdin() {
     let mut child = StdCommand::new(assert_cmd::cargo::cargo_bin("overseer"))
         .env("OVERSEER_HOME", &env.home)
         .env("OVERSEER_CONFIG", env.home.join("config.toml"))
+        .env("OVERSEER_LAUNCHCTL", env.launchctl_stub())
         .args(["ctl", "bd", "--", "list"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -773,4 +983,349 @@ fn report_needs_a_slot_and_summary_and_reject_work() {
     stdout_of(env.ctl(&["plan", "propose", "-"]).write_stdin(plan));
     let out = stdout_of(&mut env.ctl(&["plan", "reject", "1", "not now"]));
     assert_eq!(out.trim(), "Plan 1 rejected.");
+}
+
+fn uid() -> String {
+    let out = StdCommand::new("id").arg("-u").output().unwrap();
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+fn agent_plists(env: &Env) -> Vec<PathBuf> {
+    match std::fs::read_dir(env.home.join("agent")) {
+        Ok(rd) => rd.map(|e| e.unwrap().path()).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+#[test]
+fn install_agent_in_a_custom_home_never_names_the_real_agent() {
+    let env = Env::new();
+    let out = stdout_of(&mut env.agent(&["install-agent", "--yes"]));
+    let plists = agent_plists(&env);
+    assert_eq!(plists.len(), 1, "{plists:?}");
+    let plist = &plists[0];
+    let name = plist.file_name().unwrap().to_string_lossy().into_owned();
+    let label = name.strip_suffix(".plist").unwrap();
+    assert!(label.starts_with("uk.co.techize.overseer-home-"), "{name}");
+    let xml = std::fs::read_to_string(plist).unwrap();
+    assert!(xml.contains("<key>OVERSEER_HOME</key>"), "{xml}");
+    assert!(xml.contains(&format!("<string>{label}</string>")), "{xml}");
+    assert!(
+        !env.home.join("home/Library/LaunchAgents").exists(),
+        "a plist went to the LaunchAgents folder"
+    );
+    assert!(out.contains(label), "{out}");
+    let log = env.launchctl_log();
+    let bootstrap = format!("bootstrap gui/{} {}/agent/", uid(), env.home.display());
+    assert!(
+        log.lines().any(|l| l.starts_with(&bootstrap)),
+        "no {bootstrap:?} in:\n{log}"
+    );
+    for line in log.lines().filter(|l| l.contains("uk.co.techize.overseer")) {
+        assert!(line.contains("uk.co.techize.overseer-home-"), "{line}");
+    }
+}
+
+#[test]
+fn uninstall_agent_in_a_custom_home_removes_its_plist() {
+    let env = Env::new();
+    env.agent(&["install-agent"]).assert().success();
+    assert_eq!(agent_plists(&env).len(), 1);
+    let out = stdout_of(&mut env.agent(&["uninstall-agent"]));
+    assert!(agent_plists(&env).is_empty(), "{out}");
+    assert!(out.contains("removed "), "{out}");
+    for line in env
+        .launchctl_log()
+        .lines()
+        .filter(|l| l.contains("uk.co.techize.overseer"))
+    {
+        assert!(line.contains("uk.co.techize.overseer-home-"), "{line}");
+    }
+}
+
+/// The `S<n>` line of `ctl status`.
+fn status_line(env: &Env, n: u8) -> String {
+    let out = stdout_of(&mut env.ctl(&["status"]));
+    let name = format!("S{n} ");
+    out.lines()
+        .find(|l| l.starts_with(&name))
+        .unwrap_or_else(|| panic!("no S{n} in:\n{out}"))
+        .to_string()
+}
+
+/// The pid on a `running  pid <p>` status line, or the daemon's in `ctl version`.
+fn pid_after(text: &str, marker: &str) -> u32 {
+    let rest = &text[text.find(marker).unwrap_or_else(|| panic!("{text}")) + marker.len()..];
+    rest.split_whitespace().next().unwrap().parse().unwrap()
+}
+
+const WARNING_START: &str = "The daemon (build dev) has 1 running session: S1 demo lane. \
+    Restarting it ends them; each comes back as resumable, and r on its card resumes it.";
+
+/// S1 running the sleeping `claude`, labelled `demo lane`.
+fn start_claude(env: &Env) -> u32 {
+    let cwd = env.home.display().to_string();
+    env.ctl_claude(&["start", "1", "--cwd", &cwd, "--label", "demo lane"])
+        .assert()
+        .success();
+    let s1 = status_line(env, 1);
+    assert!(s1.starts_with("S1  running  pid "), "{s1}");
+    pid_after(&s1, "pid ")
+}
+
+#[test]
+fn install_agent_keeps_a_daemon_with_running_sessions() {
+    let env = Env::new();
+    let pid = start_claude(&env);
+    let out = stdout_of(
+        env.agent_claude(&["install-agent"])
+            .pipe_stdin("/dev/null")
+            .unwrap(),
+    );
+    assert!(out.contains(WARNING_START), "{out}");
+    assert!(
+        out.contains(
+            "The daemon keeps running build dev. Run overseer ctl restart when you are ready to finish the upgrade."
+        ),
+        "{out}"
+    );
+    let s1 = status_line(&env, 1);
+    assert!(s1.starts_with("S1  running  pid "), "{s1}");
+    assert_eq!(pid_after(&s1, "pid "), pid);
+    // The stub's `print` fails, so `bootout` is never logged anyway; the
+    // `bootstrap` check and the unchanged pid are the real guards.
+    let log = env.launchctl_log();
+    assert!(!log.contains("bootout"), "{log}");
+    assert!(!log.contains("bootstrap"), "{log}");
+}
+
+#[test]
+fn install_agent_yes_restarts_and_the_session_is_resumable() {
+    let env = Env::new();
+    start_claude(&env);
+    let out = stdout_of(&mut env.agent_claude(&["install-agent", "--yes"]));
+    assert!(out.contains(WARNING_START), "{out}");
+    assert!(
+        out.contains("Restarted the daemon (build dev to dev)."),
+        "{out}"
+    );
+    // The stub's bootstrap starts nothing and its kickstart fails, so this
+    // autostart spawns the daemon, which finds S1 in the ledger.
+    let s1 = status_line(&env, 1);
+    assert!(s1.starts_with("S1  resumable"), "{s1}");
+}
+
+#[test]
+fn install_agent_twice_restarts_nothing() {
+    let env = Env::new();
+    env.ctl(&["status"]).assert().success();
+    let first = stdout_of(&mut env.agent(&["install-agent"]));
+    assert!(
+        first.contains("Restarted the daemon (build dev to dev)."),
+        "{first}"
+    );
+    env.ctl(&["status"]).assert().success();
+    let second = stdout_of(&mut env.agent(&["install-agent"]));
+    assert!(
+        second.contains("The daemon already runs build dev; nothing to restart."),
+        "{second}"
+    );
+    assert!(!second.contains("Restarted"), "{second}");
+}
+
+#[test]
+fn install_agent_no_restart_keeps_an_idle_daemon() {
+    let env = Env::new();
+    env.ctl(&["status"]).assert().success();
+    let before = pid_after(&stdout_of(&mut env.ctl(&["version"])), "  pid ");
+    let out = stdout_of(&mut env.agent(&["install-agent", "--no-restart"]));
+    assert!(out.contains("The daemon keeps running build dev."), "{out}");
+    let after = pid_after(&stdout_of(&mut env.ctl(&["version"])), "  pid ");
+    assert_eq!(before, after);
+    // The stub's `print` fails, so `bootout` is never logged anyway; the
+    // `bootstrap` check and the unchanged pid are the real guards.
+    let log = env.launchctl_log();
+    assert!(!log.contains("bootout"), "{log}");
+    assert!(!log.contains("bootstrap"), "{log}");
+}
+
+#[test]
+fn install_agent_with_no_daemon_starts_it() {
+    let env = Env::new();
+    let out = stdout_of(&mut env.agent(&["install-agent"]));
+    assert!(out.contains("Started the daemon (build dev)."), "{out}");
+}
+
+#[test]
+fn ctl_restart_yes_brings_the_daemon_back() {
+    let env = Env::new();
+    start_claude(&env);
+    let before = pid_after(&stdout_of(&mut env.ctl(&["version"])), "  pid ");
+    let out = stdout_of(&mut env.ctl(&["restart", "--yes"]));
+    let warned = out.find(WARNING_START).unwrap_or_else(|| panic!("{out}"));
+    let restarted = out
+        .find("Restarted the daemon (build dev to dev).")
+        .unwrap_or_else(|| panic!("{out}"));
+    assert!(warned < restarted, "{out}");
+    let after = pid_after(&stdout_of(&mut env.ctl(&["version"])), "  pid ");
+    assert_ne!(before, after);
+    let s1 = status_line(&env, 1);
+    assert!(s1.starts_with("S1  resumable"), "{s1}");
+}
+
+#[test]
+fn ctl_restart_without_a_terminal_keeps_running_sessions() {
+    let env = Env::new();
+    let pid = start_claude(&env);
+    let out = stdout_of(env.ctl(&["restart"]).pipe_stdin("/dev/null").unwrap());
+    assert!(out.contains(WARNING_START), "{out}");
+    assert!(
+        out.contains(
+            "Kept the daemon (build dev) because 1 running session would end: S1 demo lane. \
+             Run overseer ctl restart --yes to restart it anyway."
+        ),
+        "{out}"
+    );
+    assert!(!out.contains("when you are ready"), "{out}");
+    assert_eq!(pid_after(&status_line(&env, 1), "pid "), pid);
+}
+
+/// How a fake daemon on `<home>/overseer.sock` treats requests.
+#[derive(Clone, Copy)]
+enum Fake {
+    /// Reads every request and never answers.
+    Silent,
+    /// Answers `DaemonInfo` as build `b0`, errs on `ListSlots`.
+    ListErrs,
+    /// Answers `DaemonInfo` as build `b0`, never answers `ListSlots`.
+    ListHangs,
+}
+
+/// Serves `how` on this home's socket until the test ends. Remove the
+/// socket before `Env` drops, so its `ctl shutdown` does not wait on it.
+fn fake_daemon(env: &Env, how: Fake) -> PathBuf {
+    use overseer_proto::{read_frame, write_frame, DaemonInfo, Frame, Request, Response};
+    let socket = env.home.join("overseer.sock");
+    let (ready, up) = std::sync::mpsc::channel();
+    let path = socket.clone();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            let l = tokio::net::UnixListener::bind(&path).unwrap();
+            ready.send(()).unwrap();
+            loop {
+                let Ok((mut s, _)) = l.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    while let Ok(Some(Frame::Request { seq, req })) = read_frame(&mut s).await {
+                        let resp = match (how, req) {
+                            (Fake::Silent, _) => None,
+                            (_, Request::DaemonInfo) => Some(Response::DaemonInfo(DaemonInfo {
+                                version: "0.1.0".into(),
+                                build: "b0".into(),
+                                pid: 1,
+                                started_at: 0,
+                                exe: "/nonexistent/overseer".into(),
+                            })),
+                            (Fake::ListErrs, _) => Some(Response::Error {
+                                message: "not now".into(),
+                            }),
+                            (Fake::ListHangs, _) => None,
+                        };
+                        match resp {
+                            Some(resp) => {
+                                let _ = write_frame(&mut s, &Frame::Response { seq, resp }).await;
+                            }
+                            None => tokio::time::sleep(Duration::from_secs(3600)).await,
+                        }
+                    }
+                });
+            }
+        });
+    });
+    up.recv().unwrap();
+    socket
+}
+
+const UNLISTED_B0: &str =
+    "The daemon (build b0) did not list its sessions, so some may be running.";
+
+#[test]
+fn install_agent_keeps_a_daemon_whose_sessions_cannot_be_listed() {
+    let env = Env::new();
+    let socket = fake_daemon(&env, Fake::ListErrs);
+    let out = stdout_of(
+        env.agent(&["install-agent"])
+            .pipe_stdin("/dev/null")
+            .unwrap(),
+    );
+    std::fs::remove_file(socket).unwrap();
+    assert!(out.contains(UNLISTED_B0), "{out}");
+    assert!(out.contains("The daemon keeps running build b0."), "{out}");
+    assert!(!out.contains("Restarted"), "{out}");
+    let log = env.launchctl_log();
+    assert!(!log.contains("bootstrap"), "{log}");
+}
+
+#[test]
+fn install_agent_keeps_a_daemon_that_does_not_answer() {
+    let env = Env::new();
+    let socket = fake_daemon(&env, Fake::Silent);
+    let out = stdout_of(
+        env.agent(&["install-agent"])
+            .pipe_stdin("/dev/null")
+            .unwrap(),
+    );
+    std::fs::remove_file(socket).unwrap();
+    assert!(
+        out.contains("The daemon (build unknown) did not list its sessions"),
+        "{out}"
+    );
+    assert!(
+        out.contains("The daemon keeps running build unknown."),
+        "{out}"
+    );
+    assert!(!out.contains("Started"), "{out}");
+    let log = env.launchctl_log();
+    assert!(!log.contains("bootstrap"), "{log}");
+}
+
+#[test]
+fn ctl_restart_keeps_a_daemon_that_does_not_list_its_sessions() {
+    let env = Env::new();
+    let socket = fake_daemon(&env, Fake::ListHangs);
+    let out = stdout_of(env.ctl(&["restart"]).pipe_stdin("/dev/null").unwrap());
+    std::fs::remove_file(socket).unwrap();
+    assert!(out.contains(UNLISTED_B0), "{out}");
+    assert!(
+        out.contains(
+            "Kept the daemon (build b0) because its sessions could not be listed. \
+             Run overseer ctl restart --yes to restart it anyway."
+        ),
+        "{out}"
+    );
+    assert!(!out.contains("Restarted"), "{out}");
+}
+
+#[test]
+fn ctl_restart_kickstarts_this_homes_agent_when_it_is_loaded() {
+    let env = Env::new();
+    env.ctl(&["status"]).assert().success();
+    env.agent(&["install-agent"]).assert().success();
+    // The stub's bootstrap starts nothing, so this spawns the daemon.
+    env.ctl(&["status"]).assert().success();
+    // Now launchd "has" the agent: print and kickstart succeed.
+    env.write_launchctl_stub_failing("none");
+    let out = stdout_of(&mut env.ctl(&["restart", "--yes"]));
+    assert!(
+        out.contains("Restarted the daemon (build dev to dev)."),
+        "{out}"
+    );
+    let log = env.launchctl_log();
+    let kick = format!("kickstart -k gui/{}/uk.co.techize.overseer-home-", uid());
+    assert!(
+        log.lines().any(|l| l.starts_with(&kick)),
+        "no {kick:?} in:\n{log}"
+    );
 }

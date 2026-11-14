@@ -20,4 +20,5 @@ tracing.workspace = true
 
 [dev-dependencies]
 overseer-daemon = { path = "../overseer-daemon" }
+tempfile = "3"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
