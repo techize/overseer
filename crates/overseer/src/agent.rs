@@ -315,11 +315,11 @@ pub enum RestartChoice {
     Keep,
 }
 
-/// The restart rules, in order: no daemon starts one; an unchanged build and
-/// plist restarts nothing; no running session restarts without asking; with
-/// running sessions `--no-restart` keeps (it wins over `--yes`), `--yes`
-/// restarts, a terminal is asked and anything else keeps. `ctl restart`
-/// passes `unchanged = false`.
+/// The restart rules, in order: no daemon starts one; `--no-restart` keeps a
+/// running daemon, sessions or not (it wins over `--yes`); an unchanged build
+/// and plist restarts nothing; no running session restarts without asking;
+/// with running sessions `--yes` restarts, a terminal is asked and anything
+/// else keeps. `ctl restart` passes `unchanged = false`.
 pub fn restart_choice(
     daemon: Option<&RunningDaemon>,
     unchanged: bool,
@@ -328,13 +328,11 @@ pub fn restart_choice(
     let Some(d) = daemon else {
         return RestartChoice::Start;
     };
-    if unchanged {
-        RestartChoice::Nothing
-    } else if d.running.is_empty() {
-        RestartChoice::Restart
-    } else if opts.no_restart {
+    if opts.no_restart {
         RestartChoice::Keep
-    } else if opts.yes {
+    } else if unchanged {
+        RestartChoice::Nothing
+    } else if d.running.is_empty() || opts.yes {
         RestartChoice::Restart
     } else if opts.tty {
         RestartChoice::Ask
@@ -363,6 +361,16 @@ pub fn keep_text(build: &str) -> String {
 
 pub fn nothing_text(build: &str) -> String {
     format!("The daemon already runs build {build}; nothing to restart.")
+}
+
+/// `ctl restart`'s answer when it keeps the daemon for its running sessions.
+pub fn restart_kept_text(d: &RunningDaemon) -> String {
+    format!(
+        "Kept the daemon (build {}) because {} would end: {}. Run overseer ctl restart --yes to restart it anyway.",
+        d.build,
+        running_sessions_count(d.running.len()),
+        running_sessions_text(d.running.iter().map(|(id, l)| (*id, l.as_str()))),
+    )
 }
 
 fn restarted_text(old: &str, new: &str) -> String {
@@ -515,8 +523,10 @@ pub fn restart(opts: RestartOpts) -> anyhow::Result<()> {
     let choice = restart_choice(daemon.as_ref(), false, opts);
     match warn_and_settle(daemon.as_ref(), choice)? {
         RestartChoice::Keep | RestartChoice::Ask | RestartChoice::Nothing => {
-            let build = daemon.as_ref().map_or("unknown", |d| d.build.as_str());
-            println!("{}", keep_text(build));
+            // Only running sessions keep it: ctl restart has no --no-restart.
+            if let Some(d) = &daemon {
+                println!("{}", restart_kept_text(d));
+            }
             return Ok(());
         }
         RestartChoice::Start | RestartChoice::Restart => {}
@@ -852,6 +862,26 @@ mod tests {
             restart_choice(Some(&d), false, opts(true, true, true)),
             RestartChoice::Keep
         );
+    }
+
+    #[test]
+    fn no_restart_keeps_even_with_no_running_session() {
+        let idle = daemon(&[]);
+        for o in [opts(false, true, false), opts(true, true, true)] {
+            assert_eq!(restart_choice(Some(&idle), false, o), RestartChoice::Keep);
+            assert_eq!(restart_choice(Some(&idle), true, o), RestartChoice::Keep);
+        }
+    }
+
+    #[test]
+    fn kept_by_ctl_restart_says_how_to_restart_anyway() {
+        let text = restart_kept_text(&daemon(&[(1, "demo lane"), (3, "docs")]));
+        assert_eq!(
+            text,
+            "Kept the daemon (build b1) because 2 running sessions would end: S1 demo lane, S3 docs. \
+             Run overseer ctl restart --yes to restart it anyway."
+        );
+        assert!(!text.contains("ctl restart when"), "{text}");
     }
 
     #[test]

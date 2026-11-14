@@ -1043,6 +1043,20 @@ fn install_agent_twice_restarts_nothing() {
 }
 
 #[test]
+fn install_agent_no_restart_keeps_an_idle_daemon() {
+    let env = Env::new();
+    env.ctl(&["status"]).assert().success();
+    let before = pid_after(&stdout_of(&mut env.ctl(&["version"])), "  pid ");
+    let out = stdout_of(&mut env.agent(&["install-agent", "--no-restart"]));
+    assert!(out.contains("The daemon keeps running build dev."), "{out}");
+    let after = pid_after(&stdout_of(&mut env.ctl(&["version"])), "  pid ");
+    assert_eq!(before, after);
+    let log = env.launchctl_log();
+    assert!(!log.contains("bootout"), "{log}");
+    assert!(!log.contains("bootstrap"), "{log}");
+}
+
+#[test]
 fn install_agent_with_no_daemon_starts_it() {
     let env = Env::new();
     let out = stdout_of(&mut env.agent(&["install-agent"]));
@@ -1072,6 +1086,13 @@ fn ctl_restart_without_a_terminal_keeps_running_sessions() {
     let pid = start_claude(&env);
     let out = stdout_of(env.ctl(&["restart"]).pipe_stdin("/dev/null").unwrap());
     assert!(out.contains(WARNING_START), "{out}");
-    assert!(out.contains("The daemon keeps running build dev."), "{out}");
+    assert!(
+        out.contains(
+            "Kept the daemon (build dev) because 1 running session would end: S1 demo lane. \
+             Run overseer ctl restart --yes to restart it anyway."
+        ),
+        "{out}"
+    );
+    assert!(!out.contains("when you are ready"), "{out}");
     assert_eq!(pid_after(&status_line(&env, 1), "pid "), pid);
 }
