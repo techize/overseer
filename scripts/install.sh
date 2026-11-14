@@ -1,6 +1,8 @@
 #!/bin/sh
 # Build Overseer, assemble ~/Applications/Overseer.app, link
 # ~/.local/bin/overseer and install the LaunchAgent. No admin rights needed.
+# With OVERSEER_HOME set, the app and link go under it instead (see
+# scripts/locations.sh).
 #
 # Environment:
 #   YES=1                  restart the daemon without asking, even with
@@ -9,14 +11,15 @@
 #   OVERSEER_INSTALL_RUST=1  install Rust through rustup without asking
 #   OVERSEER_INSTALL_BINARY=<path>  use this binary instead of building
 #   OVERSEER_CURL          the command that fetches rustup (default curl)
-#   OVERSEER_HOME          an isolated home: its agent and logs live there
+#   OVERSEER_HOME          an isolated home: its agent, logs, app and link
+#                          live there
+#   OVERSEER_APP_DIR       the folder for Overseer.app
+#   OVERSEER_LINK_DIR      the folder for the overseer link
 #   CARGO_HOME, CARGO_TARGET_DIR  as cargo uses them
 set -eu
 
 root=$(cd "$(dirname "$0")/.." && pwd)
-app="$HOME/Applications/Overseer.app"
-app_bin="$app/Contents/MacOS/overseer"
-link="$HOME/.local/bin/overseer"
+. "$root/scripts/locations.sh"
 cargo_home=${CARGO_HOME:-"$HOME/.cargo"}
 rustup_args="-y --no-modify-path --profile minimal --default-toolchain none"
 rustup_cmd="curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- $rustup_args"
@@ -115,9 +118,15 @@ fi
 echo
 echo "Overseer is installed."
 echo "  App:    $app"
-echo "  CLI:    $link (add ~/.local/bin to PATH if it is not there)"
+echo "  CLI:    $link (add $(tilde "$link_dir") to PATH if it is not there)"
 echo "  Daemon: LaunchAgent $label, logs in $logs"
-echo "Open Overseer from ~/Applications in Finder, or run: open ~/Applications/Overseer.app"
+if [ -n "${OVERSEER_HOME:-}" ]; then
+    # Finder and open would start it without OVERSEER_HOME, on the default
+    # home's socket.
+    echo "Run it with OVERSEER_HOME set: OVERSEER_HOME=$OVERSEER_HOME $app_bin"
+else
+    echo "Open Overseer from $(tilde "$app_dir") in Finder, or run: open $(tilde "$app")"
+fi
 if [ "$installed_rust" = 1 ]; then
     echo "Add ~/.cargo/bin to your PATH to run cargo yourself."
 fi

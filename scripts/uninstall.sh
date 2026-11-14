@@ -1,22 +1,29 @@
 #!/bin/sh
 # Remove the LaunchAgent, the ~/.local/bin/overseer link and
-# ~/Applications/Overseer.app. State and logs are left in place.
+# ~/Applications/Overseer.app. State and logs are left in place. With
+# OVERSEER_HOME set, that home's agent, app and link instead (see
+# scripts/locations.sh).
 #
 # Environment:
 #   OVERSEER_HOME       an isolated home: its own agent is removed, never
 #                       the default one
 #   OVERSEER_LAUNCHCTL  the launchctl to run (default launchctl)
+#   OVERSEER_APP_DIR, OVERSEER_LINK_DIR  as for install.sh
 set -eu
 
-app="$HOME/Applications/Overseer.app"
-app_bin="$app/Contents/MacOS/overseer"
-link="$HOME/.local/bin/overseer"
+root=$(cd "$(dirname "$0")/.." && pwd)
+. "$root/scripts/locations.sh"
 label=uk.co.techize.overseer
 
 if [ -x "$app_bin" ]; then
     # It knows this home's label and plist, and honours OVERSEER_LAUNCHCTL.
-    "$app_bin" uninstall-agent
+    if ! "$app_bin" uninstall-agent; then
+        echo "uninstall.sh: overseer uninstall-agent failed; the app and link are left in place" >&2
+        exit 1
+    fi
 elif [ -z "${OVERSEER_HOME:-}" ]; then
+    # Like uninstall-agent, only OVERSEER_HOME picks the label: with it unset
+    # this is the default agent, whatever HOME is.
     "${OVERSEER_LAUNCHCTL:-launchctl}" bootout "gui/$(id -u)/$label" 2>/dev/null || true
     rm -f "$HOME/Library/LaunchAgents/$label.plist"
 else

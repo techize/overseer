@@ -66,11 +66,19 @@ Open Overseer from `~/Applications` in Finder or with
 
 ### An isolated home
 
-With `OVERSEER_HOME` set, the install gets its own agent: the label is
-`uk.co.techize.overseer-home-<hash of the path>` and its plist lives in
-`$OVERSEER_HOME/agent`, not in `~/Library/LaunchAgents`, so it never replaces
-or stops the default agent. Its logs go to `$OVERSEER_HOME/logs`. Such an agent
-is not loaded at login.
+With `OVERSEER_HOME` set, the install is kept apart from the default one:
+
+- its agent's label is `uk.co.techize.overseer-home-<hash of the path>` and its
+  plist lives in `$OVERSEER_HOME/agent`, not in `~/Library/LaunchAgents`,
+- the app goes to `$OVERSEER_HOME/Applications/Overseer.app` and the link to
+  `$OVERSEER_HOME/bin/overseer`, not `~/Applications` and `~/.local/bin`,
+- its logs go to `$OVERSEER_HOME/logs`.
+
+So installing or uninstalling it never replaces, removes or stops the default
+app and agent. `OVERSEER_APP_DIR` and `OVERSEER_LINK_DIR` choose other folders
+for the app and the link, with or without `OVERSEER_HOME`. Run such an app with
+`OVERSEER_HOME` set, as the summary shows; opening it from Finder would start
+it without, against the default home. Its agent is not loaded at login.
 
 ## Upgrade
 
@@ -103,7 +111,8 @@ removes the LaunchAgent, the `~/.local/bin/overseer` link and
 `~/Applications/Overseer.app`. It leaves the state dir
 `~/Library/Application Support/Overseer/` and the logs in place; delete those by
 hand if you want them gone. With `OVERSEER_HOME` set it removes that home's
-agent instead, and leaves `$OVERSEER_HOME` in place.
+agent, app and link instead, and leaves `$OVERSEER_HOME` and the default
+install in place.
 
 ## Daemon
 

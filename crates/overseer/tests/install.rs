@@ -58,6 +58,15 @@ struct Rig {
     tmp: tempfile::TempDir,
 }
 
+impl Drop for Rig {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            let bare = std::fs::read_to_string(self.path("bare-launchctl.log")).unwrap_or_default();
+            assert!(bare.is_empty(), "a bare launchctl ran:\n{bare}");
+        }
+    }
+}
+
 impl Rig {
     fn new() -> Rig {
         let rig = Rig {
@@ -72,6 +81,16 @@ impl Rig {
             &format!(
                 "#!/bin/sh\necho \"$*\" >> '{}'\ncase \"$1\" in print|kickstart) exit 1;; esac\nexit 0\n",
                 rig.path("launchctl.log").display()
+            ),
+        );
+        // A backstop for the real /bin/launchctl, which PATH still reaches:
+        // anything that ignores OVERSEER_LAUNCHCTL and runs a bare launchctl
+        // hits this first, which logs and fails. Drop asserts it never ran.
+        rig.write_exe(
+            &rig.stubs().join("launchctl"),
+            &format!(
+                "#!/bin/sh\necho \"$*\" >> '{}'\nexit 1\n",
+                rig.path("bare-launchctl.log").display()
             ),
         );
         rig
@@ -97,8 +116,9 @@ impl Rig {
         self.path("launchctl-stub.sh")
     }
 
+    /// A custom home's app and link live under `OVERSEER_HOME`.
     fn app(&self) -> std::path::PathBuf {
-        self.home().join("Applications/Overseer.app")
+        self.state().join("Applications/Overseer.app")
     }
 
     fn app_bin(&self) -> std::path::PathBuf {
@@ -106,7 +126,7 @@ impl Rig {
     }
 
     fn link(&self) -> std::path::PathBuf {
-        self.home().join(".local/bin/overseer")
+        self.state().join("bin/overseer")
     }
 
     fn launchctl_log(&self) -> String {
@@ -203,10 +223,13 @@ fn install_into_a_temp_home() {
     assert_no_real_label(&rig.launchctl_log());
 
     let summary = format!(
-        "Overseer is installed.\n  App:    {app}\n  CLI:    {link} (add ~/.local/bin to PATH if it is not there)\n  Daemon: LaunchAgent {label}, logs in {logs}\nOpen Overseer from ~/Applications in Finder, or run: open ~/Applications/Overseer.app\n",
+        "Overseer is installed.\n  App:    {app}\n  CLI:    {link} (add {bin} to PATH if it is not there)\n  Daemon: LaunchAgent {label}, logs in {logs}\nRun it with OVERSEER_HOME set: OVERSEER_HOME={state} {app_bin}\n",
         app = rig.app().display(),
         link = rig.link().display(),
+        bin = rig.state().join("bin").display(),
         logs = rig.state().join("logs").display(),
+        state = rig.state().display(),
+        app_bin = rig.app_bin().display(),
     );
     assert!(out.ends_with(&summary), "{out}");
 }
@@ -417,4 +440,81 @@ fn uninstall_without_a_custom_home_boots_out_through_the_stub() {
         format!("bootout gui/{}/uk.co.techize.overseer\n", uid.trim())
     );
     assert!(!plist.exists(), "{text}");
+}
+
+/// A stand-in for the app and link the default agent uses, under the rig's
+/// `HOME`; returns the marker binary.
+fn default_app_and_link(rig: &Rig) -> std::path::PathBuf {
+    let bin = rig
+        .home()
+        .join("Applications/Overseer.app/Contents/MacOS/overseer");
+    std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+    std::fs::write(&bin, "default app").unwrap();
+    let link = rig.home().join(".local/bin/overseer");
+    std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&bin, &link).unwrap();
+    bin
+}
+
+fn assert_default_app_and_link_untouched(rig: &Rig, bin: &std::path::Path) {
+    assert_eq!(std::fs::read_to_string(bin).unwrap(), "default app");
+    let link = rig.home().join(".local/bin/overseer");
+    assert_eq!(std::fs::read_link(&link).unwrap(), bin);
+}
+
+#[test]
+fn a_custom_home_install_and_uninstall_leave_the_home_app_and_link_alone() {
+    let rig = Rig::new();
+    let bin = default_app_and_link(&rig);
+
+    let out = rig.install();
+    assert!(rig.app_bin().is_file(), "{out}");
+    assert_eq!(std::fs::read_link(rig.link()).unwrap(), rig.app_bin());
+    assert_default_app_and_link_untouched(&rig, &bin);
+
+    let out = rig.script("uninstall.sh").output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{text}");
+    assert!(!rig.app().exists(), "{text}");
+    assert!(std::fs::symlink_metadata(rig.link()).is_err(), "{text}");
+    assert_default_app_and_link_untouched(&rig, &bin);
+
+    // Without its own app binary, uninstall still leaves the home's alone.
+    let out = rig.script("uninstall.sh").output().unwrap();
+    assert!(out.status.success());
+    assert_default_app_and_link_untouched(&rig, &bin);
+}
+
+#[test]
+fn app_and_link_dirs_can_be_overridden() {
+    let rig = Rig::new();
+    let apps = rig.path("apps");
+    let links = rig.path("links");
+    let out = rig
+        .script("install.sh")
+        .env(
+            "OVERSEER_INSTALL_BINARY",
+            assert_cmd::cargo::cargo_bin("overseer"),
+        )
+        .env("OVERSEER_APP_DIR", &apps)
+        .env("OVERSEER_LINK_DIR", &links)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{text}");
+    let bin = apps.join("Overseer.app/Contents/MacOS/overseer");
+    assert!(bin.is_file(), "{text}");
+    assert_eq!(std::fs::read_link(links.join("overseer")).unwrap(), bin);
+    assert!(!rig.app().exists());
+
+    let out = rig
+        .script("uninstall.sh")
+        .env("OVERSEER_APP_DIR", &apps)
+        .env("OVERSEER_LINK_DIR", &links)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(!apps.join("Overseer.app").exists());
+    assert!(std::fs::symlink_metadata(links.join("overseer")).is_err());
+    assert!(rig.plists().is_empty());
 }
