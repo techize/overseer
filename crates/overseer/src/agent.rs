@@ -83,13 +83,24 @@ pub fn agent_env(
         .collect()
 }
 
-/// `OVERSEER_HOME` as an absolute path with no trailing slash, `.` or
-/// doubled slash, so one home always hashes to one label. Symlinks are
-/// left as they are.
+/// `OVERSEER_HOME` as an absolute path with no trailing slash, `.`, `..`
+/// or doubled slash, so one home always hashes to one label. `..` is folded
+/// by name and symlinks are left as they are.
 fn canonical_home(h: &OsStr) -> OsString {
+    use std::path::Component;
     let p = Path::new(h);
     let abs = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
-    abs.components().collect::<PathBuf>().into_os_string()
+    let mut out = PathBuf::new();
+    for c in abs.components() {
+        match c {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            c => out.push(c),
+        }
+    }
+    out.into_os_string()
 }
 
 fn this_home() -> Option<OsString> {
@@ -281,6 +292,16 @@ pub struct RunningDaemon {
     pub build: String,
     /// Slot and label of each `Running` slot.
     pub running: Vec<(SlotId, String)>,
+    /// False when the daemon answered the connection but its sessions could
+    /// not be listed; `running` is then empty and means nothing.
+    pub listed: bool,
+}
+
+impl RunningDaemon {
+    /// Whether restarting could end a session: some run, or nobody knows.
+    pub fn may_end_sessions(&self) -> bool {
+        !self.listed || !self.running.is_empty()
+    }
 }
 
 /// `install-agent`'s and `ctl restart`'s flags, and whether stdin is a terminal.
@@ -318,8 +339,9 @@ pub enum RestartChoice {
 /// The restart rules, in order: no daemon starts one; `--no-restart` keeps a
 /// running daemon, sessions or not (it wins over `--yes`); an unchanged build
 /// and plist restarts nothing; no running session restarts without asking;
-/// with running sessions `--yes` restarts, a terminal is asked and anything
-/// else keeps. `ctl restart` passes `unchanged = false`.
+/// with running sessions, or sessions that could not be listed, `--yes`
+/// restarts, a terminal is asked and anything else keeps. `ctl restart`
+/// passes `unchanged = false`.
 pub fn restart_choice(
     daemon: Option<&RunningDaemon>,
     unchanged: bool,
@@ -332,7 +354,7 @@ pub fn restart_choice(
         RestartChoice::Keep
     } else if unchanged {
         RestartChoice::Nothing
-    } else if d.running.is_empty() || opts.yes {
+    } else if !d.may_end_sessions() || opts.yes {
         RestartChoice::Restart
     } else if opts.tty {
         RestartChoice::Ask
@@ -343,6 +365,12 @@ pub fn restart_choice(
 
 /// What a restart would end, said before it happens.
 pub fn restart_warning(d: &RunningDaemon) -> String {
+    if !d.listed {
+        return format!(
+            "The daemon (build {}) did not list its sessions, so some may be running. Restarting it ends any that are; each comes back as resumable, and r on its card resumes it.",
+            d.build
+        );
+    }
     format!(
         "The daemon (build {}) has {}: {}. Restarting it ends them; each comes back as resumable, and r on its card resumes it.",
         d.build,
@@ -365,6 +393,12 @@ pub fn nothing_text(build: &str) -> String {
 
 /// `ctl restart`'s answer when it keeps the daemon for its running sessions.
 pub fn restart_kept_text(d: &RunningDaemon) -> String {
+    if !d.listed {
+        return format!(
+            "Kept the daemon (build {}) because its sessions could not be listed. Run overseer ctl restart --yes to restart it anyway.",
+            d.build
+        );
+    }
     format!(
         "Kept the daemon (build {}) because {} would end: {}. Run overseer ctl restart --yes to restart it anyway.",
         d.build,
@@ -387,33 +421,52 @@ fn answer_is_yes(line: &str) -> bool {
 }
 
 /// The build and running sessions of the daemon on `socket`, without
-/// starting one. `None` when nobody answers. A daemon that predates
-/// `DaemonInfo` reports build `unknown`.
+/// starting one, in at most 2 s. `None` only when nothing accepts the
+/// connection. A daemon that accepts but does not answer `DaemonInfo` in
+/// time (or predates it) reports build `unknown`; one whose `ListSlots`
+/// fails, errs or times out is `listed: false`, never "no sessions".
 fn query_daemon(socket: &Path) -> Option<RunningDaemon> {
     let rt = tokio::runtime::Runtime::new().ok()?;
     rt.block_on(async {
-        let ask = async {
-            let client = Client::connect(socket).await.ok()?;
-            let build = match client.request(Request::DaemonInfo).await {
-                Ok(Response::DaemonInfo(info)) => info.build,
-                _ => "unknown".to_string(),
-            };
-            // An old daemon hangs up on DaemonInfo, so list on a fresh connection.
-            let client = match Client::connect(socket).await {
-                Ok(c) => c,
-                Err(_) => client,
-            };
-            let running = match client.request(Request::ListSlots).await {
-                Ok(Response::Slots(slots)) => slots
-                    .into_iter()
-                    .filter(|s| matches!(s.state, SlotState::Running { .. }))
-                    .map(|s| (s.id, s.label))
-                    .collect(),
-                _ => Vec::new(),
-            };
-            Some(RunningDaemon { build, running })
+        use tokio::time::timeout_at;
+        let deadline = tokio::time::Instant::now() + QUERY_WAIT;
+        let unknown = || RunningDaemon {
+            build: "unknown".to_string(),
+            running: Vec::new(),
+            listed: false,
         };
-        tokio::time::timeout(QUERY_WAIT, ask).await.ok().flatten()
+        let client = match timeout_at(deadline, Client::connect(socket)).await {
+            Ok(Ok(c)) => c,
+            Ok(Err(_)) => return None,
+            // Something holds the socket but will not even accept.
+            Err(_) => return Some(unknown()),
+        };
+        let build = match timeout_at(deadline, client.request(Request::DaemonInfo)).await {
+            Ok(Ok(Response::DaemonInfo(info))) => info.build,
+            _ => "unknown".to_string(),
+        };
+        // A fresh connection: an old daemon hangs up on DaemonInfo.
+        let listed = async {
+            let client = Client::connect(socket).await.ok()?;
+            match client.request(Request::ListSlots).await {
+                Ok(Response::Slots(slots)) => Some(slots),
+                _ => None,
+            }
+        };
+        let running = match timeout_at(deadline, listed).await {
+            Ok(Some(slots)) => slots,
+            _ => return Some(RunningDaemon { build, ..unknown() }),
+        };
+        let running = running
+            .into_iter()
+            .filter(|s| matches!(s.state, SlotState::Running { .. }))
+            .map(|s| (s.id, s.label))
+            .collect();
+        Some(RunningDaemon {
+            build,
+            running,
+            listed: true,
+        })
     })
 }
 
@@ -439,7 +492,7 @@ fn warn_and_settle(
     daemon: Option<&RunningDaemon>,
     choice: RestartChoice,
 ) -> anyhow::Result<RestartChoice> {
-    if let Some(d) = daemon.filter(|d| !d.running.is_empty()) {
+    if let Some(d) = daemon.filter(|d| d.may_end_sessions()) {
         if matches!(
             choice,
             RestartChoice::Restart | RestartChoice::Ask | RestartChoice::Keep
@@ -523,7 +576,8 @@ pub fn restart(opts: RestartOpts) -> anyhow::Result<()> {
     let choice = restart_choice(daemon.as_ref(), false, opts);
     match warn_and_settle(daemon.as_ref(), choice)? {
         RestartChoice::Keep | RestartChoice::Ask | RestartChoice::Nothing => {
-            // Only running sessions keep it: ctl restart has no --no-restart.
+            // Only sessions that may be running keep it: ctl restart has no
+            // --no-restart.
             if let Some(d) = &daemon {
                 println!("{}", restart_kept_text(d));
             }
@@ -783,7 +837,51 @@ mod tests {
         RunningDaemon {
             build: "b1".to_string(),
             running: running.iter().map(|(i, l)| (*i, l.to_string())).collect(),
+            listed: true,
         }
+    }
+
+    fn unlisted() -> RunningDaemon {
+        RunningDaemon {
+            build: "b1".to_string(),
+            running: Vec::new(),
+            listed: false,
+        }
+    }
+
+    #[test]
+    fn unlisted_sessions_count_as_running() {
+        let d = unlisted();
+        assert_eq!(
+            restart_choice(Some(&d), false, opts(false, false, false)),
+            RestartChoice::Keep
+        );
+        assert_eq!(
+            restart_choice(Some(&d), false, opts(false, false, true)),
+            RestartChoice::Ask
+        );
+        assert_eq!(
+            restart_choice(Some(&d), false, opts(true, false, false)),
+            RestartChoice::Restart
+        );
+        assert_eq!(
+            restart_choice(Some(&d), false, opts(true, true, true)),
+            RestartChoice::Keep
+        );
+    }
+
+    #[test]
+    fn unlisted_sessions_are_said_to_be_unknown() {
+        assert_eq!(
+            restart_warning(&unlisted()),
+            "The daemon (build b1) did not list its sessions, so some may be running. \
+             Restarting it ends any that are; each comes back as resumable, and r on its card resumes it."
+        );
+        assert_eq!(
+            restart_kept_text(&unlisted()),
+            "Kept the daemon (build b1) because its sessions could not be listed. \
+             Run overseer ctl restart --yes to restart it anyway."
+        );
     }
 
     fn opts(yes: bool, no_restart: bool, tty: bool) -> RestartOpts {
@@ -931,6 +1029,8 @@ mod tests {
         assert_eq!(canonical_home(OsStr::new("/tmp/ov-a/")), "/tmp/ov-a");
         assert_eq!(canonical_home(OsStr::new("/tmp//ov-a/./")), "/tmp/ov-a");
         assert_eq!(canonical_home(OsStr::new("/tmp/ov-a")), "/tmp/ov-a");
+        assert_eq!(canonical_home(OsStr::new("/tmp/x/../ov-a")), "/tmp/ov-a");
+        assert_eq!(canonical_home(OsStr::new("/../tmp/ov-a")), "/tmp/ov-a");
         let cwd = std::env::current_dir().unwrap();
         assert_eq!(
             canonical_home(OsStr::new("ov-a/")),

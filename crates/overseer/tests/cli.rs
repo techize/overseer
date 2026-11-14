@@ -136,12 +136,18 @@ EOF
     }
 
     fn write_launchctl_stub(&self) {
+        self.write_launchctl_stub_failing("print|kickstart");
+    }
+
+    /// The stub, exiting 1 for the subcommands in `failing` (a `case`
+    /// pattern) and 0 for the rest.
+    fn write_launchctl_stub_failing(&self, failing: &str) {
         use std::os::unix::fs::PermissionsExt;
         let stub = self.launchctl_stub();
         std::fs::write(
             &stub,
             format!(
-                "#!/bin/sh\necho \"$*\" >> '{log}'\ncase \"$1\" in print|kickstart) exit 1;; esac\nexit 0\n",
+                "#!/bin/sh\necho \"$*\" >> '{log}'\ncase \"$1\" in {failing}) exit 1;; esac\nexit 0\n",
                 log = self.home.join("launchctl.log").display()
             ),
         )
@@ -1003,6 +1009,8 @@ fn install_agent_keeps_a_daemon_with_running_sessions() {
     let s1 = status_line(&env, 1);
     assert!(s1.starts_with("S1  running  pid "), "{s1}");
     assert_eq!(pid_after(&s1, "pid "), pid);
+    // The stub's `print` fails, so `bootout` is never logged anyway; the
+    // `bootstrap` check and the unchanged pid are the real guards.
     let log = env.launchctl_log();
     assert!(!log.contains("bootout"), "{log}");
     assert!(!log.contains("bootstrap"), "{log}");
@@ -1051,6 +1059,8 @@ fn install_agent_no_restart_keeps_an_idle_daemon() {
     assert!(out.contains("The daemon keeps running build dev."), "{out}");
     let after = pid_after(&stdout_of(&mut env.ctl(&["version"])), "  pid ");
     assert_eq!(before, after);
+    // The stub's `print` fails, so `bootout` is never logged anyway; the
+    // `bootstrap` check and the unchanged pid are the real guards.
     let log = env.launchctl_log();
     assert!(!log.contains("bootout"), "{log}");
     assert!(!log.contains("bootstrap"), "{log}");
@@ -1095,4 +1105,144 @@ fn ctl_restart_without_a_terminal_keeps_running_sessions() {
     );
     assert!(!out.contains("when you are ready"), "{out}");
     assert_eq!(pid_after(&status_line(&env, 1), "pid "), pid);
+}
+
+/// How a fake daemon on `<home>/overseer.sock` treats requests.
+#[derive(Clone, Copy)]
+enum Fake {
+    /// Reads every request and never answers.
+    Silent,
+    /// Answers `DaemonInfo` as build `b0`, errs on `ListSlots`.
+    ListErrs,
+    /// Answers `DaemonInfo` as build `b0`, never answers `ListSlots`.
+    ListHangs,
+}
+
+/// Serves `how` on this home's socket until the test ends. Remove the
+/// socket before `Env` drops, so its `ctl shutdown` does not wait on it.
+fn fake_daemon(env: &Env, how: Fake) -> PathBuf {
+    use overseer_proto::{read_frame, write_frame, DaemonInfo, Frame, Request, Response};
+    let socket = env.home.join("overseer.sock");
+    let (ready, up) = std::sync::mpsc::channel();
+    let path = socket.clone();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            let l = tokio::net::UnixListener::bind(&path).unwrap();
+            ready.send(()).unwrap();
+            loop {
+                let Ok((mut s, _)) = l.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    while let Ok(Some(Frame::Request { seq, req })) = read_frame(&mut s).await {
+                        let resp = match (how, req) {
+                            (Fake::Silent, _) => None,
+                            (_, Request::DaemonInfo) => Some(Response::DaemonInfo(DaemonInfo {
+                                version: "0.1.0".into(),
+                                build: "b0".into(),
+                                pid: 1,
+                                started_at: 0,
+                                exe: "/nonexistent/overseer".into(),
+                            })),
+                            (Fake::ListErrs, _) => Some(Response::Error {
+                                message: "not now".into(),
+                            }),
+                            (Fake::ListHangs, _) => None,
+                        };
+                        match resp {
+                            Some(resp) => {
+                                let _ = write_frame(&mut s, &Frame::Response { seq, resp }).await;
+                            }
+                            None => tokio::time::sleep(Duration::from_secs(3600)).await,
+                        }
+                    }
+                });
+            }
+        });
+    });
+    up.recv().unwrap();
+    socket
+}
+
+const UNLISTED_B0: &str =
+    "The daemon (build b0) did not list its sessions, so some may be running.";
+
+#[test]
+fn install_agent_keeps_a_daemon_whose_sessions_cannot_be_listed() {
+    let env = Env::new();
+    let socket = fake_daemon(&env, Fake::ListErrs);
+    let out = stdout_of(
+        env.agent(&["install-agent"])
+            .pipe_stdin("/dev/null")
+            .unwrap(),
+    );
+    std::fs::remove_file(socket).unwrap();
+    assert!(out.contains(UNLISTED_B0), "{out}");
+    assert!(out.contains("The daemon keeps running build b0."), "{out}");
+    assert!(!out.contains("Restarted"), "{out}");
+    let log = env.launchctl_log();
+    assert!(!log.contains("bootstrap"), "{log}");
+}
+
+#[test]
+fn install_agent_keeps_a_daemon_that_does_not_answer() {
+    let env = Env::new();
+    let socket = fake_daemon(&env, Fake::Silent);
+    let out = stdout_of(
+        env.agent(&["install-agent"])
+            .pipe_stdin("/dev/null")
+            .unwrap(),
+    );
+    std::fs::remove_file(socket).unwrap();
+    assert!(
+        out.contains("The daemon (build unknown) did not list its sessions"),
+        "{out}"
+    );
+    assert!(
+        out.contains("The daemon keeps running build unknown."),
+        "{out}"
+    );
+    assert!(!out.contains("Started"), "{out}");
+    let log = env.launchctl_log();
+    assert!(!log.contains("bootstrap"), "{log}");
+}
+
+#[test]
+fn ctl_restart_keeps_a_daemon_that_does_not_list_its_sessions() {
+    let env = Env::new();
+    let socket = fake_daemon(&env, Fake::ListHangs);
+    let out = stdout_of(env.ctl(&["restart"]).pipe_stdin("/dev/null").unwrap());
+    std::fs::remove_file(socket).unwrap();
+    assert!(out.contains(UNLISTED_B0), "{out}");
+    assert!(
+        out.contains(
+            "Kept the daemon (build b0) because its sessions could not be listed. \
+             Run overseer ctl restart --yes to restart it anyway."
+        ),
+        "{out}"
+    );
+    assert!(!out.contains("Restarted"), "{out}");
+}
+
+#[test]
+fn ctl_restart_kickstarts_this_homes_agent_when_it_is_loaded() {
+    let env = Env::new();
+    env.ctl(&["status"]).assert().success();
+    env.agent(&["install-agent"]).assert().success();
+    // The stub's bootstrap starts nothing, so this spawns the daemon.
+    env.ctl(&["status"]).assert().success();
+    // Now launchd "has" the agent: print and kickstart succeed.
+    env.write_launchctl_stub_failing("none");
+    let out = stdout_of(&mut env.ctl(&["restart", "--yes"]));
+    assert!(
+        out.contains("Restarted the daemon (build dev to dev)."),
+        "{out}"
+    );
+    let log = env.launchctl_log();
+    let kick = format!("kickstart -k gui/{}/uk.co.techize.overseer-home-", uid());
+    assert!(
+        log.lines().any(|l| l.starts_with(&kick)),
+        "no {kick:?} in:\n{log}"
+    );
 }
