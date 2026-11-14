@@ -3,6 +3,7 @@
 pub mod group;
 pub mod ownership;
 pub mod sources;
+pub mod sprint;
 pub mod store;
 
 pub use group::{group, ticket_of};

@@ -3432,6 +3432,7 @@ dependencies = [
  "overseer-proto",
  "portable-pty",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -3454,6 +3455,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml 0.8.23",
+ "toml_edit 0.22.27",
  "tracing",
  "uuid",
 ]
@@ -3472,6 +3474,7 @@ dependencies = [
  "overseer-proto",
  "overseer-term",
  "serde",
+ "tempfile",
  "tokio",
  "toml 0.8.23",
  "tracing",
@@ -3483,8 +3486,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "libc",
+ "regex",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

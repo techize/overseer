@@ -11,9 +11,14 @@
 //!   otherwise goes to Claude Code, which uses it to interrupt.
 //! - Plain digits always go to whatever has focus.
 //! - `a` on the board opens the work-item picker for the selected card.
+//! - `l` on the board and `Cmd+Shift+L` anywhere navigation works open the
+//!   Locks view.
+//! - `Cmd+,` and the app menu's Settings item open the Settings view
+//!   anywhere navigation works.
 //!
 //! The routing is GPUI's keymap with the contexts `Overseer` (window),
-//! `Board`, `Session`, `Terminal`, `StartDialog` and `Picker`;
+//! `Board`, `Session`, `Terminal`, `Locks`, `StartDialog`, `Picker`,
+//! `PlanView` and `Settings`;
 //! `key_bindings` is tested against GPUI's `Keymap` directly.
 
 use std::collections::{HashMap, HashSet};
@@ -31,10 +36,13 @@ use overseer_proto::{
 };
 
 use crate::board::Dir;
+use crate::daemon_info::DaemonKnown;
+use crate::locks_view::LocksState;
 use crate::picker::{Picker, PickerEvent};
 use crate::plan_view::{PlanEvent, PlanView};
 use crate::session::{incarnation, keep_view, restart_begin, restart_on_change, Incarnation};
 use crate::session::{reply_note, EntryAction, EntryKind, PanelEntry, RestartPlan};
+use crate::settings_view::{SettingsEvent, SettingsPanel};
 use crate::start_dialog::{DialogEvent, Prefill, StartDialog};
 use crate::{FrameHub, TerminalView, Theme};
 
@@ -85,6 +93,8 @@ actions!(
         OpenRelease,
         OpenNote,
         OpenPlan,
+        GoLocks,
+        OpenSettings,
     ]
 );
 
@@ -93,11 +103,13 @@ actions!(
 pub enum Screen {
     Board,
     Session(SlotId),
+    /// Every held target and its queue; see `locks_view`.
+    Locks,
 }
 
 /// Navigation keys work anywhere in the window except the start dialog, the
-/// picker and the plan view.
-const NAV: &str = "Overseer && !StartDialog && !Picker && !PlanView";
+/// picker, the plan view and Settings.
+const NAV: &str = "Overseer && !StartDialog && !Picker && !PlanView && !Settings";
 
 pub fn key_bindings() -> Vec<KeyBinding> {
     let nav = Some(NAV);
@@ -111,6 +123,8 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-6", GoS6, nav),
         KeyBinding::new("cmd-escape", GoBoard, nav),
         KeyBinding::new("cmd-n", StartSession, nav),
+        KeyBinding::new("cmd-shift-l", GoLocks, nav),
+        KeyBinding::new("cmd-,", OpenSettings, nav),
         // Not from the terminal: there Esc closes the find bar or goes to
         // Claude Code.
         // Nor from an open Holds or Relays entry row, which takes Esc itself.
@@ -135,6 +149,7 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("r", ResumeSelected, Some("Board")),
         KeyBinding::new("a", AssignSelected, Some("Board")),
         KeyBinding::new("p", OpenPlan, Some("Board")),
+        KeyBinding::new("l", GoLocks, Some("Board")),
         KeyBinding::new("cmd-q", Quit, None),
     ]
 }
@@ -146,6 +161,7 @@ pub fn needs_tick(screen: Screen, slots: &[SlotInfo]) -> bool {
     match screen {
         Screen::Board => slots.iter().any(running),
         Screen::Session(id) => slots.get(id as usize).is_some_and(running),
+        Screen::Locks => false,
     }
 }
 
@@ -176,11 +192,13 @@ impl Ticker {
 }
 
 /// The slot `Cmd+N` starts: the selected card on the board, the shown slot in
-/// a session. None when that slot is already running.
+/// a session. None when that slot is already running, and in the Locks
+/// view, which shows no slot.
 pub fn start_target(screen: Screen, selected: SlotId, slots: &[SlotInfo]) -> Option<SlotId> {
     let id = match screen {
         Screen::Board => selected,
         Screen::Session(id) => id,
+        Screen::Locks => return None,
     };
     let info = slots.get(id as usize)?;
     (!matches!(info.state, SlotState::Running { .. })).then_some(id)
@@ -243,6 +261,7 @@ pub fn empty_work() -> WorkView {
         items: Vec::new(),
         sources: Vec::new(),
         notices: Vec::new(),
+        sprint: None,
     }
 }
 
@@ -294,6 +313,25 @@ pub(crate) fn test_plan(id: i64, state: overseer_proto::PlanState) -> overseer_p
         warnings: Vec::new(),
         outcome: Vec::new(),
     }
+}
+
+/// `slots` when a list reply on this connection filled them, else `None`:
+/// the empty slots the app starts with, or stale ones after a lost
+/// connection, would claim no session is running.
+fn known_slots(known: bool, slots: &[SlotInfo]) -> Option<&[SlotInfo]> {
+    known.then_some(slots)
+}
+
+/// The terminal theme and editor in the config file at `path`. A missing
+/// file gives the defaults.
+fn app_settings(path: &std::path::Path) -> Result<(Theme, String), String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+    };
+    let theme = Theme::from_toml(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok((theme, crate::terminal_view::editor_from_toml(&text)))
 }
 
 fn empty_slots() -> Vec<SlotInfo> {
@@ -353,6 +391,17 @@ pub struct OverseerApp {
     /// Plan views closed with a decision still on its way, kept for the
     /// answer.
     plan_leaving: Vec<(Entity<PlanView>, Subscription)>,
+    /// The open Settings view.
+    settings: Option<(Entity<SettingsPanel>, Subscription)>,
+    /// Settings views closed with a save on its way, kept for the answer.
+    settings_leaving: Vec<(Entity<SettingsPanel>, Subscription)>,
+    /// What the connected daemon said about itself; see `probe_daemon`.
+    pub(crate) daemon: DaemonKnown,
+    /// A `ctl restart --yes` from Settings is running.
+    restarting_daemon: bool,
+    /// The slots came from a list reply on this connection. Until then,
+    /// and after the connection is lost, `slots` may hide running sessions.
+    slots_known: bool,
     /// Pickers closed with an assign on its way; see `PickerEvent::Late`.
     leaving: Vec<(Entity<Picker>, Subscription)>,
     restarts: HashMap<SlotId, RestartPlan>,
@@ -363,6 +412,9 @@ pub struct OverseerApp {
     root_focus: FocusHandle,
     pub(crate) board_focus: FocusHandle,
     pub(crate) session_focus: FocusHandle,
+    /// The Locks view's selection and force-release confirm.
+    pub(crate) locks_state: LocksState,
+    pub(crate) locks_focus: FocusHandle,
     ticker: Ticker,
     _ticker: Option<Task<()>>,
     _events: Task<()>,
@@ -391,6 +443,7 @@ impl OverseerApp {
             }
         });
         Self::ask_for_lists(client.clone(), cx);
+        Self::probe_daemon(cx);
         let board_focus = cx.focus_handle();
         window.focus(&board_focus);
         OverseerApp {
@@ -416,6 +469,11 @@ impl OverseerApp {
             picker: None,
             plan_view: None,
             plan_leaving: Vec::new(),
+            settings: None,
+            settings_leaving: Vec::new(),
+            daemon: DaemonKnown::Unknown,
+            restarting_daemon: false,
+            slots_known: false,
             leaving: Vec::new(),
             restarts: HashMap::new(),
             kickoffs: HashSet::new(),
@@ -423,6 +481,8 @@ impl OverseerApp {
             root_focus: cx.focus_handle(),
             board_focus,
             session_focus: cx.focus_handle(),
+            locks_state: LocksState::default(),
+            locks_focus: cx.focus_handle(),
             ticker: Ticker::default(),
             _ticker: None,
             _events: events,
@@ -479,10 +539,48 @@ impl OverseerApp {
         .detach();
     }
 
+    /// Asks the daemon which build it runs, on a connection of its own (see
+    /// `settings_view::probe_daemon`), and says when it differs from the
+    /// app's.
+    fn probe_daemon(cx: &mut Context<Self>) {
+        let runtime = cx.global::<FrameHub>().runtime().clone();
+        let socket = overseer_proto::paths::socket_path();
+        cx.spawn(async move |this, cx| {
+            let Ok(known) = runtime
+                .spawn(crate::daemon_info::probe_daemon(socket))
+                .await
+            else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| this.daemon_known(known, cx));
+        })
+        .detach();
+    }
+
+    fn daemon_known(&mut self, known: DaemonKnown, cx: &mut Context<Self>) {
+        let notice = match &known {
+            DaemonKnown::Info(info) => {
+                overseer_proto::build_notice(overseer_proto::current_build(), &info.build)
+            }
+            DaemonKnown::Old => Some(crate::daemon_info::OLD_DAEMON_NOTICE.to_string()),
+            DaemonKnown::Unknown => None,
+        };
+        if notice.is_some() {
+            self.status = notice;
+        }
+        if let Some((s, _)) = &self.settings {
+            s.update(cx, |s, cx| s.daemon_known(&known, cx));
+        }
+        self.daemon = known;
+        cx.notify();
+    }
+
     /// Shows that the daemon is gone and tries to reach it again, with a
     /// growing pause, until it answers.
     fn connection_lost(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.status = Some(crate::terminal_view::LOST_DAEMON.into());
+        self.slots_known = false;
+        self.forward_slots(cx);
         cx.notify();
         if self.reconnecting {
             return;
@@ -523,6 +621,12 @@ impl OverseerApp {
         if let Some((v, _)) = &self.plan_view {
             v.update(cx, |v, _| v.set_client(client.clone()));
         }
+        if let Some((s, _)) = &self.settings {
+            s.update(cx, |s, _| s.set_client(client.clone()));
+        }
+        // A new daemon may be another build; ask again.
+        self.daemon = DaemonKnown::Unknown;
+        Self::probe_daemon(cx);
         // Requests in flight on the old connection have failed.
         self.restarts.clear();
         self.kickoffs.clear();
@@ -552,25 +656,23 @@ impl OverseerApp {
                 resp: Response::Slots(list),
                 ..
             } => {
+                self.slots_known = true;
                 for info in list {
                     self.apply_info(info, true, window, cx);
                 }
+                self.forward_slots(cx);
             }
             // The list asked for on connecting is not news, so it never
             // notifies; a change does.
             Frame::Response {
                 resp: Response::Locks(view),
                 ..
-            } => {
-                self.locks = view;
-                cx.notify();
-            }
+            } => self.locks_changed(view, cx),
             Frame::Event(Event::LocksChanged(view)) => {
                 for note in crate::notify::new_waits(&self.locks, &view) {
                     crate::notify::post(&note);
                 }
-                self.locks = view;
-                cx.notify();
+                self.locks_changed(view, cx);
             }
             // A push problem waits until a push succeeds, so one already
             // there on connecting is announced too, once.
@@ -646,6 +748,7 @@ impl OverseerApp {
             }
         }
         self.slots[id as usize] = info;
+        self.forward_slots(cx);
         if self.screen == Screen::Session(id) && !self.modal_open() {
             if let Some(view) = self.ensure_terminal(id, window, cx) {
                 // The old terminal had focus, or the user is waiting for
@@ -955,9 +1058,132 @@ impl OverseerApp {
             .unwrap_or_default()
     }
 
-    /// The start dialog, the picker or the plan view is up; navigation waits for it.
+    /// The start dialog, the picker, the plan view or Settings is up;
+    /// navigation waits for it.
     fn modal_open(&self) -> bool {
-        self.dialog.is_some() || self.picker.is_some() || self.plan_view.is_some()
+        self.dialog.is_some()
+            || self.picker.is_some()
+            || self.plan_view.is_some()
+            || self.settings.is_some()
+    }
+
+    /// The slots for the Settings view's restart question, or `None` when
+    /// this connection has not listed them.
+    fn known_slots(&self) -> Option<&[SlotInfo]> {
+        known_slots(self.slots_known, &self.slots)
+    }
+
+    fn forward_slots(&mut self, cx: &mut Context<Self>) {
+        if let Some((s, _)) = &self.settings {
+            let slots = known_slots(self.slots_known, &self.slots);
+            s.update(cx, |s, cx| s.set_slots(slots, cx));
+        }
+    }
+
+    /// `Cmd+,` and the app menu: the Settings view. With a daemon that
+    /// predates Settings it opens without asking, since such a daemon hangs
+    /// up on a request it does not know.
+    pub(crate) fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal_open() {
+            return;
+        }
+        self.status = None;
+        let client = self.client.clone();
+        let slots = self.known_slots().map(<[SlotInfo]>::to_vec);
+        let old = self.daemon == DaemonKnown::Old;
+        let panel = cx.new(|cx| SettingsPanel::new(client, slots, old, cx));
+        let sub = cx.subscribe_in(
+            &panel,
+            window,
+            |this, panel, ev: &SettingsEvent, window, cx| {
+                match ev {
+                    SettingsEvent::Saved { text, app_changed } => {
+                        this.settings_leaving.retain(|(p, _)| p != panel);
+                        this.status = Some(text.clone());
+                        if *app_changed {
+                            let path = panel.read(cx).config_path();
+                            this.reload_theme(path, cx);
+                        }
+                    }
+                    SettingsEvent::Closed => {
+                        let front = this.settings.take_if(|(p, _)| p == panel);
+                        match front {
+                            // Kept until its save is answered.
+                            Some(open) => {
+                                if open.0.read(cx).busy() {
+                                    this.settings_leaving.push(open);
+                                }
+                                this.restore_focus(window, cx);
+                            }
+                            // A closed view's save failed.
+                            None => {
+                                this.settings_leaving.retain(|(p, _)| p != panel);
+                                if let Some(e) = panel.read(cx).error() {
+                                    this.status = Some(format!("Settings not saved: {e}"));
+                                }
+                            }
+                        }
+                    }
+                    SettingsEvent::Restart => this.restart_daemon(cx),
+                }
+                cx.notify();
+            },
+        );
+        window.focus(&panel.focus_handle(cx));
+        self.settings = Some((panel, sub));
+        cx.notify();
+    }
+
+    /// Terminal or editor settings were saved: every terminal view takes
+    /// them up at once (Decision 9), and new ones start with them.
+    /// The file is the one the view saved to; a broken one leaves the
+    /// terminals as they are and says why on the status line.
+    fn reload_theme(&mut self, path: Option<PathBuf>, cx: &mut Context<Self>) {
+        let Some(path) = path.or_else(Theme::config_path) else {
+            return;
+        };
+        let (theme, editor) = match app_settings(&path) {
+            Ok(both) => both,
+            Err(e) => {
+                self.status = Some(format!("Saved, but the terminals kept their settings: {e}"));
+                return;
+            }
+        };
+        self.theme = theme.clone();
+        for t in self.terminals.values() {
+            t.view.update(cx, |v, cx| {
+                v.set_editor(editor.clone());
+                v.set_theme(theme.clone(), cx);
+            });
+        }
+    }
+
+    /// Settings' Restart the daemon, confirmed: runs `<this binary> ctl
+    /// restart --yes` and says how it went. The reconnect brings the app
+    /// back on the new daemon by itself.
+    fn restart_daemon(&mut self, cx: &mut Context<Self>) {
+        if self.restarting_daemon {
+            self.status = Some("The daemon is already restarting.".to_string());
+            return;
+        }
+        self.restarting_daemon = true;
+        self.status = Some("Restarting the daemon".to_string());
+        let exe = std::env::current_exe();
+        cx.spawn(async move |this, cx| {
+            let text = cx
+                .background_executor()
+                .spawn(async move { crate::daemon_info::run_restart(exe) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.restarting_daemon = false;
+                if let Some((s, _)) = &this.settings {
+                    s.update(cx, |s, cx| s.restart_done(&text, cx));
+                }
+                this.status = Some(text);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// The work-item picker for `slot`: `a` on the board, `+ assign` on an
@@ -1070,7 +1296,12 @@ impl OverseerApp {
 
     /// The only place the screen changes, so the ticker always restarts when
     /// a running slot becomes visible again.
+    /// Leaving the Locks view forgets its selection and any open confirm, so
+    /// it opens fresh next time.
     fn set_screen(&mut self, screen: Screen, cx: &mut Context<Self>) {
+        if self.screen == Screen::Locks && screen != Screen::Locks {
+            self.locks_state = LocksState::default();
+        }
         self.screen = screen;
         self.entry = None;
         self.ensure_ticker(cx);
@@ -1124,6 +1355,49 @@ impl OverseerApp {
                 }
             }
         }
+    }
+
+    /// The daemon's new lock view: keep it, and let an open force-release
+    /// confirm notice that its target changed hands.
+    fn locks_changed(&mut self, view: LockView, cx: &mut Context<Self>) {
+        self.locks = view;
+        let rows = self.lock_rows_now(now_secs());
+        if let Some(text) = self.locks_state.on_change(&rows) {
+            self.status = Some(text);
+        }
+        cx.notify();
+    }
+
+    /// `l` on the board, `Cmd+Shift+L` and a click on the board's lock
+    /// strip: the Locks view.
+    pub(crate) fn go_locks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal_open() {
+            return;
+        }
+        self.status = None;
+        self.set_screen(Screen::Locks, cx);
+        self.focus_when_ready = None;
+        window.focus(&self.locks_focus);
+        cx.notify();
+    }
+
+    /// Sends the Locks view's force release; the daemon's reply (who holds
+    /// the target now, or why nothing was released) goes to the status line
+    /// as it is.
+    pub(crate) fn force_release(&mut self, req: Request, cx: &mut Context<Self>) {
+        self.status = None;
+        let client = self.client.clone();
+        cx.spawn(async move |this, cx| {
+            let reply = client
+                .request(req)
+                .await
+                .map_err(|e| format!("{} ({e:#})", crate::terminal_view::LOST_DAEMON));
+            let _ = this.update(cx, |this, cx| {
+                this.status = reply_note(&reply);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// The daemon's new coordinator view: keep it, and let an open plan
@@ -1229,6 +1503,7 @@ impl OverseerApp {
                 Some(t) => t.view.read(cx).focus(window),
                 None => window.focus(&self.session_focus),
             },
+            Screen::Locks => window.focus(&self.locks_focus),
         }
     }
 }
@@ -1239,11 +1514,16 @@ impl Render for OverseerApp {
         let screen = match self.screen {
             Screen::Board => self.render_board(now, window, cx).into_any_element(),
             Screen::Session(id) => self.render_session(id, now, window, cx).into_any_element(),
+            Screen::Locks => self.render_locks(now, window, cx).into_any_element(),
         };
         div()
             .key_context("Overseer")
             .track_focus(&self.root_focus)
             .on_action(cx.listener(|this, _: &GoBoard, window, cx| this.go_board(window, cx)))
+            .on_action(cx.listener(|this, _: &GoLocks, window, cx| this.go_locks(window, cx)))
+            .on_action(
+                cx.listener(|this, _: &OpenSettings, window, cx| this.open_settings(window, cx)),
+            )
             .on_action(cx.listener(|this, _: &GoS0, w, cx| this.go_session(0, w, cx)))
             .on_action(cx.listener(|this, _: &GoS1, w, cx| this.go_session(1, w, cx)))
             .on_action(cx.listener(|this, _: &GoS2, w, cx| this.go_session(2, w, cx)))
@@ -1264,16 +1544,22 @@ impl Render for OverseerApp {
             .children(self.dialog.as_ref().map(|(d, _)| d.clone()))
             .children(self.picker.as_ref().map(|(p, _)| p.clone()))
             .children(self.plan_view.as_ref().map(|(p, _)| p.clone()))
+            .children(self.settings.as_ref().map(|(s, _)| s.clone()))
     }
 }
 
-/// Registers the key bindings, the Quit action and the app menu.
+/// Registers the key bindings, the Quit action and the app menu (Settings
+/// and Quit).
 pub fn install(cx: &mut App) {
     cx.bind_keys(key_bindings());
     cx.on_action(|_: &Quit, cx| cx.quit());
     cx.set_menus(vec![gpui::Menu {
         name: "Overseer".into(),
-        items: vec![gpui::MenuItem::action("Quit Overseer", Quit)],
+        items: vec![
+            gpui::MenuItem::action("Settings\u{2026}", OpenSettings),
+            gpui::MenuItem::separator(),
+            gpui::MenuItem::action("Quit Overseer", Quit),
+        ],
     }]);
 }
 
@@ -1281,6 +1567,32 @@ pub fn install(cx: &mut App) {
 mod tests {
     use super::*;
     use gpui::{KeyContext, Keymap, Keystroke};
+
+    #[test]
+    fn slots_before_the_first_list_are_unknown() {
+        let start = empty_slots();
+        assert_eq!(known_slots(false, &start), None);
+        assert_eq!(
+            crate::settings_view::restart_confirm(known_slots(false, &start)),
+            crate::settings_view::RESTART_UNLISTED
+        );
+        assert_eq!(known_slots(true, &start).map(<[SlotInfo]>::len), Some(7));
+    }
+
+    #[test]
+    fn saved_app_settings_reload_from_the_saved_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        // Missing: the defaults.
+        let (theme, _) = app_settings(&path).unwrap();
+        assert_eq!(theme.font_size, Theme::default().font_size);
+        std::fs::write(&path, "[terminal]\nfont_size = 17.0\n").unwrap();
+        let (theme, _) = app_settings(&path).unwrap();
+        assert_eq!(theme.font_size, 17.0);
+        std::fs::write(&path, "[terminal\n").unwrap();
+        let e = app_settings(&path).unwrap_err();
+        assert!(e.contains("config.toml"), "{e}");
+    }
 
     /// The action GPUI's keymap picks for `key` with focus inside
     /// `contexts` (outermost first), or None when the key goes on to the
@@ -1302,6 +1614,7 @@ mod tests {
     const DIALOG: &[&str] = &["Overseer", "StartDialog"];
     const PICKER: &[&str] = &["Overseer", "Picker"];
     const PLAN: &[&str] = &["Overseer", "PlanView"];
+    const SETTINGS: &[&str] = &["Overseer", "Settings"];
 
     #[test]
     fn cmd_digits_navigate_from_everywhere_but_the_dialog() {
@@ -1524,6 +1837,82 @@ mod tests {
         ex.state = SlotState::Exited { code: None, at: 0 };
         assert_eq!(card_click(&ex), CardClick::Open(2));
     }
+    /// Contexts that take the keyboard for themselves; window-wide
+    /// navigation waits while one is open. A new modal is one line here.
+    const MODALS: &[&[&str]] = &[DIALOG, PICKER, PLAN, SETTINGS];
+
+    #[test]
+    fn l_opens_locks_from_the_board_only() {
+        assert_eq!(routed("l", BOARD), Some("overseer::GoLocks"));
+        assert_eq!(routed("l", TERMINAL), None);
+        assert_eq!(routed("l", CHROME), None);
+    }
+
+    #[test]
+    fn cmd_shift_l_opens_locks_everywhere_but_modals() {
+        for ctx in [TERMINAL, CHROME, BOARD] {
+            assert_eq!(routed("cmd-shift-l", ctx), Some("overseer::GoLocks"));
+        }
+        for ctx in MODALS {
+            assert_eq!(routed("cmd-shift-l", ctx), None, "{ctx:?}");
+        }
+    }
+
+    #[test]
+    fn locks_keys_reach_the_view() {
+        const LOCKS: &[&str] = &["Overseer", "Locks"];
+        for k in ["escape", "enter", "f", "up", "down", "l"] {
+            assert_eq!(routed(k, LOCKS), None, "{k}");
+        }
+        assert_eq!(routed("cmd-1", LOCKS), Some("overseer::GoS1"));
+        assert_eq!(routed("cmd-escape", LOCKS), Some("overseer::GoBoard"));
+    }
+
+    #[test]
+    fn cmd_comma_opens_settings_from_everywhere_but_modals() {
+        for ctx in [TERMINAL, CHROME, BOARD, &["Overseer", "Locks"][..]] {
+            assert_eq!(
+                routed("cmd-,", ctx),
+                Some("overseer::OpenSettings"),
+                "{ctx:?}"
+            );
+        }
+        for ctx in MODALS {
+            assert_eq!(routed("cmd-,", ctx), None, "{ctx:?}");
+        }
+    }
+
+    #[test]
+    fn keys_reach_the_settings_view() {
+        for k in [
+            "escape",
+            "cmd-s",
+            "tab",
+            "shift-tab",
+            "cmd-a",
+            "cmd-v",
+            "enter",
+            "space",
+        ] {
+            assert_eq!(routed(k, SETTINGS), None, "{k}");
+        }
+        assert_eq!(routed("cmd-q", SETTINGS), Some("overseer::Quit"));
+    }
+
+    #[test]
+    fn cmd_digits_do_not_route_while_settings_open() {
+        for d in [
+            "cmd-0",
+            "cmd-3",
+            "cmd-6",
+            "cmd-n",
+            "cmd-escape",
+            "cmd-shift-l",
+        ] {
+            assert_eq!(routed(d, SETTINGS), None, "{d}");
+        }
+    }
+
     #[test]
     fn p_routes_on_the_board_only() {
         assert_eq!(routed("p", BOARD), Some("overseer::OpenPlan"));

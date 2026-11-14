@@ -76,6 +76,7 @@ async fn setup(name: &str) -> Setup {
         default_command: vec![SCRIPT.to_string()],
         env: overseer_daemon::EnvSource::Inherit,
         state_dir: dir.join("state"),
+        files: overseer_daemon::SettingsFiles::in_dir(&dir),
         hook_program: std::path::PathBuf::from("/bin/true"),
         // No real beads or Jira.
         patterns: overseer_daemon::locks::targets::default_patterns(),

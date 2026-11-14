@@ -37,7 +37,14 @@ enum Cmd {
     /// Serve the lock and relay tools to a Claude session over MCP (run by Claude, not by hand).
     Mcp,
     /// Install the LaunchAgent that keeps the daemon running.
-    InstallAgent,
+    InstallAgent {
+        /// Restart a running daemon without asking.
+        #[arg(long)]
+        yes: bool,
+        /// Keep a running daemon as it is.
+        #[arg(long)]
+        no_restart: bool,
+    },
     /// Remove the LaunchAgent.
     UninstallAgent,
 }
@@ -75,7 +82,9 @@ fn main() {
         }
         // No logger: stdout carries the protocol, nothing else may use it.
         Cmd::Mcp => mcp::run(),
-        Cmd::InstallAgent => agent::install(),
+        Cmd::InstallAgent { yes, no_restart } => {
+            agent::install(agent::RestartOpts::from_flags(yes, no_restart))
+        }
         Cmd::UninstallAgent => agent::uninstall(),
         Cmd::Daemon { foreground: _ } => {
             init_logging("daemon.log");
@@ -86,20 +95,25 @@ fn main() {
                 std::process::id(),
                 socket.display()
             );
-            let home = std::env::var_os("HOME")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| std::path::PathBuf::from("/"));
-            let (settings, config_err) =
-                overseer_daemon::Config::load(&overseer_proto::paths::config_path(), &home);
-            if let Some(e) = config_err {
+            let home = overseer_daemon::config::home_from_env();
+            let config = overseer_proto::paths::config_path();
+            let (settings, config_error) = overseer_daemon::Config::load(&config, &home);
+            if let Some(e) = &config_error {
                 tracing::warn!("config not loaded, using defaults: {e}");
             }
-            let (patterns, targets_err) = overseer_daemon::locks::targets::load_patterns(
-                &overseer_proto::paths::targets_path(),
-            );
-            if let Some(e) = targets_err {
+            let targets = overseer_proto::paths::targets_path();
+            let (patterns, targets_error) =
+                overseer_daemon::locks::targets::load_patterns(&targets);
+            if let Some(e) = &targets_error {
                 tracing::warn!("targets not loaded, using the defaults: {e}");
             }
+            let files = overseer_daemon::SettingsFiles {
+                targets_note: overseer_daemon::settings::targets_note(patterns.len(), &targets),
+                config,
+                config_error,
+                targets,
+                targets_error,
+            };
             let result = runtime().and_then(|rt| {
                 rt.block_on(overseer_daemon::run(DaemonConfig {
                     socket,
@@ -109,6 +123,7 @@ fn main() {
                     hook_program: std::env::current_exe()?,
                     settings,
                     patterns,
+                    files,
                 }))
             });
             match &result {
@@ -128,6 +143,10 @@ fn main() {
             result
         }
         Cmd::Attach { n } => runtime().and_then(|rt| rt.block_on(attach::run(n))),
+        // Synchronous, like install-agent: it makes its own runtimes.
+        Cmd::Ctl {
+            cmd: ctl::CtlCmd::Restart { yes },
+        } => agent::restart(agent::RestartOpts::from_flags(yes, false)),
         Cmd::Ctl { cmd } => runtime().and_then(|rt| rt.block_on(ctl::run(cmd))),
     };
     if let Err(e) = result {

@@ -9,16 +9,19 @@ use std::process::{Command, Stdio};
 use anyhow::{bail, Context};
 use clap::Subcommand;
 use overseer_proto::paths::{log_dir, socket_path};
+use overseer_proto::settings::{parse_text, Applies, SettingEdit, SettingsView};
 use overseer_proto::{
-    slot_name, ActivityKind, BoardView, BrainRun, BrainView, ClaimKind, Client, ItemKind, LockView,
-    Plan, PlanDecision, PlanRecord, PlanState, QueueState, RelayState, Request, Response, SlotId,
-    SlotInfo, SlotState, WorkItem, WorkView,
+    build_notice, local_hhmm, slot_name, ActivityKind, BoardView, BrainRun, BrainView, ClaimKind,
+    Client, DaemonInfo, ItemKind, LockView, Plan, PlanDecision, PlanRecord, PlanState, QueueState,
+    RelayState, Request, Response, SlotId, SlotInfo, SlotState, WorkItem, WorkView,
 };
 
 #[derive(Subcommand)]
 pub enum CtlCmd {
     /// One line per slot.
     Status,
+    /// The builds of this binary and of the running daemon.
+    Version,
     /// Start a session in a slot.
     Start {
         n: SlotId,
@@ -152,6 +155,34 @@ pub enum CtlCmd {
     },
     /// Stop the daemon and every session.
     Shutdown,
+    /// Restart the daemon. Running sessions end and come back as
+    /// resumable; you are asked first when any are running.
+    Restart {
+        /// Restart without asking, even with sessions running.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Show config.toml as Settings sees it, or change one key.
+    Settings {
+        /// Print the raw SettingsView as JSON.
+        #[arg(long)]
+        json: bool,
+        #[command(subcommand)]
+        action: Option<SettingsCmd>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SettingsCmd {
+    /// Set a key in config.toml: a number, `true` or `false`, text, or a
+    /// list as a JSON array.
+    Set {
+        key: String,
+        #[arg(allow_hyphen_values = true)]
+        value: String,
+    },
+    /// Remove a key from config.toml, so its default applies.
+    Reset { key: String },
 }
 
 #[derive(Subcommand)]
@@ -164,15 +195,13 @@ pub enum PlanCmd {
     Propose { source: String },
 }
 
-/// Starts the daemon. With the LaunchAgent installed (and the default state
-/// dir) this kickstarts the agent, so the daemon runs under launchd with the
-/// agent's PATH. Otherwise it spawns `current_exe() daemon` in its own
+/// Starts the daemon. With this home's LaunchAgent installed this
+/// kickstarts it, so the daemon runs under launchd with the agent's
+/// environment. Otherwise it spawns `current_exe() daemon` in its own
 /// session, logging to `daemon.log`.
 pub fn spawn_daemon() -> io::Result<()> {
     let plist_exists = crate::agent::plist_path().is_ok_and(|p| p.exists());
-    if crate::agent::use_launchd(std::env::var_os("OVERSEER_HOME"), plist_exists)
-        && crate::agent::kickstart()
-    {
+    if crate::agent::use_launchd(plist_exists) && crate::agent::kickstart() {
         return Ok(());
     }
     let exe = std::env::current_exe()?;
@@ -263,20 +292,6 @@ fn expect_ok(resp: Response) -> anyhow::Result<()> {
         Response::Error { message } => bail!("{message}"),
         other => bail!("unexpected reply: {other:?}"),
     }
-}
-
-/// Unix seconds as local HH:MM.
-pub(crate) fn local_hhmm(at: i64) -> String {
-    let t = at as libc::time_t;
-    // SAFETY: localtime_r writes only into the zeroed tm we pass.
-    let tm = unsafe {
-        let mut tm: libc::tm = std::mem::zeroed();
-        if libc::localtime_r(&t, &mut tm).is_null() {
-            return "--:--".into();
-        }
-        tm
-    };
-    format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
 }
 
 /// A slot given as `3` or `S3`.
@@ -705,6 +720,92 @@ pub fn format_plan(rec: &PlanRecord) -> String {
     out.join("\n")
 }
 
+/// `config.toml: <path>`, each group with its keys, then `targets.toml`
+/// and any error lines.
+pub fn format_settings(v: &SettingsView) -> Vec<String> {
+    let mut out = vec![format!("config.toml: {}", v.config_path.display())];
+    let mut group = None;
+    for s in &v.settings {
+        if group != Some(&s.group) {
+            out.push(s.group.clone());
+            group = Some(&s.group);
+        }
+        let from = if s.in_file {
+            "from the file"
+        } else {
+            "default"
+        };
+        let mut line = format!("  {} = {}  ({from})", s.key, s.value);
+        if s.restart_needed {
+            line.push_str("  restart needed");
+        }
+        if s.applies == Applies::ReadOnly {
+            line.push_str("  read-only");
+        }
+        out.push(line);
+    }
+    out.push(format!("targets.toml: {}", v.targets_note));
+    if let Some(e) = &v.load_error {
+        out.push(format!("config.toml error: {e}"));
+    }
+    if let Some(e) = &v.targets_error {
+        out.push(format!("targets.toml error: {e}"));
+    }
+    out
+}
+
+async fn get_settings(client: &Client) -> anyhow::Result<SettingsView> {
+    match client.request(Request::GetSettings).await? {
+        Response::Settings(v) => Ok(v),
+        Response::Error { message } => bail!("{message}"),
+        other => bail!("unexpected reply: {other:?}"),
+    }
+}
+
+async fn run_settings(
+    client: &Client,
+    json: bool,
+    action: Option<SettingsCmd>,
+) -> anyhow::Result<()> {
+    let view = get_settings(client).await?;
+    let edit = match action {
+        None => None,
+        Some(SettingsCmd::Set { key, value }) => {
+            let Some(s) = view.settings.iter().find(|s| s.key == key) else {
+                bail!("no setting {key}");
+            };
+            if s.applies == Applies::ReadOnly {
+                bail!("{key} is read-only here; edit config.toml");
+            }
+            let value = parse_text(&s.kind, &key, &value).map_err(|e| anyhow::anyhow!(e))?;
+            Some(SettingEdit::Set { key, value })
+        }
+        Some(SettingsCmd::Reset { key }) => Some(SettingEdit::Reset { key }),
+    };
+    let view = match edit {
+        None => view,
+        Some(edit) => match client
+            .request(Request::SaveSettings {
+                base_hash: view.file_hash,
+                edits: vec![edit],
+            })
+            .await?
+        {
+            Response::Settings(v) => v,
+            Response::Error { message } => bail!("{message}"),
+            other => bail!("unexpected reply: {other:?}"),
+        },
+    };
+    if json {
+        println!("{}", serde_json::to_string(&view)?);
+    } else {
+        for l in format_settings(&view) {
+            println!("{l}");
+        }
+    }
+    Ok(())
+}
+
 /// The pending plan, then the newest five others.
 fn plans_to_list(plans: &[PlanRecord]) -> Vec<&PlanRecord> {
     let pending = plans.iter().filter(|p| p.state == PlanState::Pending);
@@ -803,9 +904,66 @@ async fn run_plan(
     }
 }
 
+/// The `ctl version` lines: this binary, the daemon, and a notice when
+/// their builds differ.
+pub fn format_version(
+    app_version: &str,
+    app_build: &str,
+    daemon: Option<&DaemonInfo>,
+) -> Vec<String> {
+    let mut lines = vec![format!("app     {app_version} build {app_build}")];
+    match daemon {
+        Some(d) => {
+            lines.push(format!(
+                "daemon  {} build {}  pid {}  since {}",
+                d.version,
+                d.build,
+                d.pid,
+                local_hhmm(d.started_at)
+            ));
+            lines.extend(build_notice(app_build, &d.build));
+        }
+        None => lines.push("daemon  not running".to_string()),
+    }
+    lines
+}
+
+/// The `ctl version` lines for a daemon that answers but predates
+/// `DaemonInfo`, as one left running across an upgrade does.
+pub fn format_old_daemon(app_version: &str, app_build: &str) -> Vec<String> {
+    vec![
+        format!("app     {app_version} build {app_build}"),
+        "daemon  running, build unknown (older than this app)".to_string(),
+        "Restart the daemon to finish the upgrade (overseer ctl restart, or Settings).".to_string(),
+    ]
+}
+
+/// Ask a running daemon about itself, without starting one.
+async fn version() -> anyhow::Result<()> {
+    let (app_version, app_build) = (env!("CARGO_PKG_VERSION"), overseer_proto::current_build());
+    let lines = match Client::connect(socket_path()).await {
+        Ok(client) => match client.request(Request::DaemonInfo).await {
+            Ok(Response::DaemonInfo(info)) => format_version(app_version, app_build, Some(&info)),
+            // An old daemon drops the connection or refuses the unknown request.
+            Ok(Response::Error { .. }) | Err(_) => format_old_daemon(app_version, app_build),
+            Ok(other) => bail!("unexpected reply: {other:?}"),
+        },
+        Err(_) => format_version(app_version, app_build, None),
+    };
+    for line in lines {
+        println!("{line}");
+    }
+    Ok(())
+}
+
 pub async fn run(cmd: CtlCmd) -> anyhow::Result<()> {
+    if matches!(cmd, CtlCmd::Version) {
+        return version().await;
+    }
     let client = connect().await?;
     match cmd {
+        CtlCmd::Version => unreachable!("handled before connecting"),
+        CtlCmd::Restart { .. } => unreachable!("handled by agent::restart"),
         CtlCmd::Status => match client.request(Request::ListSlots).await? {
             Response::Slots(slots) => {
                 for s in &slots {
@@ -1045,6 +1203,7 @@ pub async fn run(cmd: CtlCmd) -> anyhow::Result<()> {
             other => bail!("unexpected reply: {other:?}"),
         },
         CtlCmd::Plan { json, action } => run_plan(&client, json, action).await,
+        CtlCmd::Settings { json, action } => run_settings(&client, json, action).await,
         CtlCmd::Summary { text } => print_brain_text(
             client
                 .request(Request::SetBoardSummary {
@@ -1081,6 +1240,97 @@ pub async fn run(cmd: CtlCmd) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_lines_group_keys_and_show_errors() {
+        use overseer_proto::settings::{Setting, SettingKind, SettingValue};
+        let row =
+            |key: &str, group: &str, applies: Applies, in_file: bool, restart: bool| Setting {
+                key: key.into(),
+                group: group.into(),
+                kind: SettingKind::List,
+                applies,
+                value: SettingValue::List(vec!["a.md".into()]),
+                default: SettingValue::List(vec![]),
+                in_file,
+                restart_needed: restart,
+                note: None,
+            };
+        let v = SettingsView {
+            config_path: "/tmp/demo/config.toml".into(),
+            file_hash: String::new(),
+            load_error: Some("bad line 3".into()),
+            settings: vec![
+                row("shared_files", "2ndBrain", Applies::Restart, true, true),
+                row("jira_command", "Commands", Applies::ReadOnly, false, false),
+                row("bd_command", "Commands", Applies::ReadOnly, true, false),
+            ],
+            targets_path: "/tmp/demo/targets.toml".into(),
+            targets_note: "3 built-in patterns; /tmp/demo/targets.toml does not exist".into(),
+            targets_error: Some("broken".into()),
+            daemon: DaemonInfo {
+                version: "0.1.0".into(),
+                build: "dev".into(),
+                pid: 1,
+                started_at: 0,
+                exe: "/tmp/demo/overseer".into(),
+            },
+        };
+        assert_eq!(
+            format_settings(&v),
+            vec![
+                "config.toml: /tmp/demo/config.toml",
+                "2ndBrain",
+                r#"  shared_files = ["a.md"]  (from the file)  restart needed"#,
+                "Commands",
+                r#"  jira_command = ["a.md"]  (default)  read-only"#,
+                r#"  bd_command = ["a.md"]  (from the file)  read-only"#,
+                "targets.toml: 3 built-in patterns; /tmp/demo/targets.toml does not exist",
+                "config.toml error: bad line 3",
+                "targets.toml error: broken",
+            ]
+        );
+    }
+
+    #[test]
+    fn version_lines_show_both_builds_and_the_notice() {
+        let info = DaemonInfo {
+            version: "0.1.0".into(),
+            build: "abc1234-202611140930".into(),
+            pid: 4242,
+            started_at: 1_700_000_000,
+            exe: "/Applications/Overseer.app/Contents/MacOS/overseer".into(),
+        };
+        let lines = format_version("0.1.0", "def5678-202611141000", Some(&info));
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "app     0.1.0 build def5678-202611141000");
+        let prefix = "daemon  0.1.0 build abc1234-202611140930  pid 4242  since ";
+        let clock = lines[1].strip_prefix(prefix).expect(&lines[1]);
+        let b = clock.as_bytes();
+        assert!(
+            b.len() == 5
+                && b[2] == b':'
+                && clock.chars().filter(|c| c.is_ascii_digit()).count() == 4,
+            "{clock}"
+        );
+        assert_eq!(
+            lines[2],
+            build_notice("def5678-202611141000", "abc1234-202611140930").unwrap()
+        );
+        // Same build: no notice. Dev builds never warn.
+        assert_eq!(
+            format_version("0.1.0", "abc1234-202611140930", Some(&info)).len(),
+            2
+        );
+        assert_eq!(format_version("0.1.0", "dev", Some(&info)).len(), 2);
+        assert_eq!(
+            format_version("0.1.0", "dev", None),
+            vec![
+                "app     0.1.0 build dev".to_string(),
+                "daemon  not running".to_string()
+            ]
+        );
+    }
     use overseer_proto::ReportKind;
 
     #[derive(clap::Parser)]
@@ -1194,6 +1444,7 @@ mod tests {
                 },
             ],
             notices: vec![],
+            sprint: None,
         }
     }
 

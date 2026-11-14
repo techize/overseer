@@ -2,11 +2,14 @@
 
 pub mod app;
 pub mod board;
+pub mod daemon_info;
+pub mod locks_view;
 pub mod notify;
 pub mod picker;
 pub mod plan_view;
 pub mod reconnect;
 pub mod session;
+pub mod settings_view;
 pub mod start_dialog;
 pub mod startup_error;
 pub mod terminal_view;

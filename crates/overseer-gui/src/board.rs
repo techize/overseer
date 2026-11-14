@@ -107,6 +107,11 @@ pub fn pills(items: &[&WorkItem]) -> Vec<String> {
     keys
 }
 
+/// The sprint text shown muted after `Overseer`: name and day, or `None`.
+pub fn header_title(work: &WorkView) -> Option<String> {
+    work.sprint.clone().filter(|s| !s.is_empty())
+}
+
 /// The header's source health: `jira 12 · beads 133 · 14:05`, or
 /// `jira: acli not found · beads 133 · 14:05` when a source failed. Jira
 /// leads; the time is the newest successful read, through `clock`.
@@ -142,11 +147,7 @@ pub fn short_message(msg: &str) -> String {
     }
 }
 
-/// Local `HH:MM` for unix seconds.
-pub fn local_hhmm(t: i64) -> String {
-    let full = crate::session::local_clock(t);
-    full.get(..5).unwrap_or(&full).to_string()
-}
+pub use overseer_proto::local_hhmm;
 
 /// `45s`, `8m 05s`, `2h 03m`. Negative input (clock skew) shows `0s`.
 pub fn format_elapsed(secs: i64) -> String {
@@ -894,9 +895,21 @@ impl OverseerApp {
                     .items_center()
                     .child(
                         div()
-                            .text_lg()
-                            .font_weight(FontWeight::BOLD)
-                            .child("Overseer"),
+                            .flex()
+                            .items_baseline()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .text_lg()
+                                    .font_weight(FontWeight::BOLD)
+                                    .child("Overseer"),
+                            )
+                            .children(header_title(&self.work).map(|t| {
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(colors::MUTED))
+                                    .child(t)
+                            })),
                     )
                     .child(
                         div()
@@ -1021,7 +1034,17 @@ impl OverseerApp {
                             .min_w(px(0.))
                             .truncate()
                             .text_color(rgb(colors::MUTED))
-                            .child("Click a card or press Enter to open it · A assigns work · Cmd+0 to Cmd+6 open a session · Cmd+N starts the selected slot"),
+                            .child("Click a card or press Enter to open it · A assigns work · Cmd+0 to Cmd+6 open a session · Cmd+N starts the selected slot · L shows the locks"),
+                    )
+                    .child(
+                        div()
+                            .id("locks-strip")
+                            .flex_none()
+                            .cursor_pointer()
+                            .text_color(rgb(colors::MUTED))
+                            .hover(|s| s.text_color(rgb(colors::TEXT)))
+                            .child(crate::locks_view::locks_strip(&self.locks))
+                            .on_click(cx.listener(|this, _, window, cx| this.go_locks(window, cx))),
                     )
                     .child(
                         div()
@@ -1073,7 +1096,21 @@ mod tests {
             items: vec![],
             sources: vec![],
             notices: vec![],
+            sprint: None,
         }
+    }
+
+    #[test]
+    fn header_title_is_the_sprint_text() {
+        let mut w = no_work();
+        assert_eq!(header_title(&w), None);
+        w.sprint = Some("sprint-26-01, day 4 of 10".into());
+        assert_eq!(
+            header_title(&w).as_deref(),
+            Some("sprint-26-01, day 4 of 10")
+        );
+        w.sprint = Some(String::new());
+        assert_eq!(header_title(&w), None);
     }
 
     fn no_locks() -> LockView {
