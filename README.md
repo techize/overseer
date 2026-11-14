@@ -132,6 +132,37 @@ install in place.
   app). Set `RUST_LOG` (for example `RUST_LOG=debug`) to change the level; the
   default is `info`.
 
+## Settings
+
+`Cmd+,` (or Overseer > Settings in the menu) opens the Settings view. It shows
+`config.toml`, the file the daemon reads: `$OVERSEER_CONFIG` when set, else
+`~/.config/overseer/config.toml`. The app reads its terminal and editor keys
+from the same file. Each key says whether its value comes from the file or is
+the default; `Reset` takes a key out of the file so the default applies again.
+Lists are typed as comma-separated items. `Cmd+S` saves, `Esc` closes (with
+unsaved edits the first `Esc` only warns).
+
+- Terminal keys (`terminal.font_family`, `terminal.font_size`,
+  `terminal.background`, `terminal.foreground`) and `editor.name` apply in the
+  app at once, open terminals included.
+- Every other key is the daemon's and applies after it restarts; the view marks
+  such a key `restart needed` until then. Restart the daemon in the view asks
+  first, naming the sessions a restart would end (each comes back as
+  resumable), then runs `overseer ctl restart --yes`.
+- Read-only here: `brain_writer` (it has a setup checklist), `jira_command`,
+  `bd_command` and `sync_command` (a typo turns a source off) and
+  `terminal.ansi` (the 16 colours). Change them in `config.toml`; Open opens
+  each file that exists in your text editor. `targets.toml` is shown with the
+  number of patterns the daemon read from it.
+
+The daemon writes the file, not the app: it keeps your comments, key order and
+any keys it does not know, and checks the result still loads. Editing the file
+by hand while Settings is open is safe: Save refuses to write over a file that
+changed since the view read it, and says to close and reopen Settings.
+
+The About block shows the app's build and the running daemon's, and says when
+they differ.
+
 ## Emergency fallback: `overseer attach`
 
 If the app will not open, you can still reach a session from any terminal:

@@ -8,6 +8,7 @@ pub mod picker;
 pub mod plan_view;
 pub mod reconnect;
 pub mod session;
+pub mod settings_view;
 pub mod start_dialog;
 pub mod startup_error;
 pub mod terminal_view;

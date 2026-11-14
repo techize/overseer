@@ -3474,6 +3474,7 @@ dependencies = [
  "overseer-proto",
  "overseer-term",
  "serde",
+ "tempfile",
  "tokio",
  "toml 0.8.23",
  "tracing",

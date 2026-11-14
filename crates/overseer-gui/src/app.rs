@@ -13,9 +13,12 @@
 //! - `a` on the board opens the work-item picker for the selected card.
 //! - `l` on the board and `Cmd+Shift+L` anywhere navigation works open the
 //!   Locks view.
+//! - `Cmd+,` and the app menu's Settings item open the Settings view
+//!   anywhere navigation works.
 //!
 //! The routing is GPUI's keymap with the contexts `Overseer` (window),
-//! `Board`, `Session`, `Terminal`, `Locks`, `StartDialog` and `Picker`;
+//! `Board`, `Session`, `Terminal`, `Locks`, `StartDialog`, `Picker`,
+//! `PlanView` and `Settings`;
 //! `key_bindings` is tested against GPUI's `Keymap` directly.
 
 use std::collections::{HashMap, HashSet};
@@ -38,6 +41,7 @@ use crate::picker::{Picker, PickerEvent};
 use crate::plan_view::{PlanEvent, PlanView};
 use crate::session::{incarnation, keep_view, restart_begin, restart_on_change, Incarnation};
 use crate::session::{reply_note, EntryAction, EntryKind, PanelEntry, RestartPlan};
+use crate::settings_view::{DaemonKnown, SettingsEvent, SettingsPanel};
 use crate::start_dialog::{DialogEvent, Prefill, StartDialog};
 use crate::{FrameHub, TerminalView, Theme};
 
@@ -89,6 +93,7 @@ actions!(
         OpenNote,
         OpenPlan,
         GoLocks,
+        OpenSettings,
     ]
 );
 
@@ -102,8 +107,8 @@ pub enum Screen {
 }
 
 /// Navigation keys work anywhere in the window except the start dialog, the
-/// picker and the plan view.
-const NAV: &str = "Overseer && !StartDialog && !Picker && !PlanView";
+/// picker, the plan view and Settings.
+const NAV: &str = "Overseer && !StartDialog && !Picker && !PlanView && !Settings";
 
 pub fn key_bindings() -> Vec<KeyBinding> {
     let nav = Some(NAV);
@@ -118,6 +123,7 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-escape", GoBoard, nav),
         KeyBinding::new("cmd-n", StartSession, nav),
         KeyBinding::new("cmd-shift-l", GoLocks, nav),
+        KeyBinding::new("cmd-,", OpenSettings, nav),
         // Not from the terminal: there Esc closes the find bar or goes to
         // Claude Code.
         // Nor from an open Holds or Relays entry row, which takes Esc itself.
@@ -365,6 +371,14 @@ pub struct OverseerApp {
     /// Plan views closed with a decision still on its way, kept for the
     /// answer.
     plan_leaving: Vec<(Entity<PlanView>, Subscription)>,
+    /// The open Settings view.
+    settings: Option<(Entity<SettingsPanel>, Subscription)>,
+    /// Settings views closed with a save on its way, kept for the answer.
+    settings_leaving: Vec<(Entity<SettingsPanel>, Subscription)>,
+    /// What the connected daemon said about itself; see `probe_daemon`.
+    pub(crate) daemon: DaemonKnown,
+    /// A `ctl restart --yes` from Settings is running.
+    restarting_daemon: bool,
     /// Pickers closed with an assign on its way; see `PickerEvent::Late`.
     leaving: Vec<(Entity<Picker>, Subscription)>,
     restarts: HashMap<SlotId, RestartPlan>,
@@ -406,6 +420,7 @@ impl OverseerApp {
             }
         });
         Self::ask_for_lists(client.clone(), cx);
+        Self::probe_daemon(cx);
         let board_focus = cx.focus_handle();
         window.focus(&board_focus);
         OverseerApp {
@@ -431,6 +446,10 @@ impl OverseerApp {
             picker: None,
             plan_view: None,
             plan_leaving: Vec::new(),
+            settings: None,
+            settings_leaving: Vec::new(),
+            daemon: DaemonKnown::Unknown,
+            restarting_daemon: false,
             leaving: Vec::new(),
             restarts: HashMap::new(),
             kickoffs: HashSet::new(),
@@ -496,6 +515,42 @@ impl OverseerApp {
         .detach();
     }
 
+    /// Asks the daemon which build it runs, on a connection of its own (see
+    /// `settings_view::probe_daemon`), and says when it differs from the
+    /// app's.
+    fn probe_daemon(cx: &mut Context<Self>) {
+        let runtime = cx.global::<FrameHub>().runtime().clone();
+        let socket = overseer_proto::paths::socket_path();
+        cx.spawn(async move |this, cx| {
+            let Ok(known) = runtime
+                .spawn(crate::settings_view::probe_daemon(socket))
+                .await
+            else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| this.daemon_known(known, cx));
+        })
+        .detach();
+    }
+
+    fn daemon_known(&mut self, known: DaemonKnown, cx: &mut Context<Self>) {
+        let notice = match &known {
+            DaemonKnown::Info(info) => {
+                overseer_proto::build_notice(overseer_proto::current_build(), &info.build)
+            }
+            DaemonKnown::Old => Some(crate::settings_view::OLD_DAEMON_NOTICE.to_string()),
+            DaemonKnown::Unknown => None,
+        };
+        if notice.is_some() {
+            self.status = notice;
+        }
+        if let Some((s, _)) = &self.settings {
+            s.update(cx, |s, cx| s.daemon_known(&known, cx));
+        }
+        self.daemon = known;
+        cx.notify();
+    }
+
     /// Shows that the daemon is gone and tries to reach it again, with a
     /// growing pause, until it answers.
     fn connection_lost(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -540,6 +595,12 @@ impl OverseerApp {
         if let Some((v, _)) = &self.plan_view {
             v.update(cx, |v, _| v.set_client(client.clone()));
         }
+        if let Some((s, _)) = &self.settings {
+            s.update(cx, |s, _| s.set_client(client.clone()));
+        }
+        // A new daemon may be another build; ask again.
+        self.daemon = DaemonKnown::Unknown;
+        Self::probe_daemon(cx);
         // Requests in flight on the old connection have failed.
         self.restarts.clear();
         self.kickoffs.clear();
@@ -659,6 +720,10 @@ impl OverseerApp {
             }
         }
         self.slots[id as usize] = info;
+        if let Some((s, _)) = &self.settings {
+            let slots = &self.slots;
+            s.update(cx, |s, _| s.set_slots(slots));
+        }
         if self.screen == Screen::Session(id) && !self.modal_open() {
             if let Some(view) = self.ensure_terminal(id, window, cx) {
                 // The old terminal had focus, or the user is waiting for
@@ -968,9 +1033,107 @@ impl OverseerApp {
             .unwrap_or_default()
     }
 
-    /// The start dialog, the picker or the plan view is up; navigation waits for it.
+    /// The start dialog, the picker, the plan view or Settings is up;
+    /// navigation waits for it.
     fn modal_open(&self) -> bool {
-        self.dialog.is_some() || self.picker.is_some() || self.plan_view.is_some()
+        self.dialog.is_some()
+            || self.picker.is_some()
+            || self.plan_view.is_some()
+            || self.settings.is_some()
+    }
+
+    /// `Cmd+,` and the app menu: the Settings view. With a daemon that
+    /// predates Settings it opens without asking, since such a daemon hangs
+    /// up on a request it does not know.
+    pub(crate) fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal_open() {
+            return;
+        }
+        self.status = None;
+        let client = self.client.clone();
+        let slots = self.slots.clone();
+        let old = self.daemon == DaemonKnown::Old;
+        let panel = cx.new(|cx| SettingsPanel::new(client, slots, old, cx));
+        let sub = cx.subscribe_in(
+            &panel,
+            window,
+            |this, panel, ev: &SettingsEvent, window, cx| {
+                match ev {
+                    SettingsEvent::Saved { text, app_changed } => {
+                        this.settings_leaving.retain(|(p, _)| p != panel);
+                        this.status = Some(text.clone());
+                        if *app_changed {
+                            this.reload_theme(cx);
+                        }
+                    }
+                    SettingsEvent::Closed => {
+                        let front = this.settings.take_if(|(p, _)| p == panel);
+                        match front {
+                            // Kept until its save is answered.
+                            Some(open) => {
+                                if open.0.read(cx).busy() {
+                                    this.settings_leaving.push(open);
+                                }
+                                this.restore_focus(window, cx);
+                            }
+                            // A closed view's save failed.
+                            None => {
+                                this.settings_leaving.retain(|(p, _)| p != panel);
+                                if let Some(e) = panel.read(cx).error() {
+                                    this.status = Some(format!("Settings not saved: {e}"));
+                                }
+                            }
+                        }
+                    }
+                    SettingsEvent::Restart => this.restart_daemon(cx),
+                }
+                cx.notify();
+            },
+        );
+        window.focus(&panel.focus_handle(cx));
+        self.settings = Some((panel, sub));
+        cx.notify();
+    }
+
+    /// Terminal or editor settings were saved: every terminal view takes
+    /// them up at once (Decision 9), and new ones start with them.
+    fn reload_theme(&mut self, cx: &mut Context<Self>) {
+        let theme = Theme::load();
+        let editor = crate::terminal_view::load_editor();
+        self.theme = theme.clone();
+        for t in self.terminals.values() {
+            t.view.update(cx, |v, cx| {
+                v.set_editor(editor.clone());
+                v.set_theme(theme.clone(), cx);
+            });
+        }
+    }
+
+    /// Settings' Restart the daemon, confirmed: runs `<this binary> ctl
+    /// restart --yes` and says how it went. The reconnect brings the app
+    /// back on the new daemon by itself.
+    fn restart_daemon(&mut self, cx: &mut Context<Self>) {
+        if self.restarting_daemon {
+            return;
+        }
+        self.restarting_daemon = true;
+        self.status = Some("Restarting the daemon".to_string());
+        let exe = std::env::current_exe();
+        cx.spawn(async move |this, cx| {
+            let text = cx
+                .background_executor()
+                .spawn(async move { crate::settings_view::run_restart(exe) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.restarting_daemon = false;
+                if let Some((s, _)) = &this.settings {
+                    s.update(cx, |s, cx| s.restart_done(&text, cx));
+                }
+                this.status = Some(text);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// The work-item picker for `slot`: `a` on the board, `+ assign` on an
@@ -1308,6 +1471,9 @@ impl Render for OverseerApp {
             .track_focus(&self.root_focus)
             .on_action(cx.listener(|this, _: &GoBoard, window, cx| this.go_board(window, cx)))
             .on_action(cx.listener(|this, _: &GoLocks, window, cx| this.go_locks(window, cx)))
+            .on_action(
+                cx.listener(|this, _: &OpenSettings, window, cx| this.open_settings(window, cx)),
+            )
             .on_action(cx.listener(|this, _: &GoS0, w, cx| this.go_session(0, w, cx)))
             .on_action(cx.listener(|this, _: &GoS1, w, cx| this.go_session(1, w, cx)))
             .on_action(cx.listener(|this, _: &GoS2, w, cx| this.go_session(2, w, cx)))
@@ -1328,16 +1494,22 @@ impl Render for OverseerApp {
             .children(self.dialog.as_ref().map(|(d, _)| d.clone()))
             .children(self.picker.as_ref().map(|(p, _)| p.clone()))
             .children(self.plan_view.as_ref().map(|(p, _)| p.clone()))
+            .children(self.settings.as_ref().map(|(s, _)| s.clone()))
     }
 }
 
-/// Registers the key bindings, the Quit action and the app menu.
+/// Registers the key bindings, the Quit action and the app menu (Settings
+/// and Quit).
 pub fn install(cx: &mut App) {
     cx.bind_keys(key_bindings());
     cx.on_action(|_: &Quit, cx| cx.quit());
     cx.set_menus(vec![gpui::Menu {
         name: "Overseer".into(),
-        items: vec![gpui::MenuItem::action("Quit Overseer", Quit)],
+        items: vec![
+            gpui::MenuItem::action("Settings\u{2026}", OpenSettings),
+            gpui::MenuItem::separator(),
+            gpui::MenuItem::action("Quit Overseer", Quit),
+        ],
     }]);
 }
 
@@ -1366,6 +1538,7 @@ mod tests {
     const DIALOG: &[&str] = &["Overseer", "StartDialog"];
     const PICKER: &[&str] = &["Overseer", "Picker"];
     const PLAN: &[&str] = &["Overseer", "PlanView"];
+    const SETTINGS: &[&str] = &["Overseer", "Settings"];
 
     #[test]
     fn cmd_digits_navigate_from_everywhere_but_the_dialog() {
@@ -1590,7 +1763,7 @@ mod tests {
     }
     /// Contexts that take the keyboard for themselves; window-wide
     /// navigation waits while one is open. A new modal is one line here.
-    const MODALS: &[&[&str]] = &[DIALOG, PICKER, PLAN];
+    const MODALS: &[&[&str]] = &[DIALOG, PICKER, PLAN, SETTINGS];
 
     #[test]
     fn l_opens_locks_from_the_board_only() {
@@ -1617,6 +1790,51 @@ mod tests {
         }
         assert_eq!(routed("cmd-1", LOCKS), Some("overseer::GoS1"));
         assert_eq!(routed("cmd-escape", LOCKS), Some("overseer::GoBoard"));
+    }
+
+    #[test]
+    fn cmd_comma_opens_settings_from_everywhere_but_modals() {
+        for ctx in [TERMINAL, CHROME, BOARD, &["Overseer", "Locks"][..]] {
+            assert_eq!(
+                routed("cmd-,", ctx),
+                Some("overseer::OpenSettings"),
+                "{ctx:?}"
+            );
+        }
+        for ctx in MODALS {
+            assert_eq!(routed("cmd-,", ctx), None, "{ctx:?}");
+        }
+    }
+
+    #[test]
+    fn keys_reach_the_settings_view() {
+        for k in [
+            "escape",
+            "cmd-s",
+            "tab",
+            "shift-tab",
+            "cmd-a",
+            "cmd-v",
+            "enter",
+            "space",
+        ] {
+            assert_eq!(routed(k, SETTINGS), None, "{k}");
+        }
+        assert_eq!(routed("cmd-q", SETTINGS), Some("overseer::Quit"));
+    }
+
+    #[test]
+    fn cmd_digits_do_not_route_while_settings_open() {
+        for d in [
+            "cmd-0",
+            "cmd-3",
+            "cmd-6",
+            "cmd-n",
+            "cmd-escape",
+            "cmd-shift-l",
+        ] {
+            assert_eq!(routed(d, SETTINGS), None, "{d}");
+        }
     }
 
     #[test]

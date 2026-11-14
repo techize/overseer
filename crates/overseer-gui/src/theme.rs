@@ -1,4 +1,5 @@
-//! Terminal font and colours, read from `~/.config/overseer/config.toml`.
+//! Terminal font and colours, read from the config file the daemon reads
+//! (`$OVERSEER_CONFIG`, else `~/.config/overseer/config.toml`).
 //!
 //! ```toml
 //! [terminal]
@@ -11,6 +12,7 @@
 //!
 //! Every key is optional. A missing or unreadable file gives the defaults.
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use overseer_term::{Palette, Rgb};
@@ -56,11 +58,18 @@ struct TerminalSection {
 }
 
 impl Theme {
-    /// `~/.config/overseer/config.toml`.
+    /// The daemon's config file: `$OVERSEER_CONFIG`, else
+    /// `$HOME/.config/overseer/config.toml` (Decision 10).
     pub fn config_path() -> Option<PathBuf> {
-        std::env::var_os("HOME")
-            .filter(|h| !h.is_empty())
-            .map(|h| PathBuf::from(h).join(".config/overseer/config.toml"))
+        Theme::config_path_from(
+            std::env::var_os("OVERSEER_CONFIG"),
+            std::env::var_os("HOME"),
+        )
+    }
+
+    /// `config_path` for the given `OVERSEER_CONFIG` and `HOME` values.
+    pub fn config_path_from(over: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
+        Some(overseer_proto::paths::config_path_from(over, home))
     }
 
     /// Reads the config file. A missing file gives the defaults; a broken one
@@ -187,6 +196,55 @@ mod tests {
     fn other_sections_ignored() {
         let t = Theme::from_toml("[editor]\nname = \"Zed\"\n").unwrap();
         assert_eq!(t.font_family, "Menlo");
+    }
+
+    #[test]
+    fn theme_and_daemon_read_the_same_config_file() {
+        // The daemon reads `paths::config_path()`; with an override both
+        // must name the override, not `$HOME/.config/overseer`.
+        let over = Some(std::ffi::OsString::from("/tmp/demo/config.toml"));
+        let home = Some(std::ffi::OsString::from("/Users/demo"));
+        let daemon = overseer_proto::paths::config_path_from(over.clone(), home.clone());
+        assert_eq!(daemon, PathBuf::from("/tmp/demo/config.toml"));
+        assert_eq!(Theme::config_path_from(over, home.clone()), Some(daemon));
+        assert_eq!(
+            Theme::config_path_from(None, home),
+            Some(PathBuf::from("/Users/demo/.config/overseer/config.toml"))
+        );
+        assert_eq!(
+            Theme::config_path(),
+            Some(overseer_proto::paths::config_path())
+        );
+    }
+
+    /// Every `terminal.*` key Settings can write must be one the theme
+    /// reads, or `deny_unknown_fields` would turn the saved file away.
+    #[test]
+    fn catalogue_terminal_keys_parse_in_theme() {
+        use overseer_daemon::settings::{default_value, CATALOGUE};
+        use overseer_proto::settings::{Applies, SettingValue};
+        let mut seen = 0;
+        for spec in CATALOGUE {
+            let Some(key) = spec.key.strip_prefix("terminal.") else {
+                continue;
+            };
+            if spec.applies == Applies::ReadOnly {
+                continue;
+            }
+            let value = match default_value(spec) {
+                SettingValue::Text(s) => toml::Value::String(s),
+                SettingValue::Float(x) => toml::Value::Float(x),
+                SettingValue::Int(n) => toml::Value::Integer(n),
+                SettingValue::Bool(b) => toml::Value::Boolean(b),
+                SettingValue::List(l) => {
+                    toml::Value::Array(l.into_iter().map(toml::Value::String).collect())
+                }
+            };
+            let text = format!("[terminal]\n{key} = {value}\n");
+            assert!(Theme::from_toml(&text).is_ok(), "{text}");
+            seen += 1;
+        }
+        assert!(seen >= 4, "the catalogue has terminal keys");
     }
 
     #[test]

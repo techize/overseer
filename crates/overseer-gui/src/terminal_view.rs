@@ -968,7 +968,8 @@ pub fn editor_from_toml(text: &str) -> String {
         .unwrap_or_else(|| DEFAULT_EDITOR.to_string())
 }
 
-/// Reads the editor from `~/.config/overseer/config.toml`.
+/// Reads the editor from the config file the daemon reads (see
+/// `Theme::config_path`).
 pub fn load_editor() -> String {
     Theme::config_path()
         .and_then(|p| std::fs::read_to_string(p).ok())
@@ -2034,6 +2035,25 @@ impl TerminalView {
             self.hover = hover;
             cx.notify();
         }
+    }
+
+    /// Settings changed the terminal font or colours: paint with `theme`
+    /// from now on. Clearing the metrics makes the next paint measure the
+    /// font again, so the grid resizes to it.
+    pub fn set_theme(&mut self, theme: Theme, cx: &mut Context<Self>) {
+        self.shared
+            .bridge
+            .lock()
+            .unwrap()
+            .set_palette(theme.palette.clone());
+        self.theme = theme;
+        self.metrics = None;
+        cx.notify();
+    }
+
+    /// The app that opens Cmd+clicked paths, after Settings changed it.
+    pub fn set_editor(&mut self, editor: String) {
+        self.editor = editor;
     }
 
     /// Cell size from the font: width is the advance of `M`. Tells the bridge
