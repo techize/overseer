@@ -224,6 +224,23 @@ async fn start_list_stop() {
 }
 
 #[tokio::test]
+async fn daemon_info_reports_pid_and_start() {
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    let Response::DaemonInfo(info) = c.request(Request::DaemonInfo).await else {
+        panic!("not a DaemonInfo reply");
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    assert_eq!(info.pid, std::process::id());
+    assert_eq!(info.build, "dev");
+    assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
+    assert!((now - info.started_at).abs() <= 5, "{}", info.started_at);
+}
+
+#[tokio::test]
 async fn double_start_refused() {
     let d = start_daemon().await;
     let mut c = Client::connect(&d.socket).await;

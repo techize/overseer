@@ -404,7 +404,7 @@ fn format_locks(view: &overseer_proto::LockView) -> String {
             "{}  {}  since {}",
             c.target,
             slot_name(c.slot),
-            crate::ctl::local_hhmm(c.since)
+            overseer_proto::local_hhmm(c.since)
         );
         if let Some(why) = c.item.as_deref().or(c.reason.as_deref()) {
             line.push_str(&format!("  for {why}"));

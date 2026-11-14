@@ -20,6 +20,8 @@
     <string>__VERSION__</string>
     <key>CFBundleVersion</key>
     <string>__VERSION__</string>
+    <key>OverseerBuild</key>
+    <string>__BUILD__</string>
     <key>LSApplicationCategoryType</key>
     <string>public.app-category.developer-tools</string>
     <key>LSMinimumSystemVersion</key>

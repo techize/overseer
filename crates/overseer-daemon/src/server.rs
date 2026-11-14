@@ -8,8 +8,8 @@ use std::time::Duration;
 use anyhow::Context;
 use bytes::Bytes;
 use overseer_proto::{
-    read_frame, slot_name, write_frame, BoardView, Event, Frame, Request, Response, SlotId,
-    SlotState,
+    read_frame, slot_name, write_frame, BoardView, DaemonInfo, Event, Frame, Request, Response,
+    SlotId, SlotState,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
@@ -93,6 +93,13 @@ async fn bind(path: &PathBuf) -> anyhow::Result<UnixListener> {
 
 pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
     let listener = bind(&cfg.socket).await?;
+    let info = Arc::new(DaemonInfo {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        build: overseer_proto::current_build().to_string(),
+        pid: std::process::id(),
+        started_at: unix_now(),
+        exe: std::env::current_exe().unwrap_or_default(),
+    });
     // Resolved in the background so clients can connect at once; a
     // StartSlot waits for it.
     let env = BaseEnv::start(&cfg.env);
@@ -219,6 +226,7 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
                             courier: courier.clone(),
                             state_dir: state_dir.clone(),
                             brain: brain.clone(),
+                            info: info.clone(),
                         },
                         shutdown.clone(),
                         env.clone(),
@@ -448,6 +456,7 @@ struct Services {
     courier: Arc<Courier>,
     state_dir: PathBuf,
     brain: Option<Arc<BrainService>>,
+    info: Arc<DaemonInfo>,
 }
 
 async fn handle_conn(
@@ -465,6 +474,7 @@ async fn handle_conn(
         courier,
         state_dir,
         brain,
+        info,
     } = services;
     let (mut rd, mut wr) = stream.into_split();
     let (out_tx, mut out_rx) = mpsc::channel::<Frame>(OUTBOUND_QUEUE);
@@ -555,6 +565,7 @@ async fn handle_conn(
                         courier: &courier,
                         state_dir: &state_dir,
                         brain: brain.as_ref(),
+                        info: &info,
                     };
                     handle_frame(f, &ctx, &outbox, &shutdown, &mut streams)
                 }
@@ -588,6 +599,7 @@ struct Ctx<'a> {
     courier: &'a Arc<Courier>,
     state_dir: &'a Path,
     brain: Option<&'a Arc<BrainService>>,
+    info: &'a DaemonInfo,
 }
 
 fn handle_frame(
@@ -801,6 +813,7 @@ fn handle_request(
             Response::Ok
         }
         Request::ListSlots => Response::Slots(manager.lock().unwrap().list()),
+        Request::DaemonInfo => Response::DaemonInfo(ctx.info.clone()),
         // RefreshWorkItems is answered in `handle_frame` once the sources
         // have run; this arm only keeps the match whole.
         Request::ListWorkItems | Request::RefreshWorkItems => Response::Work(store.view()),

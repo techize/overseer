@@ -500,6 +500,8 @@ pub enum Request {
         from: Option<SlotId>,
         text: String,
     },
+    /// Ask the daemon which build it runs.
+    DaemonInfo,
 }
 
 /// One write target a plan has a slot claim.
@@ -748,6 +750,16 @@ pub struct WriteCheck {
     pub cwd: Option<PathBuf>,
 }
 
+/// What a running daemon says about itself. `started_at` is unix seconds.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DaemonInfo {
+    pub version: String,
+    pub build: String,
+    pub pid: u32,
+    pub started_at: i64,
+    pub exe: PathBuf,
+}
+
 // Adjacent tagging because `Slots` is a tuple variant.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
@@ -792,6 +804,7 @@ pub enum Response {
         warnings: Vec<String>,
         refusal: Option<String>,
     },
+    DaemonInfo(DaemonInfo),
 }
 
 // Adjacent tagging because `SlotChanged` is a tuple variant.
@@ -1296,6 +1309,22 @@ mod tests {
             ],
             flag_after_secs: 3600,
         }
+    }
+
+    #[test]
+    fn daemon_info_round_trips() {
+        let req = Request::DaemonInfo;
+        let back: Request = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        assert_eq!(back, req);
+        let resp = Response::DaemonInfo(DaemonInfo {
+            version: "0.1.0".into(),
+            build: "abc1234-202611140930".into(),
+            pid: 42,
+            started_at: 1_700_000_000,
+            exe: "/Applications/Overseer.app/Contents/MacOS/overseer".into(),
+        });
+        let back: Response = serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
+        assert_eq!(back, resp);
     }
 
     #[test]

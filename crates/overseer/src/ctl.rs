@@ -10,15 +10,17 @@ use anyhow::{bail, Context};
 use clap::Subcommand;
 use overseer_proto::paths::{log_dir, socket_path};
 use overseer_proto::{
-    slot_name, ActivityKind, BoardView, BrainRun, BrainView, ClaimKind, Client, ItemKind, LockView,
-    Plan, PlanDecision, PlanRecord, PlanState, QueueState, RelayState, Request, Response, SlotId,
-    SlotInfo, SlotState, WorkItem, WorkView,
+    build_notice, local_hhmm, slot_name, ActivityKind, BoardView, BrainRun, BrainView, ClaimKind,
+    Client, DaemonInfo, ItemKind, LockView, Plan, PlanDecision, PlanRecord, PlanState, QueueState,
+    RelayState, Request, Response, SlotId, SlotInfo, SlotState, WorkItem, WorkView,
 };
 
 #[derive(Subcommand)]
 pub enum CtlCmd {
     /// One line per slot.
     Status,
+    /// The builds of this binary and of the running daemon.
+    Version,
     /// Start a session in a slot.
     Start {
         n: SlotId,
@@ -263,20 +265,6 @@ fn expect_ok(resp: Response) -> anyhow::Result<()> {
         Response::Error { message } => bail!("{message}"),
         other => bail!("unexpected reply: {other:?}"),
     }
-}
-
-/// Unix seconds as local HH:MM.
-pub(crate) fn local_hhmm(at: i64) -> String {
-    let t = at as libc::time_t;
-    // SAFETY: localtime_r writes only into the zeroed tm we pass.
-    let tm = unsafe {
-        let mut tm: libc::tm = std::mem::zeroed();
-        if libc::localtime_r(&t, &mut tm).is_null() {
-            return "--:--".into();
-        }
-        tm
-    };
-    format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
 }
 
 /// A slot given as `3` or `S3`.
@@ -803,9 +791,57 @@ async fn run_plan(
     }
 }
 
+/// The `ctl version` lines: this binary, the daemon, and a notice when
+/// their builds differ.
+pub fn format_version(
+    app_version: &str,
+    app_build: &str,
+    daemon: Option<&DaemonInfo>,
+) -> Vec<String> {
+    let mut lines = vec![format!("app     {app_version} build {app_build}")];
+    match daemon {
+        Some(d) => {
+            lines.push(format!(
+                "daemon  {} build {}  pid {}  since {}",
+                d.version,
+                d.build,
+                d.pid,
+                local_hhmm(d.started_at)
+            ));
+            lines.extend(build_notice(app_build, &d.build));
+        }
+        None => lines.push("daemon  not running".to_string()),
+    }
+    lines
+}
+
+/// Ask a running daemon about itself, without starting one.
+async fn version() -> anyhow::Result<()> {
+    let info = match Client::connect(socket_path()).await {
+        Ok(client) => match client.request(Request::DaemonInfo).await? {
+            Response::DaemonInfo(info) => Some(info),
+            Response::Error { message } => bail!("{message}"),
+            other => bail!("unexpected reply: {other:?}"),
+        },
+        Err(_) => None,
+    };
+    for line in format_version(
+        env!("CARGO_PKG_VERSION"),
+        overseer_proto::current_build(),
+        info.as_ref(),
+    ) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
 pub async fn run(cmd: CtlCmd) -> anyhow::Result<()> {
+    if matches!(cmd, CtlCmd::Version) {
+        return version().await;
+    }
     let client = connect().await?;
     match cmd {
+        CtlCmd::Version => unreachable!("handled before connecting"),
         CtlCmd::Status => match client.request(Request::ListSlots).await? {
             Response::Slots(slots) => {
                 for s in &slots {
@@ -1081,6 +1117,39 @@ pub async fn run(cmd: CtlCmd) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_lines_show_both_builds_and_the_notice() {
+        let info = DaemonInfo {
+            version: "0.1.0".into(),
+            build: "abc1234-202611140930".into(),
+            pid: 4242,
+            started_at: 1_700_000_000,
+            exe: "/Applications/Overseer.app/Contents/MacOS/overseer".into(),
+        };
+        let at = local_hhmm(info.started_at);
+        assert_eq!(
+            format_version("0.1.0", "def5678-202611141000", Some(&info)),
+            vec![
+                "app     0.1.0 build def5678-202611141000".to_string(),
+                format!("daemon  0.1.0 build abc1234-202611140930  pid 4242  since {at}"),
+                build_notice("def5678-202611141000", "abc1234-202611140930").unwrap(),
+            ]
+        );
+        // Same build: no notice. Dev builds never warn.
+        assert_eq!(
+            format_version("0.1.0", "abc1234-202611140930", Some(&info)).len(),
+            2
+        );
+        assert_eq!(format_version("0.1.0", "dev", Some(&info)).len(), 2);
+        assert_eq!(
+            format_version("0.1.0", "dev", None),
+            vec![
+                "app     0.1.0 build dev".to_string(),
+                "daemon  not running".to_string()
+            ]
+        );
+    }
     use overseer_proto::ReportKind;
 
     #[derive(clap::Parser)]

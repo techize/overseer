@@ -53,16 +53,7 @@ pub struct LockService {
 
 type SessionlessFn = Box<dyn Fn() -> Vec<SlotId> + Send + Sync>;
 
-/// Local `HH:MM` for unix seconds.
-pub fn local_hhmm(t: i64) -> String {
-    // SAFETY: localtime_r only writes the `tm` we pass it.
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    let time = t as libc::time_t;
-    if unsafe { libc::localtime_r(&time, &mut tm) }.is_null() {
-        return "?".into();
-    }
-    format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
-}
+pub use overseer_proto::local_hhmm;
 
 /// `repo:demo-api:main is held by S1 since 08:40 for DEMO-33`, the `for`
 /// part naming the claim's item, else its reason, else left out.
@@ -708,13 +699,6 @@ mod tests {
         locks.set_held(2, None);
         assert!(matches!(rx.try_recv(), Ok(Event::LocksChanged(_))));
         assert!(locks.view().relays.iter().all(|r| r.held.is_none()));
-    }
-
-    #[test]
-    fn hhmm_is_two_digit_fields() {
-        let t = local_hhmm(1_700_000_000);
-        assert_eq!(t.len(), 5, "{t}");
-        assert_eq!(&t[2..3], ":");
     }
 
     fn item(key: &str, kind: ItemKind, parent: Option<&str>, owner: Option<SlotId>) -> WorkItem {

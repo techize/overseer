@@ -3432,6 +3432,7 @@ dependencies = [
  "overseer-proto",
  "portable-pty",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -3483,8 +3484,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "libc",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

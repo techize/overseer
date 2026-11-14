@@ -142,11 +142,7 @@ pub fn short_message(msg: &str) -> String {
     }
 }
 
-/// Local `HH:MM` for unix seconds.
-pub fn local_hhmm(t: i64) -> String {
-    let full = crate::session::local_clock(t);
-    full.get(..5).unwrap_or(&full).to_string()
-}
+pub use overseer_proto::local_hhmm;
 
 /// `45s`, `8m 05s`, `2h 03m`. Negative input (clock skew) shows `0s`.
 pub fn format_elapsed(secs: i64) -> String {

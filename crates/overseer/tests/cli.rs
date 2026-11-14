@@ -170,6 +170,27 @@ fn ctl_status_autostarts_daemon() {
 }
 
 #[test]
+fn ctl_version_without_a_daemon_does_not_start_one() {
+    let env = Env::new();
+    let out = stdout_of(&mut env.ctl(&["version"]));
+    assert!(out.lines().any(|l| l == "daemon  not running"), "{out}");
+    assert!(out.starts_with("app     0.1.0 build dev"), "{out}");
+    assert!(!env.home.join("overseer.sock").exists());
+}
+
+#[test]
+fn ctl_version_names_the_running_daemon() {
+    let env = Env::new();
+    env.ctl(&["status"]).assert().success();
+    let out = stdout_of(&mut env.ctl(&["version"]));
+    assert!(
+        out.lines()
+            .any(|l| l.starts_with("daemon  0.1.0 build dev  pid ")),
+        "{out}"
+    );
+}
+
+#[test]
 fn ctl_start_send_status() {
     let env = Env::new();
     env.ctl(&["start", "2", "--cwd", "/tmp", "--label", "demo"])
