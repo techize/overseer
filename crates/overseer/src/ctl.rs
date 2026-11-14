@@ -815,21 +815,29 @@ pub fn format_version(
     lines
 }
 
+/// The `ctl version` lines for a daemon that answers but predates
+/// `DaemonInfo`, as one left running across an upgrade does.
+pub fn format_old_daemon(app_version: &str, app_build: &str) -> Vec<String> {
+    vec![
+        format!("app     {app_version} build {app_build}"),
+        "daemon  running, build unknown (older than this app)".to_string(),
+        "Restart the daemon to finish the upgrade (overseer ctl restart, or Settings).".to_string(),
+    ]
+}
+
 /// Ask a running daemon about itself, without starting one.
 async fn version() -> anyhow::Result<()> {
-    let info = match Client::connect(socket_path()).await {
-        Ok(client) => match client.request(Request::DaemonInfo).await? {
-            Response::DaemonInfo(info) => Some(info),
-            Response::Error { message } => bail!("{message}"),
-            other => bail!("unexpected reply: {other:?}"),
+    let (app_version, app_build) = (env!("CARGO_PKG_VERSION"), overseer_proto::current_build());
+    let lines = match Client::connect(socket_path()).await {
+        Ok(client) => match client.request(Request::DaemonInfo).await {
+            Ok(Response::DaemonInfo(info)) => format_version(app_version, app_build, Some(&info)),
+            // An old daemon drops the connection or refuses the unknown request.
+            Ok(Response::Error { .. }) | Err(_) => format_old_daemon(app_version, app_build),
+            Ok(other) => bail!("unexpected reply: {other:?}"),
         },
-        Err(_) => None,
+        Err(_) => format_version(app_version, app_build, None),
     };
-    for line in format_version(
-        env!("CARGO_PKG_VERSION"),
-        overseer_proto::current_build(),
-        info.as_ref(),
-    ) {
+    for line in lines {
         println!("{line}");
     }
     Ok(())
@@ -1127,14 +1135,21 @@ mod tests {
             started_at: 1_700_000_000,
             exe: "/Applications/Overseer.app/Contents/MacOS/overseer".into(),
         };
-        let at = local_hhmm(info.started_at);
+        let lines = format_version("0.1.0", "def5678-202611141000", Some(&info));
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "app     0.1.0 build def5678-202611141000");
+        let prefix = "daemon  0.1.0 build abc1234-202611140930  pid 4242  since ";
+        let clock = lines[1].strip_prefix(prefix).expect(&lines[1]);
+        let b = clock.as_bytes();
+        assert!(
+            b.len() == 5
+                && b[2] == b':'
+                && clock.chars().filter(|c| c.is_ascii_digit()).count() == 4,
+            "{clock}"
+        );
         assert_eq!(
-            format_version("0.1.0", "def5678-202611141000", Some(&info)),
-            vec![
-                "app     0.1.0 build def5678-202611141000".to_string(),
-                format!("daemon  0.1.0 build abc1234-202611140930  pid 4242  since {at}"),
-                build_notice("def5678-202611141000", "abc1234-202611140930").unwrap(),
-            ]
+            lines[2],
+            build_notice("def5678-202611141000", "abc1234-202611140930").unwrap()
         );
         // Same build: no notice. Dev builds never warn.
         assert_eq!(

@@ -191,6 +191,27 @@ fn ctl_version_names_the_running_daemon() {
 }
 
 #[test]
+fn ctl_version_survives_a_daemon_that_predates_daemon_info() {
+    let env = Env::new();
+    // An old daemon reads the unknown request and hangs up.
+    let listener = std::os::unix::net::UnixListener::bind(env.home.join("overseer.sock")).unwrap();
+    let old = std::thread::spawn(move || {
+        for stream in listener.incoming().take(1) {
+            let mut stream = stream.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = std::io::Read::read(&mut stream, &mut buf);
+        }
+    });
+    let out = stdout_of(&mut env.ctl(&["version"]));
+    old.join().unwrap();
+    assert!(
+        out.contains("daemon  running, build unknown (older than this app)"),
+        "{out}"
+    );
+    assert!(out.contains("Restart the daemon"), "{out}");
+}
+
+#[test]
 fn ctl_start_send_status() {
     let env = Env::new();
     env.ctl(&["start", "2", "--cwd", "/tmp", "--label", "demo"])

@@ -28,13 +28,16 @@ else
     build="$commit-$(date -u +%Y%m%d%H%M)"
 fi
 
+# Escape what sed treats specially in a replacement.
+build_esc=$(printf '%s' "$build" | sed 's/[\/&]/\\&/g')
+
 mkdir -p "$app/Contents/MacOS"
 # Unlink before copying so a running daemon or GUI keeps its old file
 # instead of having it rewritten underneath it.
 rm -f "$app/Contents/MacOS/overseer"
 cp "$bin" "$app/Contents/MacOS/overseer"
 chmod 755 "$app/Contents/MacOS/overseer"
-sed -e "s/__VERSION__/$version/g" -e "s/__BUILD__/$build/g" "$root/packaging/Info.plist" > "$app/Contents/Info.plist"
+sed -e "s/__VERSION__/$version/g" -e "s/__BUILD__/$build_esc/g" "$root/packaging/Info.plist" > "$app/Contents/Info.plist"
 
 codesign --force --sign - "$app"
 echo "bundled $app ($version, build $build)"
