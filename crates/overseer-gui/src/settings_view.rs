@@ -233,6 +233,18 @@ pub fn saved_text(after: &SettingsView, edited: &[String]) -> String {
     )
 }
 
+/// The line at the top of Settings when the daemon could not load
+/// config.toml: the rows below then show built-in values, so the reason
+/// has to come before them, not only beside the file at the bottom.
+pub fn load_banner(view: &SettingsView) -> Option<String> {
+    view.load_error.as_ref().map(|e| {
+        format!(
+            "config.toml could not be loaded, so the daemon uses built-in values for every setting until it is fixed. {}",
+            e.trim()
+        )
+    })
+}
+
 /// The question Restart the daemon asks when the app does not know the
 /// sessions (before the first list, or while the connection is lost).
 pub const RESTART_UNLISTED: &str = "Restart the daemon? Its sessions could not be listed, so some may be running. Each one that is ends and comes back as resumable.";
@@ -989,12 +1001,6 @@ impl SettingsPanel {
                 .into_any_element()
         };
         out.push(file("open-config", "config.toml", &view.config_path, cx));
-        out.extend(view.load_error.clone().map(|e| {
-            div()
-                .text_color(rgb(colors::RED))
-                .child(e)
-                .into_any_element()
-        }));
         out.push(file("open-targets", "targets.toml", &view.targets_path, cx));
         out.push(muted(view.targets_note.clone()).into_any_element());
         out.extend(view.targets_error.clone().map(|e| {
@@ -1035,6 +1041,12 @@ impl Render for SettingsPanel {
             Mode::Ready(d) => {
                 let view = d.view().clone();
                 daemon = Some(view.daemon.clone());
+                body.extend(load_banner(&view).map(|b| {
+                    div()
+                        .text_color(rgb(colors::RED))
+                        .child(b)
+                        .into_any_element()
+                }));
                 let mut group = String::new();
                 for (i, row) in d.rows().into_iter().enumerate() {
                     if row.group != group {
@@ -1110,20 +1122,28 @@ impl Render for SettingsPanel {
                         .map(|n| div().text_color(rgb(colors::TEXT_DIM)).child(n.to_string())),
                 )
                 .children(self.confirm.clone().map(|q| {
+                    // The question gets the card's whole width and wraps;
+                    // the buttons sit on their own line under it, so a long
+                    // question never pushes them past the card's edge.
                     div()
                         .flex()
-                        .items_center()
+                        .flex_col()
                         .gap_2()
-                        .child(div().flex_1().text_color(rgb(colors::ORANGE)).child(q))
-                        .child(button("restart-cancel", "Cancel", false, true).on_click(
-                            cx.listener(|this, _, _, cx| {
-                                this.confirm = None;
-                                cx.notify();
-                            }),
-                        ))
+                        .child(div().w_full().text_color(rgb(colors::ORANGE)).child(q))
                         .child(
-                            button("restart-yes", "Restart", true, true)
-                                .on_click(cx.listener(|this, _, _, cx| this.confirm_restart(cx))),
+                            div()
+                                .flex()
+                                .justify_end()
+                                .gap_2()
+                                .child(button("restart-cancel", "Cancel", false, true).on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.confirm = None;
+                                        cx.notify();
+                                    }),
+                                ))
+                                .child(button("restart-yes", "Restart", true, true).on_click(
+                                    cx.listener(|this, _, _, cx| this.confirm_restart(cx)),
+                                )),
                         )
                 }))
                 .child(
@@ -1504,6 +1524,21 @@ mod tests {
             SettingValue::Text("Zed".into())
         )]));
         assert!(!app_keys_changed(&[]));
+    }
+
+    #[test]
+    fn a_file_that_loads_has_no_banner() {
+        assert_eq!(load_banner(&view()), None);
+    }
+
+    #[test]
+    fn a_broken_file_is_named_before_the_rows() {
+        let mut v = view();
+        v.load_error = Some("/tmp/demo/config.toml: expected `=`\n".into());
+        assert_eq!(
+            load_banner(&v).as_deref(),
+            Some("config.toml could not be loaded, so the daemon uses built-in values for every setting until it is fixed. /tmp/demo/config.toml: expected `=`"),
+        );
     }
 
     #[test]
