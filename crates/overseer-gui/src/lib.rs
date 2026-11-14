@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod board;
+pub mod locks_view;
 pub mod notify;
 pub mod picker;
 pub mod plan_view;

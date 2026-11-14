@@ -1034,7 +1034,17 @@ impl OverseerApp {
                             .min_w(px(0.))
                             .truncate()
                             .text_color(rgb(colors::MUTED))
-                            .child("Click a card or press Enter to open it · A assigns work · Cmd+0 to Cmd+6 open a session · Cmd+N starts the selected slot"),
+                            .child("Click a card or press Enter to open it · A assigns work · Cmd+0 to Cmd+6 open a session · Cmd+N starts the selected slot · L shows the locks"),
+                    )
+                    .child(
+                        div()
+                            .id("locks-strip")
+                            .flex_none()
+                            .cursor_pointer()
+                            .text_color(rgb(colors::MUTED))
+                            .hover(|s| s.text_color(rgb(colors::TEXT)))
+                            .child(crate::locks_view::locks_strip(&self.locks))
+                            .on_click(cx.listener(|this, _, window, cx| this.go_locks(window, cx))),
                     )
                     .child(
                         div()

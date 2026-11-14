@@ -11,9 +11,11 @@
 //!   otherwise goes to Claude Code, which uses it to interrupt.
 //! - Plain digits always go to whatever has focus.
 //! - `a` on the board opens the work-item picker for the selected card.
+//! - `l` on the board and `Cmd+Shift+L` anywhere navigation works open the
+//!   Locks view.
 //!
 //! The routing is GPUI's keymap with the contexts `Overseer` (window),
-//! `Board`, `Session`, `Terminal`, `StartDialog` and `Picker`;
+//! `Board`, `Session`, `Terminal`, `Locks`, `StartDialog` and `Picker`;
 //! `key_bindings` is tested against GPUI's `Keymap` directly.
 
 use std::collections::{HashMap, HashSet};
@@ -31,6 +33,7 @@ use overseer_proto::{
 };
 
 use crate::board::Dir;
+use crate::locks_view::LocksState;
 use crate::picker::{Picker, PickerEvent};
 use crate::plan_view::{PlanEvent, PlanView};
 use crate::session::{incarnation, keep_view, restart_begin, restart_on_change, Incarnation};
@@ -85,6 +88,7 @@ actions!(
         OpenRelease,
         OpenNote,
         OpenPlan,
+        GoLocks,
     ]
 );
 
@@ -93,6 +97,8 @@ actions!(
 pub enum Screen {
     Board,
     Session(SlotId),
+    /// Every held target and its queue; see `locks_view`.
+    Locks,
 }
 
 /// Navigation keys work anywhere in the window except the start dialog, the
@@ -111,6 +117,7 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-6", GoS6, nav),
         KeyBinding::new("cmd-escape", GoBoard, nav),
         KeyBinding::new("cmd-n", StartSession, nav),
+        KeyBinding::new("cmd-shift-l", GoLocks, nav),
         // Not from the terminal: there Esc closes the find bar or goes to
         // Claude Code.
         // Nor from an open Holds or Relays entry row, which takes Esc itself.
@@ -135,6 +142,7 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("r", ResumeSelected, Some("Board")),
         KeyBinding::new("a", AssignSelected, Some("Board")),
         KeyBinding::new("p", OpenPlan, Some("Board")),
+        KeyBinding::new("l", GoLocks, Some("Board")),
         KeyBinding::new("cmd-q", Quit, None),
     ]
 }
@@ -146,6 +154,7 @@ pub fn needs_tick(screen: Screen, slots: &[SlotInfo]) -> bool {
     match screen {
         Screen::Board => slots.iter().any(running),
         Screen::Session(id) => slots.get(id as usize).is_some_and(running),
+        Screen::Locks => false,
     }
 }
 
@@ -176,11 +185,13 @@ impl Ticker {
 }
 
 /// The slot `Cmd+N` starts: the selected card on the board, the shown slot in
-/// a session. None when that slot is already running.
+/// a session. None when that slot is already running, and in the Locks
+/// view, which shows no slot.
 pub fn start_target(screen: Screen, selected: SlotId, slots: &[SlotInfo]) -> Option<SlotId> {
     let id = match screen {
         Screen::Board => selected,
         Screen::Session(id) => id,
+        Screen::Locks => return None,
     };
     let info = slots.get(id as usize)?;
     (!matches!(info.state, SlotState::Running { .. })).then_some(id)
@@ -364,6 +375,9 @@ pub struct OverseerApp {
     root_focus: FocusHandle,
     pub(crate) board_focus: FocusHandle,
     pub(crate) session_focus: FocusHandle,
+    /// The Locks view's selection and force-release confirm.
+    pub(crate) locks_state: LocksState,
+    pub(crate) locks_focus: FocusHandle,
     ticker: Ticker,
     _ticker: Option<Task<()>>,
     _events: Task<()>,
@@ -424,6 +438,8 @@ impl OverseerApp {
             root_focus: cx.focus_handle(),
             board_focus,
             session_focus: cx.focus_handle(),
+            locks_state: LocksState::default(),
+            locks_focus: cx.focus_handle(),
             ticker: Ticker::default(),
             _ticker: None,
             _events: events,
@@ -562,16 +578,12 @@ impl OverseerApp {
             Frame::Response {
                 resp: Response::Locks(view),
                 ..
-            } => {
-                self.locks = view;
-                cx.notify();
-            }
+            } => self.locks_changed(view, cx),
             Frame::Event(Event::LocksChanged(view)) => {
                 for note in crate::notify::new_waits(&self.locks, &view) {
                     crate::notify::post(&note);
                 }
-                self.locks = view;
-                cx.notify();
+                self.locks_changed(view, cx);
             }
             // A push problem waits until a push succeeds, so one already
             // there on connecting is announced too, once.
@@ -1071,7 +1083,12 @@ impl OverseerApp {
 
     /// The only place the screen changes, so the ticker always restarts when
     /// a running slot becomes visible again.
+    /// Leaving the Locks view forgets its selection and any open confirm, so
+    /// it opens fresh next time.
     fn set_screen(&mut self, screen: Screen, cx: &mut Context<Self>) {
+        if self.screen == Screen::Locks && screen != Screen::Locks {
+            self.locks_state = LocksState::default();
+        }
         self.screen = screen;
         self.entry = None;
         self.ensure_ticker(cx);
@@ -1125,6 +1142,49 @@ impl OverseerApp {
                 }
             }
         }
+    }
+
+    /// The daemon's new lock view: keep it, and let an open force-release
+    /// confirm notice that its target changed hands.
+    fn locks_changed(&mut self, view: LockView, cx: &mut Context<Self>) {
+        self.locks = view;
+        let rows = self.lock_rows_now(now_secs());
+        if let Some(text) = self.locks_state.on_change(&rows) {
+            self.status = Some(text);
+        }
+        cx.notify();
+    }
+
+    /// `l` on the board, `Cmd+Shift+L` and a click on the board's lock
+    /// strip: the Locks view.
+    pub(crate) fn go_locks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal_open() {
+            return;
+        }
+        self.status = None;
+        self.set_screen(Screen::Locks, cx);
+        self.focus_when_ready = None;
+        window.focus(&self.locks_focus);
+        cx.notify();
+    }
+
+    /// Sends the Locks view's force release; the daemon's reply (who holds
+    /// the target now, or why nothing was released) goes to the status line
+    /// as it is.
+    pub(crate) fn force_release(&mut self, req: Request, cx: &mut Context<Self>) {
+        self.status = None;
+        let client = self.client.clone();
+        cx.spawn(async move |this, cx| {
+            let reply = client
+                .request(req)
+                .await
+                .map_err(|e| format!("{} ({e:#})", crate::terminal_view::LOST_DAEMON));
+            let _ = this.update(cx, |this, cx| {
+                this.status = reply_note(&reply);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// The daemon's new coordinator view: keep it, and let an open plan
@@ -1230,6 +1290,7 @@ impl OverseerApp {
                 Some(t) => t.view.read(cx).focus(window),
                 None => window.focus(&self.session_focus),
             },
+            Screen::Locks => window.focus(&self.locks_focus),
         }
     }
 }
@@ -1240,11 +1301,13 @@ impl Render for OverseerApp {
         let screen = match self.screen {
             Screen::Board => self.render_board(now, window, cx).into_any_element(),
             Screen::Session(id) => self.render_session(id, now, window, cx).into_any_element(),
+            Screen::Locks => self.render_locks(now, window, cx).into_any_element(),
         };
         div()
             .key_context("Overseer")
             .track_focus(&self.root_focus)
             .on_action(cx.listener(|this, _: &GoBoard, window, cx| this.go_board(window, cx)))
+            .on_action(cx.listener(|this, _: &GoLocks, window, cx| this.go_locks(window, cx)))
             .on_action(cx.listener(|this, _: &GoS0, w, cx| this.go_session(0, w, cx)))
             .on_action(cx.listener(|this, _: &GoS1, w, cx| this.go_session(1, w, cx)))
             .on_action(cx.listener(|this, _: &GoS2, w, cx| this.go_session(2, w, cx)))
@@ -1525,6 +1588,37 @@ mod tests {
         ex.state = SlotState::Exited { code: None, at: 0 };
         assert_eq!(card_click(&ex), CardClick::Open(2));
     }
+    /// Contexts that take the keyboard for themselves; window-wide
+    /// navigation waits while one is open. A new modal is one line here.
+    const MODALS: &[&[&str]] = &[DIALOG, PICKER, PLAN];
+
+    #[test]
+    fn l_opens_locks_from_the_board_only() {
+        assert_eq!(routed("l", BOARD), Some("overseer::GoLocks"));
+        assert_eq!(routed("l", TERMINAL), None);
+        assert_eq!(routed("l", CHROME), None);
+    }
+
+    #[test]
+    fn cmd_shift_l_opens_locks_everywhere_but_modals() {
+        for ctx in [TERMINAL, CHROME, BOARD] {
+            assert_eq!(routed("cmd-shift-l", ctx), Some("overseer::GoLocks"));
+        }
+        for ctx in MODALS {
+            assert_eq!(routed("cmd-shift-l", ctx), None, "{ctx:?}");
+        }
+    }
+
+    #[test]
+    fn locks_keys_reach_the_view() {
+        const LOCKS: &[&str] = &["Overseer", "Locks"];
+        for k in ["escape", "enter", "f", "up", "down", "l"] {
+            assert_eq!(routed(k, LOCKS), None, "{k}");
+        }
+        assert_eq!(routed("cmd-1", LOCKS), Some("overseer::GoS1"));
+        assert_eq!(routed("cmd-escape", LOCKS), Some("overseer::GoBoard"));
+    }
+
     #[test]
     fn p_routes_on_the_board_only() {
         assert_eq!(routed("p", BOARD), Some("overseer::OpenPlan"));
