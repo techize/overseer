@@ -125,10 +125,57 @@ EOF
         env
     }
 
+    /// The launchctl stub every test uses: it logs its arguments to
+    /// `launchctl.log`, exits 0 for `bootstrap` and `bootout`, and 1 for
+    /// `print` and `kickstart`, so autostart falls back to spawning.
+    fn launchctl_stub(&self) -> PathBuf {
+        self.home.join("launchctl-stub.sh")
+    }
+
+    fn write_launchctl_stub(&self) {
+        use std::os::unix::fs::PermissionsExt;
+        let stub = self.launchctl_stub();
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> '{log}'\ncase \"$1\" in print|kickstart) exit 1;; esac\nexit 0\n",
+                log = self.home.join("launchctl.log").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// `overseer <args>` for the agent commands: `HOME` is `<home>/home`,
+    /// `OVERSEER_HOME` this home and launchctl the stub, so nothing reaches
+    /// the real LaunchAgents folder or launchd.
+    fn agent(&self, args: &[&str]) -> Command {
+        self.write_launchctl_stub();
+        let shell_home = self.home.join("home");
+        std::fs::create_dir_all(&shell_home).unwrap();
+        let mut c = Command::cargo_bin("overseer").unwrap();
+        c.env("HOME", shell_home)
+            .env("SHELL", "/bin/sh")
+            .env("OVERSEER_HOME", &self.home)
+            .env("OVERSEER_CONFIG", self.home.join("config.toml"))
+            .env("OVERSEER_LAUNCHCTL", self.launchctl_stub())
+            .env_remove("OVERSEER_TARGETS")
+            .env_remove("CLAUDE_CONFIG_DIR")
+            .env_remove("OVERSEER_DEFAULT_COMMAND")
+            .args(args)
+            .timeout(Duration::from_secs(20));
+        c
+    }
+
+    fn launchctl_log(&self) -> String {
+        std::fs::read_to_string(self.home.join("launchctl.log")).unwrap_or_default()
+    }
+
     fn ctl(&self, args: &[&str]) -> Command {
         let mut c = Command::cargo_bin("overseer").unwrap();
         c.env("OVERSEER_HOME", &self.home)
             .env("OVERSEER_CONFIG", self.home.join("config.toml"))
+            .env("OVERSEER_LAUNCHCTL", self.launchctl_stub())
             .env("OVERSEER_DEFAULT_COMMAND", SCRIPT)
             // Run from inside a session, these would be that slot's writes.
             .env_remove("OVERSEER_SLOT");
@@ -146,6 +193,7 @@ impl Drop for Env {
         let _ = StdCommand::new(assert_cmd::cargo::cargo_bin("overseer"))
             .env("OVERSEER_HOME", &self.home)
             .env("OVERSEER_CONFIG", self.home.join("config.toml"))
+            .env("OVERSEER_LAUNCHCTL", self.launchctl_stub())
             .args(["ctl", "shutdown"])
             .output();
         std::thread::sleep(Duration::from_millis(200));
@@ -815,4 +863,62 @@ fn report_needs_a_slot_and_summary_and_reject_work() {
     stdout_of(env.ctl(&["plan", "propose", "-"]).write_stdin(plan));
     let out = stdout_of(&mut env.ctl(&["plan", "reject", "1", "not now"]));
     assert_eq!(out.trim(), "Plan 1 rejected.");
+}
+
+fn uid() -> String {
+    let out = StdCommand::new("id").arg("-u").output().unwrap();
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+fn agent_plists(env: &Env) -> Vec<PathBuf> {
+    match std::fs::read_dir(env.home.join("agent")) {
+        Ok(rd) => rd.map(|e| e.unwrap().path()).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+#[test]
+fn install_agent_in_a_custom_home_never_names_the_real_agent() {
+    let env = Env::new();
+    let out = stdout_of(&mut env.agent(&["install-agent", "--yes"]));
+    let plists = agent_plists(&env);
+    assert_eq!(plists.len(), 1, "{plists:?}");
+    let plist = &plists[0];
+    let name = plist.file_name().unwrap().to_string_lossy().into_owned();
+    let label = name.strip_suffix(".plist").unwrap();
+    assert!(label.starts_with("uk.co.techize.overseer-home-"), "{name}");
+    let xml = std::fs::read_to_string(plist).unwrap();
+    assert!(xml.contains("<key>OVERSEER_HOME</key>"), "{xml}");
+    assert!(xml.contains(&format!("<string>{label}</string>")), "{xml}");
+    assert!(
+        !env.home.join("home/Library/LaunchAgents").exists(),
+        "a plist went to the LaunchAgents folder"
+    );
+    assert!(out.contains(label), "{out}");
+    let log = env.launchctl_log();
+    let bootstrap = format!("bootstrap gui/{} {}/agent/", uid(), env.home.display());
+    assert!(
+        log.lines().any(|l| l.starts_with(&bootstrap)),
+        "no {bootstrap:?} in:\n{log}"
+    );
+    for line in log.lines().filter(|l| l.contains("uk.co.techize.overseer")) {
+        assert!(line.contains("uk.co.techize.overseer-home-"), "{line}");
+    }
+}
+
+#[test]
+fn uninstall_agent_in_a_custom_home_removes_its_plist() {
+    let env = Env::new();
+    env.agent(&["install-agent"]).assert().success();
+    assert_eq!(agent_plists(&env).len(), 1);
+    let out = stdout_of(&mut env.agent(&["uninstall-agent"]));
+    assert!(agent_plists(&env).is_empty(), "{out}");
+    assert!(out.contains("removed "), "{out}");
+    for line in env
+        .launchctl_log()
+        .lines()
+        .filter(|l| l.contains("uk.co.techize.overseer"))
+    {
+        assert!(line.contains("uk.co.techize.overseer-home-"), "{line}");
+    }
 }

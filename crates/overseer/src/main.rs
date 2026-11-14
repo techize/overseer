@@ -37,7 +37,14 @@ enum Cmd {
     /// Serve the lock and relay tools to a Claude session over MCP (run by Claude, not by hand).
     Mcp,
     /// Install the LaunchAgent that keeps the daemon running.
-    InstallAgent,
+    InstallAgent {
+        /// Restart a running daemon without asking.
+        #[arg(long)]
+        yes: bool,
+        /// Keep a running daemon as it is.
+        #[arg(long)]
+        no_restart: bool,
+    },
     /// Remove the LaunchAgent.
     UninstallAgent,
 }
@@ -75,7 +82,11 @@ fn main() {
         }
         // No logger: stdout carries the protocol, nothing else may use it.
         Cmd::Mcp => mcp::run(),
-        Cmd::InstallAgent => agent::install(),
+        // The flags take effect in a later change; parsed now so scripts can pass them.
+        Cmd::InstallAgent {
+            yes: _,
+            no_restart: _,
+        } => agent::install(),
         Cmd::UninstallAgent => agent::uninstall(),
         Cmd::Daemon { foreground: _ } => {
             init_logging("daemon.log");
