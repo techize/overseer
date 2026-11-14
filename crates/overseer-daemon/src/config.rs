@@ -35,6 +35,8 @@ pub struct Config {
     /// Run in `brain_dir` after the queue drains; skipped when the file is missing.
     pub sync_command: Vec<String>,
     pub bd_command: Vec<String>,
+    /// Where plans put their git worktrees: `<worktree_root>/<repo>-<ticket>`.
+    pub worktree_root: PathBuf,
 }
 
 impl Default for Config {
@@ -74,6 +76,7 @@ impl Default for Config {
                 .map(|s| s.to_string())
                 .collect(),
             bd_command: vec!["bd".to_string()],
+            worktree_root: PathBuf::from("~/Repos/.worktrees"),
         }
     }
 }
@@ -93,6 +96,7 @@ impl Config {
         config.beads_dir = expand(&config.beads_dir, home);
         config.brain_dir = expand(&config.brain_dir, home);
         config.current_session = expand(&config.current_session, home);
+        config.worktree_root = expand(&config.worktree_root, home);
         (config, err)
     }
 }
@@ -216,5 +220,18 @@ mod tests {
         assert!(err.is_none());
         assert_eq!(c.beads_dir, PathBuf::from("/Users/me/work/beads"));
         assert_eq!(c.brain_dir, PathBuf::from("/abs/brain"));
+    }
+
+    #[test]
+    fn worktree_root_defaults_and_expands() {
+        let (c, _) = Config::load(Path::new("/nonexistent/config.toml"), &home());
+        assert_eq!(c.worktree_root, PathBuf::from("/Users/me/Repos/.worktrees"));
+        let (_d, p) = write("worktree_root = \"~/wt\"\n");
+        let (c, err) = Config::load(&p, &home());
+        assert!(err.is_none());
+        assert_eq!(c.worktree_root, PathBuf::from("/Users/me/wt"));
+        let (_d, p) = write("worktree_root = \"/abs/wt\"\n");
+        let (c, _) = Config::load(&p, &home());
+        assert_eq!(c.worktree_root, PathBuf::from("/abs/wt"));
     }
 }

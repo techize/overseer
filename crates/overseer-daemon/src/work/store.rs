@@ -187,6 +187,8 @@ fn folder_for(folders: &[(String, PathBuf)], key: &str) -> Option<PathBuf> {
         .map(|(_, p)| p.clone())
 }
 
+// Short-lived, built and matched on one call path: boxing buys nothing.
+#[allow(clippy::large_enum_variant)]
 enum Outcome {
     Reply(Response),
     /// The flag says a relay was queued, so lock watchers need telling.
@@ -299,7 +301,7 @@ impl WorkStore {
                 key: key.clone(),
                 kind: self.guess_kind(key),
                 title: key.clone(),
-                status: "unknown".into(),
+                status: overseer_proto::UNKNOWN_STATUS.into(),
                 priority: None,
                 parent: None,
                 owner: Some(*slot),
@@ -762,26 +764,25 @@ async fn label_worker(store: Weak<WorkStore>, mut rx: mpsc::UnboundedReceiver<La
     }
 }
 
-/// The first prompt for a slot, built from `template` and the items in
-/// `items` (the whole view) that it owns. `None` when it owns none. A bead
-/// whose ticket it also owns is listed under it; any other item is a
-/// top-level line. The folders are those of its items and, for a bead, of
-/// the bead's ticket.
-pub fn kickoff_text(
-    template: &str,
-    slot: SlotId,
-    items: &[WorkItem],
-    brain_dir: &Path,
-) -> Option<String> {
-    let mine: Vec<&WorkItem> = items.iter().filter(|i| i.owner == Some(slot)).collect();
-    if mine.is_empty() {
-        return None;
-    }
+/// What a kickoff says beyond the items: the targets the slot holds, the
+/// worktree it works in, the rules that apply and where its section of
+/// `CURRENT_SESSION.md` lives. Every part may be empty.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KickoffFacts {
+    pub held: Vec<String>,
+    pub worktree: Option<PathBuf>,
+    pub rules: Vec<String>,
+    pub current_session: PathBuf,
+}
+
+/// The items of `mine` as lines: a bead whose ticket is also in `mine` is
+/// nested under it, any other item is a top-level line.
+fn item_lines(mine: &[&WorkItem]) -> Vec<String> {
     let line =
         |i: &WorkItem, indent: &str| format!("{indent}- {} ({}): {}", i.key, i.status, i.title);
     let in_set = |key: &str| mine.iter().any(|i| i.key == key);
     let mut lines = Vec::new();
-    for top in &mine {
+    for top in mine {
         if top.parent.as_deref().is_some_and(in_set) {
             continue;
         }
@@ -793,6 +794,47 @@ pub fn kickoff_text(
             lines.push(line(child, "  "));
         }
     }
+    lines
+}
+
+/// Expands `{name}` placeholders of `line` in one pass, so braces inside a
+/// value are never expanded again. The flag says some placeholder in the
+/// line expanded to nothing.
+fn expand_line(line: &str, values: &[(&str, String)]) -> (String, bool) {
+    let mut out = String::new();
+    let mut empty = false;
+    let mut rest = line;
+    'scan: while let Some(at) = rest.find('{') {
+        out.push_str(&rest[..at]);
+        rest = &rest[at..];
+        for (name, value) in values {
+            let tag = format!("{{{name}}}");
+            if let Some(after) = rest.strip_prefix(tag.as_str()) {
+                empty |= value.is_empty();
+                out.push_str(value);
+                rest = after;
+                continue 'scan;
+            }
+        }
+        out.push('{');
+        rest = &rest[1..];
+    }
+    out.push_str(rest);
+    (out, empty)
+}
+
+/// Fills `template` for `slot` from the items it owns (`mine`) and `facts`.
+/// `items` is the whole view, for a bead's ticket folder. A line whose
+/// placeholder expands to nothing is dropped, and so is a heading (a line
+/// ending in a colon, with no placeholder) that the dropped line belonged to.
+pub(crate) fn fill_kickoff(
+    template: &str,
+    slot: SlotId,
+    mine: &[&WorkItem],
+    items: &[WorkItem],
+    brain_dir: &Path,
+    facts: &KickoffFacts,
+) -> String {
     let ticket_folder = |i: &WorkItem| {
         let parent = i.parent.as_deref()?;
         items.iter().find(|t| t.key == parent)?.folder.as_ref()
@@ -813,31 +855,85 @@ pub fn kickoff_text(
     } else {
         folders.join(", ")
     };
+    let lines = item_lines(mine);
     let values = [
         ("slot", slot_name(slot)),
-        ("items", lines.join("\n")),
+        (
+            "items",
+            if lines.is_empty() {
+                "none yet".to_string()
+            } else {
+                lines.join("\n")
+            },
+        ),
         ("folders", folders),
         ("brain", brain_dir.display().to_string()),
+        ("targets", facts.held.join(", ")),
+        (
+            "worktree",
+            facts
+                .worktree
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+        ),
+        (
+            "current_session",
+            if facts.current_session.as_os_str().is_empty() {
+                String::new()
+            } else {
+                facts.current_session.display().to_string()
+            },
+        ),
+        (
+            "rules",
+            facts
+                .rules
+                .iter()
+                .map(|r| format!("- {r}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
     ];
-    // One pass, so braces inside a title or path are never expanded again.
-    let mut out = String::new();
-    let mut rest = template;
-    'scan: while let Some(at) = rest.find('{') {
-        out.push_str(&rest[..at]);
-        rest = &rest[at..];
-        for (name, value) in &values {
-            let tag = format!("{{{name}}}");
-            if let Some(after) = rest.strip_prefix(tag.as_str()) {
-                out.push_str(value);
-                rest = after;
-                continue 'scan;
+    let mut out: Vec<String> = Vec::new();
+    // The last template line was a heading kept only if what follows stays.
+    let mut heading: Option<usize> = None;
+    for line in template.lines() {
+        let (text, empty) = expand_line(line, &values);
+        if empty {
+            if let Some(at) = heading.take() {
+                out.remove(at);
             }
+            continue;
         }
-        out.push('{');
-        rest = &rest[1..];
+        // Dropped lines must not leave two blank lines side by side.
+        if text.is_empty() && out.last().is_some_and(String::is_empty) {
+            continue;
+        }
+        let is_heading = !line.contains('{') && line.trim_end().ends_with(':');
+        heading = is_heading.then_some(out.len());
+        out.push(text);
     }
-    out.push_str(rest);
-    Some(out.trim().to_string())
+    out.join("\n").trim().to_string()
+}
+
+/// The first prompt for a slot, built from `template` and the items in
+/// `items` (the whole view) that it owns. `None` when it owns none. A bead
+/// whose ticket it also owns is listed under it; any other item is a
+/// top-level line. The folders are those of its items and, for a bead, of
+/// the bead's ticket. `facts` adds held targets, worktree and rules.
+pub fn kickoff_text(
+    template: &str,
+    slot: SlotId,
+    items: &[WorkItem],
+    brain_dir: &Path,
+    facts: &KickoffFacts,
+) -> Option<String> {
+    let mine: Vec<&WorkItem> = items.iter().filter(|i| i.owner == Some(slot)).collect();
+    if mine.is_empty() {
+        return None;
+    }
+    Some(fill_kickoff(template, slot, &mine, items, brain_dir, facts))
 }
 
 #[cfg(test)]
@@ -1025,7 +1121,14 @@ mod kickoff_tests {
             None,
         );
         t.folder = Some(PathBuf::from("/b/Sprints/s1/DEMO-12-widget"));
-        let text = kickoff_text(ASSIGNMENT, 3, &[t], Path::new("/b")).unwrap();
+        let text = kickoff_text(
+            ASSIGNMENT,
+            3,
+            &[t],
+            Path::new("/b"),
+            &KickoffFacts::default(),
+        )
+        .unwrap();
         assert!(text.starts_with("You are S3. Overseer has assigned you this work:\n\n"));
         assert!(
             text.contains("\n- DEMO-12 (In Progress): Widget wiring\n"),
@@ -1040,13 +1143,29 @@ mod kickoff_tests {
 
     #[test]
     fn kickoff_none_without_items() {
-        assert_eq!(kickoff_text(ASSIGNMENT, 3, &[], Path::new("/b")), None);
+        assert_eq!(
+            kickoff_text(
+                ASSIGNMENT,
+                3,
+                &[],
+                Path::new("/b"),
+                &KickoffFacts::default()
+            ),
+            None
+        );
     }
 
     #[test]
     fn kickoff_says_none_found_without_folders() {
         let b = it("ov-3", ItemKind::Bead, "open", "Fix {slot} thing", None);
-        let text = kickoff_text(ASSIGNMENT, 3, &[b], Path::new("/b")).unwrap();
+        let text = kickoff_text(
+            ASSIGNMENT,
+            3,
+            &[b],
+            Path::new("/b"),
+            &KickoffFacts::default(),
+        )
+        .unwrap();
         assert!(
             text.contains("Ticket folders in 2ndBrain: none found"),
             "{text}"
@@ -1074,7 +1193,14 @@ mod kickoff_tests {
                 Some("DEMO-40"),
             ),
         ];
-        let text = kickoff_text("{items}", 3, &items, Path::new("/b")).unwrap();
+        let text = kickoff_text(
+            "{items}",
+            3,
+            &items,
+            Path::new("/b"),
+            &KickoffFacts::default(),
+        )
+        .unwrap();
         assert_eq!(
             text,
             "- DEMO-12 (In Progress): Widget wiring\n  - ov-2 (open): Wire it\n- ov-9 (open): Loose bead"
@@ -1090,12 +1216,26 @@ mod kickoff_tests {
         let mut other = it("ov-4", ItemKind::Bead, "open", "Other", None);
         other.owner = Some(5);
         let items = [ticket.clone(), bead.clone(), other];
-        let text = kickoff_text("{items}|{folders}", 3, &items, Path::new("/b")).unwrap();
+        let text = kickoff_text(
+            "{items}|{folders}",
+            3,
+            &items,
+            Path::new("/b"),
+            &KickoffFacts::default(),
+        )
+        .unwrap();
         // Only S3's item is listed, with the ticket's folder.
         assert_eq!(text, "- ov-3 (open): Wire it|/b/Sprints/s1/DEMO-12-widget");
         // Owning the ticket too lists the folder once.
         ticket.owner = Some(3);
-        let text = kickoff_text("{folders}", 3, &[ticket, bead], Path::new("/b")).unwrap();
+        let text = kickoff_text(
+            "{folders}",
+            3,
+            &[ticket, bead],
+            Path::new("/b"),
+            &KickoffFacts::default(),
+        )
+        .unwrap();
         assert_eq!(text, "/b/Sprints/s1/DEMO-12-widget");
     }
 
@@ -1105,7 +1245,14 @@ mod kickoff_tests {
             it("ov-2", ItemKind::Bead, "open", "Wire it", Some("DEMO-12")),
             it("DEMO-12", ItemKind::Ticket, "To Do", "Widget wiring", None),
         ];
-        let text = kickoff_text("{items}", 3, &items, Path::new("/b")).unwrap();
+        let text = kickoff_text(
+            "{items}",
+            3,
+            &items,
+            Path::new("/b"),
+            &KickoffFacts::default(),
+        )
+        .unwrap();
         assert_eq!(
             text,
             "- DEMO-12 (To Do): Widget wiring\n  - ov-2 (open): Wire it"

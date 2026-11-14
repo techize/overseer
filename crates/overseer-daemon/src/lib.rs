@@ -3,6 +3,7 @@
 pub mod activity;
 pub mod brain;
 pub mod config;
+pub mod coord;
 pub mod env;
 pub mod launch;
 pub mod ledger;

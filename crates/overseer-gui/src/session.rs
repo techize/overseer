@@ -14,14 +14,14 @@ use std::path::{Path, PathBuf};
 use gpui::Keystroke;
 use gpui::{div, prelude::*, px, relative, rgb, Context, FontWeight, SharedString, Window};
 use overseer_proto::{
-    slot_name, ActivityKind, ClaimKind, LockView, Notice, RelayState, Request, Response, Sender,
-    SlotId, SlotInfo, SlotState, WorkView,
+    slot_name, ActivityKind, ClaimKind, CoordView, LockView, Notice, RelayState, ReportKind,
+    Request, Response, Sender, SlotId, SlotInfo, SlotState, WorkView,
 };
 
 use crate::app::{colors, OpenMessage, OpenNote, OpenRelease, OverseerApp};
 use crate::board::{
     activity_detail, activity_state, format_elapsed, local_hhmm, one_line, owned_by, slot_title,
-    tilde,
+    tilde, Tone,
 };
 use crate::start_dialog::{edit_key, DialogKey, TextField};
 
@@ -36,6 +36,16 @@ pub fn tab_label(info: &SlotInfo) -> String {
         SlotState::Running { .. } => format!("{} {name} ●", info.id),
         _ => format!("{} {name}", info.id),
     }
+}
+
+/// Whether the tab of `info` shows in orange: its session is running and needs
+/// Jonathan, the same rule as the board's orange card.
+pub fn tab_needs_you(info: &SlotInfo) -> bool {
+    matches!(info.state, SlotState::Running { .. })
+        && info
+            .activity
+            .as_ref()
+            .is_some_and(|a| a.kind == ActivityKind::NeedsYou)
 }
 
 /// What the context panel shows for a slot.
@@ -279,12 +289,28 @@ fn sender_name(s: Sender) -> String {
 /// delivered, else creation time, ties by id): `14:05 from S0: <text>`,
 /// `14:06 to S0: <text>`. A pending one ends `(pending: <reason>)`, a
 /// dropped one `(for S3, dropped: session ended)`.
-pub fn relay_rows(view: &LockView, slot: SlotId, clock: impl Fn(i64) -> String) -> Vec<String> {
+///
+/// Only the current session's relays are listed: those it received or sent
+/// since `start` (`CoordView::session_start`), and any still pending. With
+/// no session (`None`) only pending ones are.
+pub fn relay_rows(
+    view: &LockView,
+    slot: SlotId,
+    start: Option<i64>,
+    clock: impl Fn(i64) -> String,
+) -> Vec<String> {
     let when = |r: &overseer_proto::Relay| r.delivered_at.or(r.dropped_at).unwrap_or(r.at);
+    let current = |r: &overseer_proto::Relay| {
+        // A relay this slot sent belongs to the session that sent it; one
+        // it received to the session it reached.
+        let at = if r.to == slot { when(r) } else { r.at };
+        r.state == RelayState::Pending || start.is_some_and(|s| at >= s)
+    };
     let mut relays: Vec<_> = view
         .relays
         .iter()
         .filter(|r| r.to == slot || r.from == (Sender::Slot { slot }))
+        .filter(|r| current(r))
         .collect();
     relays.sort_by_key(|r| std::cmp::Reverse((when(r), r.id)));
     relays
@@ -599,7 +625,9 @@ fn button(
 }
 
 fn panel_box(title: &'static str) -> gpui::Div {
+    // Kept at its full height: the panel scrolls instead of squeezing boxes.
     div()
+        .flex_none()
         .flex()
         .flex_col()
         .gap_1()
@@ -619,13 +647,28 @@ fn panel_box(title: &'static str) -> gpui::Div {
 /// How many relays the Relays box lists.
 const RELAY_ROWS: usize = 6;
 
-fn placeholder(title: &'static str, phase: &'static str) -> gpui::Div {
-    panel_box(title).child(
-        div()
-            .text_sm()
-            .text_color(rgb(colors::TEXT_DIM))
-            .child(format!("Filled in {phase}")),
-    )
+/// How many lines the Progress box lists.
+const PROGRESS_ROWS: usize = 10;
+
+/// `slot`'s reports and state changes, newest first, `max` of them:
+/// `14:05 tests written`. Reports are `Tone::Running` (normal text), state
+/// changes `Tone::Idle` (muted).
+pub fn progress_rows(
+    view: &CoordView,
+    slot: SlotId,
+    clock: impl Fn(i64) -> String,
+    max: usize,
+) -> Vec<(String, Tone)> {
+    view.reports_for(slot)
+        .take(max)
+        .map(|r| {
+            let tone = match r.kind {
+                ReportKind::Report => Tone::Running,
+                ReportKind::State => Tone::Idle,
+            };
+            (format!("{} {}", clock(r.at), one_line(&r.text, 120)), tone)
+        })
+        .collect()
 }
 
 impl OverseerApp {
@@ -654,8 +697,12 @@ impl OverseerApp {
                     .rounded(px(5.))
                     .bg(rgb(colors::CARD))
                     .border_1()
-                    .border_color(rgb(if on { colors::ORANGE } else { colors::BORDER }))
-                    .text_color(rgb(if on { colors::ORANGE } else { colors::TEXT }))
+                    .border_color(rgb(if on { colors::ACCENT } else { colors::BORDER }))
+                    .text_color(rgb(if tab_needs_you(info) {
+                        colors::ORANGE
+                    } else {
+                        colors::TEXT
+                    }))
                     .cursor_pointer()
                     .child(tab_label(info))
                     .on_click(
@@ -728,9 +775,13 @@ impl OverseerApp {
             Some(_) => self.entry_focus.clone(),
             None => self.session_focus.clone(),
         };
+        // Scrolls as a whole, so a long Relays box does not hide Progress.
         div()
+            .id(("session-panel", usize::from(id)))
             .flex_1()
             .min_w(px(0.))
+            .min_h(px(0.))
+            .overflow_y_scroll()
             .flex()
             .flex_col()
             .gap_2()
@@ -769,7 +820,7 @@ impl OverseerApp {
             .child(self.render_owns(id, cx))
             .child(self.render_holds(id, now, cx))
             .child(self.render_relays(id, cx))
-            .child(placeholder("Progress", "phase 4"))
+            .child(self.render_progress(id))
             .children(
                 self.status
                     .clone()
@@ -890,7 +941,7 @@ impl OverseerApp {
         let focused = self.entry_focus.clone();
         let shown = match entry.kind {
             EntryKind::Release { .. } => None,
-            _ => Some(entry.field.with_cursor()),
+            _ => Some(entry.field.display(true)),
         };
         let hint = matches!(entry.kind, EntryKind::Claim) && entry.field.text.is_empty();
         Some(
@@ -917,10 +968,7 @@ impl OverseerApp {
                         .flex()
                         .gap_2()
                         .child(div().text_color(rgb(colors::ACCENT)).child(entry.prompt()))
-                        .children(
-                            shown
-                                .map(|t| div().flex_1().min_w(px(0.)).child(SharedString::from(t))),
-                        )
+                        .children(shown.map(|t| div().flex_1().min_w(px(0.)).child(t)))
                         .children(hint.then(|| {
                             div()
                                 .text_color(rgb(colors::MUTED))
@@ -1054,8 +1102,32 @@ impl OverseerApp {
             ))
     }
 
+    fn render_progress(&self, id: SlotId) -> impl IntoElement {
+        let rows = progress_rows(&self.coord, id, local_hhmm, PROGRESS_ROWS);
+        let empty = rows.is_empty();
+        panel_box("Progress")
+            .children(empty.then(|| {
+                div()
+                    .text_sm()
+                    .text_color(rgb(colors::TEXT_DIM))
+                    .child("Nothing reported yet")
+            }))
+            .children(rows.into_iter().map(|(line, tone)| {
+                let color = match tone {
+                    Tone::Idle => colors::TEXT_DIM,
+                    _ => colors::TEXT,
+                };
+                div()
+                    .text_sm()
+                    .truncate()
+                    .text_color(rgb(color))
+                    .child(line)
+            }))
+    }
+
     fn render_relays(&self, id: SlotId, cx: &mut Context<Self>) -> impl IntoElement {
-        let rows: Vec<_> = relay_rows(&self.locks, id, local_hhmm)
+        let start = self.coord.session_start(&self.slots[id as usize]);
+        let rows: Vec<_> = relay_rows(&self.locks, id, start, local_hhmm)
             .into_iter()
             .take(RELAY_ROWS)
             .map(|line| div().text_sm().truncate().child(line))
@@ -1261,6 +1333,30 @@ mod tests {
     fn tabs() {
         assert_eq!(tab_label(&info(RUN)), "2 S2 ●");
         assert_eq!(tab_label(&info(SlotState::Empty)), "2 S2");
+    }
+
+    #[test]
+    fn tab_is_orange_only_while_running_and_needing_you() {
+        use overseer_proto::Activity;
+        let with = |state, kind| SlotInfo {
+            activity: Some(Activity {
+                kind,
+                since: 100,
+                now_doing: None,
+                reason: None,
+                idle_wait: false,
+            }),
+            ..info(state)
+        };
+        assert!(tab_needs_you(&with(RUN, ActivityKind::NeedsYou)));
+        assert!(!tab_needs_you(&with(RUN, ActivityKind::Working)));
+        assert!(!tab_needs_you(&with(RUN, ActivityKind::Idle)));
+        assert!(!tab_needs_you(&info(RUN)));
+        let exited = SlotState::Exited {
+            code: Some(0),
+            at: 200,
+        };
+        assert!(!tab_needs_you(&with(exited, ActivityKind::NeedsYou)));
     }
 
     #[test]
@@ -1715,7 +1811,7 @@ mod tests {
             ),
         ];
         assert_eq!(
-            relay_rows(&v, 2, clock),
+            relay_rows(&v, 2, Some(0), clock),
             vec![
                 "T108 from Overseer: moved (pending)".to_string(),
                 "T107 from you: line one line two (pending: session is working)".to_string(),
@@ -1742,11 +1838,57 @@ mod tests {
         ];
         let clock = |t: i64| format!("T{t}");
         assert_eq!(
-            relay_rows(&v, 2, clock),
+            relay_rows(&v, 2, Some(0), clock),
             vec![
                 "T120 from S0: status? (for S2, dropped: session ended)".to_string(),
                 "T110 to S0: on it (for S0, dropped: session ended)".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn relay_rows_keep_to_the_current_session() {
+        let mut v = locks();
+        v.relays = vec![
+            // Delivered to the session before this one.
+            relay(1, Sender::You, 2, 100, Some(101), None, "old news"),
+            // Sent by the session before this one, delivered later.
+            relay(
+                2,
+                Sender::Slot { slot: 2 },
+                0,
+                102,
+                Some(210),
+                None,
+                "old reply",
+            ),
+            // Queued before this session, delivered to it.
+            relay(3, Sender::You, 2, 150, Some(201), None, "welcome"),
+            relay(
+                4,
+                Sender::Slot { slot: 2 },
+                0,
+                205,
+                Some(206),
+                None,
+                "on it",
+            ),
+            // Still waiting: always shown.
+            relay(5, Sender::Overseer, 2, 90, None, None, "queued"),
+        ];
+        let clock = |t: i64| format!("T{t}");
+        assert_eq!(
+            relay_rows(&v, 2, Some(200), clock),
+            vec![
+                "T206 to S0: on it".to_string(),
+                "T201 from you: welcome".to_string(),
+                "T90 from Overseer: queued (pending)".to_string(),
+            ]
+        );
+        // No session: only what is waiting.
+        assert_eq!(
+            relay_rows(&v, 2, None, clock),
+            vec!["T90 from Overseer: queued (pending)".to_string()]
         );
     }
 
@@ -1842,5 +1984,34 @@ mod tests {
         assert_eq!(reply_note(&Ok(err)).as_deref(), Some("no such target"));
         assert_eq!(reply_note(&Ok(Response::Ok)), None);
         assert_eq!(reply_note(&Err("lost".into())).as_deref(), Some("lost"));
+    }
+    #[test]
+    fn progress_rows_newest_first_states_muted() {
+        use crate::board::Tone;
+        use overseer_proto::{Report, ReportKind};
+        let mut view = crate::app::empty_coord();
+        let r = |id, at, slot, kind, text: &str| Report {
+            id,
+            at,
+            slot,
+            kind,
+            text: text.into(),
+        };
+        view.reports = vec![
+            r(3, 30, 1, ReportKind::State, "idle"),
+            r(2, 20, 2, ReportKind::Report, "other slot"),
+            r(1, 10, 1, ReportKind::Report, "tests written"),
+        ];
+        // Out of order on purpose: the rows are sorted, not trusted.
+        view.reports.reverse();
+        assert_eq!(
+            progress_rows(&view, 1, clock, 10),
+            vec![
+                ("T30 idle".to_string(), Tone::Idle),
+                ("T10 tests written".to_string(), Tone::Running),
+            ]
+        );
+        assert_eq!(progress_rows(&view, 1, clock, 1).len(), 1);
+        assert!(progress_rows(&view, 4, clock, 10).is_empty());
     }
 }

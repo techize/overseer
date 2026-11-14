@@ -1175,10 +1175,9 @@ fn feed_snapshot(shared: &Shared, data: &[u8]) {
     drop(shared.bridge.lock().unwrap().take_pty_writes());
 }
 
-/// Status text when the connection to the daemon has gone. Phase 1 has no
-/// reconnect, so it says how to get one.
-pub const LOST_DAEMON: &str =
-    "Lost the connection to the daemon. Quit and reopen Overseer to reconnect.";
+/// Status text when the connection to the daemon has gone. The app keeps
+/// trying to reconnect (see `reconnect`) and clears it once it has.
+pub const LOST_DAEMON: &str = "Lost the connection to the daemon. Reconnecting\u{2026}";
 
 /// Sizes the bridge to the slot's PTY (so the replay renders as it was
 /// drawn), then attaches. Returns a message for the user on failure.

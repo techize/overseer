@@ -1415,7 +1415,13 @@ async fn writer_off_answers_with_the_config_hint() {
         }
     );
     assert_eq!(v.commits(), before);
-    assert!(v.log("bd.log").is_empty());
+    // The work store's own beads refresh may run the same stub (`bd list`),
+    // so only the writer's `bd update` must be missing.
+    let bd_runs = v.log("bd.log");
+    assert!(
+        bd_runs.iter().all(|l| !l.ends_with("|update")),
+        "{bd_runs:?}"
+    );
     task.abort();
 }
 

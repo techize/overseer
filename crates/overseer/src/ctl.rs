@@ -10,8 +10,9 @@ use anyhow::{bail, Context};
 use clap::Subcommand;
 use overseer_proto::paths::{log_dir, socket_path};
 use overseer_proto::{
-    slot_name, BrainRun, BrainView, ClaimKind, Client, ItemKind, LockView, QueueState, RelayState,
-    Request, Response, SlotId, SlotInfo, SlotState, WorkItem, WorkView,
+    slot_name, ActivityKind, BoardView, BrainRun, BrainView, ClaimKind, Client, ItemKind, LockView,
+    Plan, PlanDecision, PlanRecord, PlanState, QueueState, RelayState, Request, Response, SlotId,
+    SlotInfo, SlotState, WorkItem, WorkView,
 };
 
 #[derive(Subcommand)]
@@ -122,8 +123,45 @@ pub enum CtlCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Everything on the board: summary, slots, work, locks, pending plan.
+    Board {
+        /// Print the raw BoardView as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// The pending plan and the last five, or decide on one.
+    Plan {
+        /// Print the plans as JSON.
+        #[arg(long)]
+        json: bool,
+        #[command(subcommand)]
+        action: Option<PlanCmd>,
+    },
+    /// Set the board summary. `-` reads the text from stdin.
+    Summary {
+        #[arg(allow_hyphen_values = true)]
+        text: String,
+    },
+    /// Ask a running slot for a short status.
+    StatusOf { slot: String },
+    /// Report your progress to the coordinator. `-` reads the text from
+    /// stdin. Needs `$OVERSEER_SLOT`.
+    Report {
+        #[arg(allow_hyphen_values = true)]
+        text: String,
+    },
     /// Stop the daemon and every session.
     Shutdown,
+}
+
+#[derive(Subcommand)]
+pub enum PlanCmd {
+    /// Approve plan <id> as it is stored. Only Jonathan can.
+    Approve { id: i64 },
+    /// Reject plan <id>, with a reason if you have one. Only Jonathan can.
+    Reject { id: i64, reason: Option<String> },
+    /// Propose a plan from a JSON file, or `-` for stdin.
+    Propose { source: String },
 }
 
 /// Starts the daemon. With the LaunchAgent installed (and the default state
@@ -326,7 +364,7 @@ pub fn format_locks(v: &LockView, now: i64) -> Vec<String> {
     out
 }
 
-fn now_secs() -> i64 {
+pub(crate) fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -497,6 +535,272 @@ pub fn format_work(v: &WorkView) -> Vec<String> {
         out.push(format!("notice  {}  {}", slot_name(n.slot), n.text));
     }
     out
+}
+
+/// `5m`, or `2h` from an hour on.
+fn short_age(secs: i64) -> String {
+    let mins = secs.max(0) / 60;
+    if mins < 60 {
+        format!("{mins}m")
+    } else {
+        format!("{}h", mins / 60)
+    }
+}
+
+/// `empty`, `exited`, `resumable`, `working 5m`, `needs you 2m`, `idle 12m`.
+fn board_state(s: &SlotInfo, now: i64) -> String {
+    match (&s.state, &s.activity) {
+        (SlotState::Empty, _) => "empty".into(),
+        (SlotState::Exited { .. }, _) => "exited".into(),
+        (SlotState::Resumable { .. }, _) => "resumable".into(),
+        (SlotState::Running { .. }, None) => "running".into(),
+        (SlotState::Running { .. }, Some(a)) => {
+            let word = match a.kind {
+                ActivityKind::Working => "working",
+                ActivityKind::NeedsYou => "needs you",
+                ActivityKind::Idle => "idle",
+            };
+            format!("{word} {}", short_age(now - a.since))
+        }
+    }
+}
+
+/// The board as text, shared by `get_board` and `ctl board`: the summary,
+/// one line per slot (with its last report beneath), work items, locks and
+/// the plan waiting for Jonathan.
+pub fn format_board(view: &BoardView, now: i64) -> String {
+    let mut out = Vec::new();
+    out.push(match &view.coord.summary {
+        Some(s) => format!("Summary ({}): {}", local_hhmm(s.at), s.text),
+        None => "Summary: none yet".to_string(),
+    });
+    for s in &view.slots {
+        let mut line = slot_name(s.id);
+        if !s.label.is_empty() {
+            line.push_str(&format!(" {}", s.label));
+        }
+        line.push_str(&format!("  {}", board_state(s, now)));
+        let keys = |it: Vec<&str>| it.join(", ");
+        let owns = keys(
+            view.work
+                .items
+                .iter()
+                .filter(|i| i.owner == Some(s.id))
+                .map(|i| i.key.as_str())
+                .collect(),
+        );
+        if !owns.is_empty() {
+            line.push_str(&format!("  owns {owns}"));
+        }
+        let holds = keys(
+            view.locks
+                .claims
+                .iter()
+                .filter(|c| c.slot == s.id)
+                .map(|c| c.target.as_str())
+                .collect(),
+        );
+        if !holds.is_empty() {
+            line.push_str(&format!("  holds {holds}"));
+        }
+        let waits = keys(
+            view.locks
+                .waits
+                .iter()
+                .filter(|w| w.slot == s.id)
+                .map(|w| w.target.as_str())
+                .collect(),
+        );
+        if !waits.is_empty() {
+            line.push_str(&format!("  waiting {waits}"));
+        }
+        let pending = view
+            .locks
+            .relays
+            .iter()
+            .filter(|r| r.to == s.id && r.state == RelayState::Pending)
+            .count();
+        if pending > 0 {
+            line.push_str(&format!("  {pending} relays pending"));
+        }
+        if let Some((_, at)) = view.coord.status_asked.iter().find(|(id, _)| *id == s.id) {
+            line.push_str(&format!("  status asked {}", local_hhmm(*at)));
+        }
+        out.push(line);
+        // Only a report from the slot's current (or last) session.
+        if let Some(r) = view.coord.last_report(s) {
+            out.push(format!(
+                "  last report {}: {}",
+                local_hhmm(r.at),
+                cut(&r.text, 200)
+            ));
+        }
+    }
+    out.push("Work items:".into());
+    out.extend(format_work(&view.work));
+    out.push("Locks:".into());
+    out.extend(format_locks(&view.locks, now));
+    if let Some(p) = view.coord.pending_plan() {
+        out.push(format!(
+            "Plan {} waiting for Jonathan since {}",
+            p.id,
+            local_hhmm(p.at)
+        ));
+    }
+    out.join("\n")
+}
+
+/// One plan: its state, summary, what it does for each slot, the warnings
+/// approval confirms and, once run, the outcome lines.
+pub fn format_plan(rec: &PlanRecord) -> String {
+    let state = match rec.state {
+        PlanState::Pending => "pending".to_string(),
+        PlanState::Approved => format!(
+            "approved{}",
+            rec.decided_at
+                .map(|a| format!(" {}", local_hhmm(a)))
+                .unwrap_or_default()
+        ),
+        PlanState::Rejected => "rejected".to_string(),
+        PlanState::Superseded => "superseded".to_string(),
+    };
+    let edited = if rec.edited { " (edited)" } else { "" };
+    let mut out = vec![format!(
+        "Plan {}  {state}{edited}  proposed {}",
+        rec.id,
+        local_hhmm(rec.at)
+    )];
+    if !rec.plan.summary.is_empty() {
+        out.push(format!("  {}", rec.plan.summary));
+    }
+    for s in &rec.plan.slots {
+        let mut line = slot_name(s.slot);
+        if !s.label.is_empty() {
+            line.push_str(&format!(" {}", s.label));
+        }
+        if !s.items.is_empty() {
+            line.push_str(&format!("  items {}", s.items.join(", ")));
+        }
+        if !s.targets.is_empty() {
+            let t: Vec<&str> = s.targets.iter().map(|t| t.target.as_str()).collect();
+            line.push_str(&format!("  targets {}", t.join(", ")));
+        }
+        if let Some(w) = &s.worktree {
+            line.push_str(&format!("  worktree {} {}", tilde(&w.repo), w.ticket));
+        }
+        if let Some(c) = &s.cwd {
+            line.push_str(&format!("  cwd {}", tilde(c)));
+        }
+        out.push(format!("  {line}"));
+        for r in &s.rules {
+            out.push(format!("    rule: {r}"));
+        }
+    }
+    for w in &rec.warnings {
+        out.push(format!("  warning: {w}"));
+    }
+    for o in &rec.outcome {
+        out.push(format!("  {o}"));
+    }
+    out.join("\n")
+}
+
+/// The pending plan, then the newest five others.
+fn plans_to_list(plans: &[PlanRecord]) -> Vec<&PlanRecord> {
+    let pending = plans.iter().filter(|p| p.state == PlanState::Pending);
+    let rest = plans.iter().filter(|p| p.state != PlanState::Pending);
+    pending.chain(rest.take(5)).collect()
+}
+
+async fn run_plan(
+    client: &overseer_proto::client::Client,
+    json: bool,
+    action: Option<PlanCmd>,
+) -> anyhow::Result<()> {
+    match action {
+        None => match client.request(Request::CoordStatus).await? {
+            Response::Coord(v) => {
+                let plans = plans_to_list(&v.plans);
+                if json {
+                    println!("{}", serde_json::to_string(&plans)?);
+                } else if plans.is_empty() {
+                    println!("No plans yet.");
+                } else {
+                    for p in plans {
+                        println!("{}", format_plan(p));
+                    }
+                }
+                Ok(())
+            }
+            Response::Error { message } => bail!("{message}"),
+            other => bail!("unexpected reply: {other:?}"),
+        },
+        Some(PlanCmd::Approve { id }) => {
+            let from = env_slot();
+            // Inside a session the daemon refuses before it looks at the
+            // plan, so there is no need to fetch it.
+            let plan = if from.is_some() {
+                Plan {
+                    summary: String::new(),
+                    slots: vec![],
+                }
+            } else {
+                match client.request(Request::CoordStatus).await? {
+                    Response::Coord(v) => v
+                        .plans
+                        .into_iter()
+                        .find(|p| p.id == id)
+                        .map(|p| p.plan)
+                        .with_context(|| format!("no plan {id}"))?,
+                    Response::Error { message } => bail!("{message}"),
+                    other => bail!("unexpected reply: {other:?}"),
+                }
+            };
+            print_brain_text(
+                client
+                    .request(Request::DecidePlan {
+                        id,
+                        from,
+                        decision: PlanDecision::Approve { plan },
+                    })
+                    .await?,
+            )
+        }
+        Some(PlanCmd::Reject { id, reason }) => {
+            let resp = client
+                .request(Request::DecidePlan {
+                    id,
+                    from: env_slot(),
+                    decision: PlanDecision::Reject {
+                        reason: reason.unwrap_or_default(),
+                    },
+                })
+                .await?;
+            if matches!(resp, Response::Ok) {
+                println!("Plan {id} rejected.");
+                return Ok(());
+            }
+            print_brain_text(resp)
+        }
+        Some(PlanCmd::Propose { source }) => {
+            let text = if source == "-" {
+                text_or_stdin(source)?
+            } else {
+                std::fs::read_to_string(&source).with_context(|| format!("read {source}"))?
+            };
+            let value: serde_json::Value =
+                serde_json::from_str(&text).context("the plan is not valid JSON")?;
+            let plan = crate::mcp::plan_from_json(&value).map_err(|e| anyhow::anyhow!(e))?;
+            print_brain_text(
+                client
+                    .request(Request::ProposePlan {
+                        from: env_slot(),
+                        plan,
+                    })
+                    .await?,
+            )
+        }
+    }
 }
 
 pub async fn run(cmd: CtlCmd) -> anyhow::Result<()> {
@@ -728,6 +1032,48 @@ pub async fn run(cmd: CtlCmd) -> anyhow::Result<()> {
             Response::Error { message } => bail!("{message}"),
             other => bail!("unexpected reply: {other:?}"),
         },
+        CtlCmd::Board { json } => match client.request(Request::GetBoard).await? {
+            Response::Board(v) => {
+                if json {
+                    println!("{}", serde_json::to_string(&v)?);
+                } else {
+                    println!("{}", format_board(&v, now_secs()));
+                }
+                Ok(())
+            }
+            Response::Error { message } => bail!("{message}"),
+            other => bail!("unexpected reply: {other:?}"),
+        },
+        CtlCmd::Plan { json, action } => run_plan(&client, json, action).await,
+        CtlCmd::Summary { text } => print_brain_text(
+            client
+                .request(Request::SetBoardSummary {
+                    from: env_slot(),
+                    text: text_or_stdin(text)?,
+                })
+                .await?,
+        ),
+        CtlCmd::StatusOf { slot } => print_brain_text(
+            client
+                .request(Request::RequestStatus {
+                    from: env_slot(),
+                    slot: parse_slot(&slot)?,
+                })
+                .await?,
+        ),
+        CtlCmd::Report { text } => {
+            let Some(slot) = env_slot() else {
+                bail!("report needs a slot; run it from a session");
+            };
+            print_brain_text(
+                client
+                    .request(Request::ReportProgress {
+                        slot,
+                        text: text_or_stdin(text)?,
+                    })
+                    .await?,
+            )
+        }
         CtlCmd::Shutdown => expect_ok(client.request(Request::Shutdown).await?),
     }
 }
@@ -735,6 +1081,7 @@ pub async fn run(cmd: CtlCmd) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use overseer_proto::ReportKind;
 
     #[derive(clap::Parser)]
     struct Cli {
@@ -889,5 +1236,227 @@ mod tests {
             session_note: None,
         };
         assert_eq!(format_slot(&s), "S3  resumable  eks");
+    }
+
+    fn slot_info(
+        id: SlotId,
+        label: &str,
+        state: SlotState,
+        kind: Option<ActivityKind>,
+    ) -> SlotInfo {
+        SlotInfo {
+            id,
+            label: label.into(),
+            cwd: None,
+            command: None,
+            state,
+            cols: 80,
+            rows: 24,
+            activity: kind.map(|kind| overseer_proto::Activity {
+                kind,
+                since: 700,
+                now_doing: None,
+                reason: None,
+                idle_wait: false,
+            }),
+            session_note: None,
+        }
+    }
+
+    fn board(summary: Option<overseer_proto::Summary>) -> BoardView {
+        use overseer_proto::{Claim, CoordView, Relay, Report, Sender, Wait};
+        let running = SlotState::Running { pid: 1, since: 0 };
+        let mut work = view(Some(0));
+        work.items[0].owner = Some(3);
+        work.items[0].in_list = true;
+        work.items.push(WorkItem {
+            key: "DEMO-12".into(),
+            kind: ItemKind::Ticket,
+            title: "Widget wiring".into(),
+            status: "open".into(),
+            priority: None,
+            parent: None,
+            owner: Some(3),
+            in_list: true,
+            folder: None,
+        });
+        let claim = |target: &str, slot| Claim {
+            target: target.into(),
+            slot,
+            kind: ClaimKind::Claim,
+            reason: None,
+            item: None,
+            since: 100,
+            last_used: 100,
+            pin_revision: None,
+        };
+        BoardView {
+            slots: vec![
+                slot_info(0, "", SlotState::Empty, None),
+                slot_info(1, "api", running.clone(), Some(ActivityKind::Idle)),
+                slot_info(2, "", SlotState::Exited { code: None, at: 1 }, None),
+                slot_info(3, "demo lane", running.clone(), Some(ActivityKind::Working)),
+                slot_info(4, "", running, Some(ActivityKind::NeedsYou)),
+            ],
+            work,
+            locks: LockView {
+                claims: vec![claim("repo:demo-api:main", 3)],
+                waits: vec![Wait {
+                    target: "argo:uat/root".into(),
+                    slot: 3,
+                    at: 200,
+                    reason: None,
+                }],
+                relays: vec![Relay {
+                    id: 1,
+                    at: 0,
+                    from: Sender::You,
+                    to: 3,
+                    text: "hi".into(),
+                    state: RelayState::Pending,
+                    delivered_at: None,
+                    dropped_at: None,
+                    held: None,
+                }],
+                flag_after_secs: 3600,
+            },
+            coord: CoordView {
+                summary,
+                plans: vec![PlanRecord {
+                    id: 2,
+                    at: 400,
+                    plan: Plan {
+                        summary: "two lanes".into(),
+                        slots: vec![],
+                    },
+                    state: PlanState::Pending,
+                    decided_at: None,
+                    edited: false,
+                    warnings: vec![],
+                    outcome: vec![],
+                }],
+                reports: vec![Report {
+                    id: 1,
+                    at: 500,
+                    slot: 3,
+                    kind: ReportKind::Report,
+                    text: "tests green".into(),
+                }],
+                status_asked: vec![(3, 600)],
+            },
+        }
+    }
+
+    #[test]
+    fn board_text_lists_summary_slots_work_locks_and_plan() {
+        let v = board(Some(overseer_proto::Summary {
+            at: 300,
+            text: "Two lanes running.".into(),
+        }));
+        let text = format_board(&v, 1000);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[0],
+            format!("Summary ({}): Two lanes running.", local_hhmm(300))
+        );
+        assert_eq!(lines[1], "S0  empty");
+        assert_eq!(lines[2], "S1 api  idle 5m");
+        assert_eq!(lines[3], "S2  exited");
+        assert_eq!(
+            lines[4],
+            format!(
+                "S3 demo lane  working 5m  owns ov-3, DEMO-12  holds repo:demo-api:main  waiting argo:uat/root  1 relays pending  status asked {}",
+                local_hhmm(600)
+            )
+        );
+        assert_eq!(
+            lines[5],
+            format!("  last report {}: tests green", local_hhmm(500))
+        );
+        assert_eq!(lines[6], "S4  needs you 5m");
+        let work_at = lines.iter().position(|l| *l == "Work items:").unwrap();
+        assert_eq!(
+            lines[work_at + 1],
+            "beads  ok  4 items  ".to_owned() + &local_hhmm(0)
+        );
+        let locks_at = lines.iter().position(|l| *l == "Locks:").unwrap();
+        assert!(locks_at > work_at);
+        assert!(lines[locks_at + 1].starts_with("repo:demo-api:main  S3  claim  since "));
+        assert_eq!(
+            lines.last().unwrap(),
+            &format!("Plan 2 waiting for Jonathan since {}", local_hhmm(400))
+        );
+    }
+
+    #[test]
+    fn board_text_drops_a_last_report_from_an_earlier_session() {
+        let mut v = board(None);
+        // S3's report was made at 500; its session now started at 700.
+        v.slots[3].state = SlotState::Running { pid: 2, since: 700 };
+        let text = format_board(&v, 1000);
+        assert!(!text.contains("last report"), "{text}");
+        // A report from the new session shows.
+        v.coord.reports.push(overseer_proto::Report {
+            id: 2,
+            at: 800,
+            slot: 3,
+            kind: ReportKind::Report,
+            text: "schema done".into(),
+        });
+        let text = format_board(&v, 1000);
+        assert!(
+            text.contains(&format!("  last report {}: schema done", local_hhmm(800))),
+            "{text}"
+        );
+        assert!(!text.contains("tests green"), "{text}");
+    }
+
+    #[test]
+    fn board_text_without_summary_says_none_yet() {
+        let mut v = board(None);
+        v.coord.plans.clear();
+        let text = format_board(&v, 1000);
+        assert_eq!(text.lines().next().unwrap(), "Summary: none yet");
+        assert!(!text.contains("waiting for Jonathan"), "{text}");
+    }
+
+    #[test]
+    fn plan_text_shows_slots_warnings_and_outcome() {
+        use overseer_proto::{PlanSlot, PlanTarget, PlanWorktree};
+        let rec = PlanRecord {
+            id: 7,
+            at: 0,
+            plan: Plan {
+                summary: "Ship the widget".into(),
+                slots: vec![PlanSlot {
+                    slot: 3,
+                    label: "demo lane".into(),
+                    items: vec!["DEMO-12".into(), "ov-3".into()],
+                    targets: vec![PlanTarget {
+                        target: "repo:demo-api:main".into(),
+                        reason: None,
+                    }],
+                    worktree: Some(PlanWorktree {
+                        repo: "/srv/demo-api".into(),
+                        ticket: "DEMO-12".into(),
+                    }),
+                    cwd: None,
+                    kickoff: String::new(),
+                    rules: vec!["Do not deploy before S2 merges".into()],
+                }],
+            },
+            state: PlanState::Approved,
+            decided_at: Some(0),
+            edited: true,
+            warnings: vec!["S3 is running; it will be told to work in /x but not moved".into()],
+            outcome: vec!["S3: assigned DEMO-12, ov-3".into()],
+        };
+        let at = local_hhmm(0);
+        assert_eq!(
+            format_plan(&rec),
+            format!(
+                "Plan 7  approved {at} (edited)  proposed {at}\n  Ship the widget\n  S3 demo lane  items DEMO-12, ov-3  targets repo:demo-api:main  worktree /srv/demo-api DEMO-12\n    rule: Do not deploy before S2 merges\n  warning: S3 is running; it will be told to work in /x but not moved\n  S3: assigned DEMO-12, ov-3"
+            )
+        );
     }
 }

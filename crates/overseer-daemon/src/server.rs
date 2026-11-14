@@ -8,7 +8,8 @@ use std::time::Duration;
 use anyhow::Context;
 use bytes::Bytes;
 use overseer_proto::{
-    read_frame, slot_name, write_frame, Event, Frame, Request, Response, SlotId, SlotState,
+    read_frame, slot_name, write_frame, BoardView, Event, Frame, Request, Response, SlotId,
+    SlotState,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
@@ -16,6 +17,8 @@ use tokio::sync::{broadcast, mpsc, watch, Notify};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::brain::{BrainContext, BrainOptions, BrainService, WRITER_OFF};
+use crate::coord::plan::PlanCtx;
+use crate::coord::CoordService;
 use crate::env::{BaseEnv, EnvSource};
 use crate::launch::RoleDirs;
 use crate::ledger::Ledger;
@@ -23,7 +26,7 @@ use crate::locks::{owned_items, LockService};
 use crate::manager::{valid_id, Attachment, SlotManager};
 use crate::relay::courier::Courier;
 use crate::slot::CatchUp;
-use crate::work::store::unix_now;
+use crate::work::store::{unix_now, KickoffFacts};
 use crate::work::WorkStore;
 
 /// Frames queued per connection before it is considered too slow.
@@ -111,6 +114,8 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
         env.clone(),
         Duration::from_secs(cfg.settings.lock_idle_mins.saturating_mul(60)),
     );
+    let coord = CoordService::new(ledger.clone(), events.clone());
+    let timeline = coord.watch(events.subscribe());
     let brain = BrainService::with_options(
         &cfg.settings,
         ledger.clone(),
@@ -185,6 +190,17 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
         courier.clone(),
     ));
     store.start_polling();
+    let plans = Arc::new(PlanCtx {
+        manager: manager.clone(),
+        store: store.clone(),
+        locks: locks.clone(),
+        brain: brain.clone(),
+        env: env.clone(),
+        worktree_root: cfg.settings.worktree_root.clone(),
+        brain_dir: cfg.settings.brain_dir.clone(),
+        current_session: cfg.settings.current_session.clone(),
+        state_dir: state_dir.clone(),
+    });
     let shutdown = Arc::new(Notify::new());
     let mut conns = JoinSet::new();
 
@@ -198,6 +214,8 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
                             manager: manager.clone(),
                             store: store.clone(),
                             locks: locks.clone(),
+                            coord: coord.clone(),
+                            plans: plans.clone(),
                             courier: courier.clone(),
                             state_dir: state_dir.clone(),
                             brain: brain.clone(),
@@ -224,6 +242,7 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
     // Dropping `conns` aborts every connection task, closing the sockets.
     drop(conns);
     exits.abort();
+    timeline.abort();
     Ok(())
 }
 
@@ -424,6 +443,8 @@ struct Services {
     manager: Manager,
     store: Arc<WorkStore>,
     locks: Arc<LockService>,
+    coord: Arc<CoordService>,
+    plans: Arc<PlanCtx>,
     courier: Arc<Courier>,
     state_dir: PathBuf,
     brain: Option<Arc<BrainService>>,
@@ -439,6 +460,8 @@ async fn handle_conn(
         manager,
         store,
         locks,
+        coord,
+        plans,
         courier,
         state_dir,
         brain,
@@ -527,6 +550,8 @@ async fn handle_conn(
                         manager: &manager,
                         store: &store,
                         locks: &locks,
+                        coord: &coord,
+                        plans: &plans,
                         courier: &courier,
                         state_dir: &state_dir,
                         brain: brain.as_ref(),
@@ -558,6 +583,8 @@ struct Ctx<'a> {
     manager: &'a Manager,
     store: &'a Arc<WorkStore>,
     locks: &'a Arc<LockService>,
+    coord: &'a Arc<CoordService>,
+    plans: &'a Arc<PlanCtx>,
     courier: &'a Arc<Courier>,
     state_dir: &'a Path,
     brain: Option<&'a Arc<BrainService>>,
@@ -586,6 +613,22 @@ fn handle_frame(
                     seq,
                     resp: Response::Work(task_store.view()),
                 });
+            });
+        }
+        // Approving a plan creates worktrees and starts sessions, so it is
+        // answered from a task. Two approvals at once race in the ledger;
+        // only one wins.
+        Frame::Request {
+            seq,
+            req: Request::DecidePlan { id, from, decision },
+        } => {
+            let (coord, plans, courier) =
+                (ctx.coord.clone(), ctx.plans.clone(), ctx.courier.clone());
+            let outbox = outbox.clone();
+            store.spawn(async move {
+                let resp = coord.decide(id, from, decision, &plans, unix_now()).await;
+                courier.poke();
+                outbox.send(Frame::Response { seq, resp });
             });
         }
         // Resolving targets can run git or kubectl (bounded by
@@ -655,6 +698,9 @@ fn handle_frame(
                     | Request::Assign { .. }
                     | Request::StartSlot { .. }
                     | Request::StopSlot { .. }
+                    | Request::RequestStatus { .. }
+                    | Request::ProposePlan { .. }
+                    | Request::ReportProgress { .. }
                     | Request::Hook(_)
             );
             let mut pending_attach = None;
@@ -813,6 +859,19 @@ fn handle_request(
                 );
             crate::relay::send(locks, from, to, &text, live, unix_now())
         }
+        Request::CheckPlan { plan } => {
+            let owned = ctx.coord.gather(ctx.plans);
+            match crate::coord::plan::validate(&plan, &owned.facts()) {
+                Ok(warnings) => Response::PlanCheck {
+                    warnings,
+                    refusal: None,
+                },
+                Err(refusal) => Response::PlanCheck {
+                    warnings: Vec::new(),
+                    refusal: Some(refusal),
+                },
+            }
+        }
         // Answered in `handle_frame` from a task; this arm only keeps the
         // match whole.
         Request::CheckBash(_) => Response::Verdict {
@@ -846,7 +905,25 @@ fn handle_request(
                     crate::launch::ASSIGNMENT.to_string()
                 }
             };
-            match crate::work::store::kickoff_text(&template, slot, &items, store.brain_dir()) {
+            let facts = KickoffFacts {
+                held: locks
+                    .view()
+                    .claims
+                    .iter()
+                    .filter(|c| c.slot == slot)
+                    .map(|c| c.target.clone())
+                    .collect(),
+                worktree: slot_worktree(ctx.plans, ctx.manager, slot),
+                rules: Vec::new(),
+                current_session: ctx.plans.current_session.clone(),
+            };
+            match crate::work::store::kickoff_text(
+                &template,
+                slot,
+                &items,
+                store.brain_dir(),
+                &facts,
+            ) {
                 Some(text) => Response::Text { text },
                 None => err(format!("{} owns no work items", slot_name(slot))),
             }
@@ -919,6 +996,38 @@ fn handle_request(
             None => err(format!("{} is empty", slot_name(id))),
         },
         Request::Shutdown => Response::Ok,
+        // Coordinator requests.
+        Request::GetBoard => Response::Board(BoardView {
+            slots: manager.lock().unwrap().list(),
+            work: store.view(),
+            locks: locks.view(),
+            coord: ctx.coord.view(),
+        }),
+        Request::CoordStatus => Response::Coord(ctx.coord.view()),
+        Request::SetBoardSummary { from, text } => ctx.coord.set_summary(from, &text, unix_now()),
+        Request::RequestStatus { from, slot } => {
+            let running = valid_id(slot)
+                && matches!(
+                    manager.lock().unwrap().list()[slot as usize].state,
+                    SlotState::Running { .. }
+                );
+            ctx.coord
+                .request_status(from, slot, running, locks, unix_now())
+        }
+        Request::ReportProgress { slot, text } => {
+            let live_s0 = matches!(
+                manager.lock().unwrap().list()[0].state,
+                SlotState::Running { .. }
+            );
+            ctx.coord.report(slot, &text, live_s0, locks, unix_now())
+        }
+        Request::ProposePlan { from, plan } => {
+            let owned = ctx.coord.gather(ctx.plans);
+            ctx.coord.propose(from, plan, &owned.facts(), unix_now())
+        }
+        // Answered in `handle_frame` from a task (it runs git and starts
+        // sessions); this arm only keeps the match whole.
+        Request::DecidePlan { .. } => err("not answered here".into()),
         // Always Ok: a hook runs inside Claude and must never see a failure
         // because of the daemon's state.
         Request::Hook(ev) => {
@@ -1065,6 +1174,22 @@ fn start_stream(gate: StreamGate, att: Attachment, outbox: &Outbox, streams: &mu
             }
         }
     }));
+}
+
+/// The slot's cwd when it lies under `worktree_root`, else `None`. The guard
+/// is dropped before the caller awaits anything.
+fn slot_worktree(plans: &PlanCtx, manager: &Mutex<SlotManager>, slot: SlotId) -> Option<PathBuf> {
+    let cwd = manager
+        .lock()
+        .unwrap()
+        .list()
+        .get(slot as usize)?
+        .cwd
+        .clone()?;
+    let root = &plans.worktree_root;
+    let under = |cwd: &Path, root: &Path| cwd != root && cwd.starts_with(root);
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    (under(&cwd, root) || under(&canon(&cwd), &canon(root))).then_some(cwd)
 }
 
 #[cfg(test)]

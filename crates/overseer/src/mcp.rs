@@ -8,7 +8,7 @@
 use std::io::{BufRead, Write};
 use std::time::Duration;
 
-use overseer_proto::{paths, slot_name, Client, Request, Response, SlotId};
+use overseer_proto::{paths, slot_name, Client, Plan, PlanSlot, Request, Response, SlotId};
 use serde_json::{json, Value};
 
 /// Budget for connect plus the round trip of one tool call.
@@ -22,7 +22,10 @@ fn call_within(req: &Request) -> Duration {
         Request::Commit { .. }
         | Request::AppendJournal { .. }
         | Request::EditShared { .. }
-        | Request::UpdateCurrentSession { .. } => BRAIN_CALL_WITHIN,
+        | Request::UpdateCurrentSession { .. }
+        // Approving a plan creates worktrees and starts sessions.
+        | Request::ProposePlan { .. }
+        | Request::DecidePlan { .. } => BRAIN_CALL_WITHIN,
         _ => CALL_WITHIN,
     }
 }
@@ -128,6 +131,97 @@ fn tools() -> Value {
                 },
                 "required": ["text"]
             }
+        },
+        {
+            "name": "get_board",
+            "description": "The whole board in one answer: the coordinator's summary, every slot with its state, owned items, held targets and last report, the work items, the locks and any plan waiting for Jonathan. Read-only.",
+            "inputSchema": {"type": "object", "properties": {}}
+        },
+        {
+            "name": "get_work_items",
+            "description": "List the work items (tickets and beads) with their owners and source health. Read-only.",
+            "inputSchema": {"type": "object", "properties": {}}
+        },
+        {
+            "name": "propose_plan",
+            "description": "Coordinator only. Propose a plan for Jonathan to approve: which slot takes which items, which targets it claims, where it works and what it is told. Nothing runs until Jonathan approves. A new plan replaces a pending one.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "summary": {"type": "string", "description": "What the plan is for, in a line or two."},
+                    "slots": {
+                        "type": "array",
+                        "description": "What each slot does, S1 to S6.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "slot": {"type": ["string", "integer"], "description": "The slot, as S3 or 3."},
+                                "label": {"type": "string", "description": "A short name for the slot's work."},
+                                "items": {"type": "array", "items": {"type": "string"}, "description": "Work item keys to assign, for example DEMO-12 or ov-3."},
+                                "targets": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "target": {"type": "string", "description": "For example repo:demo-api:main."},
+                                            "reason": {"type": "string"}
+                                        },
+                                        "required": ["target"]
+                                    },
+                                    "description": "Targets the slot claims."
+                                },
+                                "worktree": {
+                                    "type": "object",
+                                    "properties": {
+                                        "repo": {"type": "string", "description": "The repository folder."},
+                                        "ticket": {"type": "string", "description": "The ticket, which names the branch and the worktree."}
+                                    },
+                                    "required": ["repo", "ticket"],
+                                    "description": "A git worktree to make for the slot."
+                                },
+                                "cwd": {"type": "string", "description": "The folder to start the session in when there is no worktree."},
+                                "kickoff": {"type": "string", "description": "Extra text for the slot's first message."},
+                                "rules": {"type": "array", "items": {"type": "string"}, "description": "Collision rules, for example Do not deploy to UAT before S2 merges."}
+                            },
+                            "required": ["slot"]
+                        }
+                    }
+                },
+                "required": ["summary", "slots"]
+            }
+        },
+        {
+            "name": "request_status",
+            "description": "Coordinator only. Ask a running slot for a short status. It answers with report_progress.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "slot": {"type": ["string", "integer"], "description": "The slot to ask, as S3 or 3."}
+                },
+                "required": ["slot"]
+            }
+        },
+        {
+            "name": "report_progress",
+            "description": "Tell the coordinator where you are, in two or three lines. Use it when asked for a status and when you finish something.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "Your progress."}
+                },
+                "required": ["text"]
+            }
+        },
+        {
+            "name": "set_board_summary",
+            "description": "Coordinator only. Set the board summary Jonathan sees at the top of the board. It replaces the previous one.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "The summary."}
+                },
+                "required": ["text"]
+            }
         }
     ])
 }
@@ -187,6 +281,32 @@ fn slot_arg(v: &Value) -> Option<SlotId> {
     Some(SlotId::try_from(n).unwrap_or(SlotId::MAX))
 }
 
+/// A plan from its JSON: `{"summary": ..., "slots": [...]}`, where a slot's
+/// `slot` is `"S3"` or `3`. The rest is the wire shape of `Plan`.
+pub(crate) fn plan_from_json(v: &Value) -> Result<Plan, String> {
+    let Some(Value::Array(raw)) = v.get("slots") else {
+        return Err("`slots` must be an array".into());
+    };
+    let mut slots = Vec::new();
+    for (i, entry) in raw.iter().enumerate() {
+        let mut entry = entry.clone();
+        let id = entry
+            .get("slot")
+            .ok_or_else(|| format!("slot {} of the plan has no `slot`", i + 1))?;
+        let id = slot_arg(id)
+            .ok_or_else(|| format!("slot {}: `slot` must be a slot like \"S3\" or 3", i + 1))?;
+        entry["slot"] = json!(id);
+        slots.push(
+            serde_json::from_value::<PlanSlot>(entry)
+                .map_err(|e| format!("slot {} of the plan is not valid: {e}", i + 1))?,
+        );
+    }
+    Ok(Plan {
+        summary: opt_str_arg(v, "summary")?.unwrap_or_default(),
+        slots,
+    })
+}
+
 /// The tool call parsed into the request to send, before any slot check.
 fn tool_request(name: &str, args: &Value, slot: Option<SlotId>) -> Result<ToolPlan, String> {
     let own = slot.unwrap_or(0);
@@ -234,6 +354,34 @@ fn tool_request(name: &str, args: &Value, slot: Option<SlotId>) -> Result<ToolPl
         // The daemon names the section after the slot and its label.
         "update_current_session" => ToolPlan::Send(Request::UpdateCurrentSession {
             slot: own,
+            text: str_arg(args, "text")?.to_owned(),
+        }),
+        "get_board" => ToolPlan::Send(Request::GetBoard),
+        "get_work_items" => ToolPlan::Send(Request::ListWorkItems),
+        "propose_plan" => {
+            str_arg(args, "summary")?;
+            ToolPlan::Send(Request::ProposePlan {
+                from: slot,
+                plan: plan_from_json(args)?,
+            })
+        }
+        "request_status" => {
+            let to = args
+                .get("slot")
+                .ok_or_else(|| "missing `slot`".to_string())?;
+            let to =
+                slot_arg(to).ok_or_else(|| "`slot` must be a slot like \"S3\" or 3".to_string())?;
+            ToolPlan::Send(Request::RequestStatus {
+                from: slot,
+                slot: to,
+            })
+        }
+        "report_progress" => ToolPlan::Send(Request::ReportProgress {
+            slot: own,
+            text: str_arg(args, "text")?.to_owned(),
+        }),
+        "set_board_summary" => ToolPlan::Send(Request::SetBoardSummary {
+            from: slot,
             text: str_arg(args, "text")?.to_owned(),
         }),
         other => return Err(format!("unknown tool `{other}`")),
@@ -299,6 +447,19 @@ fn call_tool(params: &Value, slot: Option<SlotId>, call: &mut Call) -> Result<Va
         Ok(Response::Text { text }) => tool_result(text, false),
         Ok(Response::Queued { message }) => tool_result(message, false),
         Ok(Response::Locks(view)) => tool_result(format_locks(&view), false),
+        Ok(Response::Board(view)) => tool_result(
+            crate::ctl::format_board(&view, crate::ctl::now_secs()),
+            false,
+        ),
+        Ok(Response::Work(view)) => {
+            let lines = crate::ctl::format_work(&view);
+            let text = if lines.is_empty() {
+                "No work items.".to_string()
+            } else {
+                lines.join("\n")
+            };
+            tool_result(text, false)
+        }
         Ok(Response::Ok) => tool_result("Done.", false),
         Ok(other) => tool_result(format!("Unexpected reply from Overseer: {other:?}"), true),
     })
@@ -622,7 +783,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_names_the_eight_tools() {
+    fn tools_list_has_fourteen_tools() {
         let (out, _) = call_with(&rpc("tools/list", json!({})), Some(1), Ok(Response::Ok));
         let out = out.unwrap();
         let names: Vec<&str> = out["result"]["tools"]
@@ -641,9 +802,16 @@ mod tests {
                 "commit_2ndbrain",
                 "append_journal",
                 "edit_shared_file",
-                "update_current_session"
+                "update_current_session",
+                "get_board",
+                "get_work_items",
+                "propose_plan",
+                "request_status",
+                "report_progress",
+                "set_board_summary"
             ]
         );
+        assert_eq!(names.len(), 14);
     }
 
     #[test]
@@ -839,5 +1007,66 @@ mod tests {
         let (out, seen) = call_with(&tool("list_targets", json!({})), None, Ok(Response::Ok));
         assert_eq!(text_of(&out.unwrap()), (NOT_IN_A_SLOT, true));
         assert!(seen.is_empty());
+    }
+
+    #[test]
+    fn propose_plan_takes_slot_names_and_numbers() {
+        let args = json!({
+            "summary": "two lanes",
+            "slots": [
+                {"slot": "S3", "label": "demo lane", "items": ["DEMO-12"],
+                 "targets": [{"target": "repo:demo-api:main", "reason": "merge"}],
+                 "worktree": {"repo": "/srv/demo-api", "ticket": "DEMO-12"},
+                 "rules": ["Do not deploy before S2 merges"]},
+                {"slot": 3}
+            ]
+        });
+        let (_, seen) = call_with(
+            &tool("propose_plan", args),
+            Some(0),
+            Ok(Response::Text { text: "ok".into() }),
+        );
+        let Request::ProposePlan { from, plan } = &seen[0] else {
+            panic!("{seen:?}")
+        };
+        assert_eq!(*from, Some(0));
+        assert_eq!(plan.summary, "two lanes");
+        assert_eq!(plan.slots[0].slot, 3);
+        assert_eq!(plan.slots[1].slot, 3);
+        assert_eq!(plan.slots[0].targets[0].target, "repo:demo-api:main");
+        assert_eq!(plan.slots[0].worktree.as_ref().unwrap().ticket, "DEMO-12");
+        assert_eq!(plan.slots[0].rules.len(), 1);
+    }
+
+    #[test]
+    fn propose_plan_rejects_a_bad_slot_shape() {
+        let args = json!({"summary": "x", "slots": [{"slot": true}]});
+        let (out, seen) = call_with(&tool("propose_plan", args), Some(0), Ok(Response::Ok));
+        assert!(seen.is_empty());
+        assert_eq!(out.unwrap()["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn report_progress_without_a_slot_is_refused() {
+        let (out, seen) = call_with(
+            &tool("report_progress", json!({"text": "done"})),
+            None,
+            Ok(Response::Ok),
+        );
+        assert!(seen.is_empty());
+        assert_eq!(text_of(&out.unwrap()), (NOT_IN_A_SLOT, true));
+    }
+
+    #[test]
+    fn report_progress_is_from_the_calling_slot() {
+        let (_, seen) = call_with(
+            &tool("report_progress", json!({"text": "done"})),
+            Some(4),
+            Ok(Response::Ok),
+        );
+        assert!(matches!(
+            &seen[0],
+            Request::ReportProgress { slot: 4, text } if text == "done"
+        ));
     }
 }

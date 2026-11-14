@@ -7,9 +7,10 @@ use bytes::Bytes;
 use overseer_daemon::locks::targets::{default_patterns, load_patterns, Pattern};
 use overseer_daemon::{run, DaemonConfig};
 use overseer_proto::{
-    read_frame, write_frame, Activity, ActivityKind, BashCheck, ClaimKind, Event, Frame, HookEvent,
-    HookKind, ItemKind, LockView, RelayState, Request, Response, Sender, SlotInfo, SlotState,
-    SourceStatus, WorkItem, WorkView,
+    read_frame, write_frame, Activity, ActivityKind, BashCheck, BoardView, ClaimKind, CoordView,
+    Event, Frame, HookEvent, HookKind, ItemKind, LockView, Plan, PlanDecision, PlanSlot, PlanState,
+    PlanTarget, PlanWorktree, RelayState, ReportKind, Request, Response, Sender, SlotInfo,
+    SlotState, SourceStatus, WorkItem, WorkView,
 };
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::UnixStream;
@@ -1017,9 +1018,9 @@ async fn s0_started_fresh_gets_the_kickoff_last() {
     };
     assert_eq!(c.request(start).await, Response::Ok);
     let lines = wait_for_log(&log, 1).await;
-    // Kickoff ends in "what." so check the whole tail, not one word.
+    // Check the whole tail of the kickoff, not one word.
     assert!(
-        lines[0].ends_with("propose who works on what."),
+        lines[0].ends_with("propose a plan with propose_plan."),
         "{}",
         lines[0]
     );
@@ -3561,4 +3562,819 @@ fn bash_in(slot: u8, command: &str, cwd: &str) -> Request {
         cwd: Some(PathBuf::from(cwd)),
         env: vec![],
     })
+}
+
+impl Client {
+    async fn board(&mut self) -> BoardView {
+        match self.request(Request::GetBoard).await {
+            Response::Board(b) => b,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    async fn coord(&mut self) -> CoordView {
+        match self.request(Request::CoordStatus).await {
+            Response::Coord(v) => v,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    async fn set_summary(&mut self, from: Option<u8>, text: &str) -> Response {
+        self.request(Request::SetBoardSummary {
+            from,
+            text: text.into(),
+        })
+        .await
+    }
+
+    async fn ask_status(&mut self, from: Option<u8>, slot: u8) -> Response {
+        self.request(Request::RequestStatus { from, slot }).await
+    }
+
+    async fn report(&mut self, slot: u8, text: &str) -> Response {
+        self.request(Request::ReportProgress {
+            slot,
+            text: text.into(),
+        })
+        .await
+    }
+
+    /// The next `CoordChanged` event.
+    async fn coord_event(&mut self) -> CoordView {
+        loop {
+            if let Frame::Event(Event::CoordChanged(v)) =
+                self.recv().await.expect("connection closed")
+            {
+                return v;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn summary_from_s0_shows_on_the_board() {
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    assert_eq!(c.board().await.coord.summary, None);
+    let resp = c
+        .set_summary(Some(0), "Two lanes \u{2014} both green")
+        .await;
+    assert_eq!(resp, Response::Ok);
+    let event = c.coord_event().await;
+    assert_eq!(event.summary.unwrap().text, "Two lanes - both green");
+    let board = c.board().await;
+    assert_eq!(board.coord.summary.unwrap().text, "Two lanes - both green");
+    assert_eq!(board.slots.len(), 7);
+    // Jonathan, through ctl, may set it too.
+    assert_eq!(c.set_summary(None, "  Quiet  ").await, Response::Ok);
+    assert_eq!(c.coord().await.summary.unwrap().text, "Quiet");
+}
+
+#[tokio::test]
+async fn summary_from_a_worker_is_refused() {
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    let resp = c.set_summary(Some(3), "take over").await;
+    assert!(
+        is_error(&resp, "only the coordinator (S0) can set the board summary"),
+        "{resp:?}"
+    );
+    assert_eq!(c.coord().await.summary, None);
+}
+
+#[tokio::test]
+async fn summary_limits() {
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    let resp = c.set_summary(Some(0), "  ").await;
+    assert!(is_error(&resp, "the summary is empty"), "{resp:?}");
+    let resp = c.set_summary(Some(0), &"x".repeat(2001)).await;
+    assert!(
+        is_error(&resp, "the summary is longer than 2000 characters"),
+        "{resp:?}"
+    );
+    assert_eq!(
+        c.set_summary(Some(0), &"x".repeat(2000)).await,
+        Response::Ok
+    );
+    let resp = c.report(3, "").await;
+    assert!(is_error(&resp, "the report is empty"), "{resp:?}");
+}
+
+#[tokio::test]
+async fn status_request_relays_and_the_answer_comes_back() {
+    let (s0, s3) = (box_stub("status-s0"), box_stub("status-s3"));
+    let d = start_daemon_with(temp_socket(), s0.env()).await;
+    let mut c = Client::connect(&d.socket).await;
+    c.start_stub(0, &s0).await;
+    c.start_stub(3, &s3).await;
+    c.hook(hook(0, HookKind::SessionStart)).await;
+    c.hook(hook(3, HookKind::SessionStart)).await;
+    let resp = c.ask_status(Some(0), 3).await;
+    assert!(matches!(resp, Response::Text { .. }), "{resp:?}");
+    let ask = "Overseer: S0 asks for a short status. Answer with the report_progress tool in two or three lines.";
+    assert_eq!(s3.read_until(&pasted(ask)).await, pasted(ask));
+    assert_eq!(c.coord().await.status_asked.len(), 1);
+    assert_eq!(c.report(3, "Tests pass, PR next").await, Response::Ok);
+    let reply = "Overseer: S3 reports: Tests pass, PR next";
+    assert_eq!(s0.read_until(&pasted(reply)).await, pasted(reply));
+    let coord = c.coord().await;
+    assert!(coord.status_asked.is_empty(), "{:?}", coord.status_asked);
+    let report = coord.reports_for(3).next().unwrap();
+    assert_eq!(report.kind, ReportKind::Report);
+    assert_eq!(report.text, "Tests pass, PR next");
+}
+
+#[tokio::test]
+async fn second_status_request_sends_one_relay() {
+    let (s0, s3) = (box_stub("again-s0"), box_stub("again-s3"));
+    let d = start_daemon_with(temp_socket(), s0.env()).await;
+    let mut c = Client::connect(&d.socket).await;
+    c.start_stub(3, &s3).await;
+    assert!(matches!(c.ask_status(None, 3).await, Response::Text { .. }));
+    let asked = c.coord().await.status_asked[0].1;
+    let hhmm = overseer_daemon::locks::local_hhmm(asked);
+    let resp = c.ask_status(Some(0), 3).await;
+    assert_eq!(
+        resp,
+        Response::Text {
+            text: format!("already asked S3 at {hhmm}")
+        }
+    );
+    let to_s3 = c
+        .locks()
+        .await
+        .relays
+        .into_iter()
+        .filter(|r| r.to == 3)
+        .count();
+    assert_eq!(to_s3, 1);
+    // A worker may not ask.
+    let resp = c.ask_status(Some(2), 3).await;
+    assert!(
+        is_error(&resp, "only the coordinator (S0) can ask for a status"),
+        "{resp:?}"
+    );
+    drop(s0);
+}
+
+#[tokio::test]
+async fn status_of_a_stopped_slot_is_refused() {
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    let resp = c.ask_status(Some(0), 3).await;
+    assert!(is_error(&resp, "S3 is not running"), "{resp:?}");
+    assert!(c.coord().await.status_asked.is_empty());
+}
+
+#[tokio::test]
+async fn timeline_records_state_changes() {
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    assert_eq!(c.start(3).await, Response::Ok);
+    c.hook(hook(3, HookKind::UserPromptSubmit)).await;
+    c.hook(hook(3, HookKind::Stop)).await;
+    let mut texts = Vec::new();
+    for _ in 0..250 {
+        let coord = c.coord().await;
+        let mut rows: Vec<_> = coord.reports_for(3).collect();
+        rows.reverse();
+        texts = rows.iter().map(|r| r.text.clone()).collect();
+        if texts.len() >= 3 {
+            assert!(rows.iter().all(|r| r.kind == ReportKind::State));
+            break;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(texts, ["started", "working", "idle"]);
+}
+
+/// A daemon whose default command is a stub `claude` that logs each start,
+/// over stub work sources and a throwaway git repo `demo-api`.
+struct PlanRig {
+    s: Sources,
+    repo: PathBuf,
+    worktrees: PathBuf,
+    work5: PathBuf,
+    bin: PathBuf,
+    log: PathBuf,
+}
+
+fn git_in(dir: &std::path::Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "user.name=Test", "-c", "user.email=test@example.test"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+impl PlanRig {
+    fn new(name: &str) -> PlanRig {
+        let s = stub_sources(&format!("plan-{name}"), false);
+        let (bin, log) = stub_claude(&s.dir.join("stub"));
+        let repo = s.dir.join("repos/demo-api");
+        std::fs::create_dir_all(&repo).unwrap();
+        let repo = repo.canonicalize().unwrap();
+        git_in(&repo, &["init", "-q", "-b", "main"]);
+        git_in(&repo, &["commit", "-q", "--allow-empty", "-m", "start"]);
+        let worktrees = s.dir.join("worktrees");
+        std::fs::create_dir_all(&worktrees).unwrap();
+        let work5 = s.dir.join("work5");
+        std::fs::create_dir_all(&work5).unwrap();
+        PlanRig {
+            repo,
+            worktrees: worktrees.canonicalize().unwrap(),
+            work5: work5.canonicalize().unwrap(),
+            s,
+            bin,
+            log,
+        }
+    }
+
+    fn worktree(&self) -> PathBuf {
+        self.worktrees.join("demo-api-DEMO-12")
+    }
+
+    async fn daemon_at(&self, socket: PathBuf) -> Daemon {
+        let state_dir = socket.parent().unwrap().join("state");
+        let settings = overseer_daemon::Config {
+            worktree_root: self.worktrees.clone(),
+            current_session: self.s.dir.join("CURRENT_SESSION.md"),
+            ..self.s.settings()
+        };
+        let cfg = DaemonConfig {
+            socket: socket.clone(),
+            default_command: vec![self.bin.to_string_lossy().into_owned()],
+            env: self.s.env(),
+            state_dir: state_dir.clone(),
+            hook_program: PathBuf::from("/bin/true"),
+            settings,
+            patterns: default_patterns(),
+        };
+        let task = tokio::spawn(run(cfg));
+        for _ in 0..100 {
+            if UnixStream::connect(&socket).await.is_ok() {
+                return Daemon {
+                    socket,
+                    state_dir,
+                    task,
+                };
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        panic!("daemon did not come up");
+    }
+
+    /// A daemon and a client that has loaded the work items.
+    async fn start(&self) -> (Daemon, Client) {
+        let d = self.daemon_at(temp_socket()).await;
+        let mut c = Client::connect(&d.socket).await;
+        c.refresh().await;
+        (d, c)
+    }
+
+    /// Everything the stub `claude` logged.
+    fn calls(&self) -> String {
+        std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    /// How many sessions the default command started.
+    fn starts(&self) -> usize {
+        self.calls().matches("|--session-id").count()
+    }
+
+    fn slot4(&self) -> PlanSlot {
+        PlanSlot {
+            slot: 4,
+            label: String::new(),
+            items: vec!["DEMO-12".into()],
+            targets: vec![PlanTarget {
+                target: "repo:demo-api:main".into(),
+                reason: Some("merge".into()),
+            }],
+            worktree: Some(PlanWorktree {
+                repo: self.repo.clone(),
+                ticket: "DEMO-12".into(),
+            }),
+            cwd: None,
+            kickoff: "Start with the parser.".into(),
+            rules: vec![],
+        }
+    }
+
+    fn slot3(&self) -> PlanSlot {
+        PlanSlot {
+            slot: 3,
+            label: String::new(),
+            items: vec!["ov-4".into()],
+            targets: vec![],
+            worktree: None,
+            cwd: None,
+            kickoff: "Pick this up next.".into(),
+            rules: vec![],
+        }
+    }
+
+    fn slot5(&self) -> PlanSlot {
+        PlanSlot {
+            slot: 5,
+            label: "lane five".into(),
+            items: vec![],
+            targets: vec![],
+            worktree: None,
+            cwd: Some(self.work5.clone()),
+            kickoff: "Look at the logs.".into(),
+            rules: vec![],
+        }
+    }
+}
+
+fn plan_of(slots: Vec<PlanSlot>) -> Plan {
+    Plan {
+        summary: "Two lanes".into(),
+        slots,
+    }
+}
+
+impl Client {
+    async fn propose(&mut self, from: Option<u8>, plan: Plan) -> Response {
+        self.request(Request::ProposePlan { from, plan }).await
+    }
+
+    async fn approve(&mut self, id: i64, plan: Plan) -> Response {
+        self.request(Request::DecidePlan {
+            id,
+            from: None,
+            decision: PlanDecision::Approve { plan },
+        })
+        .await
+    }
+
+    async fn reject(&mut self, id: i64, reason: &str) -> Response {
+        self.request(Request::DecidePlan {
+            id,
+            from: None,
+            decision: PlanDecision::Reject {
+                reason: reason.into(),
+            },
+        })
+        .await
+    }
+
+    async fn plan_record(&mut self, id: i64) -> overseer_proto::PlanRecord {
+        self.coord()
+            .await
+            .plans
+            .into_iter()
+            .find(|p| p.id == id)
+            .unwrap_or_else(|| panic!("no plan {id}"))
+    }
+}
+
+/// S0 and S3 running as stubs that draw Claude's input box, both idle.
+async fn live_s0_and_s3(c: &mut Client, name: &str) -> (BoxStub, BoxStub) {
+    let (s0, s3) = (
+        box_stub(&format!("{name}-s0")),
+        box_stub(&format!("{name}-s3")),
+    );
+    c.start_stub(0, &s0).await;
+    c.start_stub(3, &s3).await;
+    c.hook(hook(0, HookKind::SessionStart)).await;
+    c.hook(hook(3, HookKind::SessionStart)).await;
+    (s0, s3)
+}
+
+#[tokio::test]
+async fn propose_from_a_worker_is_refused() {
+    let rig = PlanRig::new("worker");
+    let (_d, mut c) = rig.start().await;
+    let resp = c.propose(Some(3), plan_of(vec![rig.slot4()])).await;
+    assert!(
+        is_error(&resp, "only the coordinator (S0) can propose a plan"),
+        "{resp:?}"
+    );
+    assert!(c.coord().await.plans.is_empty());
+}
+
+#[tokio::test]
+async fn proposed_plan_is_pending_and_announced() {
+    let rig = PlanRig::new("announce");
+    let (_d, mut c) = rig.start().await;
+    // S2 owns the ticket, so a bead under it is a warning, not a refusal.
+    assert_eq!(c.assign("DEMO-12", 2, false, false).await, Response::Ok);
+    let mut s4 = rig.slot4();
+    s4.items = vec!["ov-1".into()];
+    let resp = c.propose(Some(0), plan_of(vec![s4])).await;
+    assert_eq!(
+        resp,
+        Response::Text {
+            text: "Plan 1 is waiting for Jonathan.".into()
+        }
+    );
+    let event = c.coord_event().await;
+    assert_eq!(event.plans.len(), 1);
+    assert_eq!(event.plans[0].state, PlanState::Pending);
+    assert_eq!(
+        event.plans[0].warnings,
+        vec!["This bead is under DEMO-12, owned by S2. Assign to S4 anyway?".to_string()]
+    );
+    assert_eq!(event.pending_plan().unwrap().id, 1);
+}
+
+#[tokio::test]
+async fn new_plan_supersedes_the_old() {
+    let rig = PlanRig::new("supersede");
+    let (_d, mut c) = rig.start().await;
+    let first = c.propose(None, plan_of(vec![rig.slot4()])).await;
+    assert_eq!(
+        first,
+        Response::Text {
+            text: "Plan 1 is waiting for Jonathan.".into()
+        }
+    );
+    let second = c.propose(Some(0), plan_of(vec![rig.slot5()])).await;
+    match second {
+        Response::Text { text } => assert!(
+            text == "Plan 2 is waiting for Jonathan. It replaces plan 1.",
+            "{text}"
+        ),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(c.plan_record(1).await.state, PlanState::Superseded);
+    assert_eq!(c.plan_record(2).await.state, PlanState::Pending);
+}
+
+#[tokio::test]
+async fn approve_runs_every_step() {
+    let rig = PlanRig::new("approve");
+    let (_d, mut c) = rig.start().await;
+    let (s0, s3) = live_s0_and_s3(&mut c, "approve").await;
+    let plan = plan_of(vec![rig.slot4(), rig.slot3()]);
+    assert!(matches!(
+        c.propose(Some(0), plan.clone()).await,
+        Response::Text { .. }
+    ));
+    let resp = c.approve(1, plan).await;
+    let text = match resp {
+        Response::Text { text } => text,
+        other => panic!("{other:?}"),
+    };
+    let wt = rig.worktree();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "S3: assigned ov-4".to_string(),
+            "S3: kickoff queued".to_string(),
+            "S4: assigned DEMO-12".to_string(),
+            format!("S4: worktree {} created", wt.display()),
+            "S4: holds repo:demo-api:main".to_string(),
+            format!("S4: started in {}", wt.display()),
+        ]
+    );
+
+    let work = c.work().await;
+    assert_eq!(item(&work, "DEMO-12").owner, Some(4));
+    assert_eq!(item(&work, "ov-4").owner, Some(3));
+    let locks = c.locks().await;
+    assert!(
+        holds(&locks).contains(&("repo:demo-api:main".to_string(), 4, ClaimKind::Claim)),
+        "{:?}",
+        holds(&locks)
+    );
+    assert!(wt.is_dir());
+
+    rig.starts_reach(1).await;
+    let calls = rig.calls();
+    assert!(calls.starts_with(&format!("{}|", wt.display())), "{calls}");
+    let prompt = calls.split_once(" -- ").unwrap().1;
+    assert!(prompt.contains("DEMO-12"), "{prompt}");
+    assert!(prompt.contains(&wt.display().to_string()), "{prompt}");
+    assert!(prompt.contains("Start with the parser."), "{prompt}");
+    assert!(
+        prompt.contains("You hold these targets: repo:demo-api:main"),
+        "{prompt}"
+    );
+
+    s3.read_until("Pick this up next.").await;
+    let told = s0.read_until("Jonathan approved plan 1.").await;
+    assert!(told.contains("S4: holds repo:demo-api:main"), "{told}");
+    assert!(told.contains("S3: kickoff queued"), "{told}");
+
+    let record = c.plan_record(1).await;
+    assert_eq!(record.state, PlanState::Approved);
+    assert!(!record.edited);
+    assert_eq!(record.outcome, lines);
+}
+
+#[tokio::test]
+async fn approve_with_edits_says_so() {
+    let rig = PlanRig::new("edits");
+    let (_d, mut c) = rig.start().await;
+    let (s0, s3) = live_s0_and_s3(&mut c, "edits").await;
+    let proposed = plan_of(vec![rig.slot4(), rig.slot3()]);
+    assert!(matches!(
+        c.propose(Some(0), proposed).await,
+        Response::Text { .. }
+    ));
+    let edited = plan_of(vec![rig.slot4()]);
+    let resp = c.approve(1, edited.clone()).await;
+    assert!(matches!(resp, Response::Text { .. }), "{resp:?}");
+    s0.read_until("Jonathan approved plan 1 with edits.").await;
+    let record = c.plan_record(1).await;
+    assert!(record.edited);
+    assert_eq!(record.plan, edited);
+    // Only S4 ran: S3 got no kickoff and ov-4 has no owner.
+    rig.starts_reach(1).await;
+    assert_eq!(rig.starts(), 1);
+    assert_eq!(item(&c.work().await, "ov-4").owner, None);
+    s3.reads_nothing_for(1).await;
+}
+
+#[tokio::test]
+async fn approval_revalidates() {
+    let rig = PlanRig::new("revalidate");
+    let (_d, mut c) = rig.start().await;
+    let plan = plan_of(vec![rig.slot4()]);
+    assert!(matches!(
+        c.propose(Some(0), plan.clone()).await,
+        Response::Text { .. }
+    ));
+    // Jonathan assigns the ticket by hand before approving.
+    assert_eq!(c.assign("DEMO-12", 2, false, false).await, Response::Ok);
+    let resp = c.approve(1, plan).await;
+    assert_eq!(
+        resp,
+        Response::Error {
+            message: "DEMO-12 is owned by S2".into()
+        }
+    );
+    assert_eq!(c.plan_record(1).await.state, PlanState::Pending);
+    assert!(matches!(c.list().await[4].state, SlotState::Empty));
+    assert_eq!(rig.starts(), 0);
+    assert!(!rig.worktree().exists());
+}
+
+#[tokio::test]
+async fn second_approval_is_refused() {
+    let rig = PlanRig::new("twice");
+    let (d, mut c1) = rig.start().await;
+    let mut c2 = Client::connect(&d.socket).await;
+    let plan = plan_of(vec![rig.slot4()]);
+    assert!(matches!(
+        c1.propose(Some(0), plan.clone()).await,
+        Response::Text { .. }
+    ));
+    let (a, b) = tokio::join!(c1.approve(1, plan.clone()), c2.approve(1, plan));
+    let (oks, errs): (Vec<_>, Vec<_>) = [a, b]
+        .into_iter()
+        .partition(|r| matches!(r, Response::Text { .. }));
+    assert_eq!(oks.len(), 1, "{oks:?} {errs:?}");
+    assert_eq!(
+        errs,
+        [Response::Error {
+            message: "plan 1 is no longer pending".into()
+        }]
+    );
+    rig.starts_reach(1).await;
+    sleep(Duration::from_millis(500)).await;
+    assert_eq!(rig.starts(), 1);
+}
+
+impl PlanRig {
+    async fn starts_reach(&self, n: usize) {
+        for _ in 0..100 {
+            if self.starts() >= n {
+                return;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        panic!("stub started {} times, wanted {n}", self.starts());
+    }
+}
+
+#[tokio::test]
+async fn a_failing_slot_does_not_stop_the_others() {
+    let rig = PlanRig::new("failing");
+    let (_d, mut c) = rig.start().await;
+    // A plain folder where S4's worktree would go.
+    std::fs::create_dir_all(rig.worktree()).unwrap();
+    let plan = plan_of(vec![rig.slot4(), rig.slot5()]);
+    assert!(matches!(
+        c.propose(Some(0), plan.clone()).await,
+        Response::Text { .. }
+    ));
+    let text = match c.approve(1, plan).await {
+        Response::Text { text } => text,
+        other => panic!("{other:?}"),
+    };
+    let wt = rig.worktree();
+    let failed = format!(
+        "S4: worktree {0} failed: {0} exists and is not a worktree of {1}; the rest of S4's plan was skipped",
+        wt.display(),
+        rig.repo.display()
+    );
+    assert!(text.lines().any(|l| l == failed), "{text}");
+    assert!(
+        text.lines()
+            .any(|l| l == format!("S5: started in {}", rig.work5.display())),
+        "{text}"
+    );
+    // S4 stopped after its items; S5 started.
+    assert!(matches!(c.list().await[4].state, SlotState::Empty));
+    rig.starts_reach(1).await;
+    assert!(rig
+        .calls()
+        .starts_with(&format!("{}|", rig.work5.display())));
+    assert_eq!(c.locks().await.claims.len(), 0);
+}
+
+#[tokio::test]
+async fn reject_tells_s0() {
+    let rig = PlanRig::new("reject");
+    let (_d, mut c) = rig.start().await;
+    let (s0, _s3) = live_s0_and_s3(&mut c, "reject").await;
+    assert!(matches!(
+        c.propose(Some(0), plan_of(vec![rig.slot4()])).await,
+        Response::Text { .. }
+    ));
+    assert_eq!(c.reject(1, "not today").await, Response::Ok);
+    s0.read_until("Jonathan rejected plan 1: not today").await;
+    assert_eq!(c.plan_record(1).await.state, PlanState::Rejected);
+    assert_eq!(rig.starts(), 0);
+    // A decided plan cannot be decided again.
+    let resp = c.reject(1, "").await;
+    assert!(is_error(&resp, "plan 1 is no longer pending"), "{resp:?}");
+}
+
+#[tokio::test]
+async fn decide_from_a_slot_is_refused() {
+    let rig = PlanRig::new("slotdecide");
+    let (_d, mut c) = rig.start().await;
+    let plan = plan_of(vec![rig.slot4()]);
+    assert!(matches!(
+        c.propose(Some(0), plan.clone()).await,
+        Response::Text { .. }
+    ));
+    for decision in [
+        PlanDecision::Approve { plan: plan.clone() },
+        PlanDecision::Reject {
+            reason: String::new(),
+        },
+    ] {
+        let resp = c
+            .request(Request::DecidePlan {
+                id: 1,
+                from: Some(0),
+                decision,
+            })
+            .await;
+        assert!(
+            is_error(&resp, "only Jonathan can approve or reject a plan"),
+            "{resp:?}"
+        );
+    }
+    assert_eq!(c.plan_record(1).await.state, PlanState::Pending);
+    assert_eq!(rig.starts(), 0);
+}
+
+#[tokio::test]
+async fn pending_plan_survives_a_restart_and_approved_never_reruns() {
+    let rig = PlanRig::new("restart");
+    let (d, mut c) = rig.start().await;
+    assert_eq!(c.assign("DEMO-12", 2, false, false).await, Response::Ok);
+    let mut s4 = rig.slot4();
+    s4.items = vec!["ov-1".into()];
+    let plan = plan_of(vec![s4]);
+    assert!(matches!(
+        c.propose(Some(0), plan.clone()).await,
+        Response::Text { .. }
+    ));
+    let warnings = c.plan_record(1).await.warnings;
+    assert_eq!(warnings.len(), 1);
+    drop(c);
+
+    let socket = shutdown(d).await;
+    let d = rig.daemon_at(socket).await;
+    let mut c = Client::connect(&d.socket).await;
+    let record = c.plan_record(1).await;
+    assert_eq!(record.state, PlanState::Pending);
+    assert_eq!(record.warnings, warnings);
+    c.refresh().await;
+    let resp = c.approve(1, plan).await;
+    assert!(matches!(resp, Response::Text { .. }), "{resp:?}");
+    rig.starts_reach(1).await;
+    drop(c);
+
+    let socket = shutdown(d).await;
+    let d = rig.daemon_at(socket).await;
+    let mut c = Client::connect(&d.socket).await;
+    let record = c.plan_record(1).await;
+    assert_eq!(record.state, PlanState::Approved);
+    assert!(!record.outcome.is_empty());
+    sleep(Duration::from_millis(500)).await;
+    assert_eq!(rig.starts(), 1);
+    let resp = c.approve(1, plan_of(vec![rig.slot4()])).await;
+    assert!(is_error(&resp, "plan 1 is no longer pending"), "{resp:?}");
+}
+
+async fn kickoff_text_of(c: &mut Client, slot: u8) -> String {
+    match c.request(Request::Kickoff { slot }).await {
+        Response::Text { text } => text,
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn manual_kickoff_names_targets_and_current_session() {
+    let rig = PlanRig::new("manual-kickoff");
+    let (_d, mut c) = rig.start().await;
+    assert_eq!(c.assign("DEMO-12", 3, false, false).await, Response::Ok);
+    assert!(matches!(
+        c.request(claim_target(3, "repo:demo-api:main", None)).await,
+        Response::Ok | Response::Text { .. }
+    ));
+    let text = kickoff_text_of(&mut c, 3).await;
+    assert!(text.contains("DEMO-12"), "{text}");
+    assert!(
+        text.contains("You hold these targets: repo:demo-api:main"),
+        "{text}"
+    );
+    assert!(text.contains("Keep your section of"), "{text}");
+    assert!(
+        text.contains(&rig.s.dir.join("CURRENT_SESSION.md").display().to_string()),
+        "{text}"
+    );
+}
+
+/// A slot working in a folder under `worktree_root` is told to work there; a
+/// slot working anywhere else is not.
+#[tokio::test]
+async fn manual_kickoff_names_the_worktree_only_under_the_root() {
+    let rig = PlanRig::new("manual-kickoff-wt");
+    let (_d, mut c) = rig.start().await;
+    let wt = rig.worktrees.join("demo-api-DEMO-12");
+    std::fs::create_dir_all(&wt).unwrap();
+    assert_eq!(c.assign("DEMO-12", 3, false, false).await, Response::Ok);
+    let start = |cwd: PathBuf| Request::StartSlot {
+        id: 3,
+        label: "t3".into(),
+        cwd,
+        command: None,
+        prompt: None,
+    };
+    assert_eq!(c.request(start(rig.work5.clone())).await, Response::Ok);
+    let text = kickoff_text_of(&mut c, 3).await;
+    assert!(!text.contains("Work in "), "{text}");
+    assert_eq!(c.request(Request::StopSlot { id: 3 }).await, Response::Ok);
+    assert_eq!(c.request(start(wt.clone())).await, Response::Ok);
+    let text = kickoff_text_of(&mut c, 3).await;
+    assert!(
+        text.contains(&format!("Work in {}.", wt.display())),
+        "{text}"
+    );
+}
+
+/// The plan view re-checks an edited plan: dropping the slot a warning is
+/// about drops the warning, and a plan with nothing left is refused.
+#[tokio::test]
+async fn check_plan_recomputes_warnings_for_an_edited_plan() {
+    let rig = PlanRig::new("check");
+    let (_d, mut c) = rig.start().await;
+    assert_eq!(c.assign("DEMO-12", 2, false, false).await, Response::Ok);
+    let mut s4 = rig.slot4();
+    s4.items = vec!["ov-1".into()];
+    let check = |plan: Plan| Request::CheckPlan { plan };
+    assert_eq!(
+        c.request(check(plan_of(vec![s4, rig.slot5()]))).await,
+        Response::PlanCheck {
+            warnings: vec![
+                "This bead is under DEMO-12, owned by S2. Assign to S4 anyway?".to_string()
+            ],
+            refusal: None,
+        }
+    );
+    assert_eq!(
+        c.request(check(plan_of(vec![rig.slot5()]))).await,
+        Response::PlanCheck {
+            warnings: vec![],
+            refusal: None,
+        }
+    );
+    assert_eq!(
+        c.request(check(plan_of(vec![]))).await,
+        Response::PlanCheck {
+            warnings: vec![],
+            refusal: Some("the plan has no slots".into()),
+        }
+    );
+    // Checking records nothing.
+    assert!(c.coord().await.plans.is_empty());
 }

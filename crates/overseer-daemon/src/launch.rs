@@ -30,10 +30,20 @@ const PREVIOUS_COORDINATOR: &[u64] = &[
     0x7ddaa223f4bdd1f6,
     0xf98858507513ed2d,
     0x551d58f77936ffa0, // phase 4
+    0xbbd3513e7aa77734, // phase 5
 ];
-const PREVIOUS_WORKER: &[u64] = &[0x215de771dfd84eb4, 0xbd3ab0020d4d25b1, 0xe8deae3b8fe65917];
-const PREVIOUS_KICKOFF: &[u64] = &[];
-const PREVIOUS_ASSIGNMENT: &[u64] = &[];
+const PREVIOUS_WORKER: &[u64] = &[
+    0x215de771dfd84eb4,
+    0xbd3ab0020d4d25b1,
+    0xe8deae3b8fe65917,
+    0x751ce33e657e6c1f, // phase 5
+];
+const PREVIOUS_KICKOFF: &[u64] = &[
+    0x05db44420ef92039, // phase 5
+];
+const PREVIOUS_ASSIGNMENT: &[u64] = &[
+    0x7563493817edf95a, // phase 5
+];
 
 fn text_hash(text: &str) -> u64 {
     text.trim_end().bytes().fold(0xcbf29ce484222325, |h, b| {
@@ -178,7 +188,7 @@ fn hook_shape(event: &str) -> (Option<&'static str>, u64) {
 }
 
 /// The Overseer MCP tools a session may use without being asked.
-const ALLOWED_TOOLS: [&str; 8] = [
+const ALLOWED_TOOLS: [&str; 14] = [
     "mcp__overseer__claim_target",
     "mcp__overseer__release_target",
     "mcp__overseer__notify_session",
@@ -187,6 +197,12 @@ const ALLOWED_TOOLS: [&str; 8] = [
     "mcp__overseer__append_journal",
     "mcp__overseer__edit_shared_file",
     "mcp__overseer__update_current_session",
+    "mcp__overseer__get_board",
+    "mcp__overseer__get_work_items",
+    "mcp__overseer__propose_plan",
+    "mcp__overseer__request_status",
+    "mcp__overseer__report_progress",
+    "mcp__overseer__set_board_summary",
 ];
 
 /// Files generated for one slot's start.
@@ -590,6 +606,12 @@ mod tests {
                 "mcp__overseer__append_journal",
                 "mcp__overseer__edit_shared_file",
                 "mcp__overseer__update_current_session",
+                "mcp__overseer__get_board",
+                "mcp__overseer__get_work_items",
+                "mcp__overseer__propose_plan",
+                "mcp__overseer__request_status",
+                "mcp__overseer__report_progress",
+                "mcp__overseer__set_board_summary",
             ])
         );
     }
@@ -796,7 +818,7 @@ mod tests {
         let p = first_prompt(&dir, 0, &Start::New("u".into()), None).unwrap();
         assert_eq!(
             p.as_deref(),
-            Some("Run the start-of-day round: check beads and Jira, check the board, and propose who works on what.")
+            Some("Run the start-of-day round: call get_board, read today's journal, and propose a plan with propose_plan.")
         );
         // An explicit prompt wins; other slots get none.
         let p = first_prompt(&dir, 0, &Start::New("u".into()), Some("mine".into())).unwrap();
@@ -874,10 +896,10 @@ mod tests {
     fn overseer_path_with_a_space_is_quoted() {
         let dir = temp("space");
         let o = Path::new("/Applications/My App/overseer");
-        let f = write_slot_files(&dir, 0, "", o, &RoleDirs::default(), None).unwrap();
+        let f = write_slot_files(&dir, 1, "", o, &RoleDirs::default(), None).unwrap();
         let role = std::fs::read_to_string(f.role).unwrap();
         assert!(
-            role.contains("\"/Applications/My App/overseer\" ctl status"),
+            role.contains("\"/Applications/My App/overseer\" ctl items"),
             "{role}"
         );
     }
@@ -887,7 +909,7 @@ mod tests {
         let dir = temp("fill");
         let f = write_slot_files(
             &dir,
-            0,
+            1,
             "lbl",
             Path::new("/Apps/overseer"),
             &RoleDirs::default(),
@@ -895,7 +917,7 @@ mod tests {
         )
         .unwrap();
         let role = std::fs::read_to_string(f.role).unwrap();
-        assert!(role.contains("\"/Apps/overseer\" ctl start"), "{role}");
+        assert!(role.contains("\"/Apps/overseer\" ctl items"), "{role}");
         assert!(
             !role.contains("{overseer}") && !role.contains("{slot}"),
             "{role}"
@@ -921,20 +943,7 @@ mod tests {
             !role.contains("2ndBrain") && !role.contains("{brain}"),
             "{role}"
         );
-        // Bead and Jira text must not be shell-expanded.
-        assert!(
-            role.contains("ctl start <n> --cwd <dir> --label '<item key>' --prompt '<text>'"),
-            "{role}"
-        );
-        assert!(role.contains("ctl send <n> '<text>'"), "{role}");
-        assert!(role.contains("ctl send 0 --raw"), "{role}");
-        assert!(role.contains("call `notify_session`"), "{role}");
-        assert!(
-            role.contains("Never claim targets on a worker's behalf."),
-            "{role}"
-        );
-        assert!(role.contains("'\\''"), "{role}");
-        assert!(!role.contains("--prompt \""), "{role}");
+        assert!(role.contains("Call `notify_session`"), "{role}");
     }
 
     const PHASE_3_WORKER: &str = include_str!("../tests/fixtures/roles-phase3/worker.md");
@@ -1014,6 +1023,96 @@ mod tests {
         assert!(COORDINATOR_ROLE.contains("Before you propose work, read today's journal."));
         assert!(COORDINATOR_ROLE.contains("date '+%Y/%m-%B/%Y-%m-%d'"));
         assert!(COORDINATOR_ROLE.contains("06-Daily/"));
+    }
+
+    const PHASE_5_ASSIGNMENT: &str = include_str!("../tests/fixtures/roles-phase5/assignment.md");
+
+    #[test]
+    fn previous_assignment_hash_is_listed() {
+        assert!(PREVIOUS_ASSIGNMENT.contains(&text_hash(PHASE_5_ASSIGNMENT)));
+        // An unedited phase 5 file is upgraded in place.
+        let dir = temp("phase5assign");
+        let roles = dir.join("roles");
+        std::fs::create_dir_all(&roles).unwrap();
+        std::fs::write(roles.join("assignment.md"), PHASE_5_ASSIGNMENT).unwrap();
+        assert_eq!(
+            assignment_template(&dir).unwrap().trim_end(),
+            ASSIGNMENT.trim_end()
+        );
+        assert!(!roles.join("assignment.md.new").exists());
+    }
+
+    const PHASE_5_COORDINATOR: &str = include_str!("../tests/fixtures/roles-phase5/coordinator.md");
+    const PHASE_5_WORKER: &str = include_str!("../tests/fixtures/roles-phase5/worker.md");
+    const PHASE_5_KICKOFF: &str = include_str!("../tests/fixtures/roles-phase5/kickoff.md");
+
+    #[test]
+    fn phase5_roles_are_previous_defaults() {
+        assert!(PREVIOUS_COORDINATOR.contains(&text_hash(PHASE_5_COORDINATOR)));
+        assert!(PREVIOUS_WORKER.contains(&text_hash(PHASE_5_WORKER)));
+        assert!(PREVIOUS_KICKOFF.contains(&text_hash(PHASE_5_KICKOFF)));
+        // Unedited phase 5 files are upgraded in place.
+        let dir = temp("phase5roles");
+        let roles = dir.join("roles");
+        std::fs::create_dir_all(&roles).unwrap();
+        for (name, old, current, previous) in [
+            ("worker.md", PHASE_5_WORKER, WORKER_ROLE, PREVIOUS_WORKER),
+            (
+                "coordinator.md",
+                PHASE_5_COORDINATOR,
+                COORDINATOR_ROLE,
+                PREVIOUS_COORDINATOR,
+            ),
+            ("kickoff.md", PHASE_5_KICKOFF, KICKOFF, PREVIOUS_KICKOFF),
+        ] {
+            std::fs::write(roles.join(name), old).unwrap();
+            let path = ensure_template(&roles, name, current, previous).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(path).unwrap().trim_end(),
+                current.trim_end()
+            );
+            assert!(!roles.join(format!("{name}.new")).exists());
+        }
+    }
+
+    #[test]
+    fn coordinator_role_names_the_board_tools() {
+        for tool in [
+            "get_board",
+            "get_work_items",
+            "propose_plan",
+            "request_status",
+            "set_board_summary",
+            "notify_session",
+        ] {
+            assert!(COORDINATOR_ROLE.contains(tool), "missing {tool}");
+        }
+        for gone in [
+            "ctl assign",
+            "ctl start",
+            "Never claim targets",
+            "To give work to a running slot",
+            "Only propose idle slots",
+        ] {
+            assert!(!COORDINATOR_ROLE.contains(gone), "still has {gone}");
+        }
+    }
+
+    #[test]
+    fn worker_role_mentions_report_progress() {
+        assert!(WORKER_ROLE.contains("report_progress"));
+    }
+
+    #[test]
+    fn coordinator_role_keeps_brain_rules() {
+        assert!(COORDINATOR_ROLE.contains("{brain_rules}"));
+    }
+
+    #[test]
+    fn roles_have_no_em_dashes() {
+        for text in [COORDINATOR_ROLE, WORKER_ROLE, KICKOFF] {
+            assert!(!text.contains('\u{2014}'));
+        }
     }
 
     const PHASE_4_WORKER: &str = include_str!("../tests/fixtures/roles-phase4/worker.md");
@@ -1127,7 +1226,7 @@ mod tests {
             !off.contains("{brain_rules}") && !off.contains("Sessions/"),
             "{off}"
         );
-        assert!(off.ends_with("what.\n"), "{off:?}");
+        assert!(off.ends_with("step.\n"), "{off:?}");
         assert!(!off.contains("\n\n\n"), "{off:?}");
     }
 
@@ -1169,6 +1268,6 @@ mod tests {
             !off.contains("append_journal") && !off.contains("{brain_rules}"),
             "{off}"
         );
-        assert!(off.ends_with("\"Run another round\"`.\n"), "{off:?}");
+        assert!(off.ends_with("into this session.\n"), "{off:?}");
     }
 }

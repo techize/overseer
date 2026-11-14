@@ -26,12 +26,13 @@ use gpui::{
     Subscription, Task, Window,
 };
 use overseer_proto::{
-    BrainView, Client, Event, Frame, LockView, Request, Response, SlotId, SlotInfo, SlotState,
-    WorkView,
+    BrainView, Client, CoordView, Event, Frame, LockView, Request, Response, SlotId, SlotInfo,
+    SlotState, WorkView,
 };
 
 use crate::board::Dir;
 use crate::picker::{Picker, PickerEvent};
+use crate::plan_view::{PlanEvent, PlanView};
 use crate::session::{incarnation, keep_view, restart_begin, restart_on_change, Incarnation};
 use crate::session::{reply_note, EntryAction, EntryKind, PanelEntry, RestartPlan};
 use crate::start_dialog::{DialogEvent, Prefill, StartDialog};
@@ -83,6 +84,7 @@ actions!(
         OpenMessage,
         OpenRelease,
         OpenNote,
+        OpenPlan,
     ]
 );
 
@@ -93,9 +95,9 @@ pub enum Screen {
     Session(SlotId),
 }
 
-/// Navigation keys work anywhere in the window except the start dialog and
-/// the picker.
-const NAV: &str = "Overseer && !StartDialog && !Picker";
+/// Navigation keys work anywhere in the window except the start dialog, the
+/// picker and the plan view.
+const NAV: &str = "Overseer && !StartDialog && !Picker && !PlanView";
 
 pub fn key_bindings() -> Vec<KeyBinding> {
     let nav = Some(NAV);
@@ -132,6 +134,7 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("enter", OpenSelected, Some("Board")),
         KeyBinding::new("r", ResumeSelected, Some("Board")),
         KeyBinding::new("a", AssignSelected, Some("Board")),
+        KeyBinding::new("p", OpenPlan, Some("Board")),
         KeyBinding::new("cmd-q", Quit, None),
     ]
 }
@@ -265,6 +268,34 @@ pub fn empty_brain() -> BrainView {
     }
 }
 
+/// The coordinator view before the daemon's first answer.
+pub fn empty_coord() -> CoordView {
+    CoordView {
+        summary: None,
+        plans: Vec::new(),
+        reports: Vec::new(),
+        status_asked: Vec::new(),
+    }
+}
+
+/// A plan record for tests in this crate.
+#[cfg(test)]
+pub(crate) fn test_plan(id: i64, state: overseer_proto::PlanState) -> overseer_proto::PlanRecord {
+    overseer_proto::PlanRecord {
+        id,
+        at: 0,
+        plan: overseer_proto::Plan {
+            summary: String::new(),
+            slots: Vec::new(),
+        },
+        state,
+        decided_at: None,
+        edited: false,
+        warnings: Vec::new(),
+        outcome: Vec::new(),
+    }
+}
+
 fn empty_slots() -> Vec<SlotInfo> {
     (0..7)
         .map(|id| SlotInfo {
@@ -297,6 +328,8 @@ pub struct OverseerApp {
     pub(crate) locks: LockView,
     /// The 2ndBrain queue and push state, for the board's bottom strip.
     pub(crate) brain: BrainView,
+    /// S0's summary, the plans and the timeline from the daemon.
+    pub(crate) coord: CoordView,
     /// The push problem text last announced; see `push_problem_note`.
     notified_push: Option<String>,
     /// The strip's list shows while hovered, or until clicked away.
@@ -315,6 +348,11 @@ pub struct OverseerApp {
     terminals: HashMap<SlotId, TermEntry>,
     dialog: Option<(Entity<StartDialog>, Subscription)>,
     picker: Option<(Entity<Picker>, Subscription)>,
+    /// The open plan approval view.
+    plan_view: Option<(Entity<PlanView>, Subscription)>,
+    /// Plan views closed with a decision still on its way, kept for the
+    /// answer.
+    plan_leaving: Vec<(Entity<PlanView>, Subscription)>,
     /// Pickers closed with an assign on its way; see `PickerEvent::Late`.
     leaving: Vec<(Entity<Picker>, Subscription)>,
     restarts: HashMap<SlotId, RestartPlan>,
@@ -329,6 +367,8 @@ pub struct OverseerApp {
     _ticker: Option<Task<()>>,
     _events: Task<()>,
     _clicks: Task<()>,
+    /// A reconnect loop is running; see `connection_lost`.
+    reconnecting: bool,
 }
 
 impl OverseerApp {
@@ -338,23 +378,7 @@ impl OverseerApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let hub = cx.global::<FrameHub>().clone();
-        let mut frames = hub.take_events();
-        let events = cx.spawn_in(window, async move |this, cx| {
-            let Some(frames) = frames.as_mut() else {
-                return;
-            };
-            while let Some(frame) = frames.recv().await {
-                let alive = this.update_in(cx, |this, window, cx| this.on_frame(frame, window, cx));
-                if alive.is_err() {
-                    return;
-                }
-            }
-            let _ = this.update(cx, |this, cx| {
-                this.status = Some(crate::terminal_view::LOST_DAEMON.into());
-                cx.notify();
-            });
-        });
+        let events = Self::listen(window, cx);
         let mut clicks = crate::notify::clicks();
         let clicked = cx.spawn_in(window, async move |this, cx| {
             while let Some(click) = clicks.recv().await {
@@ -366,30 +390,7 @@ impl OverseerApp {
                 }
             }
         });
-        // The lists come back through the event stream (marked replies), so
-        // they are applied in order with the events around them.
-        let lister = client.clone();
-        cx.spawn(async move |this, cx| {
-            let mut result = lister.request_marked(Request::ListSlots, |_| true).await;
-            if result.is_ok() {
-                result = lister
-                    .request_marked(Request::ListWorkItems, |_| true)
-                    .await;
-            }
-            if result.is_ok() {
-                result = lister.request_marked(Request::ListLocks, |_| true).await;
-            }
-            if result.is_ok() {
-                result = lister.request_marked(Request::BrainStatus, |_| true).await;
-            }
-            if let Err(e) = result {
-                let _ = this.update(cx, |this, cx| {
-                    this.status = Some(format!("{} ({e:#})", crate::terminal_view::LOST_DAEMON));
-                    cx.notify();
-                });
-            }
-        })
-        .detach();
+        Self::ask_for_lists(client.clone(), cx);
         let board_focus = cx.focus_handle();
         window.focus(&board_focus);
         OverseerApp {
@@ -399,6 +400,7 @@ impl OverseerApp {
             work: empty_work(),
             locks: empty_locks(),
             brain: empty_brain(),
+            coord: empty_coord(),
             notified_push: None,
             brain_hover: false,
             brain_pinned: false,
@@ -412,6 +414,8 @@ impl OverseerApp {
             terminals: HashMap::new(),
             dialog: None,
             picker: None,
+            plan_view: None,
+            plan_leaving: Vec::new(),
             leaving: Vec::new(),
             restarts: HashMap::new(),
             kickoffs: HashSet::new(),
@@ -423,7 +427,120 @@ impl OverseerApp {
             _ticker: None,
             _events: events,
             _clicks: clicked,
+            reconnecting: false,
         }
+    }
+
+    /// Reads the current frame hub's events into `on_frame`. When they end
+    /// (the daemon went away) the app starts reconnecting.
+    fn listen(window: &mut Window, cx: &mut Context<Self>) -> Task<()> {
+        let mut frames = cx.global::<FrameHub>().take_events();
+        cx.spawn_in(window, async move |this, cx| {
+            let Some(frames) = frames.as_mut() else {
+                return;
+            };
+            while let Some(frame) = frames.recv().await {
+                let alive = this.update_in(cx, |this, window, cx| this.on_frame(frame, window, cx));
+                if alive.is_err() {
+                    return;
+                }
+            }
+            let _ = this.update_in(cx, |this, window, cx| this.connection_lost(window, cx));
+        })
+    }
+
+    /// Asks for every list. The answers come back through the event stream
+    /// (marked replies), so they are applied in order with the events around
+    /// them, and as a first sync: nothing in them notifies.
+    fn ask_for_lists(lister: Arc<Client>, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let mut result = lister.request_marked(Request::ListSlots, |_| true).await;
+            if result.is_ok() {
+                result = lister
+                    .request_marked(Request::ListWorkItems, |_| true)
+                    .await;
+            }
+            if result.is_ok() {
+                result = lister.request_marked(Request::ListLocks, |_| true).await;
+            }
+            if result.is_ok() {
+                result = lister.request_marked(Request::BrainStatus, |_| true).await;
+            }
+            if result.is_ok() {
+                result = lister.request_marked(Request::CoordStatus, |_| true).await;
+            }
+            if let Err(e) = result {
+                let _ = this.update(cx, |this, cx| {
+                    this.status = Some(format!("{} ({e:#})", crate::terminal_view::LOST_DAEMON));
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Shows that the daemon is gone and tries to reach it again, with a
+    /// growing pause, until it answers.
+    fn connection_lost(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.status = Some(crate::terminal_view::LOST_DAEMON.into());
+        cx.notify();
+        if self.reconnecting {
+            return;
+        }
+        self.reconnecting = true;
+        let runtime = cx.global::<FrameHub>().runtime().clone();
+        let socket = overseer_proto::paths::socket_path();
+        cx.spawn_in(window, async move |this, cx| {
+            let found = runtime.spawn(crate::reconnect::reconnect(socket)).await;
+            let _ = this.update_in(cx, |this, window, cx| match found {
+                Ok(client) => this.reconnected(Arc::new(client), runtime, window, cx),
+                // The runtime is shutting down with the app.
+                Err(_) => this.reconnecting = false,
+            });
+        })
+        .detach();
+    }
+
+    /// Starts over on a new connection: a new frame hub, every list asked
+    /// for again, new terminal views (the old ones read the dead
+    /// connection), and the open dialogs on the new client.
+    fn reconnected(
+        &mut self,
+        client: Arc<Client>,
+        runtime: tokio::runtime::Handle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.reconnecting = false;
+        cx.set_global(FrameHub::start(&client, runtime));
+        self.client = client.clone();
+        if let Some((d, _)) = &self.dialog {
+            d.update(cx, |d, _| d.set_client(client.clone()));
+        }
+        if let Some((p, _)) = &self.picker {
+            p.update(cx, |p, _| p.set_client(client.clone()));
+        }
+        if let Some((v, _)) = &self.plan_view {
+            v.update(cx, |v, _| v.set_client(client.clone()));
+        }
+        // Requests in flight on the old connection have failed.
+        self.restarts.clear();
+        self.kickoffs.clear();
+        let had_focus = self
+            .terminals
+            .values()
+            .any(|t| t.view.focus_handle(cx).contains_focused(window, cx));
+        self.terminals.clear();
+        if let (Screen::Session(id), true) = (self.screen, had_focus) {
+            self.focus_when_ready = Some(id);
+        }
+        let lost = crate::terminal_view::LOST_DAEMON;
+        if self.status.as_deref().is_some_and(|s| s.starts_with(lost)) {
+            self.status = None;
+        }
+        self._events = Self::listen(window, cx);
+        Self::ask_for_lists(client, cx);
+        cx.notify();
     }
 
     fn on_frame(&mut self, frame: Frame, window: &mut Window, cx: &mut Context<Self>) {
@@ -470,6 +587,20 @@ impl OverseerApp {
                 }
                 self.brain = view;
                 cx.notify();
+            }
+            // The view asked for on connecting is not news: a plan already
+            // waiting shows on the board but does not notify.
+            Frame::Response {
+                resp: Response::Coord(view),
+                ..
+            } => {
+                self.coord_changed(view, cx);
+            }
+            Frame::Event(Event::CoordChanged(view)) => {
+                if let Some(note) = crate::notify::plan_note(&self.coord, &view) {
+                    crate::notify::post(&note);
+                }
+                self.coord_changed(view, cx);
             }
             Frame::Event(Event::WorkChanged(view))
             | Frame::Response {
@@ -824,9 +955,9 @@ impl OverseerApp {
             .unwrap_or_default()
     }
 
-    /// The start dialog or the picker is up; navigation waits for it.
+    /// The start dialog, the picker or the plan view is up; navigation waits for it.
     fn modal_open(&self) -> bool {
-        self.dialog.is_some() || self.picker.is_some()
+        self.dialog.is_some() || self.picker.is_some() || self.plan_view.is_some()
     }
 
     /// The work-item picker for `slot`: `a` on the board, `+ assign` on an
@@ -987,8 +1118,63 @@ impl OverseerApp {
             match click {
                 crate::notify::Click::Slot(id) => self.go_session(id, window, cx),
                 crate::notify::Click::Board => self.go_board(window, cx),
+                crate::notify::Click::Plan => {
+                    self.go_board(window, cx);
+                    self.open_plan(window, cx);
+                }
             }
         }
+    }
+
+    /// The daemon's new coordinator view: keep it, and let an open plan
+    /// view notice that its plan was decided elsewhere.
+    fn coord_changed(&mut self, view: CoordView, cx: &mut Context<Self>) {
+        if let Some((p, _)) = &self.plan_view {
+            p.update(cx, |p, cx| p.coord_changed(&view, cx));
+        }
+        self.coord = view;
+        cx.notify();
+    }
+
+    /// `p` on the board, and a clicked plan notice: the plan approval view
+    /// for the plan waiting for Jonathan.
+    pub(crate) fn open_plan(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal_open() {
+            return;
+        }
+        let Some(rec) = self.coord.pending_plan().cloned() else {
+            self.status = Some("No plan is waiting".to_string());
+            cx.notify();
+            return;
+        };
+        self.status = None;
+        let client = self.client.clone();
+        let view = cx.new(|cx| PlanView::new(&rec, client, cx));
+        let sub = cx.subscribe_in(&view, window, |this, view, ev: &PlanEvent, window, cx| {
+            let open = this.plan_view.take_if(|(v, _)| v == view);
+            let was_front = open.is_some();
+            match ev {
+                PlanEvent::Closed => {
+                    // Kept until its decision is answered.
+                    if let Some(open) = open {
+                        if open.0.read(cx).busy() {
+                            this.plan_leaving.push(open);
+                        }
+                    }
+                }
+                PlanEvent::Decided(line) => {
+                    this.plan_leaving.retain(|(v, _)| v != view);
+                    this.status = Some(line.clone());
+                }
+            }
+            if was_front {
+                this.restore_focus(window, cx);
+            }
+            cx.notify();
+        });
+        window.focus(&view.focus_handle(cx));
+        self.plan_view = Some((view, sub));
+        cx.notify();
     }
 
     pub(crate) fn open_card(&mut self, id: SlotId, window: &mut Window, cx: &mut Context<Self>) {
@@ -1077,6 +1263,7 @@ impl Render for OverseerApp {
             .child(screen)
             .children(self.dialog.as_ref().map(|(d, _)| d.clone()))
             .children(self.picker.as_ref().map(|(p, _)| p.clone()))
+            .children(self.plan_view.as_ref().map(|(p, _)| p.clone()))
     }
 }
 
@@ -1114,6 +1301,7 @@ mod tests {
     const BOARD: &[&str] = &["Overseer", "Board"];
     const DIALOG: &[&str] = &["Overseer", "StartDialog"];
     const PICKER: &[&str] = &["Overseer", "Picker"];
+    const PLAN: &[&str] = &["Overseer", "PlanView"];
 
     #[test]
     fn cmd_digits_navigate_from_everywhere_but_the_dialog() {
@@ -1122,6 +1310,27 @@ mod tests {
         assert_eq!(routed("cmd-6", CHROME), Some("overseer::GoS6"));
         assert_eq!(routed("cmd-1", DIALOG), None);
         assert_eq!(routed("cmd-1", PICKER), None);
+    }
+
+    #[test]
+    fn cmd_enter_and_escape_route_to_plan_view() {
+        // Neither is a global binding: both reach the view's own handler.
+        assert_eq!(routed("cmd-enter", PLAN), None);
+        assert_eq!(routed("escape", PLAN), None);
+        // Cmd+A (select all) too: no binding takes it from the text fields.
+        for k in ["tab", "enter", "a", "p", "cmd-v", "cmd-a"] {
+            assert_eq!(routed(k, PLAN), None, "{k}");
+            assert_eq!(routed(k, DIALOG), None, "{k}");
+        }
+        assert_eq!(routed("cmd-q", PLAN), Some("overseer::Quit"));
+    }
+
+    #[test]
+    fn cmd_digits_do_not_route_while_plan_view_open() {
+        for d in ["cmd-0", "cmd-3", "cmd-6", "cmd-n", "cmd-escape"] {
+            assert_eq!(routed(d, PLAN), None, "{d}");
+        }
+        assert_eq!(routed("cmd-3", BOARD), Some("overseer::GoS3"));
     }
 
     #[test]
@@ -1314,5 +1523,12 @@ mod tests {
         let mut ex = s[2].clone();
         ex.state = SlotState::Exited { code: None, at: 0 };
         assert_eq!(card_click(&ex), CardClick::Open(2));
+    }
+    #[test]
+    fn p_routes_on_the_board_only() {
+        assert_eq!(routed("p", BOARD), Some("overseer::OpenPlan"));
+        for ctx in [TERMINAL, CHROME, DIALOG, PICKER] {
+            assert_eq!(routed("p", ctx), None);
+        }
     }
 }
