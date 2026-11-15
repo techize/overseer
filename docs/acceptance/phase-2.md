@@ -205,3 +205,22 @@ any failures here.
   - L5, L6: Claude's waiting-for-input notification makes the card Idle, not
     Needs you, so neither a finished turn nor an Esc interrupt posts a
     banner. An interrupted turn still reads Working for about a minute.
+- Checked in the app on Sunday 15 November 2026 by Claude, after upgrading
+  the install to build 85e9cc9 (main at 7e8d68d):
+  - F6 passed: a slot started in an untrusted scratch folder read Needs you
+    with `Claude asks whether to trust this folder`, on `ctl board` and on the
+    board's card. Choosing to trust the folder turned it Idle. In that folder
+    the cursor started on "No, exit", so a bare Enter ends the session.
+  - F9 note passed: after a daemon restart, resuming S4 moved its recorded
+    start from 16:20:33 to 16:27:37.
+  - L1 passed in part: the resumed session ran with `OVERSEER_RUN=<daemon
+    pid>-0`. Dropping a stale event is covered by the test only.
+  - L4 passed: the start dialog shows the Prompt row. A start with a prompt
+    went in through `ctl start --prompt`; typing into the dialog by computer
+    use turns every letter into "a", so the GUI path was not driven.
+  - L5, L6 passed on the daemon: a turn left Working by an error read Idle
+    with `idle_wait` once Claude's waiting-for-input notification came, not
+    Needs you.
+  - L2, L3 not checked: macOS lists no notification setting for Overseer, so
+    it posts nothing until notifications are allowed for it in System
+    Settings.
