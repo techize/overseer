@@ -30,7 +30,7 @@ enum Esc {
     /// Inside `ESC ] ...`, up to BEL or `ESC \`.
     Osc,
     /// ESC seen inside an OSC.
-    OscEsc,
+    OscEnd,
 }
 
 /// Feeds output in chunks and says when the question has appeared.
@@ -58,9 +58,9 @@ impl TrustScan {
                 (Esc::Csi, 0x40..=0x7e) => Esc::Text,
                 (Esc::Csi, _) => Esc::Csi,
                 (Esc::Osc, 0x07) => Esc::Text,
-                (Esc::Osc, 0x1b) => Esc::OscEsc,
+                (Esc::Osc, 0x1b) => Esc::OscEnd,
                 (Esc::Osc, _) => Esc::Osc,
-                (Esc::OscEsc, _) => Esc::Text,
+                (Esc::OscEnd, _) => Esc::Text,
             };
         }
         let found = NEEDLES.iter().any(|n| self.letters.contains(n));
