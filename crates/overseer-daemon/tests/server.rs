@@ -342,6 +342,16 @@ async fn two_clients_same_slot() {
     assert_eq!(a.request(resize(90, 25)).await, Response::Ok);
     let info = &a.list().await[2];
     assert_eq!((info.cols, info.rows), (90, 25));
+    // A terminal reporting no size (a bare pty) must not shrink the slot to
+    // nothing: the relay courier reads the screen at the recorded size.
+    for (cols, rows) in [(0, 0), (0, 25), (90, 0)] {
+        let Response::Error { message } = a.request(resize(cols, rows)).await else {
+            panic!("a {cols}x{rows} resize was accepted");
+        };
+        assert!(message.contains("no usable size"), "{message}");
+    }
+    let info = &a.list().await[2];
+    assert_eq!((info.cols, info.rows), (90, 25));
 }
 
 #[tokio::test]

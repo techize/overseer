@@ -227,6 +227,26 @@ mod tests {
     }
 
     #[test]
+    fn claude_2_1_259_layout_is_found() {
+        // As a live 80x24 slot draws it: a session name in the top rule, a
+        // no-break space after the mark, then vim mode and a status line.
+        let cols = 80;
+        let titled = format!("{} DEMO-12 api check \u{2500}", rule(cols - 20));
+        let mut lines = vec![
+            "\u{273B} Churned for 2s \u{00B7} done 4:23 PM".to_string(),
+            String::new(),
+        ];
+        lines.push(titled);
+        lines.push("\u{276F}\u{00A0}\x1b[2mTry \"edit <filepath> to...\"\x1b[0m".to_string());
+        lines.push(rule(cols));
+        lines.push("  -- INSERT -- \u{23F5}\u{23F5} auto mode on (shift+tab to cycle)".to_string());
+        lines.push("  Ctx: 0K/200K (0%) \u{2591}\u{2591}\u{2591} | Sun 15 Nov 16:20".to_string());
+        assert_eq!(classify(&draw(&lines), cols as u16), InputBox::Empty);
+        lines[3] = "\u{276F}\u{00A0}run the demo-api tests".to_string();
+        assert_eq!(classify(&draw(&lines), cols as u16), InputBox::Typed);
+    }
+
+    #[test]
     fn the_working_line_shows_a_running_turn() {
         let mut lines = vec![
             "\u{273B} Pondering\u{2026} (3s \u{00B7} esc to interrupt)".to_string(),
