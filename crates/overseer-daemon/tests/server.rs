@@ -811,7 +811,11 @@ async fn a_hook_from_an_earlier_run_is_ignored() {
     let mut late = hook(2, HookKind::UserPromptSubmit);
     late.run = Some(first);
     c.hook(late).await;
-    assert_eq!(c.list().await[2].activity, None, "the old run's hook applied");
+    assert_eq!(
+        c.list().await[2].activity,
+        None,
+        "the old run's hook applied"
+    );
     let mut now = hook(2, HookKind::UserPromptSubmit);
     now.run = Some(second);
     c.hook(now).await;
@@ -926,6 +930,49 @@ fn claude_env(dir: &std::path::Path, saves: bool) -> overseer_daemon::EnvSource 
     }
     std::fs::create_dir_all(dir.join("cfg/projects")).unwrap();
     overseer_daemon::EnvSource::InheritWith(vars)
+}
+
+/// F6: Claude's folder-trust question comes before any hook, so the daemon
+/// reads it off the screen and marks the slot Needs you; the session's own
+/// `SessionStart` after the answer takes over.
+#[tokio::test]
+async fn the_folder_trust_question_needs_you() {
+    let dir = std::env::temp_dir().join(format!("ovs-trust-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("work")).unwrap();
+    let bin = dir.join("claude");
+    write_script(
+        &bin,
+        r"printf '\033[2J\033[H\033[1mIs\033[1Cthis a project you\033[0m created or one you trust?\r\n'
+exec cat",
+    );
+    let d = start_daemon_with(temp_socket(), claude_env(&dir, false)).await;
+    let mut c = Client::connect(&d.socket).await;
+    let start = Request::StartSlot {
+        id: 3,
+        label: "t3".into(),
+        cwd: dir.join("work"),
+        command: Some(vec![bin.to_string_lossy().into_owned()]),
+        prompt: None,
+    };
+    assert_eq!(c.request(start).await, Response::Ok);
+    let info = loop {
+        let info = c.next_change(3).await;
+        if info.activity.is_some() {
+            break info;
+        }
+    };
+    let a = activity_of(&info);
+    assert_eq!(a.kind, ActivityKind::NeedsYou);
+    assert_eq!(
+        a.reason.as_deref(),
+        Some("Claude asks whether to trust this folder")
+    );
+    c.hook(hook(3, HookKind::SessionStart)).await;
+    assert_eq!(
+        activity_of(&c.next_change(3).await).kind,
+        ActivityKind::Idle
+    );
 }
 
 #[tokio::test]
