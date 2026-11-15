@@ -557,6 +557,9 @@ pub fn install(opts: RestartOpts) -> anyhow::Result<()> {
             if !status.success() {
                 bail!("launchctl bootstrap failed ({status})");
             }
+            // Report it only once it answers, as ctl restart does, so a
+            // ctl command or a second install straight after finds it.
+            tokio::runtime::Runtime::new()?.block_on(crate::ctl::connect())?;
             match (how, &daemon) {
                 (RestartChoice::Restart, Some(d)) => {
                     println!("{}", restarted_text(&d.build, current_build()))

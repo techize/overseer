@@ -4396,6 +4396,9 @@ async fn manual_kickoff_names_the_worktree_only_under_the_root() {
     let text = kickoff_text_of(&mut c, 3).await;
     assert!(!text.contains("Work in "), "{text}");
     assert_eq!(c.request(Request::StopSlot { id: 3 }).await, Response::Ok);
+    // StopSlot answers before the process has gone; a start before the exit
+    // event can find the slot still running.
+    c.exited_event(3).await;
     assert_eq!(c.request(start(wt.clone())).await, Response::Ok);
     let text = kickoff_text_of(&mut c, 3).await;
     assert!(

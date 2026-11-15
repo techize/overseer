@@ -107,6 +107,15 @@ pub enum Screen {
     Locks,
 }
 
+/// Where Esc in the Locks view goes: back to the session it was opened
+/// from, or to the board.
+pub(crate) fn locks_return(from: Screen) -> Option<SlotId> {
+    match from {
+        Screen::Session(id) => Some(id),
+        Screen::Board | Screen::Locks => None,
+    }
+}
+
 /// Navigation keys work anywhere in the window except the start dialog, the
 /// picker, the plan view and Settings.
 const NAV: &str = "Overseer && !StartDialog && !Picker && !PlanView && !Settings";
@@ -415,6 +424,8 @@ pub struct OverseerApp {
     /// The Locks view's selection and force-release confirm.
     pub(crate) locks_state: LocksState,
     pub(crate) locks_focus: FocusHandle,
+    /// The session the Locks view was opened from, which Esc goes back to.
+    pub(crate) locks_from: Option<SlotId>,
     ticker: Ticker,
     _ticker: Option<Task<()>>,
     _events: Task<()>,
@@ -482,6 +493,7 @@ impl OverseerApp {
             board_focus,
             session_focus: cx.focus_handle(),
             locks_state: LocksState::default(),
+            locks_from: None,
             locks_focus: cx.focus_handle(),
             ticker: Ticker::default(),
             _ticker: None,
@@ -1375,6 +1387,9 @@ impl OverseerApp {
             return;
         }
         self.status = None;
+        if self.screen != Screen::Locks {
+            self.locks_from = locks_return(self.screen);
+        }
         self.set_screen(Screen::Locks, cx);
         self.focus_when_ready = None;
         window.focus(&self.locks_focus);
@@ -1856,6 +1871,13 @@ mod tests {
         for ctx in MODALS {
             assert_eq!(routed("cmd-shift-l", ctx), None, "{ctx:?}");
         }
+    }
+
+    #[test]
+    fn esc_in_locks_goes_back_where_it_came_from() {
+        assert_eq!(locks_return(Screen::Session(3)), Some(3));
+        assert_eq!(locks_return(Screen::Board), None);
+        assert_eq!(locks_return(Screen::Locks), None);
     }
 
     #[test]
