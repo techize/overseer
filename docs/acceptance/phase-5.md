@@ -387,3 +387,7 @@ any failures here.
   `bd sync` is a `bd_pending` row in `brain_runs` that the next start runs;
   queue entries keep a `committed_at` (ledger version 6) that the strip and
   its lines show.
+- Checked on Sunday 15 November 2026 after upgrading the install to build
+  85e9cc9: the real ledger opened at version 6 with `brain_queue.committed_at`.
+  The strip itself was not checked, since the brain writer is off and nothing
+  was committed.
