@@ -221,6 +221,16 @@ fn install_into_a_temp_home() {
     assert!(label.starts_with("uk.co.techize.overseer-home-"), "{name}");
     assert!(!rig.home().join("Library/LaunchAgents").exists());
     assert_no_real_label(&rig.launchctl_log());
+    // The agent's PATH finds this home's link before any other overseer.
+    let agent = std::fs::read_to_string(&plists[0]).unwrap();
+    let path = agent
+        .split("<key>PATH</key>")
+        .nth(1)
+        .and_then(|rest| rest.split("<string>").nth(1))
+        .and_then(|rest| rest.split("</string>").next())
+        .unwrap_or_else(|| panic!("{agent}"));
+    let bin = rig.state().join("bin");
+    assert_eq!(path.split(':').next(), bin.to_str(), "{path}");
 
     let summary = format!(
         "Overseer is installed.\n  App:    {app}\n  CLI:    {link} (add {bin} to PATH if it is not there)\n  Daemon: LaunchAgent {label}, logs in {logs}\nRun it with OVERSEER_HOME set: OVERSEER_HOME={state} {app_bin}\n",
@@ -337,7 +347,11 @@ fn install_without_cargo_installs_rust_first() {
         "{text}"
     );
     assert!(
-        text.contains("Add ~/.cargo/bin to your PATH to run cargo yourself.\n"),
+        // CARGO_HOME is the rig's, so the hint names it, not ~/.cargo.
+        text.contains(&format!(
+            "Add {}/bin to your PATH to run cargo yourself.\n",
+            rig.path("cargo").display()
+        )),
         "{text}"
     );
     let curl = std::fs::read_to_string(rig.path("curl.log")).unwrap();

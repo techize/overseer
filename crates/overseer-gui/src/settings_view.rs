@@ -239,7 +239,7 @@ pub fn saved_text(after: &SettingsView, edited: &[String]) -> String {
 pub fn load_banner(view: &SettingsView) -> Option<String> {
     view.load_error.as_ref().map(|e| {
         format!(
-            "config.toml could not be loaded, so the daemon uses built-in values for every setting until it is fixed. {}",
+            "config.toml could not be loaded, so these rows show built-in values and the daemon starts with them until the file is fixed. {}",
             e.trim()
         )
     })
@@ -1537,7 +1537,7 @@ mod tests {
         v.load_error = Some("/tmp/demo/config.toml: expected `=`\n".into());
         assert_eq!(
             load_banner(&v).as_deref(),
-            Some("config.toml could not be loaded, so the daemon uses built-in values for every setting until it is fixed. /tmp/demo/config.toml: expected `=`"),
+            Some("config.toml could not be loaded, so these rows show built-in values and the daemon starts with them until the file is fixed. /tmp/demo/config.toml: expected `=`"),
         );
     }
 

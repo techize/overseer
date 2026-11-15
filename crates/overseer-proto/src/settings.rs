@@ -178,7 +178,13 @@ pub fn check(key: &str, kind: &SettingKind, value: &SettingValue) -> Result<(), 
             if s.trim().is_empty() {
                 return empty();
             }
-            Ok(())
+            // A relative path would resolve against wherever the daemon
+            // happens to run, which is never what was meant.
+            if s == "~" || s.starts_with('/') || s.starts_with("~/") {
+                Ok(())
+            } else {
+                Err(format!("{key} must be a full path, starting with / or ~/"))
+            }
         }
         (SettingKind::Pattern, SettingValue::Text(s)) => {
             if s.is_empty() {
@@ -359,6 +365,16 @@ mod tests {
             t(&SettingKind::Path, ""),
             Err("k cannot be empty".to_string())
         );
+        assert_eq!(t(&SettingKind::Path, "/tmp/wt"), Ok(()));
+        assert_eq!(t(&SettingKind::Path, "~/Repos/.worktrees"), Ok(()));
+        assert_eq!(t(&SettingKind::Path, "~"), Ok(()));
+        for relative in ["45", "Repos/wt", "./wt", "~wt"] {
+            assert_eq!(
+                t(&SettingKind::Path, relative),
+                Err("k must be a full path, starting with / or ~/".to_string()),
+                "{relative}"
+            );
+        }
         assert_eq!(t(&SettingKind::Date, ""), Ok(()));
         assert_eq!(t(&SettingKind::Date, "2026-11-09"), Ok(()));
         assert_eq!(

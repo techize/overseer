@@ -1154,6 +1154,14 @@ fn install_agent_with_no_daemon_starts_it() {
     let env = Env::new();
     let out = stdout_of(&mut env.agent(&["install-agent"]));
     assert!(out.contains("Started the daemon (build dev)."), "{out}");
+    // It answers as soon as install-agent says so.
+    let version = stdout_of(&mut env.ctl(&["version"]));
+    assert!(version.contains("  pid "), "{version}");
+    let again = stdout_of(&mut env.agent(&["install-agent"]));
+    assert!(
+        again.contains("The daemon already runs build dev; nothing to restart."),
+        "{again}"
+    );
 }
 
 #[test]

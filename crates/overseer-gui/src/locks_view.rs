@@ -319,7 +319,10 @@ impl OverseerApp {
             LocksAction::Ignored => return,
             LocksAction::Redraw => self.status = None,
             LocksAction::Send(req) => self.force_release(req, cx),
-            LocksAction::Back => self.go_board(window, cx),
+            LocksAction::Back => match self.locks_from {
+                Some(id) => self.go_session(id, window, cx),
+                None => self.go_board(window, cx),
+            },
             LocksAction::Status(text) => self.status = Some(text),
         }
         cx.stop_propagation();

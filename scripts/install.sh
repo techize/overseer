@@ -97,7 +97,13 @@ set -- install-agent
 # prompt reads stdin, which stays yours) and keep a copy to read the label.
 {
     rc=0
-    "$app_bin" "$@" || rc=$?
+    # The agent keeps this PATH. For a custom home put its own link first,
+    # so `overseer` in its sessions is this install, not the default one.
+    if [ -n "${OVERSEER_HOME:-}" ]; then
+        PATH="$link_dir:$PATH" "$app_bin" "$@" || rc=$?
+    else
+        "$app_bin" "$@" || rc=$?
+    fi
     echo "$rc" > "$work/status"
 } | tee "$work/out"
 rc=$(cat "$work/status")
@@ -128,5 +134,5 @@ else
     echo "Open Overseer from $(tilde "$app_dir") in Finder, or run: open $(tilde "$app")"
 fi
 if [ "$installed_rust" = 1 ]; then
-    echo "Add ~/.cargo/bin to your PATH to run cargo yourself."
+    echo "Add $(tilde "$cargo_home/bin") to your PATH to run cargo yourself."
 fi
