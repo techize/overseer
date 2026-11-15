@@ -1047,6 +1047,11 @@ fn handle_request(
             streams.cut(id);
             Response::Ok
         }
+        // A terminal that reports no size (a bare pty) must not shrink the
+        // slot to nothing: the relay courier reads the screen at this size.
+        Request::Resize { cols, rows, .. } if cols == 0 || rows == 0 => {
+            err(format!("a {cols}x{rows} terminal has no usable size"))
+        }
         Request::Resize { id, cols, rows } => match manager.lock().unwrap().slot(id) {
             Some(slot) => match slot.resize(cols, rows) {
                 Ok(()) => Response::Ok,

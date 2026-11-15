@@ -136,8 +136,10 @@ pub async fn run(id: SlotId) -> anyhow::Result<()> {
         bail!("attach needs an interactive terminal");
     }
 
-    let (cols, rows) = terminal::size().context("read terminal size")?;
-    expect_ok(client.request(Request::Resize { id, cols, rows }).await?)?;
+    let size = terminal::size().context("read terminal size")?;
+    if let Some((cols, rows)) = usable_size(size) {
+        expect_ok(client.request(Request::Resize { id, cols, rows }).await?)?;
+    }
     expect_ok(client.request(Request::Attach { id }).await?)?;
     // An exit between the first check and Attach would send no event.
     if let SlotState::Exited { code, .. } = slot_state(&client, id).await? {
@@ -165,6 +167,12 @@ pub async fn run(id: SlotId) -> anyhow::Result<()> {
         }
         Ending::Lost(e) => Err(e),
     }
+}
+
+/// The terminal's size, unless a side is zero, as on a pty nobody sized.
+/// The slot then keeps the size it has.
+fn usable_size((cols, rows): (u16, u16)) -> Option<(u16, u16)> {
+    (cols > 0 && rows > 0).then_some((cols, rows))
 }
 
 async fn pump(id: SlotId, frames: &mut mpsc::Receiver<Frame>, client: &Client) -> Ending {
@@ -212,7 +220,7 @@ async fn pump(id: SlotId, frames: &mut mpsc::Receiver<Frame>, client: &Client) -
                 None => return Ending::Lost(anyhow!("terminal input closed")),
             },
             _ = winch.recv() => {
-                if let Ok((cols, rows)) = terminal::size() {
+                if let Some((cols, rows)) = terminal::size().ok().and_then(usable_size) {
                     let resize = client.request(Request::Resize { id, cols, rows });
                     let _ = tokio::time::timeout(DETACH_GRACE, resize).await;
                 }
@@ -224,6 +232,14 @@ async fn pump(id: SlotId, frames: &mut mpsc::Receiver<Frame>, client: &Client) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_zero_terminal_size_is_not_sent() {
+        assert_eq!(usable_size((120, 40)), Some((120, 40)));
+        assert_eq!(usable_size((0, 0)), None);
+        assert_eq!(usable_size((0, 40)), None);
+        assert_eq!(usable_size((120, 0)), None);
+    }
 
     #[test]
     fn split_detach_none() {
