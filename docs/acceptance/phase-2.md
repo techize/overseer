@@ -187,3 +187,21 @@ any failures here.
 - Signed off by: Jonathan Gill
 - Date: Wednesday 11 November 2026
 - Open follow-ups: F9 (the window does not reconnect after a daemon restart), L1 to L6 above, and the folder-trust prompt blocking a new slot (F6)
+- F9's reconnect was fixed later (d774beb). The rest were fixed on 2026-11-15
+  on branch `followups/sweep`, each with a test, not yet checked in the app:
+  - F6: while Claude asks whether to trust the folder, the card is Needs you
+    with `Claude asks whether to trust this folder`. The daemon reads the
+    question off a claude slot's output until the first hook arrives.
+  - F9 note: a resume records its own start, so a Resumable card's Started
+    line is the last run.
+  - L1: each spawn sets `OVERSEER_RUN` and the hook forwards it, so an event
+    from an earlier run of the slot is dropped.
+  - L2: a click that launches the app is kept and opens its session once the
+    slot list is in.
+  - L3: with Overseer in front, a notification for the session on screen goes
+    to Notification Center only, with no banner or sound.
+  - L4: the start dialog has a Prompt row; a typed prompt also overrides S0's
+    kickoff. A dialog from Assign and start keeps its kickoff.
+  - L5, L6: Claude's waiting-for-input notification makes the card Idle, not
+    Needs you, so neither a finished turn nor an Esc interrupt posts a
+    banner. An interrupted turn still reads Working for about a minute.
