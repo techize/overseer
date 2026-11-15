@@ -294,6 +294,17 @@ pub fn prefilled_fields(
     fields
 }
 
+/// The first prompt to start with (L4): a prefill's kickoff, else what was
+/// typed in the Prompt field, else none.
+pub fn first_prompt(typed: &str, prefill: Option<&Prefill>) -> Option<String> {
+    match prefill {
+        Some(p) => Some(p.prompt.clone()),
+        None => Some(typed.trim())
+            .filter(|t| !t.is_empty())
+            .map(String::from),
+    }
+}
+
 /// The note a prefilled dialog shows instead of its prompt.
 pub fn kickoff_note(keys: &[String]) -> String {
     format!("Starts with the kickoff for {}", keys.join(", "))
@@ -394,13 +405,15 @@ pub enum DialogEvent {
     Cancelled,
 }
 
-const FIELD_NAMES: [&str; 3] = ["Label", "Folder", "Command"];
+const FIELD_NAMES: [&str; 4] = ["Label", "Folder", "Command", "Prompt"];
 
 pub struct StartDialog {
     slot: SlotId,
     client: Arc<Client>,
     home: Option<PathBuf>,
-    fields: [TextField; 3],
+    /// Label, folder, command and first prompt. A prefilled dialog shows
+    /// only the first three: its kickoff is the prompt.
+    fields: [TextField; 4],
     active: usize,
     /// From "Assign and start": its prompt goes with the start request.
     prefill: Option<Prefill>,
@@ -438,6 +451,7 @@ impl StartDialog {
                 TextField::new(&label),
                 TextField::new(&cwd),
                 TextField::new(&command),
+                TextField::new(""),
             ],
             active: 0,
             prefill,
@@ -456,13 +470,22 @@ impl StartDialog {
         self.slot
     }
 
+    /// How many fields the dialog shows.
+    fn shown(&self) -> usize {
+        if self.prefill.is_some() {
+            3
+        } else {
+            4
+        }
+    }
+
     fn on_key_down(&mut self, ev: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         let outcome = edit_key(&mut self.fields[self.active], &ev.keystroke);
         match outcome {
             DialogKey::Ignored => return,
             DialogKey::Edited => self.error = None,
-            DialogKey::NextField => self.active = (self.active + 1) % 3,
-            DialogKey::PrevField => self.active = (self.active + 2) % 3,
+            DialogKey::NextField => self.active = (self.active + 1) % self.shown(),
+            DialogKey::PrevField => self.active = (self.active + self.shown() - 1) % self.shown(),
             DialogKey::Submit => self.submit(cx),
             DialogKey::Cancel => cx.emit(DialogEvent::Cancelled),
             DialogKey::Paste => {
@@ -505,13 +528,14 @@ impl StartDialog {
         if self.busy {
             return;
         }
-        let [label, cwd, command] = &self.fields;
+        let [label, cwd, command, prompt] = &self.fields;
+        let prompt = first_prompt(&prompt.text, self.prefill.as_ref());
         let req = match build_request(
             self.slot,
             &label.text,
             &cwd.text,
             &command.text,
-            self.prefill.as_ref().map(|p| p.prompt.as_str()),
+            prompt.as_deref(),
             self.home.as_deref(),
             Path::is_dir,
         ) {
@@ -571,7 +595,7 @@ fn button(id: &'static str, text: &'static str, primary: bool) -> gpui::Stateful
 impl Render for StartDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let focused = self.focus_handle.is_focused(window);
-        let rows: Vec<_> = (0..3)
+        let rows: Vec<_> = (0..self.shown())
             .map(|i| {
                 let active = i == self.active;
                 let f = &self.fields[i];
@@ -694,6 +718,25 @@ impl Render for StartDialog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_typed_prompt_goes_with_the_start_and_a_kickoff_wins() {
+        assert_eq!(first_prompt("", None), None);
+        assert_eq!(first_prompt("   ", None), None);
+        assert_eq!(
+            first_prompt("  Review demo-api  ", None).as_deref(),
+            Some("Review demo-api")
+        );
+        let prefill = Prefill {
+            label: "DEMO-7".into(),
+            prompt: "kickoff".into(),
+            keys: vec!["DEMO-7".into()],
+        };
+        assert_eq!(
+            first_prompt("ignored", Some(&prefill)).as_deref(),
+            Some("kickoff")
+        );
+    }
 
     #[test]
     fn a_stopped_slot_reopens_with_its_last_settings() {
