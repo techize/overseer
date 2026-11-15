@@ -70,18 +70,23 @@ async fn slot_reports_exit_code() {
 #[tokio::test]
 async fn slot_sets_env() {
     let (tx, mut rx) = broadcast::channel(1024);
-    let _slot = Slot::spawn(
+    let slot = Slot::spawn(
         4,
         "env".into(),
         Path::new("/tmp"),
-        &["/bin/sh".into(), "-c".into(), "echo $OVERSEER_SLOT".into()],
+        &[
+            "/bin/sh".into(),
+            "-c".into(),
+            "echo \"$OVERSEER_SLOT run=$OVERSEER_RUN.\"".into(),
+        ],
         80,
         24,
         tx,
     )
     .unwrap();
-    let out = collect_until(&mut rx, "S4", Duration::from_secs(2)).await;
-    assert!(out.contains("S4"), "got {out:?}");
+    let want = format!("S4 run={}.", slot.run());
+    let out = collect_until(&mut rx, &want, Duration::from_secs(2)).await;
+    assert!(out.contains(&want), "got {out:?}");
 }
 
 #[tokio::test]

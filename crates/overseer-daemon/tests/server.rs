@@ -673,6 +673,7 @@ fn hook(slot: u8, event: HookKind) -> HookEvent {
         notification: None,
         tool_use_id: None,
         notification_type: None,
+        run: None,
     }
 }
 
@@ -773,6 +774,57 @@ async fn hooks_for_slots_that_are_not_running_are_ignored() {
         }
     }
     assert_eq!(c.list().await[4].activity, None);
+}
+
+/// L1: a hook from the run before a restart of the same slot is dropped; one
+/// from this run, or with no run at all, is applied.
+#[tokio::test]
+async fn a_hook_from_an_earlier_run_is_ignored() {
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    let start = Request::StartSlot {
+        id: 2,
+        label: "t2".into(),
+        cwd: PathBuf::from("/tmp"),
+        command: Some(vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "echo \"RUN=[$OVERSEER_RUN]\"; exec cat".into(),
+        ]),
+        prompt: None,
+    };
+    let run_of = |out: &str| {
+        let at = out.find("RUN=[").expect("run printed") + 5;
+        out[at..at + out[at..].find(']').unwrap()].to_string()
+    };
+    assert_eq!(c.request(start.clone()).await, Response::Ok);
+    assert_eq!(c.request(Request::Attach { id: 2 }).await, Response::Ok);
+    let first = run_of(&c.output_until(2, "]").await);
+    assert!(!first.is_empty());
+    assert_eq!(c.request(Request::StopSlot { id: 2 }).await, Response::Ok);
+    c.exited_event(2).await;
+    assert_eq!(c.request(start).await, Response::Ok);
+    assert_eq!(c.request(Request::Attach { id: 2 }).await, Response::Ok);
+    let second = run_of(&c.output_until(2, "]").await);
+    assert_ne!(first, second);
+
+    let mut late = hook(2, HookKind::UserPromptSubmit);
+    late.run = Some(first);
+    c.hook(late).await;
+    assert_eq!(c.list().await[2].activity, None, "the old run's hook applied");
+    let mut now = hook(2, HookKind::UserPromptSubmit);
+    now.run = Some(second);
+    c.hook(now).await;
+    assert_eq!(
+        c.list().await[2].activity.as_ref().map(|a| a.kind),
+        Some(ActivityKind::Working)
+    );
+    c.hook(hook(2, HookKind::Stop)).await;
+    assert_eq!(
+        c.list().await[2].activity.as_ref().map(|a| a.kind),
+        Some(ActivityKind::Idle),
+        "a hook with no run is applied"
+    );
 }
 
 #[tokio::test]
@@ -2966,6 +3018,7 @@ impl Client {
         self.hook(HookEvent {
             notification: Some(message.into()),
             notification_type: Some(kind.into()),
+            run: None,
             ..hook(slot, HookKind::Notification)
         })
         .await;

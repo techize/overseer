@@ -420,6 +420,12 @@ impl SlotManager {
         if !matches!(entry.slot.info().state, SlotState::Running { .. }) {
             return;
         }
+        // A late event from the run before (killed, then started again) must
+        // not set this run's activity. An event with no run is from a hook
+        // older than the token, or a hand-run `overseer hook`: applied.
+        if ev.run.as_deref().is_some_and(|run| run != entry.slot.run()) {
+            return;
+        }
         // A resumed or compacted session can report an id other than the one
         // we generated; the ledger needs the real one to resume it. Written
         // synchronously for the same reason as the start write.

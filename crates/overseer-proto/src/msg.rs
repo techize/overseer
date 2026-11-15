@@ -124,6 +124,10 @@ pub struct HookEvent {
     /// Claude's notification type, e.g. `idle_prompt`.
     #[serde(default)]
     pub notification_type: Option<String>,
+    /// `$OVERSEER_RUN` from the hook's environment: which run of the slot
+    /// sent it, so a late event from a killed run is not applied to the next.
+    #[serde(default)]
+    pub run: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1107,6 +1111,7 @@ mod tests {
             notification: None,
             tool_use_id: None,
             notification_type: None,
+            run: None,
         });
         let back: Request = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
         assert_eq!(back, req);

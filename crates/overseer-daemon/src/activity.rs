@@ -66,6 +66,7 @@ mod tests {
             notification: None,
             tool_use_id: None,
             notification_type: None,
+            run: None,
         }
     }
 
