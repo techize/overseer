@@ -431,7 +431,7 @@ pub fn strip_text(v: &BrainView) -> (String, Tone) {
         .entries
         .iter()
         .filter(|e| e.state == QueueState::Committed)
-        .map(|e| e.at)
+        .map(QueueEntry::when)
         .max()
     {
         Some(at) => (
@@ -495,7 +495,7 @@ pub fn entry_line(e: &QueueEntry) -> String {
             _ => "failed".to_string(),
         },
     };
-    format!("{} {who}  {what}  {state}", local_hhmm(e.at))
+    format!("{} {who}  {what}  {state}", local_hhmm(e.when()))
 }
 
 pub fn running_count(slots: &[SlotInfo]) -> usize {
@@ -1273,6 +1273,7 @@ mod tests {
             commit: None,
             pushed: None,
             error: None,
+            committed_at: None,
         }
     }
 
@@ -1310,6 +1311,19 @@ mod tests {
         let (text, tone) = strip_text(&v);
         assert_eq!(text, format!("2ndBrain: committed {}", local_hhmm(2000)));
         assert_eq!(tone, Tone::Idle);
+    }
+
+    #[test]
+    fn strip_and_lines_show_when_it_committed_not_when_it_was_queued() {
+        // Queued at 1000, held, committed at 4600: the commit time shows.
+        let mut e = q(1, 1000, QueueState::Committed);
+        e.committed_at = Some(4600);
+        let (text, _) = strip_text(&brain(vec![e.clone()]));
+        assert_eq!(text, format!("2ndBrain: committed {}", local_hhmm(4600)));
+        assert!(entry_line(&e).starts_with(&format!("{} ", local_hhmm(4600))));
+        // Still queued: the queue time.
+        let e = q(2, 1000, QueueState::Queued);
+        assert!(entry_line(&e).starts_with(&format!("{} ", local_hhmm(1000))));
     }
 
     #[test]

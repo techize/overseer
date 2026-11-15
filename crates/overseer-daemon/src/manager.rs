@@ -378,7 +378,7 @@ impl SlotManager {
         // resume keeps its row (same session id) and only goes live again.
         self.restored[id as usize] = None;
         if let (Some(launch), Some(_)) = (&self.launch, &resume) {
-            if let Err(e) = launch.ledger.mark_resumed(id) {
+            if let Err(e) = launch.ledger.mark_resumed(id, start_time) {
                 tracing::warn!("{} ledger resume not recorded: {e:#}", slot_name(id));
             }
         } else if let Some(launch) = &self.launch {
@@ -887,7 +887,7 @@ mod restore_tests {
             Some("Sessions/s3-demo-lane.md")
         );
         // A resume keeps the row, note included.
-        ledger.mark_resumed(3).unwrap();
+        ledger.mark_resumed(3, 1).unwrap();
         assert!(ledger.session_note(3).unwrap().is_some());
         m.stop(3).unwrap();
         for _ in 0..100 {

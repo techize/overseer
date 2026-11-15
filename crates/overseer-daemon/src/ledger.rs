@@ -164,7 +164,11 @@ CREATE TABLE IF NOT EXISTS status_requests (
     at INTEGER NOT NULL
 )";
 
-const VERSION: i64 = 5;
+/// What version 6 adds: when each queue entry committed, apart from when
+/// it was queued. Not idempotent, like V4.
+const V6_SCHEMA: &str = "ALTER TABLE brain_queue ADD COLUMN committed_at INTEGER";
+
+const VERSION: i64 = 6;
 
 /// Reports and state changes kept per slot.
 const REPORTS_PER_SLOT: i64 = 200;
@@ -178,12 +182,13 @@ fn migrate(conn: &Connection) -> Result<()> {
     if version >= VERSION {
         return Ok(());
     }
-    let steps: [(i64, &str); 5] = [
+    let steps: [(i64, &str); 6] = [
         (1, SESSIONS_SCHEMA),
         (2, V2_SCHEMA),
         (3, V3_SCHEMA),
         (4, V4_SCHEMA),
         (5, V5_SCHEMA),
+        (6, V6_SCHEMA),
     ];
     let mut batch = String::from("BEGIN;\n");
     for (n, sql) in steps {
@@ -357,10 +362,12 @@ fn queue_entry(r: &rusqlite::Row) -> rusqlite::Result<Option<QueueEntry>> {
         commit: r.get(6)?,
         pushed: r.get::<_, Option<i64>>(7)?.map(|p| p != 0),
         error: r.get(8)?,
+        committed_at: r.get(9)?,
     }))
 }
 
-const QUEUE_COLS: &str = "id, at, sender, paths, message, state, commit_sha, pushed, error";
+const QUEUE_COLS: &str =
+    "id, at, sender, paths, message, state, commit_sha, pushed, error, committed_at";
 
 /// The name a state is stored under; every query binds it rather than
 /// spelling the literal.
@@ -432,9 +439,18 @@ pub(crate) fn queue_set_on(
     pushed: Option<bool>,
     error: Option<&str>,
 ) -> Result<()> {
+    // The first time it reads Committed is when it committed; a later push
+    // result keeps that time.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let committed_at = (state == QueueState::Committed).then_some(now);
     conn.execute(
-        "UPDATE brain_queue SET state = ?2, commit_sha = ?3, pushed = ?4, error = ?5 WHERE id = ?1",
-        rusqlite::params![id, state_name(state), sha, pushed, error],
+        "UPDATE brain_queue SET state = ?2, commit_sha = ?3, pushed = ?4, error = ?5,
+             committed_at = CASE WHEN ?6 IS NULL THEN NULL ELSE COALESCE(committed_at, ?6) END
+         WHERE id = ?1",
+        rusqlite::params![id, state_name(state), sha, pushed, error, committed_at],
     )?;
     Ok(())
 }
@@ -960,12 +976,12 @@ impl Ledger {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// Makes the slot's row live again after a resume: clears the exit, keeps
-    /// the session id and the rest.
-    pub fn mark_resumed(&self, slot: SlotId) -> Result<()> {
+    /// Makes the slot's row live again after a resume: clears the exit, sets
+    /// the start to `at` (this run's), keeps the session id and the rest.
+    pub fn mark_resumed(&self, slot: SlotId, at: i64) -> Result<()> {
         self.conn().execute(
-            "UPDATE sessions SET exited = NULL, exit_code = NULL WHERE slot = ?1",
-            rusqlite::params![slot],
+            "UPDATE sessions SET exited = NULL, exit_code = NULL, started = ?2 WHERE slot = ?1",
+            rusqlite::params![slot, at],
         )?;
         Ok(())
     }
@@ -1039,9 +1055,13 @@ mod tests {
         l.record_start(&row(4, "keep")).unwrap();
         l.record_exit(4, Some(1), 1_700_000_100).unwrap();
         assert!(l.live_at_shutdown().unwrap().is_empty());
-        l.mark_resumed(4).unwrap();
+        l.mark_resumed(4, 1_700_000_200).unwrap();
         let live = l.live_at_shutdown().unwrap();
-        assert_eq!(live, vec![row(4, "keep")]);
+        // The start is this run's, so a later Resumable card shows when the
+        // session last ran, not when it first started.
+        let mut want = row(4, "keep");
+        want.started = 1_700_000_200;
+        assert_eq!(live, vec![want]);
     }
 
     #[test]
@@ -1092,7 +1112,7 @@ mod tests {
         assert!(l.notices().unwrap().is_empty());
         l.log(1, "k", None, "e", "d").unwrap();
         lock_tables_are_empty(&l);
-        assert_eq!(user_version(&l), 5);
+        assert_eq!(user_version(&l), 6);
         let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
     }
 
@@ -1117,14 +1137,14 @@ mod tests {
             .unwrap();
         }
         let l = Ledger::open(&path).unwrap();
-        assert_eq!(user_version(&l), 5);
+        assert_eq!(user_version(&l), 6);
         assert_eq!(l.assignments().unwrap(), vec![("DEMO-12".to_string(), 3)]);
         assert_eq!(l.notices().unwrap()[0].text, "moved");
         lock_tables_are_empty(&l);
         drop(l);
         // Opening a v5 file again changes nothing.
         let l = Ledger::open(&path).unwrap();
-        assert_eq!(user_version(&l), 5);
+        assert_eq!(user_version(&l), 6);
         assert_eq!(l.assignments().unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
     }
@@ -1133,7 +1153,7 @@ mod tests {
     fn fresh_file_is_created_at_5() {
         let path = temp_db("fresh");
         let l = Ledger::open(&path).unwrap();
-        assert_eq!(user_version(&l), 5);
+        assert_eq!(user_version(&l), 6);
         lock_tables_are_empty(&l);
         let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
     }
@@ -1162,7 +1182,7 @@ mod tests {
             .unwrap();
         }
         let l = Ledger::open(&path).unwrap();
-        assert_eq!(user_version(&l), 5);
+        assert_eq!(user_version(&l), 6);
         let live = l.live_at_shutdown().unwrap();
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].session_id, "old-id");
@@ -1173,7 +1193,7 @@ mod tests {
         drop(l);
         // Opening a v5 file again changes nothing.
         let l = Ledger::open(&path).unwrap();
-        assert_eq!(user_version(&l), 5);
+        assert_eq!(user_version(&l), 6);
         assert_eq!(l.live_at_shutdown().unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
     }
@@ -1221,14 +1241,14 @@ mod tests {
         let path = temp_db("migrate-v4");
         v4_file(&path);
         let l = Ledger::open(&path).unwrap();
-        assert_eq!(user_version(&l), 5);
+        assert_eq!(user_version(&l), 6);
         assert_eq!(l.live_at_shutdown().unwrap().len(), 1);
         assert_eq!(l.session_note(2).unwrap().as_deref(), Some("Sessions/n.md"));
         assert_eq!(l.queue_recent(10).unwrap().len(), 1);
         assert_eq!(l.add_plan(&tplan(3), &[], 10).unwrap(), (1, None));
         drop(l);
         let l = Ledger::open(&path).unwrap();
-        assert_eq!(user_version(&l), 5);
+        assert_eq!(user_version(&l), 6);
         assert_eq!(l.plans(10).unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
     }
@@ -1251,7 +1271,7 @@ mod tests {
             .unwrap();
         }
         let l = Ledger::open(&path).unwrap();
-        assert_eq!(user_version(&l), 5);
+        assert_eq!(user_version(&l), 6);
         assert_eq!(l.lock_view(50, 3600).unwrap().claims.len(), 1);
         assert_eq!(l.session_note(2).unwrap(), None);
         assert!(l.plans(10).unwrap().is_empty());
@@ -1263,7 +1283,7 @@ mod tests {
     fn fresh_file_is_v5() {
         let path = temp_db("fresh-v5");
         let l = Ledger::open(&path).unwrap();
-        assert_eq!(user_version(&l), 5);
+        assert_eq!(user_version(&l), 6);
         assert!(l.plans(10).unwrap().is_empty());
         assert!(l.reports(10).unwrap().is_empty());
         assert_eq!(l.summary().unwrap(), None);
@@ -1385,8 +1405,46 @@ mod tests {
         );
         assert_eq!(l.session_note(4).unwrap(), None);
         // Marking the slot resumed keeps its note.
-        l.mark_resumed(3).unwrap();
+        l.mark_resumed(3, 1_700_000_300).unwrap();
         assert!(l.session_note(3).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_commit_records_when_it_committed_not_when_it_was_queued() {
+        use overseer_proto::msg::{QueueState, Sender};
+        let l = Ledger::in_memory();
+        let id = l
+            .queue_push(100, &Sender::You, &["a.md".into()], "m")
+            .unwrap();
+        let entry = |l: &Ledger| {
+            l.queue_recent(10)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.id == id)
+                .unwrap()
+        };
+        assert_eq!(entry(&l).committed_at, None);
+        l.queue_set(id, QueueState::Committed, Some("abc"), None, None)
+            .unwrap();
+        let first = entry(&l);
+        assert_eq!(first.at, 100, "the queue time stays");
+        let committed = first.committed_at.expect("commit time set");
+        assert!(committed > 100);
+        assert_eq!(first.when(), committed);
+        // The push result later keeps the commit time.
+        l.conn()
+            .execute(
+                "UPDATE brain_queue SET committed_at = 200 WHERE id = ?1",
+                rusqlite::params![id],
+            )
+            .unwrap();
+        l.queue_set(id, QueueState::Committed, Some("abc"), Some(true), None)
+            .unwrap();
+        assert_eq!(entry(&l).committed_at, Some(200));
+        // An entry that never committed shows its queue time.
+        l.queue_set(id, QueueState::Failed, None, None, Some("boom"))
+            .unwrap();
+        assert_eq!((entry(&l).committed_at, entry(&l).when()), (None, 100));
     }
 
     #[test]

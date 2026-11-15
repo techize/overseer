@@ -725,6 +725,17 @@ pub struct QueueEntry {
     pub commit: Option<String>,
     pub pushed: Option<bool>,
     pub error: Option<String>,
+    /// When it committed (unix seconds); `None` until then, and from an
+    /// older daemon.
+    #[serde(default)]
+    pub committed_at: Option<i64>,
+}
+
+impl QueueEntry {
+    /// When it committed, else when it was queued.
+    pub fn when(&self) -> i64 {
+        self.committed_at.unwrap_or(self.at)
+    }
 }
 
 /// The last backup or sync run. `detail` is the error text when `ok` is
@@ -1592,6 +1603,7 @@ mod tests {
             commit: Some("abc1234".into()),
             pushed: Some(false),
             error: Some("rejected".into()),
+            committed_at: Some(1700000050),
         }
     }
 
@@ -1610,6 +1622,7 @@ mod tests {
                     commit: None,
                     pushed: None,
                     error: None,
+                    committed_at: None,
                 },
             ],
             last_backup: Some(BrainRun {

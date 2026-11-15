@@ -912,6 +912,7 @@ impl BrainService {
                         commit: None,
                         pushed: None,
                         error: None,
+                        committed_at: None,
                     };
                     let state = self.attempt(&g, &entry).await;
                     let paths = format!("{} paths", keep.len());
