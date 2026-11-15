@@ -63,6 +63,10 @@ fn deny_owned(rel: &str, slot: SlotId, what: &str) -> String {
     format!("{rel} belongs to S{slot} ({what}). Ask Jonathan before writing it.")
 }
 
+/// The `brain_runs` row that says a `bd sync` is owed: `ok` is true while
+/// it is, so a restart before the drain still runs it.
+const BD_PENDING: &str = "bd_pending";
+
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -253,9 +257,14 @@ impl BrainService {
             Ok(Some((_, false, detail))) => Some(detail),
             _ => None,
         };
+        // A bd write whose sync had not run when the daemon last stopped
+        // (B7): its sync runs after the usual quiet period.
+        let bd_sync_pending = matches!(ledger.brain_run(BD_PENDING), Ok(Some((_, true, _))));
         let rt = Runtime {
             push_problem,
             next_backup: opts.backup.map(|d| Instant::now() + d),
+            bd_sync_pending,
+            last_change: bd_sync_pending.then(Instant::now),
             ..Runtime::default()
         };
         let svc = Arc::new(BrainService {
@@ -743,6 +752,7 @@ impl BrainService {
                     &format!("{shown}: {}", last_line(&o.stdout, &o.stderr)),
                 );
                 if ok && args.first().map(String::as_str) != Some("sync") {
+                    let _ = self.ledger.set_brain_run(BD_PENDING, now, true, "");
                     let mut rt = self.rt();
                     rt.bd_sync_pending = true;
                     rt.last_change = Some(Instant::now());
@@ -912,6 +922,7 @@ impl BrainService {
                         commit: None,
                         pushed: None,
                         error: None,
+                        committed_at: None,
                     };
                     let state = self.attempt(&g, &entry).await;
                     let paths = format!("{} paths", keep.len());
@@ -1446,6 +1457,9 @@ impl BrainService {
             let _ = self
                 .ledger
                 .set_brain_run("bd", unix_now(), ok, &format!("bd sync: {detail}"));
+            // Tried, so no longer owed, as the in-memory flag: the next
+            // write queues another.
+            let _ = self.ledger.set_brain_run(BD_PENDING, unix_now(), false, "");
         }
         if sync {
             self.sync().await;

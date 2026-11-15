@@ -411,6 +411,9 @@ pub struct OverseerApp {
     /// The slots came from a list reply on this connection. Until then,
     /// and after the connection is lost, `slots` may hide running sessions.
     slots_known: bool,
+    /// A notification click that came before the slot list (L2): it
+    /// opens its session once the list is in.
+    pending_click: Option<crate::notify::Click>,
     /// Pickers closed with an assign on its way; see `PickerEvent::Late`.
     leaving: Vec<(Entity<Picker>, Subscription)>,
     restarts: HashMap<SlotId, RestartPlan>,
@@ -485,6 +488,7 @@ impl OverseerApp {
             daemon: DaemonKnown::Unknown,
             restarting_daemon: false,
             slots_known: false,
+            pending_click: None,
             leaving: Vec::new(),
             restarts: HashMap::new(),
             kickoffs: HashSet::new(),
@@ -673,6 +677,9 @@ impl OverseerApp {
                     self.apply_info(info, true, window, cx);
                 }
                 self.forward_slots(cx);
+                if let Some(click) = self.pending_click.take() {
+                    self.notification_clicked(click, window, cx);
+                }
             }
             // The list asked for on connecting is not news, so it never
             // notifies; a change does.
@@ -1315,6 +1322,10 @@ impl OverseerApp {
             self.locks_state = LocksState::default();
         }
         self.screen = screen;
+        crate::notify::set_viewing(match screen {
+            Screen::Session(id) => Some(id),
+            _ => None,
+        });
         self.entry = None;
         self.ensure_ticker(cx);
     }
@@ -1357,6 +1368,10 @@ impl OverseerApp {
     ) {
         cx.activate(true);
         window.activate_window();
+        if !self.slots_known {
+            self.pending_click = Some(click);
+            return;
+        }
         if !self.modal_open() {
             match click {
                 crate::notify::Click::Slot(id) => self.go_session(id, window, cx),

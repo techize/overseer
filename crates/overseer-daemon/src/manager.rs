@@ -347,6 +347,8 @@ impl SlotManager {
         let row_label = label.clone();
         let entry_session_id = session_id.clone();
         let (tx, monitor_rx) = broadcast::channel(OUTPUT_CHANNEL_CAP);
+        // Only claude asks the folder-trust question.
+        let trust_rx = (!session_id.is_empty()).then(|| tx.subscribe());
         let slot = Slot::spawn_in(id, label, cwd, &argv, DEFAULT_COLS, DEFAULT_ROWS, tx, &env)
             .map_err(|e| {
                 tracing::warn!("{} failed to start {:?}: {e:#}", slot_name(id), argv);
@@ -376,7 +378,7 @@ impl SlotManager {
         // resume keeps its row (same session id) and only goes live again.
         self.restored[id as usize] = None;
         if let (Some(launch), Some(_)) = (&self.launch, &resume) {
-            if let Err(e) = launch.ledger.mark_resumed(id) {
+            if let Err(e) = launch.ledger.mark_resumed(id, start_time) {
                 tracing::warn!("{} ledger resume not recorded: {e:#}", slot_name(id));
             }
         } else if let Some(launch) = &self.launch {
@@ -398,6 +400,14 @@ impl SlotManager {
         }
         let _ = self.events.send(Event::SlotChanged(started));
         drop(slots);
+        if let Some(rx) = trust_rx {
+            tokio::spawn(watch_trust(
+                slot.clone(),
+                rx,
+                self.events.clone(),
+                self.slots.clone(),
+            ));
+        }
         tokio::spawn(monitor_exit(
             slot,
             monitor_rx,
@@ -418,6 +428,12 @@ impl SlotManager {
             return;
         };
         if !matches!(entry.slot.info().state, SlotState::Running { .. }) {
+            return;
+        }
+        // A late event from the run before (killed, then started again) must
+        // not set this run's activity. An event with no run is from a hook
+        // older than the token, or a hand-run `overseer hook`: applied.
+        if ev.run.as_deref().is_some_and(|run| run != entry.slot.run()) {
             return;
         }
         // A resumed or compacted session can report an id other than the one
@@ -547,6 +563,64 @@ impl SlotManager {
 /// thread dropping its sender) before announcing the exit. Clients that attach
 /// after the event therefore see the complete tail in the snapshot. The wait is
 /// bounded: a grandchild that inherited the PTY could keep the stream open.
+/// How long after a start the folder-trust question is looked for. Claude
+/// asks it before anything else, so a session past this has answered it.
+const TRUST_WINDOW: Duration = Duration::from_secs(120);
+
+/// Marks a claude slot Needs you while Claude asks whether to trust its
+/// folder (F6): the question comes before the session starts, so no hook
+/// reports it. Stops at the first hook event, at exit, or after
+/// [`TRUST_WINDOW`]. Answering it starts the session, whose `SessionStart`
+/// sets the card Idle.
+async fn watch_trust(
+    slot: Arc<Slot>,
+    mut rx: broadcast::Receiver<Bytes>,
+    events: broadcast::Sender<Event>,
+    slots: Slots,
+) {
+    let id = slot.info().id as usize;
+    // Whether this run is still in its slot with no activity reported yet.
+    let unreported = |slots: &Slots| {
+        slots.lock().unwrap()[id]
+            .as_ref()
+            .is_some_and(|e| Arc::ptr_eq(&e.slot, &slot) && e.activity.is_none())
+    };
+    let mut scan = crate::trust::TrustScan::default();
+    let asked = tokio::time::timeout(TRUST_WINDOW, async {
+        loop {
+            match rx.recv().await {
+                Ok(bytes) => {
+                    if scan.feed(&bytes) {
+                        return true;
+                    }
+                    if !unreported(&slots) {
+                        return false;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    if !asked {
+        return;
+    }
+    let mut slots = slots.lock().unwrap();
+    if let Some(e) = slots[id]
+        .as_mut()
+        .filter(|e| Arc::ptr_eq(&e.slot, &slot) && e.activity.is_none())
+    {
+        tracing::info!(
+            "{} is waiting on Claude's folder-trust question",
+            slot_name(e.slot.info().id)
+        );
+        e.activity = Some(crate::trust::activity(unix_now()));
+        let _ = events.send(Event::SlotChanged(e.info()));
+    }
+}
+
 async fn monitor_exit(
     slot: Arc<Slot>,
     mut rx: broadcast::Receiver<Bytes>,
@@ -813,7 +887,7 @@ mod restore_tests {
             Some("Sessions/s3-demo-lane.md")
         );
         // A resume keeps the row, note included.
-        ledger.mark_resumed(3).unwrap();
+        ledger.mark_resumed(3, 1).unwrap();
         assert!(ledger.session_note(3).unwrap().is_some());
         m.stop(3).unwrap();
         for _ in 0..100 {

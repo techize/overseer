@@ -383,3 +383,7 @@ any failures here.
 - Date: hand checks run 2026-11-13 by Claude in the isolated rig
 - Still pending, needing a real session or Jonathan's eyes: D1, D2, the real halves of D3, D4, B1, K1, B2, M2, RL3; G2 hover, G3, G4, the G5 notification, G6 hover
 - Open follow-ups: a pending bd sync is lost on a daemon restart (B7); the strip's committed time is the entry's enqueue time, not the commit time
+- Both fixed on 2026-11-15 on branch `followups/sweep`, with tests: an owed
+  `bd sync` is a `bd_pending` row in `brain_runs` that the next start runs;
+  queue entries keep a `committed_at` (ledger version 6) that the strip and
+  its lines show.

@@ -7,8 +7,14 @@ use overseer_proto::{Activity, ActivityKind, HookEvent, HookKind};
 ///
 /// `since` is when the slot entered its current kind, so a change of
 /// detail alone (a new tool, a new notification) does not restart it.
+///
+/// A `Notification` that only says Claude is waiting for input is `Idle`,
+/// not `NeedsYou`: Claude sends one about a minute after every turn, and
+/// after an Esc interrupt, which fires no `Stop`.
 pub fn apply(prev: Option<&Activity>, ev: &HookEvent, now: i64) -> Option<Activity> {
+    let idle_wait = ev.event == HookKind::Notification && is_idle_wait(ev);
     let (kind, now_doing, reason) = match ev.event {
+        HookKind::Notification if idle_wait => (ActivityKind::Idle, None, None),
         HookKind::UserPromptSubmit => (ActivityKind::Working, None, None),
         HookKind::PostToolUse => {
             let doing = ev.tool.as_ref().map(|tool| match &ev.detail {
@@ -20,7 +26,6 @@ pub fn apply(prev: Option<&Activity>, ev: &HookEvent, now: i64) -> Option<Activi
         HookKind::Notification => (ActivityKind::NeedsYou, None, ev.notification.clone()),
         HookKind::Stop | HookKind::SessionStart => (ActivityKind::Idle, None, None),
     };
-    let idle_wait = ev.event == HookKind::Notification && is_idle_wait(ev);
     let since = match prev {
         Some(p) if p.kind == kind => p.since,
         _ => now,
@@ -61,6 +66,7 @@ mod tests {
             notification: None,
             tool_use_id: None,
             notification_type: None,
+            run: None,
         }
     }
 
@@ -151,6 +157,20 @@ mod tests {
         assert!(!apply(None, &e, 1).unwrap().idle_wait);
         e.notification = None;
         assert!(!apply(None, &e, 1).unwrap().idle_wait);
+    }
+
+    #[test]
+    fn an_idle_wait_is_idle_not_needs_you() {
+        let mut e = ev(HookKind::Notification);
+        e.notification_type = Some("idle_prompt".into());
+        e.notification = Some("Claude is waiting for your input".into());
+        // After a turn that ended with Stop: still idle since the Stop.
+        let a = apply(Some(&act(ActivityKind::Idle, 5)), &e, 65).unwrap();
+        assert_eq!((a.kind, a.since, a.reason), (ActivityKind::Idle, 5, None));
+        assert!(a.idle_wait);
+        // After an Esc interrupt, which sends no Stop: Working ends here.
+        let a = apply(Some(&act(ActivityKind::Working, 5)), &e, 65).unwrap();
+        assert_eq!((a.kind, a.since), (ActivityKind::Idle, 65));
     }
 
     #[test]

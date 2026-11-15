@@ -852,6 +852,36 @@ async fn bd_runs_under_the_lock_then_syncs() {
     assert_eq!(v.log("bd.log").len(), 2, "one bd sync per drain");
 }
 
+/// B7: a daemon that stops between a bd write and its sync owes the sync;
+/// the next start runs it after the quiet period, once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bd_sync_owed_at_a_restart_still_runs() {
+    let v = Vault::new("bd-restart");
+    let ledger = Arc::new(Ledger::in_memory());
+    let mut slow = v.options();
+    slow.drain = Duration::from_secs(600);
+    let before = v.service(ledger.clone(), slow);
+    match before
+        .run_bd(["close", "ov-4"].map(String::from).to_vec(), None)
+        .await
+    {
+        Response::BdOutput { code, .. } => assert_eq!(code, 0),
+        other => panic!("{other:?}"),
+    }
+    drop(before);
+    sleep(DRAIN * 2).await;
+    assert_eq!(v.log("bd.log").len(), 1, "no sync before the restart");
+
+    let _after = v.service(ledger.clone(), v.options());
+    until("bd sync", || v.log("bd.log").len() == 2).await;
+    assert!(v.log("bd.log")[1].ends_with("|sync"));
+    // Run, so no longer owed: a third start syncs nothing.
+    drop(_after);
+    let _again = v.service(ledger, v.options());
+    sleep(DRAIN * 3).await;
+    assert_eq!(v.log("bd.log").len(), 2, "the sync ran once");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn changes_are_announced() {
     let v = Vault::new("events");

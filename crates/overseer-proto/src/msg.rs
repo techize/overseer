@@ -124,6 +124,10 @@ pub struct HookEvent {
     /// Claude's notification type, e.g. `idle_prompt`.
     #[serde(default)]
     pub notification_type: Option<String>,
+    /// `$OVERSEER_RUN` from the hook's environment: which run of the slot
+    /// sent it, so a late event from a killed run is not applied to the next.
+    #[serde(default)]
+    pub run: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -721,6 +725,17 @@ pub struct QueueEntry {
     pub commit: Option<String>,
     pub pushed: Option<bool>,
     pub error: Option<String>,
+    /// When it committed (unix seconds); `None` until then, and from an
+    /// older daemon.
+    #[serde(default)]
+    pub committed_at: Option<i64>,
+}
+
+impl QueueEntry {
+    /// When it committed, else when it was queued.
+    pub fn when(&self) -> i64 {
+        self.committed_at.unwrap_or(self.at)
+    }
 }
 
 /// The last backup or sync run. `detail` is the error text when `ok` is
@@ -1107,6 +1122,7 @@ mod tests {
             notification: None,
             tool_use_id: None,
             notification_type: None,
+            run: None,
         });
         let back: Request = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
         assert_eq!(back, req);
@@ -1587,6 +1603,7 @@ mod tests {
             commit: Some("abc1234".into()),
             pushed: Some(false),
             error: Some("rejected".into()),
+            committed_at: Some(1700000050),
         }
     }
 
@@ -1605,6 +1622,7 @@ mod tests {
                     commit: None,
                     pushed: None,
                     error: None,
+                    committed_at: None,
                 },
             ],
             last_backup: Some(BrainRun {

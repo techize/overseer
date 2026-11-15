@@ -52,6 +52,16 @@ pub struct Slot {
     out: broadcast::WeakSender<Bytes>,
     exit_rx: watch::Receiver<ExitValue>,
     exited_at: Arc<Mutex<Option<i64>>>,
+    /// Set as `OVERSEER_RUN` in the child's environment; unique per spawn.
+    run: String,
+}
+
+/// A token no other spawn in any daemon run shares: the daemon's pid and a
+/// counter.
+fn next_run() -> String {
+    static RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{}-{n}", std::process::id())
 }
 
 impl Slot {
@@ -71,7 +81,7 @@ impl Slot {
     }
 
     /// Spawns `command` with exactly `env` (already scrubbed) plus
-    /// `OVERSEER_SLOT`, `TERM` and `COLORTERM`.
+    /// `OVERSEER_SLOT`, `OVERSEER_RUN`, `TERM` and `COLORTERM`.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_in(
         id: SlotId,
@@ -103,6 +113,8 @@ impl Slot {
             cmd.env(k, v);
         }
         cmd.env("OVERSEER_SLOT", slot_name(id));
+        let run = next_run();
+        cmd.env("OVERSEER_RUN", &run);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
 
@@ -183,7 +195,13 @@ impl Slot {
             out: out_weak,
             exit_rx,
             exited_at,
+            run,
         })
+    }
+
+    /// This spawn's `OVERSEER_RUN`.
+    pub fn run(&self) -> &str {
+        &self.run
     }
 
     pub fn write(&self, data: &[u8]) -> io::Result<()> {

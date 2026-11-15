@@ -70,6 +70,7 @@ pub fn parse_hook(event: &str, slot_env: &str, stdin: &[u8]) -> Option<HookEvent
         notification: text("message"),
         tool_use_id: text("tool_use_id"),
         notification_type: text("notification_type"),
+        run: std::env::var("OVERSEER_RUN").ok(),
     })
 }
 

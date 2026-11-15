@@ -9,6 +9,7 @@
 //! Clicking a notification sends its slot to the app through `clicks`; the
 //! app brings its window forward and opens that session.
 
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Mutex;
 
 use overseer_proto::{slot_name, ActivityKind, CoordView, LockView, SlotId, SlotInfo};
@@ -199,20 +200,70 @@ pub fn slot_from_identifier(id: &str) -> Option<SlotId> {
     (slot <= 6).then_some(slot)
 }
 
-/// Where the delegate sends clicked slots.
-static CLICKS: Mutex<Option<mpsc::UnboundedSender<Click>>> = Mutex::new(None);
+/// Where the delegate sends clicked slots, and the clicks that came before
+/// anyone listened.
+struct Clicks {
+    tx: Option<mpsc::UnboundedSender<Click>>,
+    early: Vec<Click>,
+}
+
+static CLICKS: Mutex<Clicks> = Mutex::new(Clicks {
+    tx: None,
+    early: Vec::new(),
+});
 
 /// The stream of clicked notifications' slots. Call once; a later call
-/// takes the stream over.
+/// takes the stream over. A click that launched the app arrives before the
+/// window listens (L2), so it is kept and is the stream's first item.
 pub fn clicks() -> mpsc::UnboundedReceiver<Click> {
     let (tx, rx) = mpsc::unbounded_channel();
-    *CLICKS.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+    let mut c = CLICKS.lock().unwrap_or_else(|e| e.into_inner());
+    for click in c.early.drain(..) {
+        let _ = tx.send(click);
+    }
+    c.tx = Some(tx);
     rx
 }
 
 fn clicked(click: Click) {
-    if let Some(tx) = CLICKS.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-        let _ = tx.send(click);
+    let mut c = CLICKS.lock().unwrap_or_else(|e| e.into_inner());
+    match &c.tx {
+        Some(tx) => {
+            let _ = tx.send(click);
+        }
+        None => c.early.push(click),
+    }
+}
+
+/// The session on screen, or -1: its own banners are not shown while
+/// Overseer is in front (L3).
+static VIEWING: AtomicI32 = AtomicI32::new(-1);
+
+/// The app calls this whenever the screen changes.
+pub fn set_viewing(slot: Option<SlotId>) {
+    VIEWING.store(slot.map_or(-1, i32::from), Ordering::Relaxed);
+}
+
+fn viewing() -> Option<SlotId> {
+    SlotId::try_from(VIEWING.load(Ordering::Relaxed)).ok()
+}
+
+/// How a notification shows while it arrives with Overseer running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Presentation {
+    /// Banner, Notification Center and sound.
+    Full,
+    /// Notification Center only: Jonathan is looking at that session.
+    ListOnly,
+}
+
+/// A notification for the session Jonathan is looking at, with Overseer in
+/// front, goes to Notification Center quietly; anything else shows in full,
+/// since he may be in another session's terminal.
+pub fn presentation(identifier: &str, viewing: Option<SlotId>, app_active: bool) -> Presentation {
+    match slot_from_identifier(identifier) {
+        Some(slot) if app_active && viewing == Some(slot) => Presentation::ListOnly,
+        _ => Presentation::Full,
     }
 }
 
@@ -301,13 +352,23 @@ mod platform {
         rust_string(msg_send![err, localizedDescription])
     }
 
-    /// Show banners even while Overseer is frontmost: Jonathan may be in
-    /// another session's terminal.
-    extern "C" fn will_present(_: &Object, _: Sel, _center: Id, _note: Id, handler: Id) {
-        // SAFETY: AppKit passes a block taking the presentation options.
+    /// Banners show while Overseer is frontmost, since Jonathan may be in
+    /// another session's terminal, but not for the session he is looking at
+    /// (see `presentation`).
+    extern "C" fn will_present(_: &Object, _: Sel, _center: Id, note: Id, handler: Id) {
+        // SAFETY: `note` is a UNNotification and AppKit passes a block taking
+        // the presentation options; NSApp is the shared application.
         unsafe {
+            let request: Id = msg_send![note, request];
+            let ident = rust_string(msg_send![request, identifier]);
+            let app: Id = msg_send![class!(NSApplication), sharedApplication];
+            let active: BOOL = msg_send![app, isActive];
+            let options = match super::presentation(&ident, super::viewing(), active != NO) {
+                super::Presentation::Full => PRESENT_BANNER | PRESENT_LIST | PRESENT_SOUND,
+                super::Presentation::ListOnly => PRESENT_LIST,
+            };
             let handler = &*(handler as *const Block<(usize,), ()>);
-            handler.call((PRESENT_BANNER | PRESENT_LIST | PRESENT_SOUND,));
+            handler.call((options,));
         }
     }
 
@@ -438,6 +499,39 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_click_before_anyone_listens_is_kept_for_the_stream() {
+        clicked(Click::Slot(3));
+        let mut rx = clicks();
+        assert_eq!(rx.try_recv().ok(), Some(Click::Slot(3)));
+        clicked(Click::Board);
+        assert_eq!(rx.try_recv().ok(), Some(Click::Board));
+        assert!(rx.try_recv().is_err(), "each click arrives once");
+    }
+
+    #[test]
+    fn the_viewed_session_gets_no_banner_while_overseer_is_in_front() {
+        let s3 = identifier(3, 7);
+        assert_eq!(presentation(&s3, Some(3), true), Presentation::ListOnly);
+        // Another session, the board, or Overseer in the background: full.
+        assert_eq!(presentation(&s3, Some(2), true), Presentation::Full);
+        assert_eq!(presentation(&s3, None, true), Presentation::Full);
+        assert_eq!(presentation(&s3, Some(3), false), Presentation::Full);
+        // Not a session's notification (a push problem, a plan): full.
+        assert_eq!(
+            presentation("overseer-push-1", Some(3), true),
+            Presentation::Full
+        );
+    }
+
+    #[test]
+    fn set_viewing_round_trips() {
+        set_viewing(Some(4));
+        assert_eq!(viewing(), Some(4));
+        set_viewing(None);
+        assert_eq!(viewing(), None);
+    }
     use overseer_proto::{Activity, ActivityKind, SlotState};
 
     fn slot(kind: Option<ActivityKind>, reason: Option<&str>) -> SlotInfo {

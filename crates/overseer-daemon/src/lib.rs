@@ -14,6 +14,7 @@ pub mod ring;
 pub mod server;
 pub mod settings;
 pub mod slot;
+pub mod trust;
 pub mod vt;
 pub mod work;
 
