@@ -100,6 +100,26 @@ pub fn format_started(since: i64, now: i64, clock: impl Fn(i64) -> String) -> St
     format!("{} ({} ago)", clock(since), format_elapsed(now - since))
 }
 
+/// The slot's state as the panel's State row and the pop-over header show
+/// it: `Running`, `Exited (code 1) at 14:05:12`, with `, restarting` added
+/// while a restart is under way.
+pub fn state_text(info: &SlotInfo, restarting: bool, clock: impl Fn(i64) -> String) -> String {
+    let state = match &info.state {
+        SlotState::Empty => "Empty".to_string(),
+        SlotState::Running { .. } => "Running".to_string(),
+        SlotState::Exited { code, at } => match code {
+            Some(c) => format!("Exited (code {c}) at {}", clock(*at)),
+            None => format!("Exited at {}", clock(*at)),
+        },
+        SlotState::Resumable { .. } => "Resumable".to_string(),
+    };
+    if restarting {
+        format!("{state}, restarting")
+    } else {
+        state
+    }
+}
+
 pub fn panel_model(
     info: &SlotInfo,
     now: i64,
@@ -118,32 +138,13 @@ pub fn panel_model(
         .as_deref()
         .map(|p| tilde(p, home))
         .unwrap_or_else(dash);
-    let (pid, state, started) = match &info.state {
-        SlotState::Empty => (dash(), "Empty".to_string(), dash()),
-        SlotState::Running { pid, since } => (
-            pid.to_string(),
-            "Running".to_string(),
-            format_started(*since, now, &clock),
-        ),
-        SlotState::Exited { code, at } => (
-            dash(),
-            match code {
-                Some(c) => format!("Exited (code {c}) at {}", clock(*at)),
-                None => format!("Exited at {}", clock(*at)),
-            },
-            dash(),
-        ),
-        SlotState::Resumable { at, .. } => (
-            dash(),
-            "Resumable".to_string(),
-            format_started(*at, now, &clock),
-        ),
+    let (pid, started) = match &info.state {
+        SlotState::Empty => (dash(), dash()),
+        SlotState::Running { pid, since } => (pid.to_string(), format_started(*since, now, &clock)),
+        SlotState::Exited { .. } => (dash(), dash()),
+        SlotState::Resumable { at, .. } => (dash(), format_started(*at, now, &clock)),
     };
-    let state = if restarting {
-        format!("{state}, restarting")
-    } else {
-        state
-    };
+    let state = state_text(info, restarting, &clock);
     let running = matches!(info.state, SlotState::Running { .. });
     let mut rows = vec![
         ("Label", label),
@@ -1152,26 +1153,10 @@ impl OverseerApp {
     }
 
     /// The pop-over's top row: slot, ticket, state and the close button.
-    fn render_popover_header(
-        &self,
-        id: SlotId,
-        now: i64,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn render_popover_header(&self, id: SlotId, cx: &mut Context<Self>) -> impl IntoElement {
         let info = &self.slots[id as usize];
         let title = popover_title(info, &self.work);
-        let m = panel_model(
-            info,
-            now,
-            self.home.as_deref(),
-            self.restarting(id),
-            local_clock,
-        );
-        let state = ["Activity", "State"]
-            .iter()
-            .find_map(|k| m.rows.iter().find(|(name, _)| name == k))
-            .map(|(_, v)| v.clone())
-            .unwrap_or_default();
+        let state = state_text(info, self.restarting(id), local_clock);
         let close = div()
             .id("popover-close")
             .px_2()
@@ -1187,6 +1172,7 @@ impl OverseerApp {
             .gap_3()
             .child(
                 div()
+                    .flex_shrink()
                     .min_w(px(0.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .overflow_hidden()
@@ -1196,6 +1182,8 @@ impl OverseerApp {
             )
             .child(
                 div()
+                    .flex_none()
+                    .ml_3()
                     .text_sm()
                     .text_color(rgb(colors::MUTED))
                     .whitespace_nowrap()
@@ -1311,7 +1299,7 @@ impl OverseerApp {
         } else {
             left
         };
-        let header = self.render_popover_header(id, now, cx);
+        let header = self.render_popover_header(id, cx);
         let tabs = self.render_tabs(id, cx);
         let panel = self.render_panel(id, now, cx);
         div()
@@ -1660,6 +1648,17 @@ mod tests {
         let notes = slot_notices(&view, 2);
         assert_eq!(notes.len(), 1);
         assert_eq!(notes[0].text, "DEMO-9 moved to S4");
+    }
+
+    #[test]
+    fn state_text_matches_the_state_row() {
+        let clock = |_| "14:05:12".to_string();
+        let i = info(RUN);
+        assert_eq!(state_text(&i, false, clock), "Running");
+        assert_eq!(state_text(&i, true, clock), "Running, restarting");
+        let m = panel_model(&i, 100, None, true, clock);
+        let row = m.rows.iter().find(|(n, _)| *n == "State").unwrap();
+        assert_eq!(row.1, state_text(&i, true, clock));
     }
 
     #[test]

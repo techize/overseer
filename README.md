@@ -197,6 +197,8 @@ trimming):
 - The old keys `stage_waiting`, `stage_testing` and `stage_in_review` still
   load: the first two fill `stage_blocked` and `stage_to_be_tested` when the
   new key is absent, and the review names are added to In progress.
+- Click a session card, or press Cmd+0 to Cmd+6, to open that session over the
+  board. Cmd+Esc, the x button, or a click outside the panel closes it.
 - Pace needs `sprint_start` (a date like `2026-11-09`) and `sprint_days`
   (default 10). Without `sprint_start` the pace marker and the pace warning
   are hidden. The kanban is hidden when there are no sprint tickets.
