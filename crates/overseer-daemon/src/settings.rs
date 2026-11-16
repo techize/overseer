@@ -147,6 +147,24 @@ pub const CATALOGUE: &[Spec] = &[
     daemon("pr_repos", WORK, SettingKind::List, |c| {
         SettingValue::List(c.pr_repos.iter().map(|p| p.display().to_string()).collect())
     }),
+    daemon(
+        "pr_workspace",
+        WORK,
+        SettingKind::Text { allow_empty: true },
+        |c| text(&c.pr_workspace),
+    ),
+    daemon(
+        "pr_project",
+        WORK,
+        SettingKind::Text { allow_empty: true },
+        |c| text(&c.pr_project),
+    ),
+    daemon(
+        "pr_active_days",
+        WORK,
+        SettingKind::Int { min: 0, max: 3650 },
+        |c| int(c.pr_active_days),
+    ),
     daemon("pr_poll_secs", WORK, POLL, |c| int(c.pr_poll_secs)),
     daemon(
         "pr_author",
@@ -242,6 +260,13 @@ pub const CATALOGUE: &[Spec] = &[
         SettingKind::List,
         COMMAND_NOTE,
         Some(|c| list(&c.pr_command)),
+    ),
+    read_only(
+        "pr_repos_command",
+        COMMANDS,
+        SettingKind::List,
+        COMMAND_NOTE,
+        Some(|c| list(&c.pr_repos_command)),
     ),
     read_only(
         "bd_command",

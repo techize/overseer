@@ -49,6 +49,16 @@ pub struct Config {
     pub pr_poll_secs: u64,
     /// Only this author's pull requests; empty shows all authors.
     pub pr_author: String,
+    /// A Bitbucket workspace whose repos are found and polled; empty turns
+    /// this off. Works alongside `pr_repos`.
+    pub pr_workspace: String,
+    /// Only repos in this Bitbucket project; empty means the whole workspace.
+    pub pr_project: String,
+    /// Only repos updated in this many days are polled; 0 polls every repo.
+    pub pr_active_days: u64,
+    /// Lists the workspace's repos; `{workspace}` in any element is
+    /// replaced by `pr_workspace`.
+    pub pr_repos_command: Vec<String>,
     /// Jira status names for each board stage, matched case-insensitively.
     pub stage_todo: Vec<String>,
     pub stage_in_progress: Vec<String>,
@@ -115,6 +125,18 @@ impl Default for Config {
             ]),
             pr_poll_secs: 300,
             pr_author: String::new(),
+            pr_workspace: String::new(),
+            pr_project: String::new(),
+            pr_active_days: 30,
+            pr_repos_command: strings(&[
+                "bb",
+                "repo",
+                "list",
+                "--workspace",
+                "{workspace}",
+                "--output",
+                "json",
+            ]),
             stage_todo: strings(&[
                 "Backlog",
                 "Prioritised Backlog",
@@ -361,5 +383,34 @@ mod tests {
             ]
         );
         assert_eq!(c.pr_author, "demo");
+    }
+
+    #[test]
+    fn pr_workspace_keys_default_and_load() {
+        let (c, _) = Config::load(Path::new("/nonexistent/config.toml"), &home());
+        assert_eq!(c.pr_workspace, "");
+        assert_eq!(c.pr_project, "");
+        assert_eq!(c.pr_active_days, 30);
+        assert_eq!(
+            c.pr_repos_command,
+            [
+                "bb",
+                "repo",
+                "list",
+                "--workspace",
+                "{workspace}",
+                "--output",
+                "json"
+            ]
+        );
+        let (_d, p) = write(
+            "pr_workspace = \"demo-ws\"\npr_project = \"DEMO\"\npr_active_days = 0\npr_repos_command = [\"fake-bb\", \"{workspace}\"]\n",
+        );
+        let (c, err) = Config::load(&p, &home());
+        assert!(err.is_none());
+        assert_eq!(c.pr_workspace, "demo-ws");
+        assert_eq!(c.pr_project, "DEMO");
+        assert_eq!(c.pr_active_days, 0);
+        assert_eq!(c.pr_repos_command, ["fake-bb", "{workspace}"]);
     }
 }

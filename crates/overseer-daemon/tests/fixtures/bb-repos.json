@@ -1,0 +1,27 @@
+{
+  "pagelen": 10,
+  "values": [
+    {
+      "slug": "demo-api",
+      "full_name": "demo-ws/demo-api",
+      "name": "Demo API",
+      "updated_on": "2026-11-14T09:12:33.123456+00:00"
+    },
+    {
+      "full_name": "demo-ws/demo-web",
+      "name": "Demo Web",
+      "updated_on": "2026-11-10T17:40:00Z"
+    },
+    {
+      "slug": "demo-old",
+      "name": "Demo Old",
+      "updated_on": "2024-02-01T08:00:00Z"
+    },
+    {
+      "name": "demo-docs"
+    },
+    {
+      "description": "no name at all"
+    }
+  ]
+}
