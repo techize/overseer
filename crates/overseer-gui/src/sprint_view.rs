@@ -363,15 +363,15 @@ pub fn prio_chip(prio: Prio) -> (&'static str, u32, u32) {
     }
 }
 
-/// The column heading's icon. Waiting is `‖`, not the pause emoji, which
+/// The column heading's icon. Blocked is `‖`, not the pause emoji, which
 /// would draw in colour.
 pub fn stage_icon(stage: Stage) -> &'static str {
     match stage {
         Stage::ToDo => "○",
+        Stage::Blocked => "‖",
+        Stage::Next => "→",
         Stage::InProgress => "▶",
-        Stage::InReview => "⇄",
-        Stage::Testing => "⚗",
-        Stage::Waiting => "‖",
+        Stage::ToBeTested => "⚗",
         Stage::Done => "✓",
     }
 }
@@ -381,9 +381,9 @@ pub fn stage_color(stage: Stage) -> u32 {
     match stage {
         Stage::ToDo => colors::GREY,
         Stage::InProgress | Stage::Done => colors::GREEN,
-        Stage::InReview => colors::ACCENT,
-        Stage::Testing => colors::PURPLE,
-        Stage::Waiting => colors::ORANGE,
+        Stage::Next => colors::ACCENT,
+        Stage::ToBeTested => colors::PURPLE,
+        Stage::Blocked => colors::ORANGE,
     }
 }
 
@@ -936,7 +936,7 @@ mod tests {
             cols.iter().map(|c| c.stage).collect::<Vec<_>>(),
             Stage::ALL.to_vec()
         );
-        let c = &cols[1];
+        let c = &cols[3];
         assert_eq!((c.total, c.cards.len(), c.more), (6, 4, 2));
         assert_eq!(c.cards[0].key, "DEMO-3");
         assert_eq!(c.cards[1].key, "DEMO-2");
@@ -966,8 +966,8 @@ mod tests {
 
     #[test]
     fn card_links_prs_and_beads() {
-        let mut v = view(vec![ticket("DEMO-1", Stage::InReview, None)]);
-        let mut bead = ticket("demo-b1", Stage::InReview, None);
+        let mut v = view(vec![ticket("DEMO-1", Stage::InProgress, None)]);
+        let mut bead = ticket("demo-b1", Stage::InProgress, None);
         bead.kind = ItemKind::Bead;
         bead.parent = Some("DEMO-1".into());
         v.items.push(bead);
@@ -976,7 +976,7 @@ mod tests {
         let mut older = pr(7, Some(1000 - 3 * 86_400));
         older.ticket = Some("DEMO-1".into());
         v.prs = vec![newer, older, pr(9, Some(0))];
-        let c = &columns(&v, 1000)[2].cards[0];
+        let c = &columns(&v, 1000)[3].cards[0];
         assert_eq!(c.pr, Some(("#7 3d".to_string(), AgeTone::Ageing)));
         assert_eq!(c.beads, 1);
     }
@@ -986,14 +986,14 @@ mod tests {
         let mut odd = ticket("DEMO-1", Stage::InProgress, None);
         odd.status = "Ready for Release".into();
         let plain = ticket("DEMO-2", Stage::InProgress, None);
-        let mut review = ticket("DEMO-3", Stage::InReview, None);
-        review.status = "Code Review".into();
+        let mut review = ticket("DEMO-3", Stage::Next, None);
+        review.status = "Selected for Development".into();
         let cols = columns(&view(vec![odd, plain, review]), 0);
         assert_eq!(
-            cols[1].cards[0].raw_status.as_deref(),
+            cols[3].cards[0].raw_status.as_deref(),
             Some("Ready for Release")
         );
-        assert_eq!(cols[1].cards[1].raw_status, None);
+        assert_eq!(cols[3].cards[1].raw_status, None);
         assert_eq!(cols[2].cards[0].raw_status, None);
     }
 
@@ -1105,7 +1105,7 @@ mod tests {
         assert_eq!(prio_chip(Prio::Med), ("MED", 0x232a38, 0xaab3c2));
         assert_eq!(prio_chip(Prio::Low), ("LOW", 0x1b2029, 0x8b949e));
         let icons: Vec<_> = Stage::ALL.iter().map(|&s| stage_icon(s)).collect();
-        assert_eq!(icons, ["○", "▶", "⇄", "⚗", "‖", "✓"]);
+        assert_eq!(icons, ["○", "‖", "→", "▶", "⚗", "✓"]);
         assert_eq!(tone_word(AgeTone::Fresh), "fresh");
         assert_eq!(tone_word(AgeTone::Ageing), "ageing");
         assert_eq!(tone_word(AgeTone::Old), "old");
@@ -1114,7 +1114,7 @@ mod tests {
         let p = Progress {
             done: 1,
             total: 4,
-            per_stage: [2, 1, 0, 0, 0, 1],
+            per_stage: [2, 0, 0, 1, 0, 1],
             expected: Some(2),
             breakers_open: 0,
         };
@@ -1145,11 +1145,11 @@ mod tests {
 
     #[test]
     fn undated_pr_chip_has_unknown_tone_and_no_age() {
-        let mut v = view(vec![ticket("DEMO-1", Stage::InReview, None)]);
+        let mut v = view(vec![ticket("DEMO-1", Stage::InProgress, None)]);
         let mut p = pr(5, None);
         p.ticket = Some("DEMO-1".into());
         v.prs = vec![p];
-        let c = &columns(&v, 1000)[2].cards[0];
+        let c = &columns(&v, 1000)[3].cards[0];
         assert_eq!(c.pr, Some(("#5".to_string(), AgeTone::Unknown)));
     }
 

@@ -61,10 +61,10 @@ pub struct Config {
     pub pr_repos_command: Vec<String>,
     /// Jira status names for each board stage, matched case-insensitively.
     pub stage_todo: Vec<String>,
+    pub stage_blocked: Vec<String>,
+    pub stage_next: Vec<String>,
     pub stage_in_progress: Vec<String>,
-    pub stage_in_review: Vec<String>,
-    pub stage_testing: Vec<String>,
-    pub stage_waiting: Vec<String>,
+    pub stage_to_be_tested: Vec<String>,
     pub stage_done: Vec<String>,
 }
 
@@ -137,16 +137,11 @@ impl Default for Config {
                 "--output",
                 "json",
             ]),
-            stage_todo: strings(&[
-                "Backlog",
-                "Prioritised Backlog",
-                "To Do",
-                "Selected for Development",
-            ]),
-            stage_in_progress: strings(&["In Progress"]),
-            stage_in_review: strings(&["In Review", "Code Review", "Review"]),
-            stage_testing: strings(&["To Be Tested", "Testing", "In Testing", "QA"]),
-            stage_waiting: strings(&["Blocked", "Waiting", "On Hold"]),
+            stage_todo: strings(&["Backlog", "Prioritised Backlog", "To Do"]),
+            stage_blocked: strings(&["Blocked", "Waiting", "On Hold"]),
+            stage_next: strings(&["Next", "Selected for Development"]),
+            stage_in_progress: strings(&["In Progress", "In Review", "Code Review", "Review"]),
+            stage_to_be_tested: strings(&["To Be Tested", "Testing", "In Testing", "QA"]),
             stage_done: strings(&["Done", "Closed", "Resolved"]),
         }
     }
@@ -165,7 +160,10 @@ impl Config {
     pub fn load(path: &Path, home: &Path) -> (Config, Option<String>) {
         let (mut config, err) = match std::fs::read_to_string(path) {
             Ok(text) => match toml::from_str::<Config>(&text) {
-                Ok(c) => (c, None),
+                Ok(mut c) => {
+                    c.fold_legacy_stage_keys(&text);
+                    (c, None)
+                }
                 Err(e) => (Config::default(), Some(format!("{}: {e}", path.display()))),
             },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Config::default(), None),
@@ -177,6 +175,39 @@ impl Config {
         config.worktree_root = expand(&config.worktree_root, home);
         config.pr_repos = config.pr_repos.iter().map(|p| expand(p, home)).collect();
         (config, err)
+    }
+}
+
+impl Config {
+    /// Old config files name `stage_waiting`, `stage_testing` and
+    /// `stage_in_review`. The first two stand in for `stage_blocked` and
+    /// `stage_to_be_tested` when the new key is absent; the review names are
+    /// appended to the In Progress list in effect.
+    fn fold_legacy_stage_keys(&mut self, text: &str) {
+        let Ok(table) = text.parse::<toml::Table>() else {
+            return;
+        };
+        let list = |key: &str| -> Option<Vec<String>> {
+            table.get(key)?.as_array().map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+        };
+        if let Some(v) = list("stage_waiting").filter(|_| !table.contains_key("stage_blocked")) {
+            self.stage_blocked = v;
+        }
+        if let Some(v) = list("stage_testing").filter(|_| !table.contains_key("stage_to_be_tested"))
+        {
+            self.stage_to_be_tested = v;
+        }
+        if let Some(v) = list("stage_in_review") {
+            for name in v {
+                if !self.stage_in_progress.contains(&name) {
+                    self.stage_in_progress.push(name);
+                }
+            }
+        }
     }
 }
 
@@ -348,22 +379,17 @@ mod tests {
         );
         assert_eq!(c.pr_poll_secs, 300);
         assert_eq!(c.pr_author, "");
+        assert_eq!(c.stage_todo, ["Backlog", "Prioritised Backlog", "To Do"]);
+        assert_eq!(c.stage_blocked, ["Blocked", "Waiting", "On Hold"]);
+        assert_eq!(c.stage_next, ["Next", "Selected for Development"]);
         assert_eq!(
-            c.stage_todo,
-            [
-                "Backlog",
-                "Prioritised Backlog",
-                "To Do",
-                "Selected for Development"
-            ]
+            c.stage_in_progress,
+            ["In Progress", "In Review", "Code Review", "Review"]
         );
-        assert_eq!(c.stage_in_progress, ["In Progress"]);
-        assert_eq!(c.stage_in_review, ["In Review", "Code Review", "Review"]);
         assert_eq!(
-            c.stage_testing,
+            c.stage_to_be_tested,
             ["To Be Tested", "Testing", "In Testing", "QA"]
         );
-        assert_eq!(c.stage_waiting, ["Blocked", "Waiting", "On Hold"]);
         assert_eq!(c.stage_done, ["Done", "Closed", "Resolved"]);
 
         let (_d, p) = write("");
@@ -383,6 +409,32 @@ mod tests {
             ]
         );
         assert_eq!(c.pr_author, "demo");
+    }
+
+    #[test]
+    fn legacy_stage_keys_load() {
+        let (_d, p) = write("stage_waiting = [\"Parked\"]\nstage_in_review = [\"Peer Check\"]\n");
+        let (c, err) = Config::load(&p, &home());
+        assert!(err.is_none());
+        assert_eq!(c.stage_blocked, ["Parked"]);
+        assert_eq!(
+            c.stage_in_progress,
+            [
+                "In Progress",
+                "In Review",
+                "Code Review",
+                "Review",
+                "Peer Check"
+            ]
+        );
+
+        let (_d, p) = write("stage_testing = [\"UAT\"]\n");
+        let (c, _) = Config::load(&p, &home());
+        assert_eq!(c.stage_to_be_tested, ["UAT"]);
+
+        let (_d, p) = write("stage_waiting = [\"A\"]\nstage_blocked = [\"B\"]\n");
+        let (c, _) = Config::load(&p, &home());
+        assert_eq!(c.stage_blocked, ["B"]);
     }
 
     #[test]

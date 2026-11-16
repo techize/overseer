@@ -193,17 +193,17 @@ pub const CATALOGUE: &[Spec] = &[
     daemon("stage_todo", SPRINT, SettingKind::List, |c| {
         list(&c.stage_todo)
     }),
+    daemon("stage_blocked", SPRINT, SettingKind::List, |c| {
+        list(&c.stage_blocked)
+    }),
+    daemon("stage_next", SPRINT, SettingKind::List, |c| {
+        list(&c.stage_next)
+    }),
     daemon("stage_in_progress", SPRINT, SettingKind::List, |c| {
         list(&c.stage_in_progress)
     }),
-    daemon("stage_in_review", SPRINT, SettingKind::List, |c| {
-        list(&c.stage_in_review)
-    }),
-    daemon("stage_testing", SPRINT, SettingKind::List, |c| {
-        list(&c.stage_testing)
-    }),
-    daemon("stage_waiting", SPRINT, SettingKind::List, |c| {
-        list(&c.stage_waiting)
+    daemon("stage_to_be_tested", SPRINT, SettingKind::List, |c| {
+        list(&c.stage_to_be_tested)
     }),
     daemon("stage_done", SPRINT, SettingKind::List, |c| {
         list(&c.stage_done)

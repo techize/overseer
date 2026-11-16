@@ -168,30 +168,36 @@ pub struct WorkItem {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Stage {
     ToDo,
+    /// Was `Waiting`; the alias lets an older peer's value still parse.
+    #[serde(alias = "Waiting")]
+    Blocked,
+    Next,
+    /// Absorbs the old `InReview`.
+    #[serde(alias = "InReview")]
     InProgress,
-    InReview,
-    Testing,
-    Waiting,
+    /// Was `Testing`.
+    #[serde(alias = "Testing")]
+    ToBeTested,
     Done,
 }
 
 impl Stage {
     pub const ALL: [Stage; 6] = [
         Stage::ToDo,
+        Stage::Blocked,
+        Stage::Next,
         Stage::InProgress,
-        Stage::InReview,
-        Stage::Testing,
-        Stage::Waiting,
+        Stage::ToBeTested,
         Stage::Done,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
-            Stage::ToDo => "TO DO",
+            Stage::ToDo => "TODO",
+            Stage::Blocked => "BLOCKED",
+            Stage::Next => "NEXT",
             Stage::InProgress => "IN PROGRESS",
-            Stage::InReview => "IN REVIEW",
-            Stage::Testing => "TESTING",
-            Stage::Waiting => "WAITING",
+            Stage::ToBeTested => "TO BE TESTED",
             Stage::Done => "DONE",
         }
     }
@@ -956,14 +962,26 @@ mod tests {
         assert_eq!(
             Stage::ALL.map(Stage::label),
             [
-                "TO DO",
+                "TODO",
+                "BLOCKED",
+                "NEXT",
                 "IN PROGRESS",
-                "IN REVIEW",
-                "TESTING",
-                "WAITING",
+                "TO BE TESTED",
                 "DONE"
             ]
         );
+    }
+
+    #[test]
+    fn old_stage_names_still_parse() {
+        for (old, want) in [
+            ("Waiting", Stage::Blocked),
+            ("InReview", Stage::InProgress),
+            ("Testing", Stage::ToBeTested),
+        ] {
+            let got: Stage = serde_json::from_str(&format!("\"{old}\"")).unwrap();
+            assert_eq!(got, want, "{old}");
+        }
     }
 
     use super::*;

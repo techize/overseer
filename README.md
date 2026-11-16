@@ -180,21 +180,23 @@ trimming):
 
 | Key | Default |
 |-----|---------|
-| `stage_todo` | Backlog, Prioritised Backlog, To Do, Selected for Development |
-| `stage_in_progress` | In Progress |
-| `stage_in_review` | In Review, Code Review, Review |
-| `stage_testing` | To Be Tested, Testing, In Testing, QA |
-| `stage_waiting` | Blocked, Waiting, On Hold |
+| `stage_todo` | Backlog, Prioritised Backlog, To Do |
+| `stage_blocked` | Blocked, Waiting, On Hold |
+| `stage_next` | Next, Selected for Development |
+| `stage_in_progress` | In Progress, In Review, Code Review, Review |
+| `stage_to_be_tested` | To Be Tested, Testing, In Testing, QA |
 | `stage_done` | Done, Closed, Resolved |
 
 - A status in none of the lists lands in In progress and the card shows the
   raw Jira status (for example `Ready for Release`).
 - If a status is in more than one list, the first matching list wins, in the
-  order To do, In progress, In review, Testing, Waiting, Done.
+  order Todo, Blocked, Next, In progress, To be tested, Done.
 - After you edit a stage list and restart the daemon, a ticket whose status now
   maps to a different stage starts its time in stage from the restart.
-- A To do or In progress ticket with an open linked PR shows in In review.
-  This is display only; Jira is not changed.
+- A ticket stays in its Jira column whether or not it has an open PR.
+- The old keys `stage_waiting`, `stage_testing` and `stage_in_review` still
+  load: the first two fill `stage_blocked` and `stage_to_be_tested` when the
+  new key is absent, and the review names are added to In progress.
 - Pace needs `sprint_start` (a date like `2026-11-09`) and `sprint_days`
   (default 10). Without `sprint_start` the pace marker and the pace warning
   are hidden. The kanban is hidden when there are no sprint tickets.
