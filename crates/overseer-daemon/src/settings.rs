@@ -144,6 +144,16 @@ pub const CATALOGUE: &[Spec] = &[
     daemon("jql", WORK, NOT_EMPTY, |c| text(&c.jql)),
     daemon("jira_poll_secs", WORK, POLL, |c| int(c.jira_poll_secs)),
     daemon("beads_poll_secs", WORK, POLL, |c| int(c.beads_poll_secs)),
+    daemon("pr_repos", WORK, SettingKind::List, |c| {
+        SettingValue::List(c.pr_repos.iter().map(|p| p.display().to_string()).collect())
+    }),
+    daemon("pr_poll_secs", WORK, POLL, |c| int(c.pr_poll_secs)),
+    daemon(
+        "pr_author",
+        WORK,
+        SettingKind::Text { allow_empty: true },
+        |c| text(&c.pr_author),
+    ),
     daemon("ticket_pattern", WORK, SettingKind::Pattern, |c| {
         text(&c.ticket_pattern)
     }),
@@ -162,6 +172,24 @@ pub const CATALOGUE: &[Spec] = &[
         SettingKind::Int { min: 1, max: 30 },
         |c| SettingValue::Int(i64::from(c.sprint_days)),
     ),
+    daemon("stage_todo", SPRINT, SettingKind::List, |c| {
+        list(&c.stage_todo)
+    }),
+    daemon("stage_in_progress", SPRINT, SettingKind::List, |c| {
+        list(&c.stage_in_progress)
+    }),
+    daemon("stage_in_review", SPRINT, SettingKind::List, |c| {
+        list(&c.stage_in_review)
+    }),
+    daemon("stage_testing", SPRINT, SettingKind::List, |c| {
+        list(&c.stage_testing)
+    }),
+    daemon("stage_waiting", SPRINT, SettingKind::List, |c| {
+        list(&c.stage_waiting)
+    }),
+    daemon("stage_done", SPRINT, SettingKind::List, |c| {
+        list(&c.stage_done)
+    }),
     daemon(
         "lock_idle_mins",
         LOCKS,
@@ -207,6 +235,13 @@ pub const CATALOGUE: &[Spec] = &[
         SettingKind::List,
         COMMAND_NOTE,
         Some(|c| list(&c.jira_command)),
+    ),
+    read_only(
+        "pr_command",
+        COMMANDS,
+        SettingKind::List,
+        COMMAND_NOTE,
+        Some(|c| list(&c.pr_command)),
     ),
     read_only(
         "bd_command",

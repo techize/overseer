@@ -6,6 +6,8 @@
 
 use std::path::Path;
 
+use overseer_proto::SprintDay;
+
 /// The settings check reads `sprint_start` with the same parser.
 pub use overseer_proto::settings::{parse_ymd, Ymd};
 
@@ -18,7 +20,7 @@ const MONTHS: [&str; 12] = [
 const WEEKDAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 
 /// Days since 1970-01-01 (civil-from-days, Howard Hinnant's algorithm).
-fn to_days(t: Ymd) -> i64 {
+pub(crate) fn to_days(t: Ymd) -> i64 {
     let y = i64::from(t.y) - i64::from(t.m <= 2);
     let era = y.div_euclid(400);
     let yoe = y - era * 400;
@@ -80,25 +82,51 @@ pub fn sprint_label(name: &str, start: Option<Ymd>, days: u32, today: Ymd) -> Op
         return Some(name.to_string());
     };
     let days = i64::from(if days == 0 { DEFAULT_DAYS } else { days });
-    let mut first = to_days(start);
-    let first_wd = weekday(first);
-    if first_wd >= 5 {
-        first += 7 - first_wd;
-    }
+    let first = first_weekday(start);
     let now = to_days(today);
     if now < first {
         return Some(format!("{name}, starts {}", short_date(first)));
     }
-    let span = now - first + 1;
-    let first_wd = weekday(first);
-    let reached = span / 7 * 5 + (0..span % 7).filter(|i| (first_wd + i) % 7 < 5).count() as i64;
+    let reached = weekdays_reached(first, now);
     if reached > days {
         // The last weekday of the sprint: `days` weekdays counting `first`.
+        let first_wd = weekday(first);
         let p = first_wd + days - 1;
         let last = first - first_wd + p / 5 * 7 + p % 5;
         return Some(format!("{name}, ended {}", short_date(last)));
     }
     Some(format!("{name}, day {reached} of {days}"))
+}
+
+/// The sprint's first day as civil days: a weekend start begins on the Monday after.
+fn first_weekday(start: Ymd) -> i64 {
+    let first = to_days(start);
+    let wd = weekday(first);
+    if wd >= 5 {
+        first + 7 - wd
+    } else {
+        first
+    }
+}
+
+/// Weekdays from `first` (a weekday) through `now`, both counted.
+fn weekdays_reached(first: i64, now: i64) -> i64 {
+    let span = now - first + 1;
+    let first_wd = weekday(first);
+    span / 7 * 5 + (0..span % 7).filter(|i| (first_wd + i) % 7 < 5).count() as i64
+}
+
+/// Where `today` falls in the sprint: `None` before the first weekday, else the
+/// weekdays reached, capped at `days` (0 means 10) once the sprint is over.
+pub fn sprint_day(start: Ymd, days: u32, today: Ymd) -> Option<SprintDay> {
+    let days = if days == 0 { DEFAULT_DAYS } else { days };
+    let first = first_weekday(start);
+    let now = to_days(today);
+    if now < first {
+        return None;
+    }
+    let day = weekdays_reached(first, now).min(i64::from(days)) as u32;
+    Some(SprintDay { day, days })
 }
 
 #[cfg(test)]
@@ -160,6 +188,24 @@ mod tests {
     fn a_short_sprint_ends_on_its_last_weekday() {
         let l = sprint_label("s", Some(ymd(2026, 11, 9)), 3, ymd(2026, 11, 13));
         assert_eq!(l.as_deref(), Some("s, ended Wed 11 Nov"));
+    }
+
+    #[test]
+    fn sprint_day_counts_and_caps() {
+        let start = ymd(2026, 11, 9);
+        assert_eq!(
+            sprint_day(start, 10, ymd(2026, 11, 16)),
+            Some(SprintDay { day: 6, days: 10 })
+        );
+        assert_eq!(sprint_day(start, 10, ymd(2026, 11, 6)), None);
+        assert_eq!(
+            sprint_day(start, 10, ymd(2026, 11, 23)),
+            Some(SprintDay { day: 10, days: 10 })
+        );
+        assert_eq!(
+            sprint_day(start, 0, ymd(2026, 11, 16)),
+            Some(SprintDay { day: 6, days: 10 })
+        );
     }
 
     #[test]
