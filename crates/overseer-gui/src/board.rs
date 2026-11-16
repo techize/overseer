@@ -19,8 +19,8 @@ use std::path::Path;
 use gpui::{div, prelude::*, px, rgb, Context, FontWeight, Window};
 use overseer_proto::{
     slot_name, Activity, ActivityKind, BrainView, ClaimKind, CoordView, ItemKind, LockView,
-    PlanState, QueueEntry, QueueState, RelayState, Sender, SlotId, SlotInfo, SlotState, WorkItem,
-    WorkView,
+    PlanState, QueueEntry, QueueState, RelayState, Sender, SlotId, SlotInfo, SlotState, Stage,
+    WorkItem, WorkView, PRS_OFF,
 };
 
 use crate::app::{colors, OverseerApp};
@@ -116,7 +116,12 @@ pub fn header_title(work: &WorkView) -> Option<String> {
 /// `jira: acli not found · beads 133 · 14:05` when a source failed. Jira
 /// leads; the time is the newest successful read, through `clock`.
 pub fn source_line(view: &WorkView, clock: impl Fn(i64) -> String) -> String {
-    let mut sources: Vec<_> = view.sources.iter().collect();
+    // The PR source is off by default; the header does not mention it then.
+    let mut sources: Vec<_> = view
+        .sources
+        .iter()
+        .filter(|s| s.ok || s.message.as_deref() != Some(PRS_OFF))
+        .collect();
     sources.sort_by_key(|s| s.name != "jira");
     let mut parts: Vec<String> = sources
         .iter()
@@ -525,23 +530,24 @@ pub fn needs_you_count(slots: &[SlotInfo]) -> usize {
         .count()
 }
 
-/// Done and total tickets in the list: done is status `done`, `closed` or
-/// `resolved`, any case. Beads, tickets that left the list and placeholder
-/// tickets made from bead titles (their status is not known) are not
-/// counted.
+/// Done and total tickets in the list. A ticket with a stage is done when
+/// the stage is Done; one without (an old daemon) is done when its status
+/// is `done`, `closed` or `resolved`, any case. Beads, tickets that left
+/// the list and placeholder tickets made from bead titles (their status is
+/// not known) are not counted.
 pub fn done_count(work: &WorkView) -> (usize, usize) {
-    let tickets = work
-        .items
-        .iter()
-        .filter(|i| i.kind == ItemKind::Ticket && i.in_list && !i.is_placeholder());
-    let (mut done, mut total) = (0, 0);
-    for i in tickets {
-        total += 1;
-        let s = i.status.trim().to_lowercase();
-        if matches!(s.as_str(), "done" | "closed" | "resolved") {
-            done += 1;
-        }
-    }
+    let tickets = crate::sprint_view::sprint_tickets(work);
+    let total = tickets.len();
+    let done = tickets
+        .into_iter()
+        .filter(|i| match i.stage {
+            Some(stage) => stage == Stage::Done,
+            None => matches!(
+                i.status.trim().to_lowercase().as_str(),
+                "done" | "closed" | "resolved"
+            ),
+        })
+        .count();
     (done, total)
 }
 
@@ -1603,6 +1609,24 @@ mod tests {
             "jira: acli not found · beads: not read yet"
         );
         assert_eq!(source_line(&no_work(), hhmm), "");
+    }
+
+    #[test]
+    fn source_line_leaves_out_the_prs_source_when_off() {
+        let mut v = no_work();
+        v.sources = vec![
+            source("jira", true, 12, Some(14 * 60 + 2), None),
+            source("beads", true, 133, Some(14 * 60 + 5), None),
+        ];
+        let without = source_line(&v, hhmm);
+        v.sources.push(source("prs", false, 0, None, Some(PRS_OFF)));
+        assert_eq!(source_line(&v, hhmm), without);
+        // A failing PR source still shows.
+        v.sources[2] = source("prs", false, 0, None, Some("bb failed"));
+        assert_eq!(
+            source_line(&v, hhmm),
+            "jira 12 · beads 133 · prs: bb failed · 14:05"
+        );
     }
 
     #[test]

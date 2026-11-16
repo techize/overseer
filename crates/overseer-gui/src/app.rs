@@ -63,6 +63,9 @@ pub(crate) mod colors {
     pub const EDGE_IDLE: u32 = 0x555d6b;
     pub const ORANGE: u32 = 0xf0883e;
     pub const RED: u32 = 0xf85149;
+    // Testing stage; first drawn by the sprint kanban.
+    #[allow(dead_code)]
+    pub const PURPLE: u32 = 0xd2a8ff;
     pub const BUTTON: u32 = 0x21283a;
     pub const BUTTON_BORDER: u32 = 0x2f3850;
     pub const FIELD: u32 = 0x0b0e14;
