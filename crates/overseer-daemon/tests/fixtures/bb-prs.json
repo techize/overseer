@@ -1,0 +1,20 @@
+{
+  "values": [
+    {
+      "id": 41,
+      "title": "Wire up the widget",
+      "created_on": "2026-11-14T09:12:33.123456+00:00",
+      "source": { "branch": { "name": "feature/DEMO-12-widget" } },
+      "links": { "html": { "href": "https://bitbucket.example.test/demo/demo-api/pull-requests/41" } },
+      "author": { "display_name": "Dana Demo", "nickname": "dana" }
+    },
+    {
+      "id": 42,
+      "title": "DEMO-14 Fix the flag",
+      "created_on": "2026-11-15T17:40:00Z",
+      "source": { "branch": { "name": "fix-flag" } },
+      "links": { "html": { "href": "https://bitbucket.example.test/demo/demo-api/pull-requests/42" } },
+      "author": { "nickname": "dana" }
+    }
+  ]
+}
