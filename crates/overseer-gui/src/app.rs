@@ -271,6 +271,8 @@ pub fn empty_work() -> WorkView {
         sources: Vec::new(),
         notices: Vec::new(),
         sprint: None,
+        prs: Vec::new(),
+        sprint_day: None,
     }
 }
 
@@ -1842,6 +1844,8 @@ mod tests {
             owner,
             in_list: true,
             folder: None,
+            stage: None,
+            stage_since: None,
         };
         let mut work = empty_work();
         work.items = vec![

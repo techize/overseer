@@ -331,6 +331,8 @@ impl WorkStore {
                 owner: Some(*slot),
                 in_list: false,
                 folder: folder_for(&cache.folders, key),
+                stage: None,
+                stage_since: None,
             });
         }
         WorkView {
@@ -338,6 +340,8 @@ impl WorkStore {
             sources: vec![cache.beads_status.clone(), cache.jira_status.clone()],
             notices,
             sprint: self.sprint_text(&cache),
+            prs: Vec::new(),
+            sprint_day: None,
         }
     }
 
@@ -1185,6 +1189,8 @@ mod kickoff_tests {
             owner: Some(3),
             in_list: true,
             folder: None,
+            stage: None,
+            stage_since: None,
         }
     }
 

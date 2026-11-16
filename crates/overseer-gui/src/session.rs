@@ -1527,6 +1527,8 @@ mod tests {
             owner,
             in_list,
             folder: None,
+            stage: None,
+            stage_since: None,
         };
         let view = WorkView {
             items: vec![
@@ -1548,6 +1550,8 @@ mod tests {
                 },
             ],
             sprint: None,
+            prs: Vec::new(),
+            sprint_day: None,
         };
         let rows = owns_rows(&view, 2);
         assert_eq!(
@@ -1577,6 +1581,8 @@ mod tests {
                 owner: Some(2),
                 in_list: false,
                 folder: None,
+                stage: None,
+                stage_since: None,
             }],
             sources: vec![SourceStatus {
                 name: "beads".into(),
@@ -1587,6 +1593,8 @@ mod tests {
             }],
             notices: vec![],
             sprint: None,
+            prs: Vec::new(),
+            sprint_day: None,
         };
         let rows = owns_rows(&view, 2);
         assert!(rows[0].gone && rows[0].not_read_yet, "{rows:?}");

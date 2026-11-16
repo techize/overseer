@@ -331,6 +331,8 @@ mod tests {
             owner,
             in_list: true,
             folder: folder.map(PathBuf::from),
+            stage: None,
+            stage_since: None,
         }
     }
 
@@ -340,6 +342,8 @@ mod tests {
             sources: vec![],
             notices: vec![],
             sprint: None,
+            prs: Vec::new(),
+            sprint_day: None,
         }
     }
 

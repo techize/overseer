@@ -154,6 +154,69 @@ pub struct WorkItem {
     pub in_list: bool,
     /// The 2ndBrain ticket folder, when found.
     pub folder: Option<PathBuf>,
+    /// The kanban stage shown for the ticket; `None` for beads and for
+    /// tickets from an old daemon.
+    #[serde(default)]
+    pub stage: Option<Stage>,
+    /// Unix seconds the ticket entered its Jira stage, only when the daemon
+    /// saw it move.
+    #[serde(default)]
+    pub stage_since: Option<i64>,
+}
+
+/// A kanban column, in display order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Stage {
+    ToDo,
+    InProgress,
+    InReview,
+    Testing,
+    Waiting,
+    Done,
+}
+
+impl Stage {
+    pub const ALL: [Stage; 6] = [
+        Stage::ToDo,
+        Stage::InProgress,
+        Stage::InReview,
+        Stage::Testing,
+        Stage::Waiting,
+        Stage::Done,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Stage::ToDo => "TO DO",
+            Stage::InProgress => "IN PROGRESS",
+            Stage::InReview => "IN REVIEW",
+            Stage::Testing => "TESTING",
+            Stage::Waiting => "WAITING",
+            Stage::Done => "DONE",
+        }
+    }
+}
+
+/// An open pull request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PullRequest {
+    pub repo: String,
+    pub id: u64,
+    pub title: String,
+    pub branch: String,
+    pub url: Option<String>,
+    pub author: Option<String>,
+    /// Unix seconds the PR was opened.
+    pub created: Option<i64>,
+    /// The ticket key found in the title or branch.
+    pub ticket: Option<String>,
+}
+
+/// Where today falls in the sprint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SprintDay {
+    pub day: u32,
+    pub days: u32,
 }
 
 impl WorkItem {
@@ -189,11 +252,20 @@ pub struct WorkView {
     /// The sprint name and day for the board header, when there is a sprint.
     #[serde(default)]
     pub sprint: Option<String>,
+    /// Open pull requests from the configured repos.
+    #[serde(default)]
+    pub prs: Vec<PullRequest>,
+    /// The sprint day for the pace marker, when the sprint start is known.
+    #[serde(default)]
+    pub sprint_day: Option<SprintDay>,
 }
 
 /// The Jira source's message while `jira_command` is empty. Jira is then
 /// never read, so it never holds back an item's "not read yet".
 pub const JIRA_OFF: &str = "jira_command is empty; Jira is off";
+
+/// The PR source's message while `pr_repos` is empty.
+pub const PRS_OFF: &str = "pr_repos is empty; PRs are off";
 
 impl WorkView {
     /// An owned item missing from the list only because a source that could
@@ -871,6 +943,29 @@ pub enum Event {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn old_work_view_json_still_reads() {
+        let v: WorkView = serde_json::from_str(
+            r#"{"items":[{"key":"DEMO-1","kind":"Ticket","title":"t","status":"Done","priority":null,"parent":null,"owner":null,"in_list":true,"folder":null}],"sources":[],"notices":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(v.items[0].stage, None);
+        assert_eq!(v.items[0].stage_since, None);
+        assert!(v.prs.is_empty());
+        assert_eq!(v.sprint_day, None);
+        assert_eq!(
+            Stage::ALL.map(Stage::label),
+            [
+                "TO DO",
+                "IN PROGRESS",
+                "IN REVIEW",
+                "TESTING",
+                "WAITING",
+                "DONE"
+            ]
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -1082,6 +1177,8 @@ mod tests {
                 sources: vec![],
                 notices: vec![],
                 sprint: None,
+                prs: Vec::new(),
+                sprint_day: None,
             },
             locks: LockView {
                 claims: vec![],
@@ -1159,6 +1256,8 @@ mod tests {
                     owner: Some(2),
                     in_list: true,
                     folder: Some(PathBuf::from("/tmp/DEMO-1")),
+                    stage: None,
+                    stage_since: None,
                 },
                 WorkItem {
                     key: "bd-9".into(),
@@ -1170,6 +1269,8 @@ mod tests {
                     owner: None,
                     in_list: false,
                     folder: None,
+                    stage: None,
+                    stage_since: None,
                 },
             ],
             sources: vec![SourceStatus {
@@ -1185,6 +1286,8 @@ mod tests {
                 text: "left the list".into(),
             }],
             sprint: None,
+            prs: Vec::new(),
+            sprint_day: None,
         }
     }
 

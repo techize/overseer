@@ -154,6 +154,8 @@ mod tests {
             owner: None,
             in_list: true,
             folder: None,
+            stage: None,
+            stage_since: None,
         }
     }
     fn ticket(k: &str) -> WorkItem {

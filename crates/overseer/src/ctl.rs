@@ -1426,6 +1426,8 @@ mod tests {
                 owner: Some(4),
                 in_list: false,
                 folder: None,
+                stage: None,
+                stage_since: None,
             }],
             sources: vec![
                 SourceStatus {
@@ -1445,6 +1447,8 @@ mod tests {
             ],
             notices: vec![],
             sprint: None,
+            prs: Vec::new(),
+            sprint_day: None,
         }
     }
 
@@ -1530,6 +1534,8 @@ mod tests {
             owner: Some(3),
             in_list: true,
             folder: None,
+            stage: None,
+            stage_since: None,
         });
         let claim = |target: &str, slot| Claim {
             target: target.into(),

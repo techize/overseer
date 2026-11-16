@@ -712,6 +712,8 @@ mod tests {
             owner,
             in_list: true,
             folder: None,
+            stage: None,
+            stage_since: None,
         }
     }
 
@@ -727,6 +729,8 @@ mod tests {
             sources: Vec::new(),
             notices: Vec::new(),
             sprint: None,
+            prs: Vec::new(),
+            sprint_day: None,
         };
         assert_eq!(owned_items(&view, 1), ["DEMO-12", "ov-3"]);
         assert_eq!(owned_items(&view, 2), ["ov-4"]);
