@@ -1,8 +1,9 @@
 //! The work-item cache and its assignments, shared by every connection.
 //!
-//! Two sources fill the cache: `bd list --json` in the beads folder and the
-//! configured Jira command. Each runs off the request path with a 30 s
-//! timeout, so a slow source never stalls a slot request. Ownership lives in
+//! Three sources fill the cache: `bd list --json` in the beads folder, the
+//! configured Jira command and the PR command in each of `pr_repos`. Each
+//! runs off the request path with a 30 s timeout, so a slow source never
+//! stalls a slot request. Ownership lives in
 //! the ledger; every decision and its writes happen in one ledger
 //! transaction, so two clients assigning the same item cannot both win.
 //!
@@ -15,23 +16,24 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use overseer_proto::{
-    owned_by_message, slot_name, Event, ItemKind, Response, Sender, SlotId, SourceStatus, WorkItem,
-    WorkView, JIRA_OFF,
+    owned_by_message, slot_name, Event, ItemKind, PullRequest, Response, Sender, SlotId,
+    SourceStatus, Stage, WorkItem, WorkView, JIRA_OFF, PRS_OFF,
 };
 use regex::Regex;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
 
 use super::ownership::{decide, promotions, Decision};
-use super::sprint::{newest_sprint_folder, parse_ymd, sprint_label, Ymd};
-use super::{compile_pattern, group, parse_beads, parse_jira, run_source, Bead, Ticket};
+use super::sprint::{newest_sprint_folder, parse_ymd, sprint_day, sprint_label, Ymd};
+use super::stages::Stages;
+use super::{compile_pattern, group, parse_beads, parse_jira, parse_prs, run_source, Bead, Ticket};
 use crate::brain::paths::local_date;
 use crate::config::Config;
 use crate::env::BaseEnv;
 use crate::ledger::{self, Ledger};
 use crate::manager::valid_id;
 
-/// How long `bd` or the Jira command may run.
+/// How long `bd`, the Jira command or the PR command may run.
 pub const SOURCE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `bd list` stops at 50 rows unless told otherwise; `--limit 0` lists all.
@@ -56,6 +58,17 @@ pub const LABEL_DRAIN: Duration = Duration::from_secs(3);
 pub enum Source {
     Beads,
     Jira,
+    Prs,
+}
+
+/// Today's local date.
+fn today() -> Ymd {
+    let d = local_date(unix_now());
+    Ymd {
+        y: d.year,
+        m: d.month,
+        d: d.day,
+    }
 }
 
 pub(crate) fn unix_now() -> i64 {
@@ -73,6 +86,10 @@ struct Cache {
     items: Vec<WorkItem>,
     beads_status: SourceStatus,
     jira_status: SourceStatus,
+    /// Open PRs per entry of `pr_repos`, in the same order. A repo that
+    /// failed its last read keeps what it had.
+    prs: Vec<Vec<PullRequest>>,
+    prs_status: SourceStatus,
     /// Ticket folders under `<brain_dir>/Sprints/*/`, as (name, path),
     /// sorted by path. Listed again on every refresh.
     folders: Vec<(String, PathBuf)>,
@@ -110,8 +127,16 @@ pub struct WorkStore {
     /// `None` when the configured command is empty: Jira is off.
     jira_command: Option<Vec<String>>,
     jql: String,
+    /// Empty turns the PR source off.
+    pr_repos: Vec<PathBuf>,
+    pr_command: Vec<String>,
+    /// Lowercased and trimmed; empty keeps every author.
+    pr_author: String,
+    /// Which board stage each Jira status belongs to.
+    stages: Stages,
     beads_poll: Duration,
     jira_poll: Duration,
+    pr_poll: Duration,
     /// The ticket pattern, or one that never matches when the configured
     /// pattern is bad (beads then stay ungrouped).
     pattern: Regex,
@@ -124,6 +149,7 @@ pub struct WorkStore {
     /// source run one after another.
     beads_turn: tokio::sync::Mutex<()>,
     jira_turn: tokio::sync::Mutex<()>,
+    prs_turn: tokio::sync::Mutex<()>,
     /// Bead label changes, run in order by one task (started on first use)
     /// so a quick assign and move cannot reach `bd` swapped.
     labels: Mutex<LabelQueue>,
@@ -158,6 +184,13 @@ fn join_messages(a: Option<String>, b: Option<&String>) -> Option<String> {
         (Some(a), None) => Some(a),
         (None, b) => b.cloned(),
     }
+}
+
+/// The name a repo's PRs are shown under: its folder's name.
+fn repo_name(dir: &Path) -> String {
+    dir.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| dir.display().to_string())
 }
 
 /// Every folder one level under `<brain>/Sprints/*/`.
@@ -227,6 +260,14 @@ impl WorkStore {
                 JIRA_OFF.into()
             }),
         );
+        let prs_status = status(
+            "prs",
+            Some(if cfg.pr_repos.is_empty() {
+                PRS_OFF.into()
+            } else {
+                "not read yet".into()
+            }),
+        );
         let sprint_start = match cfg.sprint_start.trim() {
             "" => None,
             text => {
@@ -249,8 +290,13 @@ impl WorkStore {
             sprint_days: cfg.sprint_days,
             jira_command,
             jql: cfg.jql.clone(),
+            pr_repos: cfg.pr_repos.clone(),
+            pr_command: cfg.pr_command.clone(),
+            pr_author: cfg.pr_author.trim().to_lowercase(),
+            stages: Stages::from_config(cfg),
             beads_poll: Duration::from_secs(cfg.beads_poll_secs.max(1)),
             jira_poll: Duration::from_secs(cfg.jira_poll_secs.max(1)),
+            pr_poll: Duration::from_secs(cfg.pr_poll_secs.max(1)),
             pattern,
             pattern_error,
             ledger,
@@ -262,11 +308,14 @@ impl WorkStore {
                 items: Vec::new(),
                 beads_status: status("beads", Some("not read yet".into())),
                 jira_status,
+                prs: vec![Vec::new(); cfg.pr_repos.len()],
+                prs_status,
                 folders: Vec::new(),
                 sprint_folder: newest_sprint_folder(&cfg.brain_dir),
             }),
             beads_turn: tokio::sync::Mutex::new(()),
             jira_turn: tokio::sync::Mutex::new(()),
+            prs_turn: tokio::sync::Mutex::new(()),
             labels: Mutex::new(LabelQueue::default()),
             change_turn: Mutex::new(()),
             relay_hook: OnceLock::new(),
@@ -298,24 +347,53 @@ impl WorkStore {
         cmd
     }
 
-    /// The cached items with their owners and folders, owned items that have
-    /// left the cache (marked `in_list: false`), the source statuses and all
-    /// notices.
+    /// The cached items with their owners, folders and stages, owned items
+    /// that have left the cache (marked `in_list: false`), the source
+    /// statuses, all notices, the open PRs and the sprint day.
     pub fn view(&self) -> WorkView {
-        let read = self
-            .ledger
-            .transaction(|conn| Ok((ledger::assignments_on(conn)?, ledger::notices_on(conn)?)));
-        let (assigned, notices) = read.unwrap_or_else(|e| {
+        let read = self.ledger.transaction(|conn| {
+            Ok((
+                ledger::assignments_on(conn)?,
+                ledger::notices_on(conn)?,
+                ledger::stages_on(conn)?,
+            ))
+        });
+        let (assigned, notices, records) = read.unwrap_or_else(|e| {
             tracing::warn!("ledger read failed: {e:#}");
-            (Vec::new(), Vec::new())
+            (Vec::new(), Vec::new(), HashMap::new())
         });
         let owners: HashMap<&str, SlotId> =
             assigned.iter().map(|(k, s)| (k.as_str(), *s)).collect();
         let cache = self.cache();
+        let prs: Vec<PullRequest> = cache.prs.iter().flatten().cloned().collect();
+        // Only tickets Jira listed have a stage; a placeholder made up from
+        // bead titles has none.
+        let jira_stages: HashMap<&str, Stage> = cache
+            .tickets
+            .iter()
+            .map(|t| (t.key.as_str(), self.stages.stage_of(&t.status)))
+            .collect();
         let mut items = cache.items.clone();
         for it in &mut items {
             it.owner = owners.get(it.key.as_str()).copied();
             it.folder = folder_for(&cache.folders, &it.key);
+            if it.kind != ItemKind::Ticket {
+                continue;
+            }
+            let Some(&stage) = jira_stages.get(it.key.as_str()) else {
+                continue;
+            };
+            let has_pr = prs.iter().any(|p| p.ticket.as_deref() == Some(&it.key));
+            it.stage = Some(match stage {
+                Stage::ToDo | Stage::InProgress if has_pr => Stage::InReview,
+                other => other,
+            });
+            // The age shows only once the daemon has seen the ticket move
+            // into the stage Jira reports now.
+            it.stage_since = records
+                .get(&it.key)
+                .filter(|(recorded, _, moved)| *moved && *recorded == stage)
+                .map(|(_, since, _)| *since);
         }
         for (key, slot) in &assigned {
             if items.iter().any(|i| &i.key == key) {
@@ -337,11 +415,17 @@ impl WorkStore {
         }
         WorkView {
             items,
-            sources: vec![cache.beads_status.clone(), cache.jira_status.clone()],
+            sources: vec![
+                cache.beads_status.clone(),
+                cache.jira_status.clone(),
+                cache.prs_status.clone(),
+            ],
             notices,
             sprint: self.sprint_text(&cache),
-            prs: Vec::new(),
-            sprint_day: None,
+            prs,
+            sprint_day: self
+                .sprint_start
+                .and_then(|start| sprint_day(start, self.sprint_days, today())),
         }
     }
 
@@ -353,13 +437,7 @@ impl WorkStore {
         } else {
             &self.sprint_name
         };
-        let today = local_date(unix_now());
-        let today = Ymd {
-            y: today.year,
-            m: today.month,
-            d: today.day,
-        };
-        sprint_label(name, self.sprint_start, self.sprint_days, today)
+        sprint_label(name, self.sprint_start, self.sprint_days, today())
     }
 
     /// A key not in the cache is a ticket when the whole key matches the
@@ -403,6 +481,7 @@ impl WorkStore {
         let _turn = match which {
             Source::Beads => self.beads_turn.lock().await,
             Source::Jira => self.jira_turn.lock().await,
+            Source::Prs => self.prs_turn.lock().await,
         };
         // The login shell's PATH is what finds `bd` and `acli`.
         let mut env = self.env.clone();
@@ -445,6 +524,9 @@ impl WorkStore {
                     .await
                     .and_then(|out| parse_jira(&out));
                 let now = unix_now();
+                if let Ok(tickets) = &got {
+                    self.record_stages(tickets, now);
+                }
                 let mut cache = self.cache();
                 match got {
                     Ok(tickets) => {
@@ -464,14 +546,94 @@ impl WorkStore {
                     }
                 }
             }
+            Source::Prs => {
+                // Off: nothing to read and nothing in the view changes.
+                if self.pr_repos.is_empty() {
+                    return;
+                }
+                let mut got = Vec::with_capacity(self.pr_repos.len());
+                for dir in &self.pr_repos {
+                    let repo = repo_name(dir);
+                    let read = run_source(&self.pr_command, dir, SOURCE_TIMEOUT, &vars)
+                        .await
+                        .and_then(|out| parse_prs(&out, &repo));
+                    got.push((repo, read));
+                }
+                let now = unix_now();
+                let mut cache = self.cache();
+                let mut errors = Vec::new();
+                let mut answered = false;
+                for (i, (repo, read)) in got.into_iter().enumerate() {
+                    match read {
+                        Ok(prs) => {
+                            answered = true;
+                            cache.prs[i] = prs
+                                .into_iter()
+                                .filter(|p| self.wants_author(p))
+                                .map(|p| self.link_ticket(p))
+                                .collect();
+                        }
+                        Err(e) => {
+                            tracing::warn!("prs source: {repo}: {e}");
+                            errors.push(format!("{repo}: {e}"));
+                        }
+                    }
+                }
+                let count = cache.prs.iter().map(Vec::len).sum();
+                let s = &mut cache.prs_status;
+                s.ok = errors.is_empty();
+                s.count = count;
+                if answered {
+                    s.at = Some(now);
+                }
+                s.message = (!errors.is_empty()).then(|| errors.join("; "));
+            }
         }
         self.regroup(unix_now());
         self.announce();
     }
 
-    /// Both sources at once; returns when both are done.
+    /// Every source at once; returns when all are done.
     pub async fn refresh_all(&self) {
-        tokio::join!(self.refresh(Source::Beads), self.refresh(Source::Jira));
+        tokio::join!(
+            self.refresh(Source::Beads),
+            self.refresh(Source::Jira),
+            self.refresh(Source::Prs)
+        );
+    }
+
+    /// Records each ticket's Jira stage, so the board can tell how long it
+    /// has been there. A failure costs only the stage ages.
+    fn record_stages(&self, tickets: &[Ticket], now: i64) {
+        let seen: Vec<(String, Stage)> = tickets
+            .iter()
+            .map(|t| (t.key.clone(), self.stages.stage_of(&t.status)))
+            .collect();
+        if let Err(e) = self
+            .ledger
+            .transaction(|conn| ledger::record_stages_on(conn, &seen, now))
+        {
+            tracing::warn!("recording ticket stages failed: {e:#}");
+        }
+    }
+
+    /// With `pr_author` set, only that author's PRs, ignoring case.
+    fn wants_author(&self, pr: &PullRequest) -> bool {
+        self.pr_author.is_empty()
+            || pr
+                .author
+                .as_deref()
+                .is_some_and(|a| a.trim().to_lowercase() == self.pr_author)
+    }
+
+    /// `pr` with the first ticket key in its title, else in its branch.
+    fn link_ticket(&self, mut pr: PullRequest) -> PullRequest {
+        pr.ticket = self
+            .pattern
+            .find(&pr.title)
+            .or_else(|| self.pattern.find(&pr.branch))
+            .map(|m| m.as_str().to_owned());
+        pr
     }
 
     /// Rebuilds the grouped list. A bead that was standalone and owned and is
@@ -782,6 +944,7 @@ impl WorkStore {
         for (which, every) in [
             (Source::Beads, self.beads_poll),
             (Source::Jira, self.jira_poll),
+            (Source::Prs, self.pr_poll),
         ] {
             let store = self.clone();
             self.spawn(async move {
@@ -988,6 +1151,7 @@ pub fn kickoff_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use overseer_proto::SprintDay;
 
     /// Makes `finish` pause between the commit and the queueing, so a
     /// missing `change_turn` shows up as labels out of order.
@@ -1170,6 +1334,236 @@ mod tests {
         assert!(n > 6, "only {n} labels");
         let owner = s.ledger.assignments().unwrap().first().map(|(_, o)| *o);
         assert_eq!(on_bead, owner);
+    }
+
+    /// A fresh temp folder for one test.
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ovs-store-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A fake command: `sh -c script`.
+    fn sh(script: &str) -> Vec<String> {
+        vec!["/bin/sh".into(), "-c".into(), script.into()]
+    }
+
+    /// A store with the ticket pattern `DEMO-\d+` and `edit` applied.
+    fn store_with(edit: impl FnOnce(&mut Config)) -> Arc<WorkStore> {
+        let mut cfg = Config {
+            ticket_pattern: r"DEMO-\d+".into(),
+            jira_command: vec![],
+            ..Config::default()
+        };
+        edit(&mut cfg);
+        let (events, _) = broadcast::channel(16);
+        WorkStore::new(
+            &cfg,
+            Arc::new(Ledger::in_memory()),
+            events,
+            BaseEnv::ready(vec![]),
+        )
+    }
+
+    /// A fake `bb` that prints a PR list chosen by the folder it runs in.
+    const FAKE_BB: &str = r#"case "$PWD" in
+*/demo-api) printf '%s' '{"values":[{"id":7,"title":"Widget wiring","source":{"branch":{"name":"feature/DEMO-12-widget"}},"author":{"display_name":"Dana Demo"}},{"id":8,"title":"DEMO-3 tidy logs","source":{"branch":{"name":"chore/logs"}},"author":{"display_name":"Sam Sample"}}]}' ;;
+*/demo-web) printf '%s' '[{"id":"21","title":"Button colours","source":{"branch":{"name":"fix/buttons"}},"author":{"display_name":"Sam Sample"}}]' ;;
+*) echo "no repo here" >&2; exit 1 ;;
+esac"#;
+
+    fn prs_source(v: &WorkView) -> &SourceStatus {
+        v.sources
+            .iter()
+            .find(|s| s.name == "prs")
+            .expect("prs source")
+    }
+
+    #[tokio::test]
+    async fn pr_source_reads_each_repo_and_links_tickets() {
+        let dir = temp_dir("prs");
+        let (api, web) = (dir.join("demo-api"), dir.join("demo-web"));
+        std::fs::create_dir_all(&api).unwrap();
+        std::fs::create_dir_all(&web).unwrap();
+        let s = store_with(|c| {
+            c.pr_repos = vec![api.clone(), web.clone()];
+            c.pr_command = sh(FAKE_BB);
+        });
+        s.refresh(Source::Prs).await;
+        let v = s.view();
+        let got: Vec<_> = v
+            .prs
+            .iter()
+            .map(|p| (p.repo.as_str(), p.id, p.ticket.as_deref()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("demo-api", 7, Some("DEMO-12")),
+                ("demo-api", 8, Some("DEMO-3")),
+                ("demo-web", 21, None),
+            ]
+        );
+        assert_eq!(v.sources[2].name, "prs");
+        let prs = prs_source(&v);
+        assert!(prs.ok, "{prs:?}");
+        assert_eq!(prs.count, 3);
+        assert_eq!(prs.message, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn one_failing_repo_keeps_the_others() {
+        let dir = temp_dir("prs-gone");
+        let api = dir.join("demo-api");
+        std::fs::create_dir_all(&api).unwrap();
+        let s = store_with(|c| {
+            c.pr_repos = vec![api.clone(), dir.join("demo-gone")];
+            c.pr_command = sh(FAKE_BB);
+        });
+        s.refresh(Source::Prs).await;
+        let v = s.view();
+        assert_eq!(v.prs.len(), 2);
+        assert!(v.prs.iter().all(|p| p.repo == "demo-api"));
+        let prs = prs_source(&v);
+        assert!(!prs.ok);
+        let msg = prs.message.as_deref().unwrap_or("");
+        assert!(msg.starts_with("demo-gone: "), "{msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn failing_repo_keeps_its_previous_prs() {
+        let dir = temp_dir("prs-blip");
+        let (api, web) = (dir.join("demo-api"), dir.join("demo-web"));
+        std::fs::create_dir_all(&api).unwrap();
+        std::fs::create_dir_all(&web).unwrap();
+        let s = store_with(|c| {
+            c.pr_repos = vec![api.clone(), web.clone()];
+            c.pr_command = sh(FAKE_BB);
+        });
+        s.refresh(Source::Prs).await;
+        assert_eq!(s.view().prs.len(), 3);
+        // Both repos fail on the next read: the panel keeps what it had.
+        std::fs::remove_dir_all(&api).unwrap();
+        std::fs::remove_dir_all(&web).unwrap();
+        s.refresh(Source::Prs).await;
+        let v = s.view();
+        assert_eq!(v.prs.len(), 3);
+        let msg = prs_source(&v).message.clone().unwrap_or_default();
+        assert!(
+            msg.starts_with("demo-api: ") && msg.contains("; demo-web: "),
+            "{msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn pr_author_filters_prs() {
+        let dir = temp_dir("prs-author");
+        let api = dir.join("demo-api");
+        std::fs::create_dir_all(&api).unwrap();
+        let s = store_with(|c| {
+            c.pr_repos = vec![api.clone()];
+            c.pr_command = sh(FAKE_BB);
+            c.pr_author = "dana demo".into();
+        });
+        s.refresh(Source::Prs).await;
+        let v = s.view();
+        let ids: Vec<_> = v.prs.iter().map(|p| p.id).collect();
+        assert_eq!(ids, [7]);
+        assert_eq!(prs_source(&v).count, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn empty_pr_repos_is_off() {
+        let s = store_with(|c| c.pr_command = sh("echo ran >&2; exit 1"));
+        s.refresh(Source::Prs).await;
+        let v = s.view();
+        assert_eq!(prs_source(&v).message.as_deref(), Some(PRS_OFF));
+        assert!(v.prs.is_empty());
+    }
+
+    /// A fake Jira command that prints whatever `jira.json` in `dir` holds.
+    fn fake_jira(dir: &Path) -> Vec<String> {
+        sh(&format!("cat '{}'", dir.join("jira.json").display()))
+    }
+
+    fn write_jira(dir: &Path, key: &str, status: &str) {
+        let json = format!(
+            r#"{{"issues":[{{"key":"{key}","fields":{{"summary":"Widget wiring","status":{{"name":"{status}"}}}}}}]}}"#
+        );
+        std::fs::write(dir.join("jira.json"), json).unwrap();
+    }
+
+    fn item<'a>(v: &'a WorkView, key: &str) -> &'a WorkItem {
+        v.items.iter().find(|i| i.key == key).expect("item")
+    }
+
+    #[tokio::test]
+    async fn ticket_with_an_open_pr_shows_in_review() {
+        let dir = temp_dir("stage-review");
+        let api = dir.join("demo-api");
+        std::fs::create_dir_all(&api).unwrap();
+        write_jira(&dir, "DEMO-12", "In Progress");
+        let s = store_with(|c| {
+            c.jira_command = fake_jira(&dir);
+            c.pr_repos = vec![api.clone()];
+            c.pr_command = sh(FAKE_BB);
+        });
+        s.refresh(Source::Jira).await;
+        assert_eq!(item(&s.view(), "DEMO-12").stage, Some(Stage::InProgress));
+        s.refresh(Source::Prs).await;
+        assert_eq!(item(&s.view(), "DEMO-12").stage, Some(Stage::InReview));
+        let records = s.ledger.transaction(ledger::stages_on).unwrap();
+        assert_eq!(records["DEMO-12"].0, Stage::InProgress);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn stage_age_only_after_a_move() {
+        let dir = temp_dir("stage-age");
+        write_jira(&dir, "DEMO-1", "To Do");
+        let s = store_with(|c| c.jira_command = fake_jira(&dir));
+        s.refresh(Source::Jira).await;
+        let it = item(&s.view(), "DEMO-1").clone();
+        assert_eq!(it.stage, Some(Stage::ToDo));
+        assert_eq!(it.stage_since, None);
+        write_jira(&dir, "DEMO-1", "To Be Tested");
+        s.refresh(Source::Jira).await;
+        let it = item(&s.view(), "DEMO-1").clone();
+        assert_eq!(it.stage, Some(Stage::Testing));
+        assert!(it.stage_since.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn beads_and_placeholder_tickets_have_no_stage() {
+        let s = store(r"DEMO-\d+");
+        s.cache().beads = vec![Bead {
+            id: "ov-3".into(),
+            title: "about DEMO-40".into(),
+            status: "open".into(),
+            priority: None,
+            external_ref: None,
+            labels: vec![],
+        }];
+        s.regroup(1);
+        let v = s.view();
+        assert_eq!(v.items.len(), 2);
+        assert!(v.items.iter().all(|i| i.stage.is_none()), "{:?}", v.items);
+    }
+
+    #[test]
+    fn sprint_day_comes_from_the_sprint_start() {
+        let s = store_with(|c| {
+            c.sprint_start = "2020-01-06".into();
+            c.sprint_days = 10;
+        });
+        // Long over: capped at the last day.
+        assert_eq!(s.view().sprint_day, Some(SprintDay { day: 10, days: 10 }));
+        assert_eq!(store_with(|_| {}).view().sprint_day, None);
     }
 }
 
