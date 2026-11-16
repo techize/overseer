@@ -171,13 +171,10 @@ pub async fn run_source(
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Parse `bb pullrequest list --output json`. Text before the JSON is skipped,
-/// even text holding a bracket. Accepts an array or an object holding `values` (else
-/// `pullrequests`). Entries without a usable id are skipped.
-pub fn parse_prs(out: &str, repo: &str) -> Result<Vec<PullRequest>, String> {
-    // Try each `[` or `{` in turn: a warning such as `[notice] cached` before
-    // the JSON must not hide it.
-    let mut found = None;
+/// The first JSON list in `out`: an array, or the array under the first of
+/// `keys` an object holds. Each `[` or `{` is tried in turn, so a warning
+/// such as `[notice] cached` before the JSON does not hide it.
+fn find_list(out: &str, keys: &[&str]) -> Option<Vec<Value>> {
     for (start, _) in out.match_indices(['[', '{']) {
         let Some(Ok(v)) = serde_json::Deserializer::from_str(&out[start..])
             .into_iter::<Value>()
@@ -185,21 +182,27 @@ pub fn parse_prs(out: &str, repo: &str) -> Result<Vec<PullRequest>, String> {
         else {
             continue;
         };
-        let list = match &v {
-            Value::Array(a) => Some(a.clone()),
-            Value::Object(_) => v
-                .get("values")
-                .or_else(|| v.get("pullrequests"))
-                .and_then(Value::as_array)
-                .cloned(),
+        let list = match v {
+            Value::Array(a) => Some(a),
+            Value::Object(mut o) => keys.iter().find_map(|k| match o.remove(*k) {
+                Some(Value::Array(a)) => Some(a),
+                _ => None,
+            }),
             _ => None,
         };
-        if let Some(list) = list {
-            found = Some(list);
-            break;
+        if list.is_some() {
+            return list;
         }
     }
-    let arr = &found.ok_or("bb output: no pull request list")?;
+    None
+}
+
+/// Parse `bb pullrequest list --output json`. Text before the JSON is skipped,
+/// even text holding a bracket. Accepts an array or an object holding `values` (else
+/// `pullrequests`). Entries without a usable id are skipped.
+pub fn parse_prs(out: &str, repo: &str) -> Result<Vec<PullRequest>, String> {
+    let arr =
+        &find_list(out, &["values", "pullrequests"]).ok_or("bb output: no pull request list")?;
     let at = |item: &Value, path: &[&str]| {
         path.iter()
             .try_fold(item, |v, k| v.get(k))
@@ -229,6 +232,47 @@ pub fn parse_prs(out: &str, repo: &str) -> Result<Vec<PullRequest>, String> {
         });
     }
     Ok(prs)
+}
+
+/// Parse `bb repo list --output json` into (name, last update) pairs, as
+/// leniently as `parse_prs`. The name is `slug`, else the part of
+/// `full_name` after `/`, else `name`; entries with none are skipped.
+pub fn parse_repos(out: &str) -> Result<Vec<(String, Option<i64>)>, String> {
+    let arr = find_list(out, &["values", "repositories"]).ok_or("bb output: no repo list")?;
+    let mut repos = Vec::with_capacity(arr.len());
+    for item in &arr {
+        let text = |k: &str| {
+            str_of(item, k)
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+        };
+        let name = text("slug")
+            .or_else(|| {
+                text("full_name").map(|f| match f.rsplit_once('/') {
+                    Some((_, slug)) => slug.to_owned(),
+                    None => f,
+                })
+            })
+            .filter(|s| !s.is_empty())
+            .or_else(|| text("name"));
+        let Some(name) = name else {
+            continue;
+        };
+        let updated = str_of(item, "updated_on").and_then(|s| parse_iso_time(&s));
+        repos.push((name, updated));
+    }
+    Ok(repos)
+}
+
+/// The names of the repos updated in the last `days` days at `now`, in
+/// order. `days` 0 keeps every repo, and so does a missing update time.
+pub fn active_repos(repos: &[(String, Option<i64>)], days: u64, now: i64) -> Vec<String> {
+    let window = i64::try_from(days.saturating_mul(86_400)).unwrap_or(i64::MAX);
+    repos
+        .iter()
+        .filter(|(_, updated)| days == 0 || updated.is_none_or(|t| t >= now.saturating_sub(window)))
+        .map(|(name, _)| name.clone())
+        .collect()
 }
 
 /// RFC 3339 to unix seconds, honouring the offset. Fractional seconds are
@@ -483,5 +527,62 @@ mod tests {
         let prs = parse_prs("warn {x}\n[{\"id\":5}]", "demo-api").unwrap();
         assert_eq!(prs[0].id, 5);
         assert!(parse_prs("[notice] only text", "demo-api").is_err());
+    }
+
+    #[test]
+    fn parses_bb_repos_fixture() {
+        let repos = parse_repos(include_str!("../../tests/fixtures/bb-repos.json")).unwrap();
+        let names: Vec<_> = repos.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["demo-api", "demo-web", "demo-old", "demo-docs"]);
+        assert_eq!(
+            repos[0].1,
+            parse_iso_time("2026-11-14T09:12:33+00:00"),
+            "{repos:?}"
+        );
+        assert!(repos[1].1.is_some());
+        assert!(repos[2].1.is_some());
+        assert_eq!(repos[3].1, None);
+    }
+
+    #[test]
+    fn repo_list_shapes_and_name_fallbacks() {
+        let repos = parse_repos(
+            r#"[notice] cached
+[{"slug":"demo-a","full_name":"demo-ws/demo-x","name":"X"},
+ {"full_name":"demo-ws/demo-b","name":"Y"},
+ {"name":"demo-c"},
+ {"slug":"","full_name":"","name":""},
+ 7,
+ {"full_name":"demo-d"}]"#,
+        )
+        .unwrap();
+        let names: Vec<_> = repos.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["demo-a", "demo-b", "demo-c", "demo-d"]);
+        let repos =
+            parse_repos(r#"{"values":[{"slug":"demo-e","updated_on":"1970-01-02T00:00:00Z"}]}"#)
+                .unwrap();
+        assert_eq!(repos, [("demo-e".to_string(), Some(86_400))]);
+        assert!(parse_repos("no json here").is_err());
+        assert!(parse_repos(r#"{"nope":1}"#).is_err());
+    }
+
+    #[test]
+    fn active_repos_drop_old_ones() {
+        let day = 86_400;
+        let now = 1_000 * day;
+        let repos = vec![
+            ("demo-api".to_string(), Some(now - 2 * day)),
+            ("demo-old".to_string(), Some(now - 31 * day)),
+            ("demo-docs".to_string(), None),
+        ];
+        assert_eq!(active_repos(&repos, 30, now), ["demo-api", "demo-docs"]);
+        assert_eq!(
+            active_repos(&repos, 0, now),
+            ["demo-api", "demo-old", "demo-docs"]
+        );
+        assert_eq!(
+            active_repos(&repos, 40, now),
+            ["demo-api", "demo-old", "demo-docs"]
+        );
     }
 }

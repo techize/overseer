@@ -209,10 +209,29 @@ PRs from Bitbucket. The PR source runs `bb` once in each folder listed in
 | `pr_command` | `bb pullrequest list --state open --output json` | Command run in each repo folder. |
 | `pr_poll_secs` | `300` | Seconds between polls. |
 | `pr_author` | `""` | Empty shows every open PR in those repos; otherwise only that author's. |
+| `pr_workspace` | `""` | A Bitbucket workspace whose repos are found and polled. Empty turns this off. |
+| `pr_project` | `""` | Only repos in this Bitbucket project key. Empty means the whole workspace. |
+| `pr_active_days` | `30` | Only repos updated in this many days are polled. `0` polls every repo. |
+| `pr_repos_command` | `bb repo list --workspace {workspace} --output json` | Lists the workspace's repos; `{workspace}` is replaced by `pr_workspace`. |
 
 A PR links to a ticket when its title or branch name matches `ticket_pattern`
 (for example `DEMO-12` in `DEMO-12-fix-login`). If `bb` fails in one repo, the
 other repos' PRs still show and the PR source message names the failing repo.
+
+Whole workspace. Instead of listing folders, set `pr_workspace` (for example
+`demo-ws`) and the daemon finds the repos itself: it runs `pr_repos_command`,
+keeps the repos updated in the last `pr_active_days` days (a repo with no
+update time is kept), and runs `pr_command` with `--repository demo-ws/<repo>`
+added for each one, from `/`, so no clone is needed. Set `pr_project` to add
+`--project <key>` to the repo list. The repo list is read again once an hour;
+if a read fails, the last good list is kept and the PR source message shows
+`repos: <error>`. `pr_repos` and `pr_workspace` can both be set: repos from both
+are polled, and a folder whose name matches a workspace repo is polled once,
+from the folder. The PR source is off only when both are empty.
+
+This costs one Bitbucket call per active repo per poll, plus one repo list an
+hour, and Bitbucket limits API calls per hour. With many active repos, raise
+`pr_poll_secs` or set `pr_project` (or lower `pr_active_days`).
 
 ## Emergency fallback: `overseer attach`
 

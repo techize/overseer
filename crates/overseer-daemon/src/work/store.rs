@@ -1,19 +1,19 @@
 //! The work-item cache and its assignments, shared by every connection.
 //!
 //! Three sources fill the cache: `bd list --json` in the beads folder, the
-//! configured Jira command and the PR command in each of `pr_repos`. Each
-//! runs off the request path with a 30 s timeout, so a slow source never
-//! stalls a slot request. Ownership lives in
+//! configured Jira command and the PR command, run in each of `pr_repos`
+//! and for each active repo of `pr_workspace`. Each runs off the request
+//! path with a 30 s timeout, so a slow source never stalls a slot request. Ownership lives in
 //! the ledger; every decision and its writes happen in one ledger
 //! transaction, so two clients assigning the same item cannot both win.
 //!
 //! Lock order: `change_turn`, then the ledger's lock, then the cache's.
 //! None is held across an await.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use overseer_proto::{
     owned_by_message, slot_name, Event, ItemKind, PullRequest, Response, Sender, SlotId,
@@ -26,15 +26,29 @@ use tokio::task::{JoinHandle, JoinSet};
 use super::ownership::{decide, promotions, Decision};
 use super::sprint::{newest_sprint_folder, parse_ymd, sprint_day, sprint_label, Ymd};
 use super::stages::Stages;
-use super::{compile_pattern, group, parse_beads, parse_jira, parse_prs, run_source, Bead, Ticket};
+use super::{
+    active_repos, compile_pattern, group, parse_beads, parse_jira, parse_prs, parse_repos,
+    run_source, Bead, Ticket,
+};
 use crate::brain::paths::local_date;
 use crate::config::Config;
-use crate::env::BaseEnv;
+use crate::env::{BaseEnv, Vars};
 use crate::ledger::{self, Ledger};
 use crate::manager::valid_id;
 
 /// How long `bd`, the Jira command or the PR command may run.
 pub const SOURCE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a workspace's repo list is used before it is read again.
+pub const REPO_LIST_MAX_AGE: Duration = Duration::from_secs(3600);
+
+/// At most this many PR commands run at once.
+const PR_PARALLEL: usize = 4;
+
+/// Where the repo list and the workspace repos' PR commands run: they name
+/// the repo themselves, so no clone is needed, and `/` keeps any repo's own
+/// settings out of the way. The Jira command runs here too.
+const WORKSPACE_CWD: &str = "/";
 
 /// `bd list` stops at 50 rows unless told otherwise; `--limit 0` lists all.
 /// Run after the configured `bd_command`.
@@ -86,15 +100,31 @@ struct Cache {
     items: Vec<WorkItem>,
     beads_status: SourceStatus,
     jira_status: SourceStatus,
-    /// Open PRs per entry of `pr_repos`, in the same order. A repo that
-    /// failed its last read keeps what it had.
-    prs: Vec<Vec<PullRequest>>,
+    /// Open PRs by repo name. A repo that failed its last read keeps what
+    /// it had; a repo no longer polled is dropped.
+    prs: BTreeMap<String, Vec<PullRequest>>,
+    /// The workspace's repos at the last good read of `pr_repos_command`.
+    repo_list: Option<RepoList>,
     prs_status: SourceStatus,
     /// Ticket folders under `<brain_dir>/Sprints/*/`, as (name, path),
     /// sorted by path. Listed again on every refresh.
     folders: Vec<(String, PathBuf)>,
     /// The newest `Sprints/sprint-*` folder at the last scan.
     sprint_folder: Option<String>,
+}
+
+struct RepoList {
+    /// (name, last update), as `parse_repos` gives them.
+    repos: Vec<(String, Option<i64>)>,
+    read_at: Instant,
+}
+
+/// Where one repo's PR command runs.
+enum PrTarget {
+    /// In this clone.
+    Folder(PathBuf),
+    /// In `WORKSPACE_CWD`, with `--repository <workspace>/<slug>` added.
+    Workspace(String),
 }
 
 /// A label change to make on a bead with `bd update`.
@@ -127,9 +157,15 @@ pub struct WorkStore {
     /// `None` when the configured command is empty: Jira is off.
     jira_command: Option<Vec<String>>,
     jql: String,
-    /// Empty turns the PR source off.
+    /// The PR source is off when both this and `pr_workspace` are empty.
     pr_repos: Vec<PathBuf>,
     pr_command: Vec<String>,
+    /// Trimmed; empty finds no repos.
+    pr_workspace: String,
+    /// Trimmed; empty lists every repo in the workspace.
+    pr_project: String,
+    pr_active_days: u64,
+    pr_repos_command: Vec<String>,
     /// Lowercased and trimmed; empty keeps every author.
     pr_author: String,
     /// Which board stage each Jira status belongs to.
@@ -191,6 +227,51 @@ fn repo_name(dir: &Path) -> String {
     dir.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| dir.display().to_string())
+}
+
+/// Runs `pr_command` for each target, at most `PR_PARALLEL` at once, and
+/// gives each target's PRs (or error) in the same order.
+async fn poll_prs(
+    pr_command: &[String],
+    targets: &[(String, PrTarget)],
+    vars: Arc<Vars>,
+) -> Vec<Result<Vec<PullRequest>, String>> {
+    let mut results: Vec<Option<Result<Vec<PullRequest>, String>>> =
+        targets.iter().map(|_| None).collect();
+    // Dropping the set (shutdown) stops the commands still running.
+    let mut running = JoinSet::new();
+    let mut next = targets.iter().enumerate();
+    loop {
+        while running.len() < PR_PARALLEL {
+            let Some((i, (repo, target))) = next.next() else {
+                break;
+            };
+            let mut cmd = pr_command.to_vec();
+            let cwd = match target {
+                PrTarget::Folder(dir) => dir.clone(),
+                PrTarget::Workspace(full) => {
+                    cmd.extend(["--repository".to_owned(), full.clone()]);
+                    PathBuf::from(WORKSPACE_CWD)
+                }
+            };
+            let (repo, vars) = (repo.clone(), vars.clone());
+            running.spawn(async move {
+                let read = run_source(&cmd, &cwd, SOURCE_TIMEOUT, &vars)
+                    .await
+                    .and_then(|out| parse_prs(&out, &repo));
+                (i, read)
+            });
+        }
+        match running.join_next().await {
+            Some(Ok((i, read))) => results[i] = Some(read),
+            Some(Err(e)) => tracing::warn!("prs source: a poll task failed: {e}"),
+            None => break,
+        }
+    }
+    results
+        .into_iter()
+        .map(|r| r.unwrap_or_else(|| Err("the poll task failed".into())))
+        .collect()
 }
 
 /// Every folder one level under `<brain>/Sprints/*/`.
@@ -262,11 +343,13 @@ impl WorkStore {
         );
         let prs_status = status(
             "prs",
-            Some(if cfg.pr_repos.is_empty() {
-                PRS_OFF.into()
-            } else {
-                "not read yet".into()
-            }),
+            Some(
+                if cfg.pr_repos.is_empty() && cfg.pr_workspace.trim().is_empty() {
+                    PRS_OFF.into()
+                } else {
+                    "not read yet".into()
+                },
+            ),
         );
         let sprint_start = match cfg.sprint_start.trim() {
             "" => None,
@@ -292,6 +375,10 @@ impl WorkStore {
             jql: cfg.jql.clone(),
             pr_repos: cfg.pr_repos.clone(),
             pr_command: cfg.pr_command.clone(),
+            pr_workspace: cfg.pr_workspace.trim().to_owned(),
+            pr_project: cfg.pr_project.trim().to_owned(),
+            pr_active_days: cfg.pr_active_days,
+            pr_repos_command: cfg.pr_repos_command.clone(),
             pr_author: cfg.pr_author.trim().to_lowercase(),
             stages: Stages::from_config(cfg),
             beads_poll: Duration::from_secs(cfg.beads_poll_secs.max(1)),
@@ -308,7 +395,8 @@ impl WorkStore {
                 items: Vec::new(),
                 beads_status: status("beads", Some("not read yet".into())),
                 jira_status,
-                prs: vec![Vec::new(); cfg.pr_repos.len()],
+                prs: BTreeMap::new(),
+                repo_list: None,
                 prs_status,
                 folders: Vec::new(),
                 sprint_folder: newest_sprint_folder(&cfg.brain_dir),
@@ -365,7 +453,7 @@ impl WorkStore {
         let owners: HashMap<&str, SlotId> =
             assigned.iter().map(|(k, s)| (k.as_str(), *s)).collect();
         let cache = self.cache();
-        let prs: Vec<PullRequest> = cache.prs.iter().flatten().cloned().collect();
+        let prs: Vec<PullRequest> = cache.prs.values().flatten().cloned().collect();
         // Only tickets Jira listed have a stage; a placeholder made up from
         // bead titles has none.
         let jira_stages: HashMap<&str, Stage> = cache
@@ -548,30 +636,30 @@ impl WorkStore {
             }
             Source::Prs => {
                 // Off: nothing to read and nothing in the view changes.
-                if self.pr_repos.is_empty() {
+                if self.pr_repos.is_empty() && self.pr_workspace.is_empty() {
                     return;
                 }
-                let mut got = Vec::with_capacity(self.pr_repos.len());
-                for dir in &self.pr_repos {
-                    let repo = repo_name(dir);
-                    let read = run_source(&self.pr_command, dir, SOURCE_TIMEOUT, &vars)
-                        .await
-                        .and_then(|out| parse_prs(&out, &repo));
-                    got.push((repo, read));
-                }
+                let repos_error = self.read_repo_list(&vars).await;
+                let targets = self.pr_targets(unix_now());
+                let got = poll_prs(&self.pr_command, &targets, vars).await;
                 let now = unix_now();
                 let mut cache = self.cache();
                 let mut errors = Vec::new();
-                let mut answered = false;
-                for (i, (repo, read)) in got.into_iter().enumerate() {
+                if let Some(e) = &repos_error {
+                    errors.push(format!("repos: {e}"));
+                }
+                // A workspace with no active repos is a good read too.
+                let mut answered = targets.is_empty() && repos_error.is_none();
+                for ((repo, _), read) in targets.iter().zip(got) {
                     match read {
                         Ok(prs) => {
                             answered = true;
-                            cache.prs[i] = prs
+                            let prs = prs
                                 .into_iter()
                                 .filter(|p| self.wants_author(p))
                                 .map(|p| self.link_ticket(p))
                                 .collect();
+                            cache.prs.insert(repo.clone(), prs);
                         }
                         Err(e) => {
                             tracing::warn!("prs source: {repo}: {e}");
@@ -579,7 +667,9 @@ impl WorkStore {
                         }
                     }
                 }
-                let count = cache.prs.iter().map(Vec::len).sum();
+                let polled: HashSet<&str> = targets.iter().map(|(r, _)| r.as_str()).collect();
+                cache.prs.retain(|repo, _| polled.contains(repo.as_str()));
+                let count = cache.prs.values().map(Vec::len).sum();
                 let s = &mut cache.prs_status;
                 s.ok = errors.is_empty();
                 s.count = count;
@@ -615,6 +705,69 @@ impl WorkStore {
         {
             tracing::warn!("recording ticket stages failed: {e:#}");
         }
+    }
+
+    /// Reads the workspace's repo list when there is none yet or it is
+    /// older than `REPO_LIST_MAX_AGE`. A failed read keeps the last good
+    /// list, is tried again on the next poll and gives the error.
+    async fn read_repo_list(&self, vars: &Vars) -> Option<String> {
+        if self.pr_workspace.is_empty() {
+            return None;
+        }
+        let fresh = self
+            .cache()
+            .repo_list
+            .as_ref()
+            .is_some_and(|l| l.read_at.elapsed() < REPO_LIST_MAX_AGE);
+        if fresh {
+            return None;
+        }
+        let mut cmd: Vec<String> = self
+            .pr_repos_command
+            .iter()
+            .map(|a| a.replace("{workspace}", &self.pr_workspace))
+            .collect();
+        if !self.pr_project.is_empty() {
+            cmd.extend(["--project".to_owned(), self.pr_project.clone()]);
+        }
+        let read = run_source(&cmd, Path::new(WORKSPACE_CWD), SOURCE_TIMEOUT, vars)
+            .await
+            .and_then(|out| parse_repos(&out));
+        match read {
+            Ok(repos) => {
+                self.cache().repo_list = Some(RepoList {
+                    repos,
+                    read_at: Instant::now(),
+                });
+                None
+            }
+            Err(e) => {
+                tracing::warn!("prs source: repo list: {e}");
+                Some(e)
+            }
+        }
+    }
+
+    /// The repos to poll, by name: each `pr_repos` folder, then each active
+    /// workspace repo whose name no folder has.
+    fn pr_targets(&self, now: i64) -> Vec<(String, PrTarget)> {
+        let mut seen = HashSet::new();
+        let mut targets = Vec::new();
+        for dir in &self.pr_repos {
+            let name = repo_name(dir);
+            if seen.insert(name.clone()) {
+                targets.push((name, PrTarget::Folder(dir.clone())));
+            }
+        }
+        if let Some(list) = &self.cache().repo_list {
+            for name in active_repos(&list.repos, self.pr_active_days, now) {
+                if seen.insert(name.clone()) {
+                    let full = format!("{}/{name}", self.pr_workspace);
+                    targets.push((name, PrTarget::Workspace(full)));
+                }
+            }
+        }
+        targets
     }
 
     /// With `pr_author` set, only that author's PRs, ignoring case.
@@ -1483,6 +1636,316 @@ esac"#;
         let v = s.view();
         assert_eq!(prs_source(&v).message.as_deref(), Some(PRS_OFF));
         assert!(v.prs.is_empty());
+    }
+
+    /// A fake `bb` for workspace mode, run as `sh -c script fake-bb <args>`.
+    /// `repo list` prints `repos.json` from `dir` (failing when it is
+    /// missing); `pullrequest list` answers by `--repository`, or by the
+    /// folder it runs in. Every call is appended to `calls.log` in `dir`.
+    fn fake_ws_bb(dir: &Path) -> String {
+        format!(
+            r#"echo "$PWD $*" >> '{log}'
+case "$*" in
+"repo list"*) cat '{repos}' ;;
+*"--repository demo-ws/demo-api"*) printf '%s' '[{{"id":7,"title":"DEMO-12 api work"}}]' ;;
+*"--repository demo-ws/demo-web"*) printf '%s' '{{"values":[{{"id":21,"title":"Button colours"}}]}}' ;;
+*"--repository demo-ws/demo-old"*) printf '%s' '[{{"id":99,"title":"old"}}]' ;;
+*"--repository"*) echo "repo not found" >&2; exit 1 ;;
+*) case "$PWD" in
+   */demo-api) printf '%s' '[{{"id":1,"title":"from the folder"}}]' ;;
+   *) echo "no repo here" >&2; exit 1 ;;
+   esac ;;
+esac"#,
+            log = dir.join("calls.log").display(),
+            repos = dir.join("repos.json").display(),
+        )
+    }
+
+    /// `sh -c script fake-bb` followed by `args`.
+    fn fake_cmd(script: &str, args: &[&str]) -> Vec<String> {
+        let mut cmd = sh(script);
+        cmd.push("fake-bb".into());
+        cmd.extend(args.iter().map(|a| a.to_string()));
+        cmd
+    }
+
+    /// Writes `repos.json` for `fake_ws_bb`: each (slug, days since update),
+    /// where `None` leaves `updated_on` out.
+    fn write_repos(dir: &Path, repos: &[(&str, Option<i64>)]) {
+        let now = unix_now();
+        let entries: Vec<String> = repos
+            .iter()
+            .map(|(slug, days)| match days {
+                Some(d) => {
+                    let t = utc_iso(now - d * 86_400);
+                    format!(r#"{{"slug":"{slug}","updated_on":"{t}"}}"#)
+                }
+                None => format!(r#"{{"slug":"{slug}"}}"#),
+            })
+            .collect();
+        let json = format!(r#"{{"values":[{}]}}"#, entries.join(","));
+        std::fs::write(dir.join("repos.json"), json).unwrap();
+    }
+
+    /// Unix seconds as `YYYY-MM-DDTHH:MM:SSZ`.
+    fn utc_iso(secs: i64) -> String {
+        let days = secs.div_euclid(86_400);
+        let rest = secs.rem_euclid(86_400);
+        // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = yoe + era * 400 + i64::from(m <= 2);
+        format!(
+            "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+            rest / 3600,
+            rest % 3600 / 60,
+            rest % 60
+        )
+    }
+
+    fn calls(dir: &Path) -> String {
+        std::fs::read_to_string(dir.join("calls.log")).unwrap_or_default()
+    }
+
+    /// A store in workspace mode `demo-ws` using `fake_ws_bb`.
+    fn ws_store(dir: &Path, edit: impl FnOnce(&mut Config)) -> Arc<WorkStore> {
+        let script = fake_ws_bb(dir);
+        store_with(|c| {
+            c.pr_workspace = "demo-ws".into();
+            c.pr_repos_command = fake_cmd(
+                &script,
+                &[
+                    "repo",
+                    "list",
+                    "--workspace",
+                    "{workspace}",
+                    "--output",
+                    "json",
+                ],
+            );
+            c.pr_command = fake_cmd(
+                &script,
+                &["pullrequest", "list", "--state", "open", "--output", "json"],
+            );
+            edit(c);
+        })
+    }
+
+    #[test]
+    fn utc_iso_round_trips() {
+        assert_eq!(utc_iso(86_400), "1970-01-02T00:00:00Z");
+        let t = 1_794_000_123;
+        assert_eq!(super::super::sources::parse_iso_time(&utc_iso(t)), Some(t));
+    }
+
+    #[tokio::test]
+    async fn workspace_mode_polls_active_repos() {
+        let dir = temp_dir("ws");
+        write_repos(
+            &dir,
+            &[
+                ("demo-api", Some(1)),
+                ("demo-web", None),
+                ("demo-old", Some(400)),
+                ("demo-broken", Some(2)),
+            ],
+        );
+        let s = ws_store(&dir, |_| {});
+        s.refresh(Source::Prs).await;
+        let v = s.view();
+        let got: Vec<_> = v
+            .prs
+            .iter()
+            .map(|p| (p.repo.as_str(), p.id, p.ticket.as_deref()))
+            .collect();
+        assert_eq!(
+            got,
+            [("demo-api", 7, Some("DEMO-12")), ("demo-web", 21, None)]
+        );
+        let log = calls(&dir);
+        assert!(
+            log.contains("repo list --workspace demo-ws --output json"),
+            "{log}"
+        );
+        assert!(!log.contains("demo-old"), "{log}");
+        assert!(log.contains("--repository demo-ws/demo-broken"), "{log}");
+        // Workspace repos run in `/`, not in some repo folder.
+        assert!(
+            log.lines()
+                .filter(|l| l.contains("--repository"))
+                .all(|l| l.starts_with("/ ")),
+            "{log}"
+        );
+        let prs = prs_source(&v);
+        assert!(!prs.ok);
+        assert_eq!(prs.count, 2);
+        assert!(prs.at.is_some());
+        let msg = prs.message.as_deref().unwrap_or("");
+        assert!(msg.starts_with("demo-broken: "), "{msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn active_days_zero_polls_every_repo() {
+        let dir = temp_dir("ws-all");
+        write_repos(&dir, &[("demo-api", Some(1)), ("demo-old", Some(400))]);
+        let s = ws_store(&dir, |c| c.pr_active_days = 0);
+        s.refresh(Source::Prs).await;
+        let repos: Vec<_> = s.view().prs.iter().map(|p| p.repo.clone()).collect();
+        assert_eq!(repos, ["demo-api", "demo-old"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn pr_project_is_added_to_the_repo_list() {
+        let dir = temp_dir("ws-project");
+        write_repos(&dir, &[("demo-api", Some(1))]);
+        let s = ws_store(&dir, |c| c.pr_project = "DEMO".into());
+        s.refresh(Source::Prs).await;
+        let log = calls(&dir);
+        assert!(
+            log.contains("repo list --workspace demo-ws --output json --project DEMO"),
+            "{log}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn repo_list_is_read_once_an_hour() {
+        let dir = temp_dir("ws-cache");
+        write_repos(&dir, &[("demo-api", Some(1))]);
+        let s = ws_store(&dir, |_| {});
+        s.refresh(Source::Prs).await;
+        s.refresh(Source::Prs).await;
+        let log = calls(&dir);
+        assert_eq!(log.matches("repo list").count(), 1, "{log}");
+        assert_eq!(
+            log.matches("--repository demo-ws/demo-api").count(),
+            2,
+            "{log}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Makes the cached repo list look older than `REPO_LIST_MAX_AGE`.
+    fn age_repo_list(s: &WorkStore) {
+        let mut cache = s.cache();
+        let list = cache.repo_list.as_mut().expect("a repo list");
+        list.read_at = Instant::now()
+            .checked_sub(REPO_LIST_MAX_AGE + Duration::from_secs(1))
+            .expect("clock far enough from boot");
+    }
+
+    #[tokio::test]
+    async fn failed_repo_list_keeps_the_last_good_one() {
+        let dir = temp_dir("ws-keep");
+        write_repos(&dir, &[("demo-api", Some(1)), ("demo-web", Some(1))]);
+        let s = ws_store(&dir, |_| {});
+        s.refresh(Source::Prs).await;
+        assert_eq!(s.view().prs.len(), 2);
+        age_repo_list(&s);
+        std::fs::remove_file(dir.join("repos.json")).unwrap();
+        s.refresh(Source::Prs).await;
+        let v = s.view();
+        assert_eq!(v.prs.len(), 2);
+        let prs = prs_source(&v);
+        assert!(!prs.ok);
+        let msg = prs.message.as_deref().unwrap_or("");
+        assert!(msg.starts_with("repos: "), "{msg}");
+        // The failed read is tried again on the next poll.
+        write_repos(&dir, &[("demo-api", Some(1))]);
+        s.refresh(Source::Prs).await;
+        let v = s.view();
+        // demo-web left the list, so its PRs go.
+        let repos: Vec<_> = v.prs.iter().map(|p| p.repo.as_str()).collect();
+        assert_eq!(repos, ["demo-api"]);
+        assert!(prs_source(&v).ok, "{:?}", prs_source(&v));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn repo_list_failing_from_the_start_still_polls_folders() {
+        let dir = temp_dir("ws-none");
+        let api = dir.join("demo-api");
+        std::fs::create_dir_all(&api).unwrap();
+        let s = ws_store(&dir, |c| c.pr_repos = vec![api.clone()]);
+        s.refresh(Source::Prs).await;
+        let v = s.view();
+        let ids: Vec<_> = v.prs.iter().map(|p| p.id).collect();
+        assert_eq!(ids, [1]);
+        let msg = prs_source(&v).message.clone().unwrap_or_default();
+        assert!(msg.starts_with("repos: "), "{msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_folder_and_a_workspace_repo_of_one_name_poll_once() {
+        let dir = temp_dir("ws-both");
+        let api = dir.join("demo-api");
+        std::fs::create_dir_all(&api).unwrap();
+        write_repos(&dir, &[("demo-api", Some(1)), ("demo-web", Some(1))]);
+        let s = ws_store(&dir, |c| c.pr_repos = vec![api.clone()]);
+        s.refresh(Source::Prs).await;
+        let v = s.view();
+        let got: Vec<_> = v.prs.iter().map(|p| (p.repo.as_str(), p.id)).collect();
+        // The folder entry wins for demo-api.
+        assert_eq!(got, [("demo-api", 1), ("demo-web", 21)]);
+        let log = calls(&dir);
+        assert!(!log.contains("--repository demo-ws/demo-api"), "{log}");
+        assert_eq!(log.matches("pullrequest list").count(), 2, "{log}");
+        assert!(prs_source(&v).ok);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn workspace_alone_turns_prs_on() {
+        let dir = temp_dir("ws-on");
+        let s = ws_store(&dir, |_| {});
+        let v = s.view();
+        assert_eq!(prs_source(&v).message.as_deref(), Some("not read yet"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn many_repos_are_polled_at_most_four_at_once() {
+        let dir = temp_dir("ws-limit");
+        let names: Vec<String> = (0..9).map(|i| format!("demo-r{i}")).collect();
+        let repos: Vec<(&str, Option<i64>)> = names.iter().map(|n| (n.as_str(), Some(1))).collect();
+        write_repos(&dir, &repos);
+        let live = dir.join("live");
+        std::fs::create_dir_all(&live).unwrap();
+        // Each PR call marks itself live, records how many are live, waits
+        // a little, then leaves.
+        let script = format!(
+            r#"case "$*" in
+"repo list"*) cat '{repos}' ;;
+*) f="{live}/$$"; : > "$f"; set -- '{live}'/*; echo $# >> '{peak}'; i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done; /bin/rm -f "$f"; printf '[]' ;;
+esac"#,
+            repos = dir.join("repos.json").display(),
+            live = live.display(),
+            peak = dir.join("peak.log").display(),
+        );
+        let s = store_with(|c| {
+            c.pr_workspace = "demo-ws".into();
+            c.pr_repos_command = fake_cmd(&script, &["repo", "list"]);
+            c.pr_command = fake_cmd(&script, &["pullrequest", "list"]);
+        });
+        s.refresh(Source::Prs).await;
+        let peaks: Vec<usize> = std::fs::read_to_string(dir.join("peak.log"))
+            .unwrap()
+            .lines()
+            .map(|l| l.trim().parse().unwrap())
+            .collect();
+        assert_eq!(peaks.len(), 9, "{peaks:?}");
+        assert!(peaks.iter().all(|&n| n <= 4), "{peaks:?}");
+        assert!(prs_source(&s.view()).ok, "{:?}", prs_source(&s.view()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A fake Jira command that prints whatever `jira.json` in `dir` holds.

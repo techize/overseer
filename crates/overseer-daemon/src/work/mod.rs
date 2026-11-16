@@ -8,7 +8,10 @@ pub mod stages;
 pub mod store;
 
 pub use group::{group, ticket_of};
-pub use sources::{parse_beads, parse_iso_time, parse_jira, parse_prs, run_source, Bead, Ticket};
+pub use sources::{
+    active_repos, parse_beads, parse_iso_time, parse_jira, parse_prs, parse_repos, run_source,
+    Bead, Ticket,
+};
 pub use store::{Source, WorkStore};
 
 /// Compile a ticket pattern. A bad pattern is an error the caller can show.
