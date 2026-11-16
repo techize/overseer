@@ -50,7 +50,7 @@ The kanban today caps each column at 4 cards with "+N more", and its columns do 
 - When the session ends while the pop-over is open, it stays open showing the final output until closed, as the session screen does now.
 - The old full-window session screen goes away; every path that opened it (card click, keyboard Enter, notifications, the locks screen's return) opens the pop-over instead.
 - Cmd+0 to Cmd+6 open that slot's pop-over; with a pop-over already open they switch it to the other slot.
-- State (my call): `Screen` keeps `Board` and `Locks`; the open pop-over is a separate `popover: Option<SlotId>` on top of `Board`. The session counts as "being viewed" while its pop-over is open, so notification suppression, ticking and `start_target` treat it as the old session screen did. The pop-over has its own key context in place of `Session`, carrying the same bindings.
+- State (my call): `Screen::Session(id)` now means "the board with slot id's pop-over open", so notification suppression, `start_target` and `locks_return` keep working unchanged. The pop-over keeps the `Session` key context. It is drawn as a sibling of the board element, not inside it, so the board's own keys (arrows, Enter, r, a, p, l) never fire while the pop-over has focus. The elapsed-time ticker runs while any slot is running, since the board stays visible behind the pop-over.
 - Locks stays a full-window screen (my call). Opening it from a pop-over hides the pop-over; leaving Locks reopens the pop-over it came from, as `locks_return` does for the session screen today. Plan and Settings keep their own Esc behaviour.
 - Clicking a notification for another slot while a pop-over is open switches the pop-over to that slot (my call).
 
