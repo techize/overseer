@@ -12,8 +12,10 @@ use overseer_proto::{slot_name, ItemKind, SlotId, Stage, WorkItem, WorkView, PRS
 use crate::app::{colors, open_external, OverseerApp};
 
 const DAY: i64 = 86_400;
-/// Cards a kanban column shows before `+N more`.
-const MAX_CARDS: usize = 4;
+/// Height of the kanban block. Fixed so the board never grows with the
+/// ticket count: the header, the six session cards and this fit a 1440 by
+/// 900 window, and each column scrolls inside it.
+const KANBAN_HEIGHT: f32 = 340.;
 /// Rows the PR panel shows before `+N more`.
 const MAX_PR_ROWS: usize = 8;
 
@@ -100,7 +102,6 @@ pub struct Column {
     pub stage: Stage,
     pub total: usize,
     pub cards: Vec<TicketCard>,
-    pub more: usize,
 }
 
 fn card(view: &WorkView, t: &WorkItem, now: i64) -> TicketCard {
@@ -141,9 +142,9 @@ fn card(view: &WorkView, t: &WorkItem, now: i64) -> TicketCard {
     }
 }
 
-/// Six columns in `Stage::ALL` order. Cards sort by priority, then by the
-/// time in stage (oldest first, unknown last), and are cut to four. The
-/// Done column carries no cards: the board shows its count and `last_done`.
+/// Six columns in `Stage::ALL` order, every ticket in its column. Cards
+/// sort by priority, then by the time in stage (oldest first, unknown
+/// last). The Done column lists the latest finished first, unknown last.
 pub fn columns(view: &WorkView, now: i64) -> Vec<Column> {
     let tickets = sprint_tickets(view);
     Stage::ALL
@@ -152,47 +153,27 @@ pub fn columns(view: &WorkView, now: i64) -> Vec<Column> {
             let mut mine: Vec<&WorkItem> = tickets
                 .iter()
                 .copied()
-                .filter(|t| t.stage == Some(stage))
+                .filter(|t| board_stage(t) == Some(stage))
                 .collect();
             let total = mine.len();
             if stage == Stage::Done {
-                return Column {
-                    stage,
-                    total,
-                    cards: Vec::new(),
-                    more: 0,
-                };
+                mine.sort_by_key(|t| (t.stage_since.is_none(), std::cmp::Reverse(t.stage_since)));
+            } else {
+                mine.sort_by_key(|t| {
+                    (
+                        prio_of(t.priority.as_deref()),
+                        t.stage_since.is_none(),
+                        t.stage_since,
+                    )
+                });
             }
-            mine.sort_by_key(|t| {
-                (
-                    prio_of(t.priority.as_deref()),
-                    t.stage_since.is_none(),
-                    t.stage_since,
-                )
-            });
-            let more = total.saturating_sub(MAX_CARDS);
-            mine.truncate(MAX_CARDS);
             Column {
                 stage,
                 total,
                 cards: mine.into_iter().map(|t| card(view, t, now)).collect(),
-                more,
             }
         })
         .collect()
-}
-
-/// The Done ticket that moved last, else the first Done ticket.
-pub fn last_done(view: &WorkView) -> Option<String> {
-    let done: Vec<_> = sprint_tickets(view)
-        .into_iter()
-        .filter(|t| board_stage(t) == Some(Stage::Done))
-        .collect();
-    done.iter()
-        .filter(|t| t.stage_since.is_some())
-        .max_by_key(|t| t.stage_since)
-        .or_else(|| done.first())
-        .map(|t| t.key.clone())
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -587,6 +568,44 @@ fn ticket_card(c: TicketCard, cx: &mut Context<OverseerApp>) -> impl IntoElement
         })
 }
 
+/// A Done card: the key and the title on one line each.
+fn done_card(c: TicketCard, cx: &mut Context<OverseerApp>) -> impl IntoElement {
+    div()
+        .id(ElementId::Name(format!("kanban-{}", c.key).into()))
+        .flex_none()
+        .flex()
+        .flex_col()
+        .px_2()
+        .py_1()
+        .rounded(px(6.))
+        .bg(rgb(colors::CARD))
+        .border_1()
+        .border_color(rgb(colors::BORDER))
+        .text_xs()
+        .child(
+            div()
+                .truncate()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(colors::ACCENT))
+                .child(c.key),
+        )
+        .child(
+            div()
+                .truncate()
+                .text_color(rgb(colors::TEXT))
+                .child(c.title),
+        )
+        .when_some(c.folder, |d, folder| {
+            d.cursor_pointer()
+                .hover(|s| s.bg(rgb(colors::CARD_HOVER)))
+                .on_click(
+                    cx.listener(move |_, _, _, _| {
+                        open_external(folder.clone(), "the ticket folder")
+                    }),
+                )
+        })
+}
+
 /// The column heading: icon, label and count in the stage colour.
 fn column_heading(stage: Stage, count: usize) -> gpui::Div {
     div()
@@ -723,7 +742,6 @@ impl OverseerApp {
     ) -> Option<impl IntoElement> {
         let p = progress(&self.work)?;
         let behind = behind_text(&p);
-        let last = last_done(&self.work);
         let bar = div()
             .flex_1()
             .min_w(px(200.))
@@ -778,12 +796,27 @@ impl OverseerApp {
             .enumerate()
             .map(|(n, col)| {
                 let done = col.stage == Stage::Done;
-                // The Done count comes from `progress`, as the header's does.
-                let count = if done { p.done } else { col.total };
-                let cards: Vec<_> = col.cards.into_iter().map(|c| ticket_card(c, cx)).collect();
-                div()
-                    .flex_1()
+                let count = col.total;
+                let cards: Vec<_> = col
+                    .cards
+                    .into_iter()
+                    .map(|c| {
+                        if done {
+                            done_card(c, cx).into_any_element()
+                        } else {
+                            ticket_card(c, cx).into_any_element()
+                        }
+                    })
+                    .collect();
+                // Done stays the narrowest column.
+                let col_div = if done {
+                    div().flex_none().w(px(150.))
+                } else {
+                    div().flex_1()
+                };
+                col_div
                     .min_w(px(0.))
+                    .min_h(px(0.))
                     .flex()
                     .flex_col()
                     .gap_1()
@@ -800,44 +833,16 @@ impl OverseerApp {
                             .flex()
                             .flex_col()
                             .gap_1()
-                            .children(cards)
-                            .children((col.more > 0).then(|| {
-                                div()
-                                    .text_xs()
-                                    .text_center()
-                                    .text_color(rgb(colors::MUTED))
-                                    .child(format!("+{} more", col.more))
-                            }))
-                            .children(done.then(|| {
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .items_center()
-                                    .gap_1()
-                                    .child(
-                                        div()
-                                            .text_2xl()
-                                            .font_weight(FontWeight::BOLD)
-                                            .text_color(rgb(colors::GREEN))
-                                            .child(p.done.to_string()),
-                                    )
-                                    .children(last.clone().map(|k| {
-                                        div()
-                                            .text_xs()
-                                            .text_color(rgb(colors::MUTED))
-                                            .child(format!("last {k}"))
-                                    }))
-                            })),
+                            .children(cards),
                     )
             })
             .collect();
-        // Takes the room left between the slot grid and the status line;
-        // a column with more than fits scrolls instead of pushing the
-        // footer off a 1440 by 900 window.
+        // A fixed height: a column with more than fits scrolls in place, so
+        // the session cards above never move and the footer stays on screen.
         Some(
             div()
-                .flex_1()
-                .min_h(px(0.))
+                .flex_none()
+                .h(px(KANBAN_HEIGHT))
                 .flex()
                 .flex_col()
                 .gap_2()
@@ -919,7 +924,7 @@ mod tests {
     }
 
     #[test]
-    fn columns_sort_and_overflow() {
+    fn columns_sort_without_truncation() {
         let mut items = vec![
             ticket("DEMO-1", Stage::InProgress, Some("High")),
             ticket("DEMO-2", Stage::InProgress, Some("High")),
@@ -937,31 +942,39 @@ mod tests {
             Stage::ALL.to_vec()
         );
         let c = &cols[3];
-        assert_eq!((c.total, c.cards.len(), c.more), (6, 4, 2));
+        assert_eq!((c.total, c.cards.len()), (6, 6));
         assert_eq!(c.cards[0].key, "DEMO-3");
         assert_eq!(c.cards[1].key, "DEMO-2");
         assert_eq!(c.cards[1].age.as_deref(), Some("15m"));
         assert_eq!(c.cards[2].key, "DEMO-1");
         assert_eq!(c.cards[3].age, None);
+        assert_eq!(c.cards[3].key, "DEMO-4");
+        assert_eq!(c.cards[5].key, "DEMO-6");
         assert_eq!(cols[0].total, 0);
     }
 
     #[test]
-    fn done_column_has_count_and_last_done_but_no_cards() {
+    fn columns_show_every_ticket() {
+        let items = (1..=30)
+            .map(|n| ticket(&format!("DEMO-{n}"), Stage::ToDo, None))
+            .collect();
+        let todo = &columns(&view(items), 100)[0];
+        assert_eq!((todo.total, todo.cards.len()), (30, 30));
+    }
+
+    #[test]
+    fn done_column_lists_tickets_latest_first() {
         let mut items = vec![
             ticket("DEMO-1", Stage::Done, None),
             ticket("DEMO-2", Stage::Done, None),
             ticket("DEMO-3", Stage::Done, None),
         ];
-        let v = view(items.clone());
-        assert_eq!(last_done(&v).as_deref(), Some("DEMO-1"));
-        items[1].stage_since = Some(10);
-        items[2].stage_since = Some(20);
-        let v = view(items);
-        assert_eq!(last_done(&v).as_deref(), Some("DEMO-3"));
-        let done = &columns(&v, 100)[5];
-        assert_eq!((done.total, done.cards.len(), done.more), (3, 0, 0));
-        assert_eq!(last_done(&view(vec![])), None);
+        items[0].stage_since = Some(100);
+        items[1].stage_since = Some(300);
+        let done = &columns(&view(items), 400)[5];
+        let keys: Vec<_> = done.cards.iter().map(|c| c.key.as_str()).collect();
+        assert_eq!(keys, ["DEMO-2", "DEMO-1", "DEMO-3"]);
+        assert_eq!(done.total, 3);
     }
 
     #[test]
@@ -1151,15 +1164,6 @@ mod tests {
         v.prs = vec![p];
         let c = &columns(&v, 1000)[3].cards[0];
         assert_eq!(c.pr, Some(("#5".to_string(), AgeTone::Unknown)));
-    }
-
-    #[test]
-    fn last_done_follows_the_board_stage() {
-        // An old daemon sends no stage; a Closed status still counts.
-        let mut old = ticket("DEMO-1", Stage::Done, None);
-        old.stage = None;
-        old.status = "Closed".into();
-        assert_eq!(last_done(&view(vec![old])).as_deref(), Some("DEMO-1"));
     }
 
     #[test]
