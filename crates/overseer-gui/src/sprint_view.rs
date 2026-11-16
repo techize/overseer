@@ -592,14 +592,14 @@ fn column_heading(stage: Stage, count: usize) -> gpui::Div {
     div()
         .flex()
         .items_center()
-        .gap_1()
+        .gap_2()
         .text_xs()
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(rgb(stage_color(stage)))
         .child(
             div()
                 .flex_none()
-                .w(px(12.))
+                .w(px(16.))
                 .text_center()
                 .child(stage_icon(stage)),
         )
