@@ -19,8 +19,8 @@ use std::path::Path;
 use gpui::{div, prelude::*, px, rgb, Context, FontWeight, Window};
 use overseer_proto::{
     slot_name, Activity, ActivityKind, BrainView, ClaimKind, CoordView, ItemKind, LockView,
-    PlanState, QueueEntry, QueueState, RelayState, Sender, SlotId, SlotInfo, SlotState, Stage,
-    WorkItem, WorkView, PRS_OFF,
+    PlanState, QueueEntry, QueueState, RelayState, Sender, SlotId, SlotInfo, SlotState, WorkItem,
+    WorkView, PRS_OFF,
 };
 
 use crate::app::{colors, OverseerApp};
@@ -530,25 +530,11 @@ pub fn needs_you_count(slots: &[SlotInfo]) -> usize {
         .count()
 }
 
-/// Done and total tickets in the list. A ticket with a stage is done when
-/// the stage is Done; one without (an old daemon) is done when its status
-/// is `done`, `closed` or `resolved`, any case. Beads, tickets that left
-/// the list and placeholder tickets made from bead titles (their status is
-/// not known) are not counted.
+/// Done and total tickets in the list, from `sprint_view::progress` so the
+/// header and the kanban agree; see `sprint_view::board_stage` for what
+/// counts as done.
 pub fn done_count(work: &WorkView) -> (usize, usize) {
-    let tickets = crate::sprint_view::sprint_tickets(work);
-    let total = tickets.len();
-    let done = tickets
-        .into_iter()
-        .filter(|i| match i.stage {
-            Some(stage) => stage == Stage::Done,
-            None => matches!(
-                i.status.trim().to_lowercase().as_str(),
-                "done" | "closed" | "resolved"
-            ),
-        })
-        .count();
-    (done, total)
+    crate::sprint_view::progress(work).map_or((0, 0), |p| (p.done, p.total))
 }
 
 /// The header's right-hand text with the sessions that need Jonathan and
@@ -854,6 +840,8 @@ impl OverseerApp {
         };
         let top = row([1, 2, 3], self, cx);
         let bottom = row([4, 5, 6], self, cx);
+        let pr_panel = self.render_pr_panel(now, cx);
+        let kanban = self.render_kanban(now, cx);
         div()
             .key_context("Board")
             .track_focus(&self.board_focus)
@@ -938,8 +926,18 @@ impl OverseerApp {
                             ),
                     ),
             )
+            // The coordinator panel with the open PRs to its right; the
+            // PR panel wraps below in a window too narrow for both.
             .child(
                 div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .child(
+                div()
+                    .flex_grow()
+                    .flex_basis(px(560.))
+                    .min_w(px(0.))
                     .flex()
                     .flex_col()
                     .gap_2()
@@ -989,8 +987,11 @@ impl OverseerApp {
                             .children(outcome_lines.into_iter().map(|l| div().child(l)))
                     }))
                     .child(div().flex().child(s0)),
+                    )
+                    .children(pr_panel),
             )
             .child(div().flex().flex_col().gap_2().child(top).child(bottom))
+            .children(kanban)
             .children(self.status.clone().map(|s| {
                 div()
                     .text_sm()

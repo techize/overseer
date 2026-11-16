@@ -3,7 +3,13 @@
 
 use std::path::PathBuf;
 
-use overseer_proto::{ItemKind, SlotId, Stage, WorkItem, WorkView};
+use gpui::{
+    div, prelude::*, px, relative, rgb, rgba, Context, ElementId, FontWeight, Rgba, SharedString,
+    Window,
+};
+use overseer_proto::{slot_name, ItemKind, SlotId, Stage, WorkItem, WorkView, PRS_OFF};
+
+use crate::app::{colors, open_external, OverseerApp};
 
 const DAY: i64 = 86_400;
 /// Cards a kanban column shows before `+N more`.
@@ -194,7 +200,21 @@ pub struct Progress {
     pub breakers_open: usize,
 }
 
-/// `None` when the sprint has no tickets.
+/// The stage the board counts a ticket in: its stage, or for a ticket with
+/// none (an old daemon) Done when its status is `done`, `closed` or
+/// `resolved`, any case, and no stage otherwise.
+pub fn board_stage(t: &WorkItem) -> Option<Stage> {
+    t.stage.or_else(|| {
+        matches!(
+            t.status.trim().to_lowercase().as_str(),
+            "done" | "closed" | "resolved"
+        )
+        .then_some(Stage::Done)
+    })
+}
+
+/// `None` when the sprint has no tickets. `done` is also the header's done
+/// count (`board::done_count`) and the Done column's count.
 pub fn progress(view: &WorkView) -> Option<Progress> {
     let tickets = sprint_tickets(view);
     let total = tickets.len();
@@ -203,21 +223,21 @@ pub fn progress(view: &WorkView) -> Option<Progress> {
     }
     let mut per_stage = [0; 6];
     for t in &tickets {
-        if let Some(i) = t
-            .stage
-            .and_then(|s| Stage::ALL.iter().position(|&x| x == s))
-        {
+        if let Some(i) = board_stage(t).and_then(|s| Stage::ALL.iter().position(|&x| x == s)) {
             per_stage[i] += 1;
         }
     }
     let done = per_stage[Stage::ALL.len() - 1];
+    // Past the last day (a long sprint) the pace still tops out at all.
     let expected = view
         .sprint_day
         .filter(|d| d.days > 0)
-        .map(|d| total * d.day as usize / d.days as usize);
+        .map(|d| (total * d.day as usize / d.days as usize).min(total));
     let breakers_open = tickets
         .iter()
-        .filter(|t| t.stage != Some(Stage::Done) && prio_of(t.priority.as_deref()) == Prio::Breaker)
+        .filter(|t| {
+            board_stage(t) != Some(Stage::Done) && prio_of(t.priority.as_deref()) == Prio::Breaker
+        })
         .count();
     Some(Progress {
         done,
@@ -273,6 +293,480 @@ pub fn pr_header(view: &WorkView, now: i64) -> String {
         text.push_str(&format!(" · oldest {}", age_text(now - oldest)));
     }
     text
+}
+
+/// The PR panel shows while the daemon reports a `prs` source that is not
+/// off. An old daemon sends none, so it stays hidden there too.
+pub fn pr_panel_shown(view: &WorkView) -> bool {
+    view.sources
+        .iter()
+        .any(|s| s.name == "prs" && s.message.as_deref() != Some(PRS_OFF))
+}
+
+/// The chip text, background and foreground for a priority.
+pub fn prio_chip(prio: Prio) -> (&'static str, u32, u32) {
+    match prio {
+        Prio::Breaker => ("BREAKER", 0x4a1d1d, 0xff9a94),
+        Prio::High => ("HIGH", 0x45290f, 0xf0a868),
+        Prio::Med => ("MED", 0x232a38, 0xaab3c2),
+        Prio::Low => ("LOW", 0x1b2029, 0x8b949e),
+    }
+}
+
+/// The column heading's icon. Waiting is `‖`, not the pause emoji, which
+/// would draw in colour.
+pub fn stage_icon(stage: Stage) -> &'static str {
+    match stage {
+        Stage::ToDo => "○",
+        Stage::InProgress => "▶",
+        Stage::InReview => "⇄",
+        Stage::Testing => "⚗",
+        Stage::Waiting => "‖",
+        Stage::Done => "✓",
+    }
+}
+
+/// The stage's colour for headings and counts.
+pub fn stage_color(stage: Stage) -> u32 {
+    match stage {
+        Stage::ToDo => colors::GREY,
+        Stage::InProgress | Stage::Done => colors::GREEN,
+        Stage::InReview => colors::ACCENT,
+        Stage::Testing => colors::PURPLE,
+        Stage::Waiting => colors::ORANGE,
+    }
+}
+
+/// The stage's fill in the progress bar: In progress is a dimmed green so
+/// Done stands out at full strength.
+fn stage_fill(stage: Stage) -> Rgba {
+    match stage {
+        Stage::InProgress => rgba((colors::GREEN << 8) | 0x8c),
+        s => rgb(stage_color(s)),
+    }
+}
+
+pub fn tone_color(tone: AgeTone) -> u32 {
+    match tone {
+        AgeTone::Fresh => colors::GREEN,
+        AgeTone::Ageing => colors::ORANGE,
+        AgeTone::Old => colors::RED,
+    }
+}
+
+/// The tooltip on a PR's age dot.
+pub fn tone_word(tone: AgeTone) -> &'static str {
+    match tone {
+        AgeTone::Fresh => "fresh",
+        AgeTone::Ageing => "ageing",
+        AgeTone::Old => "old",
+    }
+}
+
+pub fn beads_text(n: usize) -> String {
+    match n {
+        1 => "1 bead".into(),
+        n => format!("{n} beads"),
+    }
+}
+
+/// Each non-empty stage and its share of the bar, in `Stage::ALL` order.
+pub fn bar_segments(p: &Progress) -> Vec<(Stage, f32)> {
+    Stage::ALL
+        .iter()
+        .zip(p.per_stage)
+        .filter(|(_, n)| *n > 0)
+        .map(|(&s, n)| (s, n as f32 / p.total as f32))
+        .collect()
+}
+
+/// Where the pace tick sits along the bar, 0 to 1.
+pub fn tick_at(p: &Progress) -> Option<f32> {
+    p.expected.map(|e| e as f32 / p.total as f32)
+}
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+
+/// Plain text in a small dark box, for `.tooltip`.
+struct TextTooltip(SharedString);
+
+impl Render for TextTooltip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .rounded(px(4.))
+            .text_xs()
+            .bg(rgb(colors::CARD_HOVER))
+            .border_1()
+            .border_color(rgb(colors::BORDER_COORD))
+            .text_color(rgb(colors::TEXT))
+            .child(self.0.clone())
+    }
+}
+
+/// Small caps-style section heading in the accent colour.
+fn heading(text: impl Into<SharedString>) -> gpui::Div {
+    div()
+        .text_xs()
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(rgb(colors::ACCENT))
+        .child(text.into())
+}
+
+fn chip(text: impl Into<SharedString>, bg: u32, fg: u32) -> gpui::Div {
+    div()
+        .flex_none()
+        .px_1()
+        .rounded(px(4.))
+        .text_xs()
+        .font_weight(FontWeight::BOLD)
+        .bg(rgb(bg))
+        .text_color(rgb(fg))
+        .child(text.into())
+}
+
+/// One kanban card: priority chip and key, the title on up to two lines,
+/// then slot, PR, beads, raw status and the age.
+fn ticket_card(c: TicketCard, cx: &mut Context<OverseerApp>) -> impl IntoElement {
+    let (prio, bg, fg) = prio_chip(c.prio);
+    div()
+        .id(ElementId::Name(format!("kanban-{}", c.key).into()))
+        .flex_none()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .px_2()
+        .py_1()
+        .rounded(px(6.))
+        .bg(rgb(colors::CARD))
+        .border_1()
+        .border_color(rgb(colors::BORDER))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(chip(prio, bg, fg))
+                .child(
+                    div()
+                        .min_w(px(0.))
+                        .truncate()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(colors::ACCENT))
+                        .child(c.key),
+                ),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(colors::TEXT))
+                .line_clamp(2)
+                .child(c.title),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .text_xs()
+                .overflow_hidden()
+                .children(c.slot.map(|s| {
+                    div()
+                        .flex_none()
+                        .px_1()
+                        .rounded(px(4.))
+                        .bg(rgb(colors::ACCENT_BG))
+                        .text_color(rgb(colors::ACCENT))
+                        .child(slot_name(s))
+                }))
+                .children(c.pr.map(|(id, tone)| {
+                    div()
+                        .flex_none()
+                        .text_color(rgb(tone_color(tone)))
+                        .child(id)
+                }))
+                .children((c.beads > 0).then(|| {
+                    div()
+                        .flex_none()
+                        .text_color(rgb(colors::MUTED))
+                        .child(beads_text(c.beads))
+                }))
+                .children(c.raw_status.map(|s| {
+                    div()
+                        .min_w(px(0.))
+                        .truncate()
+                        .text_color(rgb(colors::MUTED))
+                        .child(s)
+                }))
+                .children(c.age.map(|a| {
+                    div()
+                        .flex_none()
+                        .ml_auto()
+                        .text_color(rgb(colors::MUTED))
+                        .child(a)
+                })),
+        )
+        .when_some(c.folder, |d, folder| {
+            d.cursor_pointer()
+                .hover(|s| s.bg(rgb(colors::CARD_HOVER)))
+                .on_click(
+                    cx.listener(move |_, _, _, _| {
+                        open_external(folder.clone(), "the ticket folder")
+                    }),
+                )
+        })
+}
+
+/// The column heading: icon, label and count in the stage colour.
+fn column_heading(stage: Stage, count: usize) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .text_xs()
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(rgb(stage_color(stage)))
+        .child(stage_icon(stage))
+        .child(stage.label())
+        .child(div().ml_auto().child(count.to_string()))
+}
+
+impl OverseerApp {
+    /// The open-PR panel beside the coordinator, or `None` while PRs are
+    /// off.
+    pub(crate) fn render_pr_panel(
+        &self,
+        now: i64,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        if !pr_panel_shown(&self.work) {
+            return None;
+        }
+        let (rows, more) = pr_rows(&self.work, now);
+        let empty = rows.is_empty();
+        let rows: Vec<_> = rows
+            .into_iter()
+            .enumerate()
+            .map(|(n, r)| {
+                let tone = tone_color(r.tone);
+                let word = tone_word(r.tone);
+                div()
+                    .id(("pr-row", n))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_xs()
+                    .child(
+                        div()
+                            .id(("pr-dot", n))
+                            .flex_none()
+                            .size(px(8.))
+                            .rounded(px(4.))
+                            .bg(rgb(tone))
+                            .tooltip(move |_, cx| cx.new(|_| TextTooltip(word.into())).into()),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(format!("{} #{}", r.repo, r.id)),
+                    )
+                    .children(
+                        r.ticket
+                            .map(|t| div().flex_none().text_color(rgb(colors::ACCENT)).child(t)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_color(rgb(colors::TEXT_DIM))
+                            .child(r.title),
+                    )
+                    .children(r.age.map(|a| {
+                        div()
+                            .flex_none()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(tone))
+                            .child(a)
+                    }))
+                    .when_some(r.url, |d, url| {
+                        d.cursor_pointer()
+                            .hover(|s| s.bg(rgb(colors::CARD_HOVER)))
+                            .on_click(cx.listener(move |_, _, _, _| {
+                                open_external(url.clone(), "the pull request")
+                            }))
+                    })
+            })
+            .collect();
+        Some(
+            div()
+                .flex_none()
+                .w(px(380.))
+                .flex()
+                .flex_col()
+                .gap_1()
+                .p_2()
+                .rounded(px(6.))
+                .bg(rgb(colors::CARD))
+                .border_1()
+                .border_color(rgb(colors::BORDER_COORD))
+                .child(heading(pr_header(&self.work, now)))
+                .children(rows)
+                .children(empty.then(|| {
+                    div()
+                        .text_xs()
+                        .text_color(rgb(colors::MUTED))
+                        .child("No open PRs")
+                }))
+                .children((more > 0).then(|| {
+                    div()
+                        .text_xs()
+                        .text_color(rgb(colors::MUTED))
+                        .child(format!("+{more} more"))
+                })),
+        )
+    }
+
+    /// The sprint kanban: progress header and six columns, or `None` when
+    /// the sprint has no tickets.
+    pub(crate) fn render_kanban(
+        &self,
+        now: i64,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        let p = progress(&self.work)?;
+        let behind = behind_text(&p);
+        let last = last_done(&self.work);
+        let bar = div()
+            .flex_1()
+            .min_w(px(200.))
+            .relative()
+            .h(px(10.))
+            .child(
+                div()
+                    .size_full()
+                    .flex()
+                    .rounded(px(5.))
+                    .overflow_hidden()
+                    .bg(rgb(colors::FIELD))
+                    .children(
+                        bar_segments(&p)
+                            .into_iter()
+                            .map(|(s, share)| div().h_full().w(relative(share)).bg(stage_fill(s))),
+                    ),
+            )
+            .children(tick_at(&p).map(|at| {
+                div()
+                    .absolute()
+                    .left(relative(at))
+                    .top(px(-5.))
+                    .w(px(2.))
+                    .h(px(20.))
+                    .bg(rgb(colors::TEXT))
+            }));
+        let header = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_3()
+            .text_xs()
+            .child(heading("SPRINT"))
+            .child(bar)
+            .child(
+                div()
+                    .flex_none()
+                    .text_color(rgb(colors::TEXT_DIM))
+                    .child(format!("{} of {} done", p.done, p.total)),
+            )
+            .children(behind.map(|b| div().flex_none().text_color(rgb(colors::ORANGE)).child(b)))
+            .children((p.breakers_open > 0).then(|| {
+                div()
+                    .flex_none()
+                    .text_color(rgb(colors::RED))
+                    .child(format!("{} sprint breakers open", p.breakers_open))
+            }));
+        let cols: Vec<_> = columns(&self.work, now)
+            .into_iter()
+            .enumerate()
+            .map(|(n, col)| {
+                let done = col.stage == Stage::Done;
+                // The Done count comes from `progress`, as the header's does.
+                let count = if done { p.done } else { col.total };
+                let cards: Vec<_> = col.cards.into_iter().map(|c| ticket_card(c, cx)).collect();
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .p_2()
+                    .rounded(px(6.))
+                    .bg(rgb(colors::BG))
+                    .child(column_heading(col.stage, count))
+                    .child(
+                        div()
+                            .id(("kanban-col", n))
+                            .flex_1()
+                            .min_h(px(0.))
+                            .overflow_y_scroll()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .children(cards)
+                            .children((col.more > 0).then(|| {
+                                div()
+                                    .text_xs()
+                                    .text_center()
+                                    .text_color(rgb(colors::MUTED))
+                                    .child(format!("+{} more", col.more))
+                            }))
+                            .children(done.then(|| {
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .text_2xl()
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(rgb(colors::GREEN))
+                                            .child(p.done.to_string()),
+                                    )
+                                    .children(last.clone().map(|k| {
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(colors::MUTED))
+                                            .child(format!("last {k}"))
+                                    }))
+                            })),
+                    )
+            })
+            .collect();
+        // Takes the room left between the slot grid and the status line;
+        // a column with more than fits scrolls instead of pushing the
+        // footer off a 1440 by 900 window.
+        Some(
+            div()
+                .flex_1()
+                .min_h(px(0.))
+                .flex()
+                .flex_col()
+                .gap_2()
+                .p_2()
+                .rounded(px(6.))
+                .bg(rgb(colors::CARD))
+                .border_1()
+                .border_color(rgb(colors::BORDER))
+                .child(header)
+                .child(div().flex_1().min_h(px(0.)).flex().gap_2().children(cols)),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -441,6 +935,9 @@ mod tests {
             behind_text(&p).as_deref(),
             Some("Behind pace: 6 expected done by today")
         );
+        // A sprint run past its last day expects all, not more.
+        v.sprint_day = Some(SprintDay { day: 13, days: 10 });
+        assert_eq!(progress(&v).unwrap().expected, Some(10));
         v.sprint_day = None;
         let p = progress(&v).unwrap();
         assert_eq!(p.expected, None);
@@ -475,6 +972,82 @@ mod tests {
             .collect();
         assert_eq!(pr_header(&v, now), "OPEN PRS · 10 · oldest 6d");
         assert_eq!(pr_header(&view(vec![]), now), "OPEN PRS · 0");
+    }
+
+    #[test]
+    fn header_and_kanban_done_agree() {
+        // A stage-less Closed ticket (old daemon) counts as done in the
+        // header, the kanban summary and its bar alike.
+        let mut old = ticket("DEMO-1", Stage::Done, None);
+        old.stage = None;
+        old.status = "Closed".into();
+        let mut odd = ticket("DEMO-2", Stage::Done, None);
+        odd.stage = None;
+        odd.status = "Ready for Release".into();
+        let items = vec![old, odd, ticket("DEMO-3", Stage::Done, None)];
+        let v = view(items);
+        let p = progress(&v).unwrap();
+        assert_eq!(done_count(&v), (p.done, p.total));
+        assert_eq!((p.done, p.total), (2, 3));
+        assert_eq!(p.per_stage[5], p.done);
+        assert_eq!(done_count(&view(vec![])), (0, 0));
+    }
+
+    #[test]
+    fn pr_panel_shows_unless_the_source_is_off() {
+        let src = |message: Option<&str>| overseer_proto::SourceStatus {
+            name: "prs".into(),
+            ok: message.is_none(),
+            count: 0,
+            at: None,
+            message: message.map(String::from),
+        };
+        let mut v = view(vec![]);
+        assert!(!pr_panel_shown(&v), "an old daemon sends no prs source");
+        v.sources = vec![src(Some(overseer_proto::PRS_OFF))];
+        assert!(!pr_panel_shown(&v));
+        v.sources = vec![src(Some("not read yet"))];
+        assert!(pr_panel_shown(&v));
+        v.sources = vec![src(None)];
+        assert!(pr_panel_shown(&v));
+    }
+
+    #[test]
+    fn chips_icons_and_bar_weights() {
+        assert_eq!(prio_chip(Prio::Breaker), ("BREAKER", 0x4a1d1d, 0xff9a94));
+        assert_eq!(prio_chip(Prio::High), ("HIGH", 0x45290f, 0xf0a868));
+        assert_eq!(prio_chip(Prio::Med), ("MED", 0x232a38, 0xaab3c2));
+        assert_eq!(prio_chip(Prio::Low), ("LOW", 0x1b2029, 0x8b949e));
+        let icons: Vec<_> = Stage::ALL.iter().map(|&s| stage_icon(s)).collect();
+        assert_eq!(icons, ["○", "▶", "⇄", "⚗", "‖", "✓"]);
+        assert_eq!(tone_word(AgeTone::Fresh), "fresh");
+        assert_eq!(tone_word(AgeTone::Ageing), "ageing");
+        assert_eq!(tone_word(AgeTone::Old), "old");
+        assert_eq!(beads_text(1), "1 bead");
+        assert_eq!(beads_text(3), "3 beads");
+        let p = Progress {
+            done: 1,
+            total: 4,
+            per_stage: [2, 1, 0, 0, 0, 1],
+            expected: Some(2),
+            breakers_open: 0,
+        };
+        assert_eq!(
+            bar_segments(&p),
+            vec![
+                (Stage::ToDo, 0.5),
+                (Stage::InProgress, 0.25),
+                (Stage::Done, 0.25)
+            ]
+        );
+        assert_eq!(tick_at(&p), Some(0.5));
+        assert_eq!(
+            tick_at(&Progress {
+                expected: None,
+                ..p
+            }),
+            None
+        );
     }
 
     #[test]
