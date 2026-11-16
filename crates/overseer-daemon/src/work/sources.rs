@@ -171,25 +171,35 @@ pub async fn run_source(
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Parse `bb pullrequest list --output json`. Text before the first `[` or
-/// `{` is skipped. Accepts an array or an object holding `values` (else
+/// Parse `bb pullrequest list --output json`. Text before the JSON is skipped,
+/// even text holding a bracket. Accepts an array or an object holding `values` (else
 /// `pullrequests`). Entries without a usable id are skipped.
 pub fn parse_prs(out: &str, repo: &str) -> Result<Vec<PullRequest>, String> {
-    let start = out.find(['[', '{']).ok_or("bb output: no JSON found")?;
-    let v: Value = serde_json::Deserializer::from_str(&out[start..])
-        .into_iter::<Value>()
-        .next()
-        .ok_or("bb output: no JSON found")?
-        .map_err(|e| format!("bb output: {e}"))?;
-    let arr = match &v {
-        Value::Array(a) => a,
-        Value::Object(_) => v
-            .get("values")
-            .or_else(|| v.get("pullrequests"))
-            .and_then(Value::as_array)
-            .ok_or("bb output: no pull request list")?,
-        _ => return Err("bb output: unexpected JSON".into()),
-    };
+    // Try each `[` or `{` in turn: a warning such as `[notice] cached` before
+    // the JSON must not hide it.
+    let mut found = None;
+    for (start, _) in out.match_indices(['[', '{']) {
+        let Some(Ok(v)) = serde_json::Deserializer::from_str(&out[start..])
+            .into_iter::<Value>()
+            .next()
+        else {
+            continue;
+        };
+        let list = match &v {
+            Value::Array(a) => Some(a.clone()),
+            Value::Object(_) => v
+                .get("values")
+                .or_else(|| v.get("pullrequests"))
+                .and_then(Value::as_array)
+                .cloned(),
+            _ => None,
+        };
+        if let Some(list) = list {
+            found = Some(list);
+            break;
+        }
+    }
+    let arr = &found.ok_or("bb output: no pull request list")?;
     let at = |item: &Value, path: &[&str]| {
         path.iter()
             .try_fold(item, |v, k| v.get(k))
@@ -240,7 +250,13 @@ pub fn parse_iso_time(s: &str) -> Option<i64> {
                 0
             } else {
                 let sign = if tz.starts_with('-') { -1 } else { 1 };
-                let (h, mi) = tz[1..].split_once(':').unwrap_or((&tz[1..], "0"));
+                let body = &tz[1..];
+                let (h, mi) = match body.split_once(':') {
+                    Some(parts) => parts,
+                    // `+0100` is hours and minutes, not 100 hours.
+                    None if body.len() == 4 && body.is_ascii() => body.split_at(2),
+                    None => (body, "0"),
+                };
                 let h: i64 = h.parse().ok()?;
                 let mi: i64 = mi.parse().ok()?;
                 sign * (h * 3600 + mi * 60)
@@ -446,5 +462,26 @@ mod tests {
         assert_eq!(parse_iso_time("1970-01-02T00:00:00Z"), Some(86_400));
         assert_eq!(parse_iso_time("1970-01-02T01:00:00.5+01:00"), Some(86_400));
         assert_eq!(parse_iso_time("2026-11-14"), None);
+    }
+
+    #[test]
+    fn iso_offsets_without_a_colon_and_negative() {
+        assert_eq!(parse_iso_time("1970-01-02T01:00:00+0100"), Some(86_400));
+        assert_eq!(parse_iso_time("1970-01-02T01:30:00+0130"), Some(86_400));
+        assert_eq!(parse_iso_time("1969-12-31T19:00:00-0500"), Some(0));
+        assert_eq!(parse_iso_time("1969-12-31T19:00:00-05:00"), Some(0));
+    }
+
+    #[test]
+    fn bb_leading_text_with_a_bracket() {
+        let prs = parse_prs(
+            "[notice] cached credentials\n{\"values\":[{\"id\":4,\"title\":\"x\"}]}",
+            "demo-api",
+        )
+        .unwrap();
+        assert_eq!(prs.iter().map(|p| p.id).collect::<Vec<_>>(), [4]);
+        let prs = parse_prs("warn {x}\n[{\"id\":5}]", "demo-api").unwrap();
+        assert_eq!(prs[0].id, 5);
+        assert!(parse_prs("[notice] only text", "demo-api").is_err());
     }
 }

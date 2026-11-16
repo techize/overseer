@@ -61,6 +61,8 @@ pub enum AgeTone {
     Fresh,
     Ageing,
     Old,
+    /// The PR carries no creation date.
+    Unknown,
 }
 
 /// A PR under 2 days old is fresh, from 2 days ageing, from 5 days old.
@@ -82,7 +84,8 @@ pub struct TicketCard {
     /// How long it has been in its stage, when the daemon saw it move.
     pub age: Option<String>,
     pub slot: Option<SlotId>,
-    /// `#<id>` of the oldest linked PR and its tone.
+    /// `#<id> <age>` of the oldest linked PR (no age when undated) and its
+    /// tone.
     pub pr: Option<(String, AgeTone)>,
     /// Beads grouped under the ticket.
     pub beads: usize,
@@ -109,8 +112,12 @@ fn card(view: &WorkView, t: &WorkItem, now: i64) -> TicketCard {
     // Oldest first; a PR with no date last.
     linked.sort_by_key(|p| (p.created.is_none(), p.created));
     let pr = linked.first().map(|p| {
-        let tone = p.created.map_or(AgeTone::Fresh, |c| pr_age_tone(now - c));
-        (format!("#{}", p.id), tone)
+        let tone = p.created.map_or(AgeTone::Unknown, |c| pr_age_tone(now - c));
+        let chip = match p.created {
+            Some(c) => format!("#{} {}", p.id, age_text(now - c)),
+            None => format!("#{}", p.id),
+        };
+        (chip, tone)
     });
     let raw = t.status.trim();
     let raw_status = (t.stage == Some(Stage::InProgress)
@@ -179,7 +186,7 @@ pub fn columns(view: &WorkView, now: i64) -> Vec<Column> {
 pub fn last_done(view: &WorkView) -> Option<String> {
     let done: Vec<_> = sprint_tickets(view)
         .into_iter()
-        .filter(|t| t.stage == Some(Stage::Done))
+        .filter(|t| board_stage(t) == Some(Stage::Done))
         .collect();
     done.iter()
         .filter(|t| t.stage_since.is_some())
@@ -279,7 +286,7 @@ pub fn pr_rows(view: &WorkView, now: i64) -> (Vec<PrRow>, usize) {
             ticket: p.ticket.clone(),
             title: p.title.clone(),
             age: p.created.map(|c| age_text(now - c)),
-            tone: p.created.map_or(AgeTone::Fresh, |c| pr_age_tone(now - c)),
+            tone: p.created.map_or(AgeTone::Unknown, |c| pr_age_tone(now - c)),
             url: p.url.clone(),
         })
         .collect();
@@ -301,6 +308,49 @@ pub fn pr_panel_shown(view: &WorkView) -> bool {
     view.sources
         .iter()
         .any(|s| s.name == "prs" && s.message.as_deref() != Some(PRS_OFF))
+}
+
+/// The PR source's state for the panel: a word and the line to show, or
+/// `None` when the last read was clean. A source that never answered is
+/// `not read yet` or `failed`; one that answered before and fails now is
+/// `stale`, since the rows shown are from the earlier read.
+pub fn pr_source_note(view: &WorkView) -> Option<(&'static str, String)> {
+    let s = view.sources.iter().find(|s| s.name == "prs")?;
+    if s.ok {
+        return None;
+    }
+    let msg = s.message.as_deref().unwrap_or("").trim();
+    let short: String = if msg.chars().count() > 100 {
+        msg.chars().take(100).chain("...".chars()).collect()
+    } else {
+        msg.to_owned()
+    };
+    Some(match (s.at.is_some(), msg) {
+        (false, "not read yet") => ("not read yet", "not read yet".to_owned()),
+        (false, _) => ("failed", format!("failed: {short}")),
+        (true, _) => ("stale", format!("stale: {short}")),
+    })
+}
+
+/// Whether the PR source has read successfully at least once, so an empty
+/// list means no open PRs and not no answer.
+pub fn pr_answered(view: &WorkView) -> bool {
+    view.sources
+        .iter()
+        .any(|s| s.name == "prs" && s.at.is_some())
+}
+
+/// Only web links go to `open`: not a `file:` URL, an app path or an option.
+pub fn is_http_url(url: &str) -> bool {
+    url.starts_with("https://") || url.starts_with("http://")
+}
+
+/// `1 sprint breaker open`, `2 sprint breakers open`.
+pub fn breakers_text(n: usize) -> String {
+    match n {
+        1 => "1 sprint breaker open".into(),
+        n => format!("{n} sprint breakers open"),
+    }
 }
 
 /// The chip text, background and foreground for a priority.
@@ -351,6 +401,7 @@ pub fn tone_color(tone: AgeTone) -> u32 {
         AgeTone::Fresh => colors::GREEN,
         AgeTone::Ageing => colors::ORANGE,
         AgeTone::Old => colors::RED,
+        AgeTone::Unknown => colors::MUTED,
     }
 }
 
@@ -360,6 +411,7 @@ pub fn tone_word(tone: AgeTone) -> &'static str {
         AgeTone::Fresh => "fresh",
         AgeTone::Ageing => "ageing",
         AgeTone::Old => "old",
+        AgeTone::Unknown => "age unknown",
     }
 }
 
@@ -370,14 +422,24 @@ pub fn beads_text(n: usize) -> String {
     }
 }
 
-/// Each non-empty stage and its share of the bar, in `Stage::ALL` order.
+/// Each non-empty stage and its share of the bar: Done first, then the
+/// other five in `Stage::ALL` order.
 pub fn bar_segments(p: &Progress) -> Vec<(Stage, f32)> {
-    Stage::ALL
-        .iter()
-        .zip(p.per_stage)
-        .filter(|(_, n)| *n > 0)
-        .map(|(&s, n)| (s, n as f32 / p.total as f32))
+    let done = Stage::Done;
+    std::iter::once(done)
+        .chain(Stage::ALL.iter().copied().filter(|&s| s != done))
+        .filter_map(|s| {
+            let i = Stage::ALL.iter().position(|&x| x == s)?;
+            let n = p.per_stage[i];
+            (n > 0).then(|| (s, n as f32 / p.total as f32))
+        })
         .collect()
+}
+
+/// Left margin for the 2px pace tick so it stays inside the bar at the
+/// far end: nothing at 0, the full tick width at 1.
+pub fn tick_margin(at: f32) -> f32 {
+    -2.0 * at.clamp(0.0, 1.0)
 }
 
 /// Where the pace tick sits along the bar, 0 to 1.
@@ -432,6 +494,7 @@ fn chip(text: impl Into<SharedString>, bg: u32, fg: u32) -> gpui::Div {
 /// then slot, PR, beads, raw status and the age.
 fn ticket_card(c: TicketCard, cx: &mut Context<OverseerApp>) -> impl IntoElement {
     let (prio, bg, fg) = prio_chip(c.prio);
+    let pr_key = c.key.clone();
     div()
         .id(ElementId::Name(format!("kanban-{}", c.key).into()))
         .flex_none()
@@ -483,11 +546,14 @@ fn ticket_card(c: TicketCard, cx: &mut Context<OverseerApp>) -> impl IntoElement
                         .text_color(rgb(colors::ACCENT))
                         .child(slot_name(s))
                 }))
-                .children(c.pr.map(|(id, tone)| {
+                .children(c.pr.map(|(text, tone)| {
+                    let word = tone_word(tone);
                     div()
+                        .id(ElementId::Name(format!("kanban-pr-{pr_key}").into()))
                         .flex_none()
                         .text_color(rgb(tone_color(tone)))
-                        .child(id)
+                        .tooltip(move |_, cx| cx.new(|_| TextTooltip(word.into())).into())
+                        .child(text)
                 }))
                 .children((c.beads > 0).then(|| {
                     div()
@@ -530,7 +596,13 @@ fn column_heading(stage: Stage, count: usize) -> gpui::Div {
         .text_xs()
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(rgb(stage_color(stage)))
-        .child(stage_icon(stage))
+        .child(
+            div()
+                .flex_none()
+                .w(px(12.))
+                .text_center()
+                .child(stage_icon(stage)),
+        )
         .child(stage.label())
         .child(div().ml_auto().child(count.to_string()))
 }
@@ -548,6 +620,8 @@ impl OverseerApp {
         }
         let (rows, more) = pr_rows(&self.work, now);
         let empty = rows.is_empty();
+        let note = pr_source_note(&self.work);
+        let answered = pr_answered(&self.work);
         let rows: Vec<_> = rows
             .into_iter()
             .enumerate()
@@ -594,7 +668,7 @@ impl OverseerApp {
                             .text_color(rgb(tone))
                             .child(a)
                     }))
-                    .when_some(r.url, |d, url| {
+                    .when_some(r.url.filter(|u| is_http_url(u)), |d, url| {
                         d.cursor_pointer()
                             .hover(|s| s.bg(rgb(colors::CARD_HOVER)))
                             .on_click(cx.listener(move |_, _, _, _| {
@@ -617,7 +691,15 @@ impl OverseerApp {
                 .border_color(rgb(colors::BORDER_COORD))
                 .child(heading(pr_header(&self.work, now)))
                 .children(rows)
-                .children(empty.then(|| {
+                .children(note.map(|(word, text)| {
+                    let color = match word {
+                        "stale" => colors::ORANGE,
+                        "failed" => colors::RED,
+                        _ => colors::MUTED,
+                    };
+                    div().text_xs().text_color(rgb(color)).child(text)
+                }))
+                .children((empty && answered).then(|| {
                     div()
                         .text_xs()
                         .text_color(rgb(colors::MUTED))
@@ -664,6 +746,7 @@ impl OverseerApp {
                 div()
                     .absolute()
                     .left(relative(at))
+                    .ml(px(tick_margin(at)))
                     .top(px(-5.))
                     .w(px(2.))
                     .h(px(20.))
@@ -688,7 +771,7 @@ impl OverseerApp {
                 div()
                     .flex_none()
                     .text_color(rgb(colors::RED))
-                    .child(format!("{} sprint breakers open", p.breakers_open))
+                    .child(breakers_text(p.breakers_open))
             }));
         let cols: Vec<_> = columns(&self.work, now)
             .into_iter()
@@ -894,7 +977,7 @@ mod tests {
         older.ticket = Some("DEMO-1".into());
         v.prs = vec![newer, older, pr(9, Some(0))];
         let c = &columns(&v, 1000)[2].cards[0];
-        assert_eq!(c.pr, Some(("#7".to_string(), AgeTone::Ageing)));
+        assert_eq!(c.pr, Some(("#7 3d".to_string(), AgeTone::Ageing)));
         assert_eq!(c.beads, 1);
     }
 
@@ -966,7 +1049,10 @@ mod tests {
             now,
         );
         assert_eq!((rows[0].id, rows[1].id), (2, 1));
-        assert_eq!((rows[1].age.clone(), rows[1].tone), (None, AgeTone::Fresh));
+        assert_eq!(
+            (rows[1].age.clone(), rows[1].tone),
+            (None, AgeTone::Unknown)
+        );
         v.prs = (1..=10)
             .map(|i| pr(i, Some(now - if i == 3 { 6 * 86_400 } else { 3_600 })))
             .collect();
@@ -1035,11 +1121,18 @@ mod tests {
         assert_eq!(
             bar_segments(&p),
             vec![
+                (Stage::Done, 0.25),
                 (Stage::ToDo, 0.5),
                 (Stage::InProgress, 0.25),
-                (Stage::Done, 0.25)
             ]
         );
+        assert_eq!(tone_word(AgeTone::Unknown), "age unknown");
+        assert_eq!(tone_color(AgeTone::Unknown), colors::MUTED);
+        assert_eq!(breakers_text(1), "1 sprint breaker open");
+        assert_eq!(breakers_text(2), "2 sprint breakers open");
+        assert_eq!(tick_margin(0.0), 0.0);
+        assert_eq!(tick_margin(1.0), -2.0);
+        assert_eq!(tick_margin(3.0), -2.0);
         assert_eq!(tick_at(&p), Some(0.5));
         assert_eq!(
             tick_at(&Progress {
@@ -1048,6 +1141,71 @@ mod tests {
             }),
             None
         );
+    }
+
+    #[test]
+    fn undated_pr_chip_has_unknown_tone_and_no_age() {
+        let mut v = view(vec![ticket("DEMO-1", Stage::InReview, None)]);
+        let mut p = pr(5, None);
+        p.ticket = Some("DEMO-1".into());
+        v.prs = vec![p];
+        let c = &columns(&v, 1000)[2].cards[0];
+        assert_eq!(c.pr, Some(("#5".to_string(), AgeTone::Unknown)));
+    }
+
+    #[test]
+    fn last_done_follows_the_board_stage() {
+        // An old daemon sends no stage; a Closed status still counts.
+        let mut old = ticket("DEMO-1", Stage::Done, None);
+        old.stage = None;
+        old.status = "Closed".into();
+        assert_eq!(last_done(&view(vec![old])).as_deref(), Some("DEMO-1"));
+    }
+
+    #[test]
+    fn pr_panel_says_when_the_source_failed_or_is_stale() {
+        let src = |ok: bool, at: Option<i64>, message: Option<&str>| overseer_proto::SourceStatus {
+            name: "prs".into(),
+            ok,
+            count: 0,
+            at,
+            message: message.map(String::from),
+        };
+        let mut v = view(vec![]);
+        assert_eq!(pr_source_note(&v), None);
+        assert!(!pr_answered(&v));
+        v.sources = vec![src(false, None, Some("not read yet"))];
+        assert_eq!(pr_source_note(&v).unwrap().0, "not read yet");
+        assert!(!pr_answered(&v), "no answer yet, so no `No open PRs`");
+        v.sources = vec![src(false, None, Some("demo-api: bb not found"))];
+        let (word, text) = pr_source_note(&v).unwrap();
+        assert_eq!(
+            (word, text.as_str()),
+            ("failed", "failed: demo-api: bb not found")
+        );
+        assert!(!pr_answered(&v));
+        v.sources = vec![src(false, Some(50), Some("demo-web: timed out"))];
+        let (word, text) = pr_source_note(&v).unwrap();
+        assert_eq!(
+            (word, text.as_str()),
+            ("stale", "stale: demo-web: timed out")
+        );
+        assert!(pr_answered(&v));
+        v.sources = vec![src(true, Some(50), None)];
+        assert_eq!(pr_source_note(&v), None);
+        assert!(pr_answered(&v));
+        let long = "x".repeat(300);
+        v.sources = vec![src(false, Some(50), Some(&long))];
+        assert!(pr_source_note(&v).unwrap().1.chars().count() < 120);
+    }
+
+    #[test]
+    fn only_web_urls_are_opened() {
+        assert!(is_http_url("https://bitbucket.example.test/demo/pr/1"));
+        assert!(is_http_url("http://bitbucket.example.test/demo/pr/1"));
+        assert!(!is_http_url("file:///etc/hosts"));
+        assert!(!is_http_url("-a Calculator"));
+        assert!(!is_http_url("/Applications/Demo.app"));
     }
 
     #[test]

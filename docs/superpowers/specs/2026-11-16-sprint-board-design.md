@@ -78,7 +78,7 @@ Each card shows:
 - time in this stage: the daemon records when it first saw the ticket in its current stage and keeps that in the ledger, so it survives restarts (Jira's own change date is not in the search output today). A ticket the daemon has never seen move shows no age, since its first sighting is not when it entered the stage (my call)
 - chips along the bottom: the owning slot (`S2`), the linked PR with its age coloured as below, the bead count
 
-Waiting cards show "waiting" and their time waiting. The reason ("on VEND-361") is not in the Jira search output, so it is left out.
+Waiting cards show "waiting" and their time waiting. The reason ("on DEMO-361") is not in the Jira search output, so it is left out.
 
 Cards sort by priority, then by time in stage, oldest first. Each column shows at most 4 cards, then "+N more". Done shows only its count and the most recently finished key. Clicking a card opens the ticket's 2ndBrain folder, as the picker does; a ticket with no folder does nothing on click.
 

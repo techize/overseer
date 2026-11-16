@@ -189,6 +189,10 @@ trimming):
 
 - A status in none of the lists lands in In progress and the card shows the
   raw Jira status (for example `Ready for Release`).
+- If a status is in more than one list, the first matching list wins, in the
+  order To do, In progress, In review, Testing, Waiting, Done.
+- After you edit a stage list and restart the daemon, a ticket whose status now
+  maps to a different stage starts its time in stage from the restart.
 - A To do or In progress ticket with an open linked PR shows in In review.
   This is display only; Jira is not changed.
 - Pace needs `sprint_start` (a date like `2026-11-09`) and `sprint_days`
