@@ -254,7 +254,8 @@ pub fn parse_repos(out: &str) -> Result<Vec<(String, Option<i64>)>, String> {
                 })
             })
             .filter(|s| !s.is_empty())
-            .or_else(|| text("name"));
+            // A display name with a space is not a slug `bb` could look up.
+            .or_else(|| text("name").filter(|n| !n.contains(char::is_whitespace)));
         let Some(name) = name else {
             continue;
         };
@@ -551,6 +552,7 @@ mod tests {
 [{"slug":"demo-a","full_name":"demo-ws/demo-x","name":"X"},
  {"full_name":"demo-ws/demo-b","name":"Y"},
  {"name":"demo-c"},
+ {"name":"Demo Old"},
  {"slug":"","full_name":"","name":""},
  7,
  {"full_name":"demo-d"}]"#,

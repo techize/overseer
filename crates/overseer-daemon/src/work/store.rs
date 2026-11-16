@@ -3,9 +3,10 @@
 //! Three sources fill the cache: `bd list --json` in the beads folder, the
 //! configured Jira command and the PR command, run in each of `pr_repos`
 //! and for each active repo of `pr_workspace`. Each runs off the request
-//! path with a 30 s timeout, so a slow source never stalls a slot request. Ownership lives in
-//! the ledger; every decision and its writes happen in one ledger
-//! transaction, so two clients assigning the same item cannot both win.
+//! path with a 30 s timeout, so a slow source never stalls a slot request.
+//! Ownership lives in the ledger; every decision and its writes happen in
+//! one ledger transaction, so two clients assigning the same item cannot
+//! both win.
 //!
 //! Lock order: `change_turn`, then the ledger's lock, then the cache's.
 //! None is held across an await.

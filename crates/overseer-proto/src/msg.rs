@@ -265,7 +265,7 @@ pub struct WorkView {
 pub const JIRA_OFF: &str = "jira_command is empty; Jira is off";
 
 /// The PR source's message while `pr_repos` is empty.
-pub const PRS_OFF: &str = "pr_repos is empty; PRs are off";
+pub const PRS_OFF: &str = "pr_repos and pr_workspace are empty; PRs are off";
 
 impl WorkView {
     /// An owned item missing from the list only because a source that could
