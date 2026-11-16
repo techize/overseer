@@ -168,6 +168,52 @@ changed since the view read it, and says to close and reopen Settings.
 The About block shows the app's build and the running daemon's, and says when
 they differ.
 
+## Sprint board and open PRs
+
+The board shows a sprint kanban under the session cards and an Open PRs panel
+at the top right. All of these keys live in `config.toml` and apply after a
+daemon restart.
+
+Sprint stages. Each ticket lands in one column by its Jira status. Six keys
+list the status names for a column (matched case-insensitively, after
+trimming):
+
+| Key | Default |
+|-----|---------|
+| `stage_todo` | Backlog, Prioritised Backlog, To Do, Selected for Development |
+| `stage_in_progress` | In Progress |
+| `stage_in_review` | In Review, Code Review, Review |
+| `stage_testing` | To Be Tested, Testing, In Testing, QA |
+| `stage_waiting` | Blocked, Waiting, On Hold |
+| `stage_done` | Done, Closed, Resolved |
+
+- A status in none of the lists lands in In progress and the card shows the
+  raw Jira status (for example `Ready for Release`).
+- If a status is in more than one list, the first matching list wins, in the
+  order To do, In progress, In review, Testing, Waiting, Done.
+- After you edit a stage list and restart the daemon, a ticket whose status now
+  maps to a different stage starts its time in stage from the restart.
+- A To do or In progress ticket with an open linked PR shows in In review.
+  This is display only; Jira is not changed.
+- Pace needs `sprint_start` (a date like `2026-11-09`) and `sprint_days`
+  (default 10). Without `sprint_start` the pace marker and the pace warning
+  are hidden. The kanban is hidden when there are no sprint tickets.
+
+PRs from Bitbucket. The PR source runs `bb` once in each folder listed in
+`pr_repos`, so each folder must be a clone `bb` understands (for example
+`~/Repos/demo-api` and `~/Repos/demo-web`).
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `pr_repos` | `[]` | Repo folders to poll. Empty turns the PR source off. |
+| `pr_command` | `bb pullrequest list --state open --output json` | Command run in each repo folder. |
+| `pr_poll_secs` | `300` | Seconds between polls. |
+| `pr_author` | `""` | Empty shows every open PR in those repos; otherwise only that author's. |
+
+A PR links to a ticket when its title or branch name matches `ticket_pattern`
+(for example `DEMO-12` in `DEMO-12-fix-login`). If `bb` fails in one repo, the
+other repos' PRs still show and the PR source message names the failing repo.
+
 ## Emergency fallback: `overseer attach`
 
 If the app will not open, you can still reach a session from any terminal:

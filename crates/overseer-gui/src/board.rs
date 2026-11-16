@@ -20,7 +20,7 @@ use gpui::{div, prelude::*, px, rgb, Context, FontWeight, Window};
 use overseer_proto::{
     slot_name, Activity, ActivityKind, BrainView, ClaimKind, CoordView, ItemKind, LockView,
     PlanState, QueueEntry, QueueState, RelayState, Sender, SlotId, SlotInfo, SlotState, WorkItem,
-    WorkView,
+    WorkView, PRS_OFF,
 };
 
 use crate::app::{colors, OverseerApp};
@@ -116,7 +116,12 @@ pub fn header_title(work: &WorkView) -> Option<String> {
 /// `jira: acli not found · beads 133 · 14:05` when a source failed. Jira
 /// leads; the time is the newest successful read, through `clock`.
 pub fn source_line(view: &WorkView, clock: impl Fn(i64) -> String) -> String {
-    let mut sources: Vec<_> = view.sources.iter().collect();
+    // The PR source is off by default; the header does not mention it then.
+    let mut sources: Vec<_> = view
+        .sources
+        .iter()
+        .filter(|s| s.ok || s.message.as_deref() != Some(PRS_OFF))
+        .collect();
     sources.sort_by_key(|s| s.name != "jira");
     let mut parts: Vec<String> = sources
         .iter()
@@ -525,24 +530,11 @@ pub fn needs_you_count(slots: &[SlotInfo]) -> usize {
         .count()
 }
 
-/// Done and total tickets in the list: done is status `done`, `closed` or
-/// `resolved`, any case. Beads, tickets that left the list and placeholder
-/// tickets made from bead titles (their status is not known) are not
-/// counted.
+/// Done and total tickets in the list, from `sprint_view::progress` so the
+/// header and the kanban agree; see `sprint_view::board_stage` for what
+/// counts as done.
 pub fn done_count(work: &WorkView) -> (usize, usize) {
-    let tickets = work
-        .items
-        .iter()
-        .filter(|i| i.kind == ItemKind::Ticket && i.in_list && !i.is_placeholder());
-    let (mut done, mut total) = (0, 0);
-    for i in tickets {
-        total += 1;
-        let s = i.status.trim().to_lowercase();
-        if matches!(s.as_str(), "done" | "closed" | "resolved") {
-            done += 1;
-        }
-    }
-    (done, total)
+    crate::sprint_view::progress(work).map_or((0, 0), |p| (p.done, p.total))
 }
 
 /// The header's right-hand text with the sessions that need Jonathan and
@@ -848,6 +840,8 @@ impl OverseerApp {
         };
         let top = row([1, 2, 3], self, cx);
         let bottom = row([4, 5, 6], self, cx);
+        let pr_panel = self.render_pr_panel(now, cx);
+        let kanban = self.render_kanban(now, cx);
         div()
             .key_context("Board")
             .track_focus(&self.board_focus)
@@ -932,8 +926,18 @@ impl OverseerApp {
                             ),
                     ),
             )
+            // The coordinator panel with the open PRs to its right; the
+            // PR panel wraps below in a window too narrow for both.
             .child(
                 div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .child(
+                div()
+                    .flex_grow()
+                    .flex_basis(px(560.))
+                    .min_w(px(0.))
                     .flex()
                     .flex_col()
                     .gap_2()
@@ -983,8 +987,11 @@ impl OverseerApp {
                             .children(outcome_lines.into_iter().map(|l| div().child(l)))
                     }))
                     .child(div().flex().child(s0)),
+                    )
+                    .children(pr_panel),
             )
             .child(div().flex().flex_col().gap_2().child(top).child(bottom))
+            .children(kanban)
             .children(self.status.clone().map(|s| {
                 div()
                     .text_sm()
@@ -1097,6 +1104,8 @@ mod tests {
             sources: vec![],
             notices: vec![],
             sprint: None,
+            prs: Vec::new(),
+            sprint_day: None,
         }
     }
 
@@ -1509,6 +1518,8 @@ mod tests {
             owner,
             in_list: true,
             folder: None,
+            stage: None,
+            stage_since: None,
         }
     }
 
@@ -1599,6 +1610,24 @@ mod tests {
             "jira: acli not found · beads: not read yet"
         );
         assert_eq!(source_line(&no_work(), hhmm), "");
+    }
+
+    #[test]
+    fn source_line_leaves_out_the_prs_source_when_off() {
+        let mut v = no_work();
+        v.sources = vec![
+            source("jira", true, 12, Some(14 * 60 + 2), None),
+            source("beads", true, 133, Some(14 * 60 + 5), None),
+        ];
+        let without = source_line(&v, hhmm);
+        v.sources.push(source("prs", false, 0, None, Some(PRS_OFF)));
+        assert_eq!(source_line(&v, hhmm), without);
+        // A failing PR source still shows.
+        v.sources[2] = source("prs", false, 0, None, Some("bb failed"));
+        assert_eq!(
+            source_line(&v, hhmm),
+            "jira 12 · beads 133 · prs: bb failed · 14:05"
+        );
     }
 
     #[test]
@@ -1893,6 +1922,8 @@ mod tests {
             owner: None,
             in_list: true,
             folder: None,
+            stage: None,
+            stage_since: None,
         }
     }
 

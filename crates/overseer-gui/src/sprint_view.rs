@@ -1,0 +1,1223 @@
+//! The sprint kanban and open-PR panel models: pure functions from a
+//! `WorkView` (and the clock, passed in as `now`) to what the board draws.
+
+use std::path::PathBuf;
+
+use gpui::{
+    div, prelude::*, px, relative, rgb, rgba, Context, ElementId, FontWeight, Rgba, SharedString,
+    Window,
+};
+use overseer_proto::{slot_name, ItemKind, SlotId, Stage, WorkItem, WorkView, PRS_OFF};
+
+use crate::app::{colors, open_external, OverseerApp};
+
+const DAY: i64 = 86_400;
+/// Cards a kanban column shows before `+N more`.
+const MAX_CARDS: usize = 4;
+/// Rows the PR panel shows before `+N more`.
+const MAX_PR_ROWS: usize = 8;
+
+/// The tickets in the sprint list: tickets still in the list, without the
+/// placeholders made from bead titles.
+pub fn sprint_tickets(view: &WorkView) -> Vec<&WorkItem> {
+    view.items
+        .iter()
+        .filter(|i| i.kind == ItemKind::Ticket && i.in_list && !i.is_placeholder())
+        .collect()
+}
+
+/// Ticket priority as the board shows it; the order is the sort order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Prio {
+    Breaker,
+    High,
+    Med,
+    Low,
+}
+
+pub fn prio_of(priority: Option<&str>) -> Prio {
+    match priority {
+        Some("Sprint Breaker") => Prio::Breaker,
+        Some("Highest") | Some("High") => Prio::High,
+        Some("Low") | Some("Lowest") => Prio::Low,
+        _ => Prio::Med,
+    }
+}
+
+/// `12m`, `5h`, `3d`: the largest whole unit. Negative counts as 0.
+pub fn age_text(secs: i64) -> String {
+    let s = secs.max(0);
+    if s < 3600 {
+        format!("{}m", s / 60)
+    } else if s < DAY {
+        format!("{}h", s / 3600)
+    } else {
+        format!("{}d", s / DAY)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgeTone {
+    Fresh,
+    Ageing,
+    Old,
+    /// The PR carries no creation date.
+    Unknown,
+}
+
+/// A PR under 2 days old is fresh, from 2 days ageing, from 5 days old.
+pub fn pr_age_tone(secs: i64) -> AgeTone {
+    if secs >= 5 * DAY {
+        AgeTone::Old
+    } else if secs >= 2 * DAY {
+        AgeTone::Ageing
+    } else {
+        AgeTone::Fresh
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TicketCard {
+    pub key: String,
+    pub title: String,
+    pub prio: Prio,
+    /// How long it has been in its stage, when the daemon saw it move.
+    pub age: Option<String>,
+    pub slot: Option<SlotId>,
+    /// `#<id> <age>` of the oldest linked PR (no age when undated) and its
+    /// tone.
+    pub pr: Option<(String, AgeTone)>,
+    /// Beads grouped under the ticket.
+    pub beads: usize,
+    /// The Jira status, when the ticket is In progress only because no
+    /// stage list named that status.
+    pub raw_status: Option<String>,
+    pub folder: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Column {
+    pub stage: Stage,
+    pub total: usize,
+    pub cards: Vec<TicketCard>,
+    pub more: usize,
+}
+
+fn card(view: &WorkView, t: &WorkItem, now: i64) -> TicketCard {
+    let mut linked: Vec<_> = view
+        .prs
+        .iter()
+        .filter(|p| p.ticket.as_deref() == Some(t.key.as_str()))
+        .collect();
+    // Oldest first; a PR with no date last.
+    linked.sort_by_key(|p| (p.created.is_none(), p.created));
+    let pr = linked.first().map(|p| {
+        let tone = p.created.map_or(AgeTone::Unknown, |c| pr_age_tone(now - c));
+        let chip = match p.created {
+            Some(c) => format!("#{} {}", p.id, age_text(now - c)),
+            None => format!("#{}", p.id),
+        };
+        (chip, tone)
+    });
+    let raw = t.status.trim();
+    let raw_status = (t.stage == Some(Stage::InProgress)
+        && !raw.is_empty()
+        && raw.to_lowercase() != "in progress")
+        .then(|| t.status.clone());
+    TicketCard {
+        key: t.key.clone(),
+        title: t.title.clone(),
+        prio: prio_of(t.priority.as_deref()),
+        age: t.stage_since.map(|s| age_text(now - s)),
+        slot: t.owner,
+        pr,
+        beads: view
+            .items
+            .iter()
+            .filter(|b| b.kind == ItemKind::Bead && b.parent.as_deref() == Some(t.key.as_str()))
+            .count(),
+        raw_status,
+        folder: t.folder.clone(),
+    }
+}
+
+/// Six columns in `Stage::ALL` order. Cards sort by priority, then by the
+/// time in stage (oldest first, unknown last), and are cut to four. The
+/// Done column carries no cards: the board shows its count and `last_done`.
+pub fn columns(view: &WorkView, now: i64) -> Vec<Column> {
+    let tickets = sprint_tickets(view);
+    Stage::ALL
+        .iter()
+        .map(|&stage| {
+            let mut mine: Vec<&WorkItem> = tickets
+                .iter()
+                .copied()
+                .filter(|t| t.stage == Some(stage))
+                .collect();
+            let total = mine.len();
+            if stage == Stage::Done {
+                return Column {
+                    stage,
+                    total,
+                    cards: Vec::new(),
+                    more: 0,
+                };
+            }
+            mine.sort_by_key(|t| {
+                (
+                    prio_of(t.priority.as_deref()),
+                    t.stage_since.is_none(),
+                    t.stage_since,
+                )
+            });
+            let more = total.saturating_sub(MAX_CARDS);
+            mine.truncate(MAX_CARDS);
+            Column {
+                stage,
+                total,
+                cards: mine.into_iter().map(|t| card(view, t, now)).collect(),
+                more,
+            }
+        })
+        .collect()
+}
+
+/// The Done ticket that moved last, else the first Done ticket.
+pub fn last_done(view: &WorkView) -> Option<String> {
+    let done: Vec<_> = sprint_tickets(view)
+        .into_iter()
+        .filter(|t| board_stage(t) == Some(Stage::Done))
+        .collect();
+    done.iter()
+        .filter(|t| t.stage_since.is_some())
+        .max_by_key(|t| t.stage_since)
+        .or_else(|| done.first())
+        .map(|t| t.key.clone())
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Progress {
+    pub done: usize,
+    pub total: usize,
+    /// Tickets per stage, in `Stage::ALL` order.
+    pub per_stage: [usize; 6],
+    /// Tickets that should be done by today at an even pace.
+    pub expected: Option<usize>,
+    /// Sprint Breaker tickets not yet done.
+    pub breakers_open: usize,
+}
+
+/// The stage the board counts a ticket in: its stage, or for a ticket with
+/// none (an old daemon) Done when its status is `done`, `closed` or
+/// `resolved`, any case, and no stage otherwise.
+pub fn board_stage(t: &WorkItem) -> Option<Stage> {
+    t.stage.or_else(|| {
+        matches!(
+            t.status.trim().to_lowercase().as_str(),
+            "done" | "closed" | "resolved"
+        )
+        .then_some(Stage::Done)
+    })
+}
+
+/// `None` when the sprint has no tickets. `done` is also the header's done
+/// count (`board::done_count`) and the Done column's count.
+pub fn progress(view: &WorkView) -> Option<Progress> {
+    let tickets = sprint_tickets(view);
+    let total = tickets.len();
+    if total == 0 {
+        return None;
+    }
+    let mut per_stage = [0; 6];
+    for t in &tickets {
+        if let Some(i) = board_stage(t).and_then(|s| Stage::ALL.iter().position(|&x| x == s)) {
+            per_stage[i] += 1;
+        }
+    }
+    let done = per_stage[Stage::ALL.len() - 1];
+    // Past the last day (a long sprint) the pace still tops out at all.
+    let expected = view
+        .sprint_day
+        .filter(|d| d.days > 0)
+        .map(|d| (total * d.day as usize / d.days as usize).min(total));
+    let breakers_open = tickets
+        .iter()
+        .filter(|t| {
+            board_stage(t) != Some(Stage::Done) && prio_of(t.priority.as_deref()) == Prio::Breaker
+        })
+        .count();
+    Some(Progress {
+        done,
+        total,
+        per_stage,
+        expected,
+        breakers_open,
+    })
+}
+
+/// The warning when fewer tickets are done than an even pace expects.
+pub fn behind_text(p: &Progress) -> Option<String> {
+    let expected = p.expected?;
+    (p.done < expected).then(|| format!("Behind pace: {expected} expected done by today"))
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrRow {
+    pub repo: String,
+    pub id: u64,
+    pub ticket: Option<String>,
+    pub title: String,
+    pub age: Option<String>,
+    pub tone: AgeTone,
+    pub url: Option<String>,
+}
+
+/// Open PRs oldest first (no date last), at most 8, and how many are left.
+pub fn pr_rows(view: &WorkView, now: i64) -> (Vec<PrRow>, usize) {
+    let mut prs: Vec<_> = view.prs.iter().collect();
+    prs.sort_by_key(|p| (p.created.is_none(), p.created));
+    let more = prs.len().saturating_sub(MAX_PR_ROWS);
+    prs.truncate(MAX_PR_ROWS);
+    let rows = prs
+        .into_iter()
+        .map(|p| PrRow {
+            repo: p.repo.clone(),
+            id: p.id,
+            ticket: p.ticket.clone(),
+            title: p.title.clone(),
+            age: p.created.map(|c| age_text(now - c)),
+            tone: p.created.map_or(AgeTone::Unknown, |c| pr_age_tone(now - c)),
+            url: p.url.clone(),
+        })
+        .collect();
+    (rows, more)
+}
+
+/// `OPEN PRS · 3`, or `OPEN PRS · 3 · oldest 6d` when any PR has a date.
+pub fn pr_header(view: &WorkView, now: i64) -> String {
+    let mut text = format!("OPEN PRS · {}", view.prs.len());
+    if let Some(oldest) = view.prs.iter().filter_map(|p| p.created).min() {
+        text.push_str(&format!(" · oldest {}", age_text(now - oldest)));
+    }
+    text
+}
+
+/// The PR panel shows while the daemon reports a `prs` source that is not
+/// off. An old daemon sends none, so it stays hidden there too.
+pub fn pr_panel_shown(view: &WorkView) -> bool {
+    view.sources
+        .iter()
+        .any(|s| s.name == "prs" && s.message.as_deref() != Some(PRS_OFF))
+}
+
+/// The PR source's state for the panel: a word and the line to show, or
+/// `None` when the last read was clean. A source that never answered is
+/// `not read yet` or `failed`; one that answered before and fails now is
+/// `stale`, since the rows shown are from the earlier read.
+pub fn pr_source_note(view: &WorkView) -> Option<(&'static str, String)> {
+    let s = view.sources.iter().find(|s| s.name == "prs")?;
+    if s.ok {
+        return None;
+    }
+    let msg = s.message.as_deref().unwrap_or("").trim();
+    let short: String = if msg.chars().count() > 100 {
+        msg.chars().take(100).chain("...".chars()).collect()
+    } else {
+        msg.to_owned()
+    };
+    Some(match (s.at.is_some(), msg) {
+        (false, "not read yet") => ("not read yet", "not read yet".to_owned()),
+        (false, _) => ("failed", format!("failed: {short}")),
+        (true, _) => ("stale", format!("stale: {short}")),
+    })
+}
+
+/// Whether the PR source has read successfully at least once, so an empty
+/// list means no open PRs and not no answer.
+pub fn pr_answered(view: &WorkView) -> bool {
+    view.sources
+        .iter()
+        .any(|s| s.name == "prs" && s.at.is_some())
+}
+
+/// Only web links go to `open`: not a `file:` URL, an app path or an option.
+pub fn is_http_url(url: &str) -> bool {
+    url.starts_with("https://") || url.starts_with("http://")
+}
+
+/// `1 sprint breaker open`, `2 sprint breakers open`.
+pub fn breakers_text(n: usize) -> String {
+    match n {
+        1 => "1 sprint breaker open".into(),
+        n => format!("{n} sprint breakers open"),
+    }
+}
+
+/// The chip text, background and foreground for a priority.
+pub fn prio_chip(prio: Prio) -> (&'static str, u32, u32) {
+    match prio {
+        Prio::Breaker => ("BREAKER", 0x4a1d1d, 0xff9a94),
+        Prio::High => ("HIGH", 0x45290f, 0xf0a868),
+        Prio::Med => ("MED", 0x232a38, 0xaab3c2),
+        Prio::Low => ("LOW", 0x1b2029, 0x8b949e),
+    }
+}
+
+/// The column heading's icon. Waiting is `‖`, not the pause emoji, which
+/// would draw in colour.
+pub fn stage_icon(stage: Stage) -> &'static str {
+    match stage {
+        Stage::ToDo => "○",
+        Stage::InProgress => "▶",
+        Stage::InReview => "⇄",
+        Stage::Testing => "⚗",
+        Stage::Waiting => "‖",
+        Stage::Done => "✓",
+    }
+}
+
+/// The stage's colour for headings and counts.
+pub fn stage_color(stage: Stage) -> u32 {
+    match stage {
+        Stage::ToDo => colors::GREY,
+        Stage::InProgress | Stage::Done => colors::GREEN,
+        Stage::InReview => colors::ACCENT,
+        Stage::Testing => colors::PURPLE,
+        Stage::Waiting => colors::ORANGE,
+    }
+}
+
+/// The stage's fill in the progress bar: In progress is a dimmed green so
+/// Done stands out at full strength.
+fn stage_fill(stage: Stage) -> Rgba {
+    match stage {
+        Stage::InProgress => rgba((colors::GREEN << 8) | 0x8c),
+        s => rgb(stage_color(s)),
+    }
+}
+
+pub fn tone_color(tone: AgeTone) -> u32 {
+    match tone {
+        AgeTone::Fresh => colors::GREEN,
+        AgeTone::Ageing => colors::ORANGE,
+        AgeTone::Old => colors::RED,
+        AgeTone::Unknown => colors::MUTED,
+    }
+}
+
+/// The tooltip on a PR's age dot.
+pub fn tone_word(tone: AgeTone) -> &'static str {
+    match tone {
+        AgeTone::Fresh => "fresh",
+        AgeTone::Ageing => "ageing",
+        AgeTone::Old => "old",
+        AgeTone::Unknown => "age unknown",
+    }
+}
+
+pub fn beads_text(n: usize) -> String {
+    match n {
+        1 => "1 bead".into(),
+        n => format!("{n} beads"),
+    }
+}
+
+/// Each non-empty stage and its share of the bar: Done first, then the
+/// other five in `Stage::ALL` order.
+pub fn bar_segments(p: &Progress) -> Vec<(Stage, f32)> {
+    let done = Stage::Done;
+    std::iter::once(done)
+        .chain(Stage::ALL.iter().copied().filter(|&s| s != done))
+        .filter_map(|s| {
+            let i = Stage::ALL.iter().position(|&x| x == s)?;
+            let n = p.per_stage[i];
+            (n > 0).then(|| (s, n as f32 / p.total as f32))
+        })
+        .collect()
+}
+
+/// Left margin for the 2px pace tick so it stays inside the bar at the
+/// far end: nothing at 0, the full tick width at 1.
+pub fn tick_margin(at: f32) -> f32 {
+    -2.0 * at.clamp(0.0, 1.0)
+}
+
+/// Where the pace tick sits along the bar, 0 to 1.
+pub fn tick_at(p: &Progress) -> Option<f32> {
+    p.expected.map(|e| e as f32 / p.total as f32)
+}
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+
+/// Plain text in a small dark box, for `.tooltip`.
+struct TextTooltip(SharedString);
+
+impl Render for TextTooltip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .rounded(px(4.))
+            .text_xs()
+            .bg(rgb(colors::CARD_HOVER))
+            .border_1()
+            .border_color(rgb(colors::BORDER_COORD))
+            .text_color(rgb(colors::TEXT))
+            .child(self.0.clone())
+    }
+}
+
+/// Small caps-style section heading in the accent colour.
+fn heading(text: impl Into<SharedString>) -> gpui::Div {
+    div()
+        .text_xs()
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(rgb(colors::ACCENT))
+        .child(text.into())
+}
+
+fn chip(text: impl Into<SharedString>, bg: u32, fg: u32) -> gpui::Div {
+    div()
+        .flex_none()
+        .px_1()
+        .rounded(px(4.))
+        .text_xs()
+        .font_weight(FontWeight::BOLD)
+        .bg(rgb(bg))
+        .text_color(rgb(fg))
+        .child(text.into())
+}
+
+/// One kanban card: priority chip and key, the title on up to two lines,
+/// then slot, PR, beads, raw status and the age.
+fn ticket_card(c: TicketCard, cx: &mut Context<OverseerApp>) -> impl IntoElement {
+    let (prio, bg, fg) = prio_chip(c.prio);
+    let pr_key = c.key.clone();
+    div()
+        .id(ElementId::Name(format!("kanban-{}", c.key).into()))
+        .flex_none()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .px_2()
+        .py_1()
+        .rounded(px(6.))
+        .bg(rgb(colors::CARD))
+        .border_1()
+        .border_color(rgb(colors::BORDER))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(chip(prio, bg, fg))
+                .child(
+                    div()
+                        .min_w(px(0.))
+                        .truncate()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(colors::ACCENT))
+                        .child(c.key),
+                ),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(colors::TEXT))
+                .line_clamp(2)
+                .child(c.title),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .text_xs()
+                .overflow_hidden()
+                .children(c.slot.map(|s| {
+                    div()
+                        .flex_none()
+                        .px_1()
+                        .rounded(px(4.))
+                        .bg(rgb(colors::ACCENT_BG))
+                        .text_color(rgb(colors::ACCENT))
+                        .child(slot_name(s))
+                }))
+                .children(c.pr.map(|(text, tone)| {
+                    let word = tone_word(tone);
+                    div()
+                        .id(ElementId::Name(format!("kanban-pr-{pr_key}").into()))
+                        .flex_none()
+                        .text_color(rgb(tone_color(tone)))
+                        .tooltip(move |_, cx| cx.new(|_| TextTooltip(word.into())).into())
+                        .child(text)
+                }))
+                .children((c.beads > 0).then(|| {
+                    div()
+                        .flex_none()
+                        .text_color(rgb(colors::MUTED))
+                        .child(beads_text(c.beads))
+                }))
+                .children(c.raw_status.map(|s| {
+                    div()
+                        .min_w(px(0.))
+                        .truncate()
+                        .text_color(rgb(colors::MUTED))
+                        .child(s)
+                }))
+                .children(c.age.map(|a| {
+                    div()
+                        .flex_none()
+                        .ml_auto()
+                        .text_color(rgb(colors::MUTED))
+                        .child(a)
+                })),
+        )
+        .when_some(c.folder, |d, folder| {
+            d.cursor_pointer()
+                .hover(|s| s.bg(rgb(colors::CARD_HOVER)))
+                .on_click(
+                    cx.listener(move |_, _, _, _| {
+                        open_external(folder.clone(), "the ticket folder")
+                    }),
+                )
+        })
+}
+
+/// The column heading: icon, label and count in the stage colour.
+fn column_heading(stage: Stage, count: usize) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .text_xs()
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(rgb(stage_color(stage)))
+        .child(
+            div()
+                .flex_none()
+                .w(px(16.))
+                .text_center()
+                .child(stage_icon(stage)),
+        )
+        .child(stage.label())
+        .child(div().ml_auto().child(count.to_string()))
+}
+
+impl OverseerApp {
+    /// The open-PR panel beside the coordinator, or `None` while PRs are
+    /// off.
+    pub(crate) fn render_pr_panel(
+        &self,
+        now: i64,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        if !pr_panel_shown(&self.work) {
+            return None;
+        }
+        let (rows, more) = pr_rows(&self.work, now);
+        let empty = rows.is_empty();
+        let note = pr_source_note(&self.work);
+        let answered = pr_answered(&self.work);
+        let rows: Vec<_> = rows
+            .into_iter()
+            .enumerate()
+            .map(|(n, r)| {
+                let tone = tone_color(r.tone);
+                let word = tone_word(r.tone);
+                div()
+                    .id(("pr-row", n))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_xs()
+                    .child(
+                        div()
+                            .id(("pr-dot", n))
+                            .flex_none()
+                            .size(px(8.))
+                            .rounded(px(4.))
+                            .bg(rgb(tone))
+                            .tooltip(move |_, cx| cx.new(|_| TextTooltip(word.into())).into()),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(format!("{} #{}", r.repo, r.id)),
+                    )
+                    .children(
+                        r.ticket
+                            .map(|t| div().flex_none().text_color(rgb(colors::ACCENT)).child(t)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_color(rgb(colors::TEXT_DIM))
+                            .child(r.title),
+                    )
+                    .children(r.age.map(|a| {
+                        div()
+                            .flex_none()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(tone))
+                            .child(a)
+                    }))
+                    .when_some(r.url.filter(|u| is_http_url(u)), |d, url| {
+                        d.cursor_pointer()
+                            .hover(|s| s.bg(rgb(colors::CARD_HOVER)))
+                            .on_click(cx.listener(move |_, _, _, _| {
+                                open_external(url.clone(), "the pull request")
+                            }))
+                    })
+            })
+            .collect();
+        Some(
+            div()
+                .flex_none()
+                .w(px(380.))
+                .flex()
+                .flex_col()
+                .gap_1()
+                .p_2()
+                .rounded(px(6.))
+                .bg(rgb(colors::CARD))
+                .border_1()
+                .border_color(rgb(colors::BORDER_COORD))
+                .child(heading(pr_header(&self.work, now)))
+                .children(rows)
+                .children(note.map(|(word, text)| {
+                    let color = match word {
+                        "stale" => colors::ORANGE,
+                        "failed" => colors::RED,
+                        _ => colors::MUTED,
+                    };
+                    div().text_xs().text_color(rgb(color)).child(text)
+                }))
+                .children((empty && answered).then(|| {
+                    div()
+                        .text_xs()
+                        .text_color(rgb(colors::MUTED))
+                        .child("No open PRs")
+                }))
+                .children((more > 0).then(|| {
+                    div()
+                        .text_xs()
+                        .text_color(rgb(colors::MUTED))
+                        .child(format!("+{more} more"))
+                })),
+        )
+    }
+
+    /// The sprint kanban: progress header and six columns, or `None` when
+    /// the sprint has no tickets.
+    pub(crate) fn render_kanban(
+        &self,
+        now: i64,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        let p = progress(&self.work)?;
+        let behind = behind_text(&p);
+        let last = last_done(&self.work);
+        let bar = div()
+            .flex_1()
+            .min_w(px(200.))
+            .relative()
+            .h(px(10.))
+            .child(
+                div()
+                    .size_full()
+                    .flex()
+                    .rounded(px(5.))
+                    .overflow_hidden()
+                    .bg(rgb(colors::FIELD))
+                    .children(
+                        bar_segments(&p)
+                            .into_iter()
+                            .map(|(s, share)| div().h_full().w(relative(share)).bg(stage_fill(s))),
+                    ),
+            )
+            .children(tick_at(&p).map(|at| {
+                div()
+                    .absolute()
+                    .left(relative(at))
+                    .ml(px(tick_margin(at)))
+                    .top(px(-5.))
+                    .w(px(2.))
+                    .h(px(20.))
+                    .bg(rgb(colors::TEXT))
+            }));
+        let header = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_3()
+            .text_xs()
+            .child(heading("SPRINT"))
+            .child(bar)
+            .child(
+                div()
+                    .flex_none()
+                    .text_color(rgb(colors::TEXT_DIM))
+                    .child(format!("{} of {} done", p.done, p.total)),
+            )
+            .children(behind.map(|b| div().flex_none().text_color(rgb(colors::ORANGE)).child(b)))
+            .children((p.breakers_open > 0).then(|| {
+                div()
+                    .flex_none()
+                    .text_color(rgb(colors::RED))
+                    .child(breakers_text(p.breakers_open))
+            }));
+        let cols: Vec<_> = columns(&self.work, now)
+            .into_iter()
+            .enumerate()
+            .map(|(n, col)| {
+                let done = col.stage == Stage::Done;
+                // The Done count comes from `progress`, as the header's does.
+                let count = if done { p.done } else { col.total };
+                let cards: Vec<_> = col.cards.into_iter().map(|c| ticket_card(c, cx)).collect();
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .p_2()
+                    .rounded(px(6.))
+                    .bg(rgb(colors::BG))
+                    .child(column_heading(col.stage, count))
+                    .child(
+                        div()
+                            .id(("kanban-col", n))
+                            .flex_1()
+                            .min_h(px(0.))
+                            .overflow_y_scroll()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .children(cards)
+                            .children((col.more > 0).then(|| {
+                                div()
+                                    .text_xs()
+                                    .text_center()
+                                    .text_color(rgb(colors::MUTED))
+                                    .child(format!("+{} more", col.more))
+                            }))
+                            .children(done.then(|| {
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .text_2xl()
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(rgb(colors::GREEN))
+                                            .child(p.done.to_string()),
+                                    )
+                                    .children(last.clone().map(|k| {
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(colors::MUTED))
+                                            .child(format!("last {k}"))
+                                    }))
+                            })),
+                    )
+            })
+            .collect();
+        // Takes the room left between the slot grid and the status line;
+        // a column with more than fits scrolls instead of pushing the
+        // footer off a 1440 by 900 window.
+        Some(
+            div()
+                .flex_1()
+                .min_h(px(0.))
+                .flex()
+                .flex_col()
+                .gap_2()
+                .p_2()
+                .rounded(px(6.))
+                .bg(rgb(colors::CARD))
+                .border_1()
+                .border_color(rgb(colors::BORDER))
+                .child(header)
+                .child(div().flex_1().min_h(px(0.)).flex().gap_2().children(cols)),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::board::done_count;
+    use overseer_proto::{PullRequest, SprintDay};
+
+    fn ticket(key: &str, stage: Stage, prio: Option<&str>) -> WorkItem {
+        WorkItem {
+            key: key.into(),
+            kind: ItemKind::Ticket,
+            title: format!("{key} title"),
+            status: "In Progress".into(),
+            priority: prio.map(String::from),
+            parent: None,
+            owner: None,
+            in_list: true,
+            folder: None,
+            stage: Some(stage),
+            stage_since: None,
+        }
+    }
+
+    fn pr(id: u64, created: Option<i64>) -> PullRequest {
+        PullRequest {
+            repo: "demo-api".into(),
+            id,
+            title: format!("PR {id}"),
+            branch: "demo-branch".into(),
+            url: None,
+            author: None,
+            created,
+            ticket: None,
+        }
+    }
+
+    fn view(items: Vec<WorkItem>) -> WorkView {
+        WorkView {
+            items,
+            ..crate::app::empty_work()
+        }
+    }
+
+    #[test]
+    fn age_text_and_tones() {
+        assert_eq!(age_text(59), "0m");
+        assert_eq!(age_text(3600 * 5), "5h");
+        assert_eq!(age_text(86_400 * 3), "3d");
+        assert_eq!(age_text(-30), "0m");
+        assert_eq!(pr_age_tone(86_400 * 2 - 1), AgeTone::Fresh);
+        assert_eq!(pr_age_tone(86_400 * 2), AgeTone::Ageing);
+        assert_eq!(pr_age_tone(86_400 * 5 - 1), AgeTone::Ageing);
+        assert_eq!(pr_age_tone(86_400 * 5), AgeTone::Old);
+    }
+
+    #[test]
+    fn prio_mapping() {
+        assert_eq!(prio_of(Some("Sprint Breaker")), Prio::Breaker);
+        assert_eq!(prio_of(Some("Highest")), Prio::High);
+        assert_eq!(prio_of(Some("High")), Prio::High);
+        assert_eq!(prio_of(Some("Medium")), Prio::Med);
+        assert_eq!(prio_of(Some("Low")), Prio::Low);
+        assert_eq!(prio_of(Some("Lowest")), Prio::Low);
+        assert_eq!(prio_of(None), Prio::Med);
+        assert_eq!(prio_of(Some("Whatever")), Prio::Med);
+    }
+
+    #[test]
+    fn columns_sort_and_overflow() {
+        let mut items = vec![
+            ticket("DEMO-1", Stage::InProgress, Some("High")),
+            ticket("DEMO-2", Stage::InProgress, Some("High")),
+            ticket("DEMO-3", Stage::InProgress, Some("Sprint Breaker")),
+            ticket("DEMO-4", Stage::InProgress, None),
+            ticket("DEMO-5", Stage::InProgress, None),
+            ticket("DEMO-6", Stage::InProgress, Some("Low")),
+        ];
+        items[0].stage_since = Some(100);
+        items[1].stage_since = Some(50);
+        let cols = columns(&view(items), 1000);
+        assert_eq!(cols.len(), 6);
+        assert_eq!(
+            cols.iter().map(|c| c.stage).collect::<Vec<_>>(),
+            Stage::ALL.to_vec()
+        );
+        let c = &cols[1];
+        assert_eq!((c.total, c.cards.len(), c.more), (6, 4, 2));
+        assert_eq!(c.cards[0].key, "DEMO-3");
+        assert_eq!(c.cards[1].key, "DEMO-2");
+        assert_eq!(c.cards[1].age.as_deref(), Some("15m"));
+        assert_eq!(c.cards[2].key, "DEMO-1");
+        assert_eq!(c.cards[3].age, None);
+        assert_eq!(cols[0].total, 0);
+    }
+
+    #[test]
+    fn done_column_has_count_and_last_done_but_no_cards() {
+        let mut items = vec![
+            ticket("DEMO-1", Stage::Done, None),
+            ticket("DEMO-2", Stage::Done, None),
+            ticket("DEMO-3", Stage::Done, None),
+        ];
+        let v = view(items.clone());
+        assert_eq!(last_done(&v).as_deref(), Some("DEMO-1"));
+        items[1].stage_since = Some(10);
+        items[2].stage_since = Some(20);
+        let v = view(items);
+        assert_eq!(last_done(&v).as_deref(), Some("DEMO-3"));
+        let done = &columns(&v, 100)[5];
+        assert_eq!((done.total, done.cards.len(), done.more), (3, 0, 0));
+        assert_eq!(last_done(&view(vec![])), None);
+    }
+
+    #[test]
+    fn card_links_prs_and_beads() {
+        let mut v = view(vec![ticket("DEMO-1", Stage::InReview, None)]);
+        let mut bead = ticket("demo-b1", Stage::InReview, None);
+        bead.kind = ItemKind::Bead;
+        bead.parent = Some("DEMO-1".into());
+        v.items.push(bead);
+        let mut newer = pr(8, Some(1000));
+        newer.ticket = Some("DEMO-1".into());
+        let mut older = pr(7, Some(1000 - 3 * 86_400));
+        older.ticket = Some("DEMO-1".into());
+        v.prs = vec![newer, older, pr(9, Some(0))];
+        let c = &columns(&v, 1000)[2].cards[0];
+        assert_eq!(c.pr, Some(("#7 3d".to_string(), AgeTone::Ageing)));
+        assert_eq!(c.beads, 1);
+    }
+
+    #[test]
+    fn unmapped_status_shows_raw() {
+        let mut odd = ticket("DEMO-1", Stage::InProgress, None);
+        odd.status = "Ready for Release".into();
+        let plain = ticket("DEMO-2", Stage::InProgress, None);
+        let mut review = ticket("DEMO-3", Stage::InReview, None);
+        review.status = "Code Review".into();
+        let cols = columns(&view(vec![odd, plain, review]), 0);
+        assert_eq!(
+            cols[1].cards[0].raw_status.as_deref(),
+            Some("Ready for Release")
+        );
+        assert_eq!(cols[1].cards[1].raw_status, None);
+        assert_eq!(cols[2].cards[0].raw_status, None);
+    }
+
+    #[test]
+    fn progress_and_pace() {
+        let mut items: Vec<_> = (0..10)
+            .map(|i| {
+                let stage = if i < 3 { Stage::Done } else { Stage::ToDo };
+                ticket(&format!("DEMO-{i}"), stage, None)
+            })
+            .collect();
+        items[5].priority = Some("Sprint Breaker".into());
+        items[0].priority = Some("Sprint Breaker".into());
+        let mut v = view(items);
+        v.sprint_day = Some(SprintDay { day: 6, days: 10 });
+        let p = progress(&v).unwrap();
+        assert_eq!((p.done, p.total), (3, 10));
+        assert_eq!(p.per_stage, [7, 0, 0, 0, 0, 3]);
+        assert_eq!(p.expected, Some(6));
+        assert_eq!(p.breakers_open, 1);
+        assert_eq!(
+            behind_text(&p).as_deref(),
+            Some("Behind pace: 6 expected done by today")
+        );
+        // A sprint run past its last day expects all, not more.
+        v.sprint_day = Some(SprintDay { day: 13, days: 10 });
+        assert_eq!(progress(&v).unwrap().expected, Some(10));
+        v.sprint_day = None;
+        let p = progress(&v).unwrap();
+        assert_eq!(p.expected, None);
+        assert_eq!(behind_text(&p), None);
+        assert!(progress(&view(vec![])).is_none());
+    }
+
+    #[test]
+    fn pr_rows_oldest_first_capped() {
+        let now = 10 * 86_400;
+        let mut v = view(vec![]);
+        v.prs = (1..=9)
+            .map(|i| pr(i, Some(now - i as i64 * 86_400)))
+            .collect();
+        v.prs.push(pr(10, None));
+        let (rows, more) = pr_rows(&v, now);
+        assert_eq!((rows.len(), more), (8, 2));
+        assert_eq!(rows[0].id, 9);
+        assert_eq!(rows[0].tone, AgeTone::Old);
+        assert_eq!(rows[7].id, 2);
+        let (rows, _) = pr_rows(
+            &WorkView {
+                prs: vec![pr(1, None), pr(2, Some(now))],
+                ..view(vec![])
+            },
+            now,
+        );
+        assert_eq!((rows[0].id, rows[1].id), (2, 1));
+        assert_eq!(
+            (rows[1].age.clone(), rows[1].tone),
+            (None, AgeTone::Unknown)
+        );
+        v.prs = (1..=10)
+            .map(|i| pr(i, Some(now - if i == 3 { 6 * 86_400 } else { 3_600 })))
+            .collect();
+        assert_eq!(pr_header(&v, now), "OPEN PRS · 10 · oldest 6d");
+        assert_eq!(pr_header(&view(vec![]), now), "OPEN PRS · 0");
+    }
+
+    #[test]
+    fn header_and_kanban_done_agree() {
+        // A stage-less Closed ticket (old daemon) counts as done in the
+        // header, the kanban summary and its bar alike.
+        let mut old = ticket("DEMO-1", Stage::Done, None);
+        old.stage = None;
+        old.status = "Closed".into();
+        let mut odd = ticket("DEMO-2", Stage::Done, None);
+        odd.stage = None;
+        odd.status = "Ready for Release".into();
+        let items = vec![old, odd, ticket("DEMO-3", Stage::Done, None)];
+        let v = view(items);
+        let p = progress(&v).unwrap();
+        assert_eq!(done_count(&v), (p.done, p.total));
+        assert_eq!((p.done, p.total), (2, 3));
+        assert_eq!(p.per_stage[5], p.done);
+        assert_eq!(done_count(&view(vec![])), (0, 0));
+    }
+
+    #[test]
+    fn pr_panel_shows_unless_the_source_is_off() {
+        let src = |message: Option<&str>| overseer_proto::SourceStatus {
+            name: "prs".into(),
+            ok: message.is_none(),
+            count: 0,
+            at: None,
+            message: message.map(String::from),
+        };
+        let mut v = view(vec![]);
+        assert!(!pr_panel_shown(&v), "an old daemon sends no prs source");
+        v.sources = vec![src(Some(overseer_proto::PRS_OFF))];
+        assert!(!pr_panel_shown(&v));
+        v.sources = vec![src(Some("not read yet"))];
+        assert!(pr_panel_shown(&v));
+        v.sources = vec![src(None)];
+        assert!(pr_panel_shown(&v));
+    }
+
+    #[test]
+    fn chips_icons_and_bar_weights() {
+        assert_eq!(prio_chip(Prio::Breaker), ("BREAKER", 0x4a1d1d, 0xff9a94));
+        assert_eq!(prio_chip(Prio::High), ("HIGH", 0x45290f, 0xf0a868));
+        assert_eq!(prio_chip(Prio::Med), ("MED", 0x232a38, 0xaab3c2));
+        assert_eq!(prio_chip(Prio::Low), ("LOW", 0x1b2029, 0x8b949e));
+        let icons: Vec<_> = Stage::ALL.iter().map(|&s| stage_icon(s)).collect();
+        assert_eq!(icons, ["○", "▶", "⇄", "⚗", "‖", "✓"]);
+        assert_eq!(tone_word(AgeTone::Fresh), "fresh");
+        assert_eq!(tone_word(AgeTone::Ageing), "ageing");
+        assert_eq!(tone_word(AgeTone::Old), "old");
+        assert_eq!(beads_text(1), "1 bead");
+        assert_eq!(beads_text(3), "3 beads");
+        let p = Progress {
+            done: 1,
+            total: 4,
+            per_stage: [2, 1, 0, 0, 0, 1],
+            expected: Some(2),
+            breakers_open: 0,
+        };
+        assert_eq!(
+            bar_segments(&p),
+            vec![
+                (Stage::Done, 0.25),
+                (Stage::ToDo, 0.5),
+                (Stage::InProgress, 0.25),
+            ]
+        );
+        assert_eq!(tone_word(AgeTone::Unknown), "age unknown");
+        assert_eq!(tone_color(AgeTone::Unknown), colors::MUTED);
+        assert_eq!(breakers_text(1), "1 sprint breaker open");
+        assert_eq!(breakers_text(2), "2 sprint breakers open");
+        assert_eq!(tick_margin(0.0), 0.0);
+        assert_eq!(tick_margin(1.0), -2.0);
+        assert_eq!(tick_margin(3.0), -2.0);
+        assert_eq!(tick_at(&p), Some(0.5));
+        assert_eq!(
+            tick_at(&Progress {
+                expected: None,
+                ..p
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn undated_pr_chip_has_unknown_tone_and_no_age() {
+        let mut v = view(vec![ticket("DEMO-1", Stage::InReview, None)]);
+        let mut p = pr(5, None);
+        p.ticket = Some("DEMO-1".into());
+        v.prs = vec![p];
+        let c = &columns(&v, 1000)[2].cards[0];
+        assert_eq!(c.pr, Some(("#5".to_string(), AgeTone::Unknown)));
+    }
+
+    #[test]
+    fn last_done_follows_the_board_stage() {
+        // An old daemon sends no stage; a Closed status still counts.
+        let mut old = ticket("DEMO-1", Stage::Done, None);
+        old.stage = None;
+        old.status = "Closed".into();
+        assert_eq!(last_done(&view(vec![old])).as_deref(), Some("DEMO-1"));
+    }
+
+    #[test]
+    fn pr_panel_says_when_the_source_failed_or_is_stale() {
+        let src = |ok: bool, at: Option<i64>, message: Option<&str>| overseer_proto::SourceStatus {
+            name: "prs".into(),
+            ok,
+            count: 0,
+            at,
+            message: message.map(String::from),
+        };
+        let mut v = view(vec![]);
+        assert_eq!(pr_source_note(&v), None);
+        assert!(!pr_answered(&v));
+        v.sources = vec![src(false, None, Some("not read yet"))];
+        assert_eq!(pr_source_note(&v).unwrap().0, "not read yet");
+        assert!(!pr_answered(&v), "no answer yet, so no `No open PRs`");
+        v.sources = vec![src(false, None, Some("demo-api: bb not found"))];
+        let (word, text) = pr_source_note(&v).unwrap();
+        assert_eq!(
+            (word, text.as_str()),
+            ("failed", "failed: demo-api: bb not found")
+        );
+        assert!(!pr_answered(&v));
+        v.sources = vec![src(false, Some(50), Some("demo-web: timed out"))];
+        let (word, text) = pr_source_note(&v).unwrap();
+        assert_eq!(
+            (word, text.as_str()),
+            ("stale", "stale: demo-web: timed out")
+        );
+        assert!(pr_answered(&v));
+        v.sources = vec![src(true, Some(50), None)];
+        assert_eq!(pr_source_note(&v), None);
+        assert!(pr_answered(&v));
+        let long = "x".repeat(300);
+        v.sources = vec![src(false, Some(50), Some(&long))];
+        assert!(pr_source_note(&v).unwrap().1.chars().count() < 120);
+    }
+
+    #[test]
+    fn only_web_urls_are_opened() {
+        assert!(is_http_url("https://bitbucket.example.test/demo/pr/1"));
+        assert!(is_http_url("http://bitbucket.example.test/demo/pr/1"));
+        assert!(!is_http_url("file:///etc/hosts"));
+        assert!(!is_http_url("-a Calculator"));
+        assert!(!is_http_url("/Applications/Demo.app"));
+    }
+
+    #[test]
+    fn done_count_uses_stage_when_present() {
+        let mut shipped = ticket("DEMO-1", Stage::Done, None);
+        shipped.status = "Shipped".into();
+        let v = view(vec![shipped]);
+        assert_eq!(done_count(&v), (1, 1));
+        // A stage-less ticket (old daemon) still falls back to the status.
+        let mut old = ticket("DEMO-2", Stage::Done, None);
+        old.stage = None;
+        old.status = "Closed".into();
+        assert_eq!(done_count(&view(vec![old])), (1, 1));
+    }
+}

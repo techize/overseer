@@ -63,10 +63,23 @@ pub(crate) mod colors {
     pub const EDGE_IDLE: u32 = 0x555d6b;
     pub const ORANGE: u32 = 0xf0883e;
     pub const RED: u32 = 0xf85149;
+    pub const PURPLE: u32 = 0xd2a8ff;
     pub const BUTTON: u32 = 0x21283a;
     pub const BUTTON_BORDER: u32 = 0x2f3850;
     pub const FIELD: u32 = 0x0b0e14;
     pub const TERM_EMPTY: u32 = 0x05070a;
+}
+
+/// Hands `target` (a URL or a path) to macOS `open`. `what` names it in
+/// the log when that fails. Waited on off the UI thread so the child does
+/// not linger.
+pub(crate) fn open_external(target: impl Into<std::ffi::OsString>, what: &'static str) {
+    let target = target.into();
+    std::thread::spawn(move || {
+        if let Err(e) = std::process::Command::new("open").arg(&target).status() {
+            tracing::warn!("could not open {what}: {e}");
+        }
+    });
 }
 
 actions!(
@@ -271,6 +284,8 @@ pub fn empty_work() -> WorkView {
         sources: Vec::new(),
         notices: Vec::new(),
         sprint: None,
+        prs: Vec::new(),
+        sprint_day: None,
     }
 }
 
@@ -995,13 +1010,7 @@ impl OverseerApp {
         let target =
             crate::session::note_target(&self.slots[id as usize], self.brain.brain_dir.as_deref());
         if let Some(url) = target {
-            // Waited on off the UI thread so the child does not linger.
-            std::thread::spawn(move || {
-                match std::process::Command::new("open").arg(&url).status() {
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!("could not open the session note: {e}"),
-                }
-            });
+            open_external(url, "the session note");
         }
     }
 
@@ -1842,6 +1851,8 @@ mod tests {
             owner,
             in_list: true,
             folder: None,
+            stage: None,
+            stage_since: None,
         };
         let mut work = empty_work();
         work.items = vec![

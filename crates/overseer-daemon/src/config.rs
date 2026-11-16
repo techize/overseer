@@ -43,6 +43,23 @@ pub struct Config {
     pub sprint_start: String,
     /// Weekdays in the sprint; 0 counts as 10.
     pub sprint_days: u32,
+    /// Repos whose open pull requests the board lists; empty turns the PR source off.
+    pub pr_repos: Vec<PathBuf>,
+    pub pr_command: Vec<String>,
+    pub pr_poll_secs: u64,
+    /// Only this author's pull requests; empty shows all authors.
+    pub pr_author: String,
+    /// Jira status names for each board stage, matched case-insensitively.
+    pub stage_todo: Vec<String>,
+    pub stage_in_progress: Vec<String>,
+    pub stage_in_review: Vec<String>,
+    pub stage_testing: Vec<String>,
+    pub stage_waiting: Vec<String>,
+    pub stage_done: Vec<String>,
+}
+
+fn strings(v: &[&str]) -> Vec<String> {
+    v.iter().map(|s| s.to_string()).collect()
 }
 
 impl Default for Config {
@@ -86,6 +103,29 @@ impl Default for Config {
             sprint_name: String::new(),
             sprint_start: String::new(),
             sprint_days: 10,
+            pr_repos: Vec::new(),
+            pr_command: strings(&[
+                "bb",
+                "pullrequest",
+                "list",
+                "--state",
+                "open",
+                "--output",
+                "json",
+            ]),
+            pr_poll_secs: 300,
+            pr_author: String::new(),
+            stage_todo: strings(&[
+                "Backlog",
+                "Prioritised Backlog",
+                "To Do",
+                "Selected for Development",
+            ]),
+            stage_in_progress: strings(&["In Progress"]),
+            stage_in_review: strings(&["In Review", "Code Review", "Review"]),
+            stage_testing: strings(&["To Be Tested", "Testing", "In Testing", "QA"]),
+            stage_waiting: strings(&["Blocked", "Waiting", "On Hold"]),
+            stage_done: strings(&["Done", "Closed", "Resolved"]),
         }
     }
 }
@@ -113,6 +153,7 @@ impl Config {
         config.brain_dir = expand(&config.brain_dir, home);
         config.current_session = expand(&config.current_session, home);
         config.worktree_root = expand(&config.worktree_root, home);
+        config.pr_repos = config.pr_repos.iter().map(|p| expand(p, home)).collect();
         (config, err)
     }
 }
@@ -264,5 +305,61 @@ mod tests {
         assert_eq!(c.sprint_name, "Demo");
         assert_eq!(c.sprint_start, "2026-11-09");
         assert_eq!(c.sprint_days, 5);
+    }
+
+    #[test]
+    fn pr_and_stage_keys_default_and_load() {
+        let (c, err) = Config::load(Path::new("/nonexistent/config.toml"), &home());
+        assert!(err.is_none());
+        assert!(c.pr_repos.is_empty());
+        assert_eq!(
+            c.pr_command,
+            [
+                "bb",
+                "pullrequest",
+                "list",
+                "--state",
+                "open",
+                "--output",
+                "json"
+            ]
+        );
+        assert_eq!(c.pr_poll_secs, 300);
+        assert_eq!(c.pr_author, "");
+        assert_eq!(
+            c.stage_todo,
+            [
+                "Backlog",
+                "Prioritised Backlog",
+                "To Do",
+                "Selected for Development"
+            ]
+        );
+        assert_eq!(c.stage_in_progress, ["In Progress"]);
+        assert_eq!(c.stage_in_review, ["In Review", "Code Review", "Review"]);
+        assert_eq!(
+            c.stage_testing,
+            ["To Be Tested", "Testing", "In Testing", "QA"]
+        );
+        assert_eq!(c.stage_waiting, ["Blocked", "Waiting", "On Hold"]);
+        assert_eq!(c.stage_done, ["Done", "Closed", "Resolved"]);
+
+        let (_d, p) = write("");
+        let (c, _) = Config::load(&p, &home());
+        assert!(c.pr_repos.is_empty());
+        assert_eq!(c.pr_poll_secs, 300);
+
+        let (_d, p) =
+            write("pr_repos = [\"~/Repos/demo-api\", \"/abs/demo-web\"]\npr_author = \"demo\"\n");
+        let (c, err) = Config::load(&p, &home());
+        assert!(err.is_none());
+        assert_eq!(
+            c.pr_repos,
+            [
+                PathBuf::from("/Users/me/Repos/demo-api"),
+                PathBuf::from("/abs/demo-web")
+            ]
+        );
+        assert_eq!(c.pr_author, "demo");
     }
 }

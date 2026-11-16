@@ -393,6 +393,15 @@ Editor, then `Files` and `About`.
   by writing the database with the daemon stopped.
 - **The sprint day comes from `sprint_start`, not Jira.** Without it the
   header shows the name alone; weekdays are counted, no holidays.
+- **Sprint stages and PRs are set in `config.toml`.** `stage_todo`,
+  `stage_in_progress`, `stage_in_review`, `stage_testing`, `stage_waiting` and
+  `stage_done` list Jira status names (case-insensitive; an unmapped status
+  shows in In progress with its raw status). `pr_repos` (default empty, which
+  turns the PR source off), `pr_command` (default `bb pullrequest list --state
+  open --output json`, run in each repo folder), `pr_poll_secs` (300) and
+  `pr_author` (empty means all authors) drive the Open PRs panel. A PR links to
+  a ticket when its title or branch matches `ticket_pattern`. Without
+  `sprint_start` the pace marker and warning are hidden.
 - **An isolated home's agent is not loaded at login.** Only the default home's
   agent is installed as a login item; a custom `OVERSEER_HOME` agent is for
   tests and is removed by `make uninstall`.

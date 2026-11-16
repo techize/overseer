@@ -639,6 +639,8 @@ mod tests {
             owner,
             in_list: true,
             folder: None,
+            stage: None,
+            stage_since: None,
         }
     }
 
@@ -663,6 +665,8 @@ mod tests {
                     sources: vec![],
                     notices: vec![],
                     sprint: None,
+                    prs: Vec::new(),
+                    sprint_day: None,
                 },
                 locks: LockView {
                     claims: vec![],
