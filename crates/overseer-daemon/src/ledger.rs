@@ -4,13 +4,14 @@
 //! sessions that were live when it last went down. It holds one row per slot,
 //! replaced on every start, in a small SQLite file.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::Result;
 use overseer_proto::msg::{
     LockView, Notice, Plan, PlanRecord, PlanState, QueueEntry, QueueState, Report, ReportKind,
-    Sender, SlotId, Summary,
+    Sender, SlotId, Stage, Summary,
 };
 use rusqlite::Connection;
 
@@ -168,7 +169,18 @@ CREATE TABLE IF NOT EXISTS status_requests (
 /// it was queued. Not idempotent, like V4.
 const V6_SCHEMA: &str = "ALTER TABLE brain_queue ADD COLUMN committed_at INTEGER";
 
-const VERSION: i64 = 6;
+/// What version 7 adds: when each ticket entered its current Jira stage, so
+/// a card's stage age survives a daemon restart. `moved` is 0 for a ticket
+/// first seen in its stage (the real entry time is unknown) and 1 once the
+/// daemon has watched it change stage.
+const V7_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS ticket_stages (
+    key TEXT PRIMARY KEY,
+    stage TEXT NOT NULL,
+    since INTEGER NOT NULL,
+    moved INTEGER NOT NULL
+)";
+
+const VERSION: i64 = 7;
 
 /// Reports and state changes kept per slot.
 const REPORTS_PER_SLOT: i64 = 200;
@@ -182,13 +194,14 @@ fn migrate(conn: &Connection) -> Result<()> {
     if version >= VERSION {
         return Ok(());
     }
-    let steps: [(i64, &str); 6] = [
+    let steps: [(i64, &str); 7] = [
         (1, SESSIONS_SCHEMA),
         (2, V2_SCHEMA),
         (3, V3_SCHEMA),
         (4, V4_SCHEMA),
         (5, V5_SCHEMA),
         (6, V6_SCHEMA),
+        (7, V7_SCHEMA),
     ];
     let mut batch = String::from("BEGIN;\n");
     for (n, sql) in steps {
@@ -523,6 +536,45 @@ pub(crate) fn assign_on(conn: &Connection, key: &str, slot: SlotId, at: i64) -> 
         rusqlite::params![key, slot, at],
     )?;
     Ok(())
+}
+
+/// Notes the stage each ticket in `seen` is in at `now`. A new key starts at
+/// `now` with `moved = false`; a key whose stage changed restarts at `now`
+/// with `moved = true`; an unchanged key is left alone. Keys not in `seen`
+/// are kept, since a ticket can drop out of one Jira read.
+pub fn record_stages_on(conn: &Connection, seen: &[(String, Stage)], now: i64) -> Result<()> {
+    for (key, stage) in seen {
+        let name = enum_name(stage);
+        conn.execute(
+            "INSERT INTO ticket_stages (key, stage, since, moved) VALUES (?1, ?2, ?3, 0)
+             ON CONFLICT(key) DO UPDATE SET stage = ?2, since = ?3, moved = 1
+             WHERE stage != ?2",
+            rusqlite::params![key, name, now],
+        )?;
+    }
+    Ok(())
+}
+
+/// Every ticket's recorded stage as `(stage, since, moved)`. A row with a
+/// stage name this build does not know is skipped.
+pub fn stages_on(conn: &Connection) -> Result<HashMap<String, (Stage, i64, bool)>> {
+    let mut stmt = conn.prepare("SELECT key, stage, since, moved FROM ticket_stages")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, i64>(3)?,
+        ))
+    })?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let (key, stage, since, moved) = row?;
+        if let Some(stage) = enum_from_name::<Stage>(&stage) {
+            out.insert(key, (stage, since, moved != 0));
+        }
+    }
+    Ok(out)
 }
 
 /// Drops the assignment for `key`, returning the slot that held it.
@@ -1112,7 +1164,7 @@ mod tests {
         assert!(l.notices().unwrap().is_empty());
         l.log(1, "k", None, "e", "d").unwrap();
         lock_tables_are_empty(&l);
-        assert_eq!(user_version(&l), 6);
+        assert_eq!(user_version(&l), 7);
         let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
     }
 
@@ -1137,14 +1189,14 @@ mod tests {
             .unwrap();
         }
         let l = Ledger::open(&path).unwrap();
-        assert_eq!(user_version(&l), 6);
+        assert_eq!(user_version(&l), 7);
         assert_eq!(l.assignments().unwrap(), vec![("DEMO-12".to_string(), 3)]);
         assert_eq!(l.notices().unwrap()[0].text, "moved");
         lock_tables_are_empty(&l);
         drop(l);
         // Opening a v5 file again changes nothing.
         let l = Ledger::open(&path).unwrap();
-        assert_eq!(user_version(&l), 6);
+        assert_eq!(user_version(&l), 7);
         assert_eq!(l.assignments().unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
     }
@@ -1153,7 +1205,7 @@ mod tests {
     fn fresh_file_is_created_at_5() {
         let path = temp_db("fresh");
         let l = Ledger::open(&path).unwrap();
-        assert_eq!(user_version(&l), 6);
+        assert_eq!(user_version(&l), 7);
         lock_tables_are_empty(&l);
         let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
     }
@@ -1182,7 +1234,7 @@ mod tests {
             .unwrap();
         }
         let l = Ledger::open(&path).unwrap();
-        assert_eq!(user_version(&l), 6);
+        assert_eq!(user_version(&l), 7);
         let live = l.live_at_shutdown().unwrap();
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].session_id, "old-id");
@@ -1193,7 +1245,7 @@ mod tests {
         drop(l);
         // Opening a v5 file again changes nothing.
         let l = Ledger::open(&path).unwrap();
-        assert_eq!(user_version(&l), 6);
+        assert_eq!(user_version(&l), 7);
         assert_eq!(l.live_at_shutdown().unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
     }
@@ -1241,14 +1293,14 @@ mod tests {
         let path = temp_db("migrate-v4");
         v4_file(&path);
         let l = Ledger::open(&path).unwrap();
-        assert_eq!(user_version(&l), 6);
+        assert_eq!(user_version(&l), 7);
         assert_eq!(l.live_at_shutdown().unwrap().len(), 1);
         assert_eq!(l.session_note(2).unwrap().as_deref(), Some("Sessions/n.md"));
         assert_eq!(l.queue_recent(10).unwrap().len(), 1);
         assert_eq!(l.add_plan(&tplan(3), &[], 10).unwrap(), (1, None));
         drop(l);
         let l = Ledger::open(&path).unwrap();
-        assert_eq!(user_version(&l), 6);
+        assert_eq!(user_version(&l), 7);
         assert_eq!(l.plans(10).unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
     }
@@ -1271,7 +1323,7 @@ mod tests {
             .unwrap();
         }
         let l = Ledger::open(&path).unwrap();
-        assert_eq!(user_version(&l), 6);
+        assert_eq!(user_version(&l), 7);
         assert_eq!(l.lock_view(50, 3600).unwrap().claims.len(), 1);
         assert_eq!(l.session_note(2).unwrap(), None);
         assert!(l.plans(10).unwrap().is_empty());
@@ -1283,7 +1335,7 @@ mod tests {
     fn fresh_file_is_v5() {
         let path = temp_db("fresh-v5");
         let l = Ledger::open(&path).unwrap();
-        assert_eq!(user_version(&l), 6);
+        assert_eq!(user_version(&l), 7);
         assert!(l.plans(10).unwrap().is_empty());
         assert!(l.reports(10).unwrap().is_empty());
         assert_eq!(l.summary().unwrap(), None);
@@ -1722,6 +1774,76 @@ mod tests {
         .unwrap();
         assert!(l.assignments().unwrap().is_empty());
         assert_eq!(l.notices().unwrap()[0].text, "heads up");
+    }
+
+    #[test]
+    fn stage_records_keep_when_a_ticket_moved() {
+        let l = Ledger::in_memory();
+        l.transaction(|c| record_stages_on(c, &[("DEMO-1".into(), Stage::ToDo)], 100))
+            .unwrap();
+        l.transaction(|c| record_stages_on(c, &[("DEMO-1".into(), Stage::ToDo)], 200))
+            .unwrap();
+        assert_eq!(
+            l.transaction(stages_on).unwrap()["DEMO-1"],
+            (Stage::ToDo, 100, false)
+        );
+        l.transaction(|c| record_stages_on(c, &[("DEMO-1".into(), Stage::Testing)], 300))
+            .unwrap();
+        assert_eq!(
+            l.transaction(stages_on).unwrap()["DEMO-1"],
+            (Stage::Testing, 300, true)
+        );
+        // A ticket missing from one read keeps its record.
+        l.transaction(|c| record_stages_on(c, &[("DEMO-2".into(), Stage::Done)], 400))
+            .unwrap();
+        let all = l.transaction(stages_on).unwrap();
+        assert_eq!(all["DEMO-1"], (Stage::Testing, 300, true));
+        assert_eq!(all["DEMO-2"], (Stage::Done, 400, false));
+    }
+
+    #[test]
+    fn stage_records_survive_a_reopen() {
+        let path = temp_db("stages-reopen");
+        {
+            let l = Ledger::open(&path).unwrap();
+            l.transaction(|c| record_stages_on(c, &[("DEMO-1".into(), Stage::InReview)], 50))
+                .unwrap();
+            l.transaction(|c| record_stages_on(c, &[("DEMO-1".into(), Stage::Testing)], 60))
+                .unwrap();
+        }
+        let l = Ledger::open(&path).unwrap();
+        assert_eq!(
+            l.transaction(stages_on).unwrap()["DEMO-1"],
+            (Stage::Testing, 60, true)
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn v6_file_keeps_its_rows_and_gains_ticket_stages() {
+        let path = temp_db("migrate-v6");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(&format!(
+                "{SESSIONS_SCHEMA};\n{V2_SCHEMA};\n{V3_SCHEMA};\n{V4_SCHEMA};\n{V5_SCHEMA};\n{V6_SCHEMA};\nPRAGMA user_version = 6;"
+            ))
+            .unwrap();
+            conn.execute(
+                "INSERT INTO claims (target, slot, kind, since, last_used)
+                 VALUES ('uat/root', 2, 'claim', 10, 11)",
+                [],
+            )
+            .unwrap();
+        }
+        let l = Ledger::open(&path).unwrap();
+        assert_eq!(user_version(&l), 7);
+        assert_eq!(l.lock_view(50, 3600).unwrap().claims.len(), 1);
+        assert!(l.transaction(stages_on).unwrap().is_empty());
+        l.transaction(|c| record_stages_on(c, &[("DEMO-1".into(), Stage::ToDo)], 5))
+            .unwrap();
+        assert_eq!(l.transaction(stages_on).unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
     }
 
     #[test]
