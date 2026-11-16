@@ -12,10 +12,10 @@
 use std::path::{Path, PathBuf};
 
 use gpui::Keystroke;
-use gpui::{div, prelude::*, px, relative, rgb, Context, FontWeight, SharedString, Window};
+use gpui::{div, prelude::*, px, relative, rgb, rgba, Context, FontWeight, SharedString, Window};
 use overseer_proto::{
-    slot_name, ActivityKind, ClaimKind, CoordView, LockView, Notice, RelayState, ReportKind,
-    Request, Response, Sender, SlotId, SlotInfo, SlotState, WorkView,
+    slot_name, ActivityKind, ClaimKind, CoordView, ItemKind, LockView, Notice, RelayState,
+    ReportKind, Request, Response, Sender, SlotId, SlotInfo, SlotState, WorkView,
 };
 
 use crate::app::{colors, OpenMessage, OpenNote, OpenRelease, OverseerApp};
@@ -185,6 +185,19 @@ pub struct OwnsRow {
     /// Not in the list only because its source has not answered since the
     /// daemon started (implies `gone`).
     pub not_read_yet: bool,
+}
+
+/// The pop-over's heading: `S2 · DEMO-12 Title` for a slot that owns a
+/// ticket, else the slot name alone.
+pub fn popover_title(info: &SlotInfo, view: &WorkView) -> String {
+    let name = slot_name(info.id);
+    match owned_by(view, info.id)
+        .into_iter()
+        .find(|i| i.kind == ItemKind::Ticket)
+    {
+        Some(t) => format!("{name} \u{b7} {} {}", t.key, t.title.trim()),
+        None => name,
+    }
 }
 
 /// What the Owns box lists for `slot`, in `owned_by` order.
@@ -673,17 +686,6 @@ pub fn progress_rows(
 
 impl OverseerApp {
     fn render_tabs(&self, current: SlotId, cx: &mut Context<Self>) -> impl IntoElement {
-        let board_tab = div()
-            .id("tab-board")
-            .px_2()
-            .py_1()
-            .rounded(px(5.))
-            .bg(rgb(colors::CARD))
-            .border_1()
-            .border_color(rgb(colors::BORDER))
-            .cursor_pointer()
-            .child("Esc board")
-            .on_click(cx.listener(|this, _, window, cx| this.go_board(window, cx)));
         let tabs: Vec<_> = self
             .slots
             .iter()
@@ -719,13 +721,12 @@ impl OverseerApp {
             .on_mouse_down(gpui::MouseButton::Left, move |_, window, _| {
                 window.focus(&focus)
             })
-            .child(board_tab)
             .children(tabs)
             .child(
                 div()
                     .ml_auto()
                     .text_color(rgb(colors::MUTED))
-                    .child("Cmd+0 to Cmd+6 switch · Cmd+Esc board"),
+                    .child("Cmd+0 to Cmd+6 switch · Cmd+Esc close"),
             )
     }
 
@@ -1150,6 +1151,98 @@ impl OverseerApp {
             ))
     }
 
+    /// The pop-over's top row: slot, ticket, state and the close button.
+    fn render_popover_header(
+        &self,
+        id: SlotId,
+        now: i64,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let info = &self.slots[id as usize];
+        let title = popover_title(info, &self.work);
+        let m = panel_model(
+            info,
+            now,
+            self.home.as_deref(),
+            self.restarting(id),
+            local_clock,
+        );
+        let state = ["Activity", "State"]
+            .iter()
+            .find_map(|k| m.rows.iter().find(|(name, _)| name == k))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        let close = div()
+            .id("popover-close")
+            .px_2()
+            .rounded(px(5.))
+            .text_color(rgb(colors::TEXT_DIM))
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(colors::CARD_HOVER)).text_color(rgb(colors::TEXT)))
+            .child("x")
+            .on_click(cx.listener(|this, _, window, cx| this.go_board(window, cx)));
+        div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .child(
+                div()
+                    .min_w(px(0.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .child(title),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(colors::MUTED))
+                    .whitespace_nowrap()
+                    .child(state),
+            )
+            .child(div().ml_auto().child(close))
+    }
+
+    /// Slot `id`'s session over the board: a scrim that closes the
+    /// pop-over when clicked, and a centred panel holding the session.
+    pub(crate) fn render_popover(
+        &mut self,
+        id: SlotId,
+        now: i64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let session = self.render_session(id, now, window, cx);
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba((colors::BG << 8) | 0xb3))
+            .occlude()
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, window, cx| this.go_board(window, cx)),
+            )
+            .child(
+                div()
+                    .w(relative(0.9))
+                    .h(relative(0.9))
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(rgb(colors::BORDER))
+                    .bg(rgb(colors::BG))
+                    .overflow_hidden()
+                    // A click inside the panel never reaches the scrim.
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(session),
+            )
+    }
+
     pub(crate) fn render_session(
         &mut self,
         id: SlotId,
@@ -1218,6 +1311,7 @@ impl OverseerApp {
         } else {
             left
         };
+        let header = self.render_popover_header(id, now, cx);
         let tabs = self.render_tabs(id, cx);
         let panel = self.render_panel(id, now, cx);
         div()
@@ -1235,6 +1329,7 @@ impl OverseerApp {
             .flex_col()
             .gap_2()
             .p_2()
+            .child(header)
             .child(tabs)
             .child(
                 div()
@@ -1565,6 +1660,44 @@ mod tests {
         let notes = slot_notices(&view, 2);
         assert_eq!(notes.len(), 1);
         assert_eq!(notes[0].text, "DEMO-9 moved to S4");
+    }
+
+    #[test]
+    fn popover_title_names_the_slot_and_its_ticket() {
+        use overseer_proto::{ItemKind, WorkItem};
+        let item = |key: &str, kind, owner| WorkItem {
+            key: key.into(),
+            kind,
+            title: format!("Title of {key}"),
+            status: "In Progress".into(),
+            priority: None,
+            parent: None,
+            owner,
+            in_list: true,
+            folder: None,
+            stage: None,
+            stage_since: None,
+        };
+        let view = WorkView {
+            items: vec![
+                item("ov-3", ItemKind::Bead, Some(2)),
+                item("DEMO-12", ItemKind::Ticket, Some(2)),
+                item("DEMO-7", ItemKind::Ticket, Some(4)),
+            ],
+            sources: vec![],
+            notices: vec![],
+            sprint: None,
+            prs: Vec::new(),
+            sprint_day: None,
+        };
+        let mut i = info(RUN);
+        assert_eq!(
+            popover_title(&i, &view),
+            "S2 \u{b7} DEMO-12 Title of DEMO-12"
+        );
+        // No ticket: the slot name alone.
+        i.id = 1;
+        assert_eq!(popover_title(&i, &view), "S1");
     }
 
     #[test]

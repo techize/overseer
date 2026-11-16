@@ -2,10 +2,10 @@
 //! updates and the per-slot terminal views.
 //!
 //! Navigation keys never take terminal input:
-//! - `Cmd+0` to `Cmd+6` open a session and `Cmd+Esc` goes to the board, from
+//! - `Cmd+0` to `Cmd+6` open a session's pop-over and `Cmd+Esc` closes it, from
 //!   anywhere except the start dialog and the picker. Cmd keys never reach
 //!   the PTY anyway.
-//! - Plain `Esc` goes to the board only when focus is in the session view
+//! - Plain `Esc` closes the pop-over only when focus is in the session view
 //!   but not in its terminal (after clicking the tab strip or the context
 //!   panel). In the terminal, Esc closes the find bar when it is open and
 //!   otherwise goes to Claude Code, which uses it to interrupt.
@@ -115,6 +115,7 @@ actions!(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
     Board,
+    /// The board with slot id's session in a pop-over over it.
     Session(SlotId),
     /// Every held target and its queue; see `locks_view`.
     Locks,
@@ -181,8 +182,8 @@ pub fn key_bindings() -> Vec<KeyBinding> {
 pub fn needs_tick(screen: Screen, slots: &[SlotInfo]) -> bool {
     let running = |s: &SlotInfo| matches!(s.state, SlotState::Running { .. });
     match screen {
-        Screen::Board => slots.iter().any(running),
-        Screen::Session(id) => slots.get(id as usize).is_some_and(running),
+        // The pop-over leaves the board visible behind it.
+        Screen::Board | Screen::Session(_) => slots.iter().any(running),
         Screen::Locks => false,
     }
 }
@@ -1551,9 +1552,16 @@ impl Render for OverseerApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let now = now_secs();
         let screen = match self.screen {
-            Screen::Board => self.render_board(now, window, cx).into_any_element(),
-            Screen::Session(id) => self.render_session(id, now, window, cx).into_any_element(),
+            Screen::Board | Screen::Session(_) => {
+                self.render_board(now, window, cx).into_any_element()
+            }
             Screen::Locks => self.render_locks(now, window, cx).into_any_element(),
+        };
+        // Beside the board, never inside it, so the terminal's key context
+        // stack has no Board and the board's keys stay out of the session.
+        let popover = match self.screen {
+            Screen::Session(id) => Some(self.render_popover(id, now, window, cx)),
+            _ => None,
         };
         div()
             .key_context("Overseer")
@@ -1580,6 +1588,7 @@ impl Render for OverseerApp {
             .bg(rgb(colors::BG))
             .text_color(rgb(colors::TEXT))
             .child(screen)
+            .children(popover)
             .children(self.dialog.as_ref().map(|(d, _)| d.clone()))
             .children(self.picker.as_ref().map(|(p, _)| p.clone()))
             .children(self.plan_view.as_ref().map(|(p, _)| p.clone()))
@@ -1782,8 +1791,23 @@ mod tests {
         assert!(!needs_tick(Screen::Board, &slots_with(&[])));
         assert!(needs_tick(Screen::Board, &slots_with(&[3])));
         assert!(needs_tick(Screen::Session(3), &slots_with(&[3])));
-        assert!(!needs_tick(Screen::Session(2), &slots_with(&[3])));
-        assert!(!needs_tick(Screen::Session(9), &slots_with(&[3])));
+        // The board stays visible behind the pop-over, so any running slot
+        // keeps the ticker going.
+        assert!(needs_tick(Screen::Session(2), &slots_with(&[3])));
+        assert!(needs_tick(Screen::Session(9), &slots_with(&[3])));
+        assert!(!needs_tick(Screen::Session(2), &slots_with(&[])));
+    }
+
+    #[test]
+    fn board_keys_stay_out_of_the_popover() {
+        // The pop-over is drawn beside the board, not inside it, so the
+        // focused terminal's context stack has no Board.
+        const POPOVER: &[&str] = &["Overseer", "Session", "Terminal"];
+        for k in ["left", "enter", "r", "a", "p", "l"] {
+            assert_eq!(routed(k, POPOVER), None, "{k}");
+        }
+        assert_eq!(routed("cmd-escape", POPOVER), Some("overseer::GoBoard"));
+        assert_eq!(routed("escape", POPOVER), None);
     }
 
     #[test]
@@ -1792,9 +1816,11 @@ mod tests {
         let mut t = Ticker::default();
         assert!(t.on_change(Screen::Board, &s), "starts on the board");
         assert!(!t.on_change(Screen::Board, &s), "only one ticker");
-        // An empty session hides every running slot, so the ticker ends.
-        assert!(!t.on_tick(Screen::Session(2), &s));
-        // Back on the board the running card is visible again.
+        // A pop-over on an empty slot still shows the running card behind it.
+        assert!(t.on_tick(Screen::Session(2), &s));
+        // The slot stops: nothing running is visible, so the ticker ends.
+        assert!(!t.on_tick(Screen::Session(2), &slots_with(&[])));
+        // It runs again: the running card is visible again.
         assert!(t.on_change(Screen::Board, &s));
         assert!(t.on_tick(Screen::Board, &s));
         // Nothing running anywhere: no ticker.
