@@ -6,7 +6,7 @@
 //! without a window.
 //!
 //! A running claude slot also carries its hook-reported activity: the badge
-//! then says Working, Needs you or Idle with the time in that state, and a
+//! then says Working, Needs you or Your turn with the time in that state, and a
 //! line under the cwd says what it is doing or why it needs you. A running
 //! slot without activity (any other command) keeps the plain Running badge,
 //! with its command (`htop`) on the line under the cwd.
@@ -36,6 +36,8 @@ pub enum Tone {
     Running,
     Working,
     NeedsYou,
+    /// Running and waiting for the next prompt.
+    YourTurn,
     Idle,
     /// Queued behind another slot's lock and not working.
     Blocked,
@@ -171,7 +173,7 @@ pub fn activity_state(a: &Activity, now: i64) -> String {
     let word = match a.kind {
         ActivityKind::Working => "Working",
         ActivityKind::NeedsYou => "Needs you",
-        ActivityKind::Idle => "Idle",
+        ActivityKind::Idle => "Your turn",
     };
     format!("{word} {}", format_elapsed(now - a.since))
 }
@@ -274,11 +276,19 @@ pub fn card_model(
                     info.command.as_deref().and_then(command_line),
                 ),
                 Some(a) => (
-                    format!("● {}", activity_state(a, now)),
+                    format!(
+                        "{} {}",
+                        if a.kind == ActivityKind::Idle {
+                            "○"
+                        } else {
+                            "●"
+                        },
+                        activity_state(a, now)
+                    ),
                     match a.kind {
                         ActivityKind::Working => Tone::Working,
                         ActivityKind::NeedsYou => Tone::NeedsYou,
-                        ActivityKind::Idle => Tone::Idle,
+                        ActivityKind::Idle => Tone::YourTurn,
                     },
                     activity_detail(a),
                 ),
@@ -530,6 +540,31 @@ pub fn needs_you_count(slots: &[SlotInfo]) -> usize {
         .count()
 }
 
+/// Running slots that wait for the next prompt.
+pub fn your_turn_count(slots: &[SlotInfo]) -> usize {
+    slots
+        .iter()
+        .filter(|s| {
+            matches!(s.state, SlotState::Running { .. })
+                && s.activity
+                    .as_ref()
+                    .is_some_and(|a| a.kind == ActivityKind::Idle)
+        })
+        .count()
+}
+
+/// `2 need you · 1 your turn`, leaving out a part whose count is zero.
+pub fn attention_text(need: usize, turn: usize) -> Option<String> {
+    let mut parts = Vec::new();
+    if need > 0 {
+        parts.push(format!("{need} need you"));
+    }
+    if turn > 0 {
+        parts.push(format!("{turn} your turn"));
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
 /// Done and total tickets in the list, from `sprint_view::progress` so the
 /// header and the kanban agree; see `sprint_view::board_stage` for what
 /// counts as done.
@@ -540,10 +575,15 @@ pub fn done_count(work: &WorkView) -> (usize, usize) {
 /// The header's right-hand text with the sessions that need Jonathan and
 /// the ticket count: `3 running, 1 need you, done 2/5`. No tickets, no
 /// count.
-pub fn header_text(running: usize, need_you: usize, done: (usize, usize)) -> String {
-    let mut text = match need_you {
-        0 => header_count(running),
-        n => format!("{}, {n} need you", header_count(running)),
+pub fn header_text(
+    running: usize,
+    need_you: usize,
+    your_turn: usize,
+    done: (usize, usize),
+) -> String {
+    let mut text = match attention_text(need_you, your_turn) {
+        None => header_count(running),
+        Some(a) => format!("{}, {a}", header_count(running)),
     };
     if done.1 > 0 {
         text.push_str(&format!(", done {}/{}", done.0, done.1));
@@ -629,6 +669,7 @@ fn tone_color(tone: Tone) -> u32 {
     match tone {
         Tone::Running | Tone::Working => colors::GREEN,
         Tone::NeedsYou => colors::ORANGE,
+        Tone::YourTurn => colors::ACCENT,
         Tone::Blocked => colors::RED,
         Tone::Idle | Tone::Exited | Tone::Resumable | Tone::Empty => colors::GREY,
     }
@@ -637,9 +678,12 @@ fn tone_color(tone: Tone) -> u32 {
 /// The card's left edge: the badge colour while the slot runs.
 fn edge_color(tone: Tone) -> u32 {
     match tone {
-        Tone::Running | Tone::Working | Tone::NeedsYou | Tone::Idle | Tone::Blocked => {
-            tone_color(tone)
-        }
+        Tone::Running
+        | Tone::Working
+        | Tone::NeedsYou
+        | Tone::YourTurn
+        | Tone::Idle
+        | Tone::Blocked => tone_color(tone),
         Tone::Exited | Tone::Resumable | Tone::Empty => colors::EDGE_IDLE,
     }
 }
@@ -824,6 +868,7 @@ impl OverseerApp {
     ) -> impl IntoElement {
         let running = running_count(&self.slots);
         let need_you = needs_you_count(&self.slots);
+        let your_turn = your_turn_count(&self.slots);
         let strip = strip_lines(&self.locks, local_hhmm, 5);
         let (summary_title, summary_body) = summary_lines(&self.coord, local_hhmm);
         let plan_line = plan_line(&self.coord);
@@ -914,10 +959,17 @@ impl OverseerApp {
                                 div()
                                     .text_color(rgb(if need_you > 0 {
                                         colors::ORANGE
+                                    } else if your_turn > 0 {
+                                        colors::ACCENT
                                     } else {
                                         colors::MUTED
                                     }))
-                                    .child(header_text(running, need_you, done_count(&self.work))),
+                                    .child(header_text(
+                                        running,
+                                        need_you,
+                                        your_turn,
+                                        done_count(&self.work),
+                                    )),
                             )
                             .child(
                                 div()
@@ -1237,7 +1289,7 @@ mod tests {
             &no_work(),
             &v,
         );
-        assert_eq!(m.tone, Tone::Idle);
+        assert_eq!(m.tone, Tone::YourTurn);
         assert_eq!(m.waiting_on, None);
     }
 
@@ -1770,9 +1822,10 @@ mod tests {
             2000 + 720,
             None,
         );
-        assert_eq!(i.badge, "● Idle 12m 00s");
-        assert_eq!(i.tone, Tone::Idle);
-        assert_eq!(tone_color(i.tone), colors::GREY);
+        assert_eq!(i.badge, "○ Your turn 12m 00s");
+        assert_eq!(i.tone, Tone::YourTurn);
+        assert_eq!(tone_color(i.tone), colors::ACCENT);
+        assert_eq!(edge_color(i.tone), colors::ACCENT);
         assert_eq!(i.now_doing, None);
 
         // Working before the first tool, or needs you without a reason.
@@ -1829,12 +1882,53 @@ mod tests {
             info(4, "", SlotState::Empty),
         ];
         assert_eq!(needs_you_count(&slots), 2);
-        assert_eq!(header_text(3, 2, (0, 0)), "3 running, 2 need you");
-        assert_eq!(header_text(3, 1, (0, 0)), "3 running, 1 need you");
-        assert_eq!(header_text(3, 0, (0, 0)), "3 running");
-        assert_eq!(header_text(0, 0, (0, 0)), "none running");
+        assert_eq!(header_text(3, 2, 0, (0, 0)), "3 running, 2 need you");
+        assert_eq!(header_text(3, 1, 0, (0, 0)), "3 running, 1 need you");
+        assert_eq!(header_text(3, 0, 0, (0, 0)), "3 running");
+        assert_eq!(header_text(0, 0, 0, (0, 0)), "none running");
         slots.truncate(2);
         assert_eq!(needs_you_count(&slots), 1);
+    }
+
+    #[test]
+    fn your_turn_activity_and_counts() {
+        let a = Activity {
+            kind: ActivityKind::Idle,
+            since: 0,
+            now_doing: None,
+            reason: None,
+            idle_wait: false,
+        };
+        assert_eq!(activity_state(&a, 185), "Your turn 3m 05s");
+        let slots = vec![
+            with_activity(ActivityKind::Idle, None, None),
+            with_activity(ActivityKind::Idle, None, None),
+            with_activity(ActivityKind::Working, None, None),
+            with_activity(ActivityKind::NeedsYou, None, None),
+            info(5, "", SlotState::Empty),
+        ];
+        assert_eq!(your_turn_count(&slots), 2);
+        let mut exited = with_activity(ActivityKind::Idle, None, None);
+        exited.state = SlotState::Exited {
+            code: Some(0),
+            at: 1,
+        };
+        assert_eq!(your_turn_count(&[exited]), 0);
+        assert_eq!(
+            header_text(3, 1, 2, (0, 0)),
+            "3 running, 1 need you · 2 your turn"
+        );
+    }
+
+    #[test]
+    fn attention_text_leaves_out_zero_parts() {
+        assert_eq!(
+            attention_text(2, 1).as_deref(),
+            Some("2 need you · 1 your turn")
+        );
+        assert_eq!(attention_text(0, 1).as_deref(), Some("1 your turn"));
+        assert_eq!(attention_text(1, 0).as_deref(), Some("1 need you"));
+        assert_eq!(attention_text(0, 0), None);
     }
 
     #[test]
@@ -1974,16 +2068,19 @@ mod tests {
         };
         work.items = vec![placeholder("DEMO-12"), placeholder("DEMO-13")];
         assert_eq!(done_count(&work), (0, 0));
-        assert_eq!(header_text(1, 0, done_count(&work)), "1 running");
+        assert_eq!(header_text(1, 0, 0, done_count(&work)), "1 running");
         work.items.push(ticket("DEMO-14", "Done", ItemKind::Ticket));
         assert_eq!(done_count(&work), (1, 1));
     }
 
     #[test]
     fn header_text_has_done_count() {
-        assert_eq!(header_text(3, 1, (2, 5)), "3 running, 1 need you, done 2/5");
-        assert_eq!(header_text(0, 0, (0, 4)), "none running, done 0/4");
-        assert_eq!(header_text(3, 0, (0, 0)), "3 running");
+        assert_eq!(
+            header_text(3, 1, 0, (2, 5)),
+            "3 running, 1 need you, done 2/5"
+        );
+        assert_eq!(header_text(0, 0, 0, (0, 4)), "none running, done 0/4");
+        assert_eq!(header_text(3, 0, 0, (0, 0)), "3 running");
     }
 
     #[test]

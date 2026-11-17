@@ -29,10 +29,11 @@ use crate::start_dialog::{edit_key, DialogKey, TextField};
 // Pure logic
 // ---------------------------------------------------------------------------
 
-/// Text of tab `id`: `0 S0`, `3 S3`, with a dot while it runs.
+/// Text of tab `id`: `0 S0`, `3 S3`, with a dot while it runs and a hollow one on its turn.
 pub fn tab_label(info: &SlotInfo) -> String {
     let name = slot_name(info.id);
     match info.state {
+        SlotState::Running { .. } if tab_your_turn(info) => format!("{} {name} ○", info.id),
         SlotState::Running { .. } => format!("{} {name} ●", info.id),
         _ => format!("{} {name}", info.id),
     }
@@ -46,6 +47,16 @@ pub fn tab_needs_you(info: &SlotInfo) -> bool {
             .activity
             .as_ref()
             .is_some_and(|a| a.kind == ActivityKind::NeedsYou)
+}
+
+/// Whether the tab of `info` shows the accent mark: its session is running and
+/// waits for the next prompt.
+pub fn tab_your_turn(info: &SlotInfo) -> bool {
+    matches!(info.state, SlotState::Running { .. })
+        && info
+            .activity
+            .as_ref()
+            .is_some_and(|a| a.kind == ActivityKind::Idle)
 }
 
 /// What the context panel shows for a slot.
@@ -703,6 +714,8 @@ impl OverseerApp {
                     .border_color(rgb(if on { colors::ACCENT } else { colors::BORDER }))
                     .text_color(rgb(if tab_needs_you(info) {
                         colors::ORANGE
+                    } else if tab_your_turn(info) {
+                        colors::ACCENT
                     } else {
                         colors::TEXT
                     }))
@@ -1435,11 +1448,18 @@ mod tests {
         assert!(!tab_needs_you(&with(RUN, ActivityKind::Working)));
         assert!(!tab_needs_you(&with(RUN, ActivityKind::Idle)));
         assert!(!tab_needs_you(&info(RUN)));
+        assert!(tab_your_turn(&with(RUN, ActivityKind::Idle)));
+        assert_eq!(tab_label(&with(RUN, ActivityKind::Idle)), "2 S2 ○");
+        assert!(!tab_your_turn(&with(RUN, ActivityKind::Working)));
         let exited = SlotState::Exited {
             code: Some(0),
             at: 200,
         };
-        assert!(!tab_needs_you(&with(exited, ActivityKind::NeedsYou)));
+        assert!(!tab_needs_you(&with(
+            exited.clone(),
+            ActivityKind::NeedsYou
+        )));
+        assert!(!tab_your_turn(&with(exited, ActivityKind::Idle)));
     }
 
     #[test]
@@ -1512,7 +1532,7 @@ mod tests {
             idle_wait: false,
         });
         let m = panel_model(&i, 165, None, false, clock);
-        assert_eq!(m.rows[5], ("Activity", "Idle 5s".to_string()));
+        assert_eq!(m.rows[5], ("Activity", "Your turn 5s".to_string()));
         assert_eq!(m.rows.len(), 6);
     }
 
