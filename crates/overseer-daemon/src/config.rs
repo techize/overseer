@@ -316,6 +316,10 @@ impl Config {
             if !set("current_session") {
                 config.current_session = config.brain_dir.join("CURRENT_SESSION.md");
             }
+            // The default runs a script that lives in the maintainer's vault.
+            if !set("sync_command") {
+                config.sync_command.clear();
+            }
         }
         config.jira_site = site_host(&config.jira_site);
         config.user_name = effective_user_name(&config.user_name, full_name, env_user);
@@ -643,6 +647,7 @@ mod tests {
         assert_eq!(c.jira_command[0], "acli");
         assert_eq!(c.ticket_pattern, "");
         assert_eq!(c.user_name, "Demo");
+        assert_eq!(c.sync_command[0], "05-Meta/Sync-System/sync-run.sh");
     }
 
     #[test]
@@ -658,6 +663,17 @@ mod tests {
             c.current_session,
             h.0.join("OverseerNotes/CURRENT_SESSION.md")
         );
+        assert!(c.sync_command.is_empty());
+    }
+
+    #[test]
+    fn owned_folder_keeps_a_set_sync_command() {
+        let h = fresh_home();
+        let (_d, p) = write("sync_command = [\"demo-sync\"]\n");
+        let (c, err) = Config::load_with(&p, &h.0, None);
+        assert!(err.is_none());
+        assert!(c.notes_owned);
+        assert_eq!(c.sync_command, vec!["demo-sync".to_string()]);
     }
 
     #[test]
