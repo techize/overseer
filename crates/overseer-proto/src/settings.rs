@@ -187,8 +187,9 @@ pub fn check(key: &str, kind: &SettingKind, value: &SettingValue) -> Result<(), 
             }
         }
         (SettingKind::Pattern, SettingValue::Text(s)) => {
+            // Empty is valid: the pattern is then derived from the tickets.
             if s.is_empty() {
-                return empty();
+                return Ok(());
             }
             regex::Regex::new(s).map(|_| ()).map_err(|e| {
                 let text = e.to_string();
@@ -387,6 +388,7 @@ mod tests {
             Err("k must be a colour like #1e1e2e".to_string())
         );
         assert_eq!(t(&SettingKind::Pattern, r"DEMO-\d+"), Ok(()));
+        assert_eq!(t(&SettingKind::Pattern, ""), Ok(()));
         assert_eq!(
             t(&SettingKind::Pattern, "("),
             Err("k is not a valid pattern: error: unclosed group".to_string())

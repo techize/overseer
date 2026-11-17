@@ -325,7 +325,13 @@ impl WorkStore {
         events: broadcast::Sender<Event>,
         env: BaseEnv,
     ) -> Arc<WorkStore> {
-        let (pattern, pattern_error) = match compile_pattern(&cfg.ticket_pattern) {
+        // An empty pattern is the default: any project key.
+        let wanted = if cfg.ticket_pattern.trim().is_empty() {
+            r"[A-Z][A-Z0-9]+-\d+"
+        } else {
+            cfg.ticket_pattern.as_str()
+        };
+        let (pattern, pattern_error) = match compile_pattern(wanted) {
             Ok(p) => (p, None),
             Err(e) => {
                 tracing::warn!("{e}; beads will not be grouped under tickets");
@@ -1345,6 +1351,14 @@ mod tests {
             events,
             BaseEnv::ready(vec![]),
         )
+    }
+
+    #[test]
+    fn an_empty_pattern_means_any_project_key() {
+        let s = store("");
+        assert!(s.pattern_error.is_none());
+        assert!(s.pattern.is_match("fix ABC1-42 now"));
+        assert!(!s.pattern.is_match("abc-42"));
     }
 
     #[test]
