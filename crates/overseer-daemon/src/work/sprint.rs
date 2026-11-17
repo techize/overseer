@@ -151,17 +151,9 @@ const FOLDER_NAME_MAX: usize = 50;
 /// `sprint` gets no second prefix. At most 50 characters; `sprint` when
 /// nothing is left.
 pub fn sprint_folder_name(jira_name: &str) -> String {
-    let mut slug = String::new();
-    for c in jira_name.chars() {
-        if c.is_ascii_alphanumeric() {
-            slug.push(c.to_ascii_lowercase());
-        } else if !slug.is_empty() && !slug.ends_with('-') {
-            slug.push('-');
-        }
-    }
-    let slug = slug.trim_end_matches('-');
+    let slug = slug(jira_name);
     let mut name = if slug.starts_with("sprint") {
-        slug.to_owned()
+        slug
     } else if slug.is_empty() {
         "sprint".to_owned()
     } else {
@@ -170,6 +162,21 @@ pub fn sprint_folder_name(jira_name: &str) -> String {
     // Every character is ASCII, so this cuts on a character boundary.
     name.truncate(FOLDER_NAME_MAX);
     name.trim_end_matches('-').to_owned()
+}
+
+/// The text lowercased, with every run of characters other than ASCII
+/// letters and digits made one `-`, and no `-` at either end.
+pub(crate) fn slug(text: &str) -> String {
+    let mut slug = String::new();
+    for c in text.chars() {
+        if c.is_ascii_alphanumeric() {
+            slug.push(c.to_ascii_lowercase());
+        } else if !slug.is_empty() && !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    slug.truncate(slug.trim_end_matches('-').len());
+    slug
 }
 
 #[cfg(test)]

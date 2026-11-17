@@ -231,6 +231,8 @@ pub struct WorkStore {
     jira: JiraSource,
     /// The Jira email, the Keychain item's account.
     jira_email: String,
+    /// The Jira site host; empty on the `acli` path.
+    jira_site: String,
     /// Set when `jira_board` is: the API also reads the active sprint.
     has_board: bool,
     /// The `security` tool's path; tests point it at a stub.
@@ -358,7 +360,7 @@ async fn poll_prs(
 }
 
 /// Every folder one level under `<brain>/Sprints/*/`.
-fn list_folders(brain: &Path) -> Vec<(String, PathBuf)> {
+pub(crate) fn list_folders(brain: &Path) -> Vec<(String, PathBuf)> {
     let mut out = Vec::new();
     let Ok(sprints) = std::fs::read_dir(brain.join("Sprints")) else {
         return out;
@@ -383,7 +385,7 @@ fn list_folders(brain: &Path) -> Vec<(String, PathBuf)> {
 
 /// The folder named `key` or starting with `key-`. When several sprints have
 /// one, the last by path (normally the latest sprint) wins.
-fn folder_for(folders: &[(String, PathBuf)], key: &str) -> Option<PathBuf> {
+pub(crate) fn folder_for(folders: &[(String, PathBuf)], key: &str) -> Option<PathBuf> {
     let prefix = format!("{key}-");
     folders
         .iter()
@@ -477,6 +479,7 @@ impl WorkStore {
             sprint_days: cfg.sprint_days,
             jira,
             jira_email: email.to_owned(),
+            jira_site: site.to_owned(),
             has_board: !cfg.jira_board.trim().is_empty(),
             security: SECURITY.to_owned(),
             notes_owned: cfg.notes_owned,
@@ -841,6 +844,32 @@ impl WorkStore {
         }
         self.regroup(unix_now());
         self.announce();
+        if matches!(which, Source::Jira) {
+            self.sync_notes().await;
+        }
+    }
+
+    /// Writes the active sprint's tickets into the owned notes folder, off
+    /// the async thread. Only for an owned folder with an active sprint; an
+    /// error is logged and costs nothing else.
+    async fn sync_notes(&self) {
+        if !self.notes_owned {
+            return;
+        }
+        let Some(sprint) = self.active_sprint() else {
+            return;
+        };
+        let (dir, site) = (self.brain_dir.clone(), self.jira_site.clone());
+        let (name, tickets) = (sprint_folder_name(&sprint.name), self.tickets());
+        let done = tokio::task::spawn_blocking(move || {
+            crate::notes::sync_sprint(&dir, &name, &tickets, &site, unix_now())
+        })
+        .await;
+        match done {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => tracing::warn!("syncing ticket folders failed: {e}"),
+            Err(e) => tracing::warn!("syncing ticket folders failed: {e}"),
+        }
     }
 
     /// The tickets and, with a board, the active sprint through the API.

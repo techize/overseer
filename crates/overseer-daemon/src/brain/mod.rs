@@ -74,7 +74,7 @@ fn unix_now() -> i64 {
 }
 
 /// `2026-11-13 09:30` in local time, from `localtime_r`.
-fn local_stamp(now: i64) -> String {
+pub(crate) fn local_stamp(now: i64) -> String {
     // SAFETY: localtime_r only writes the `tm` we pass it.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     let t = now as libc::time_t;
