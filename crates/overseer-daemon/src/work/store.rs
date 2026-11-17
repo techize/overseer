@@ -472,11 +472,7 @@ impl WorkStore {
             let Some(&stage) = jira_stages.get(it.key.as_str()) else {
                 continue;
             };
-            let has_pr = prs.iter().any(|p| p.ticket.as_deref() == Some(&it.key));
-            it.stage = Some(match stage {
-                Stage::ToDo | Stage::InProgress if has_pr => Stage::InReview,
-                other => other,
-            });
+            it.stage = Some(stage);
             // The age shows only once the daemon has seen the ticket move
             // into the stage Jira reports now.
             it.stage_since = records
@@ -1966,22 +1962,22 @@ esac"#,
     }
 
     #[tokio::test]
-    async fn ticket_with_an_open_pr_shows_in_review() {
+    async fn ticket_with_an_open_pr_stays_in_its_jira_column() {
         let dir = temp_dir("stage-review");
         let api = dir.join("demo-api");
         std::fs::create_dir_all(&api).unwrap();
-        write_jira(&dir, "DEMO-12", "In Progress");
+        write_jira(&dir, "DEMO-12", "To Do");
         let s = store_with(|c| {
             c.jira_command = fake_jira(&dir);
             c.pr_repos = vec![api.clone()];
             c.pr_command = sh(FAKE_BB);
         });
         s.refresh(Source::Jira).await;
-        assert_eq!(item(&s.view(), "DEMO-12").stage, Some(Stage::InProgress));
+        assert_eq!(item(&s.view(), "DEMO-12").stage, Some(Stage::ToDo));
         s.refresh(Source::Prs).await;
-        assert_eq!(item(&s.view(), "DEMO-12").stage, Some(Stage::InReview));
+        assert_eq!(item(&s.view(), "DEMO-12").stage, Some(Stage::ToDo));
         let records = s.ledger.transaction(ledger::stages_on).unwrap();
-        assert_eq!(records["DEMO-12"].0, Stage::InProgress);
+        assert_eq!(records["DEMO-12"].0, Stage::ToDo);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1997,7 +1993,7 @@ esac"#,
         write_jira(&dir, "DEMO-1", "To Be Tested");
         s.refresh(Source::Jira).await;
         let it = item(&s.view(), "DEMO-1").clone();
-        assert_eq!(it.stage, Some(Stage::Testing));
+        assert_eq!(it.stage, Some(Stage::ToBeTested));
         assert!(it.stage_since.is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }

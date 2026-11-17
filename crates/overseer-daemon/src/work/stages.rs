@@ -19,10 +19,10 @@ impl Stages {
         Stages {
             lists: vec![
                 (Stage::ToDo, of(&cfg.stage_todo)),
+                (Stage::Blocked, of(&cfg.stage_blocked)),
+                (Stage::Next, of(&cfg.stage_next)),
                 (Stage::InProgress, of(&cfg.stage_in_progress)),
-                (Stage::InReview, of(&cfg.stage_in_review)),
-                (Stage::Testing, of(&cfg.stage_testing)),
-                (Stage::Waiting, of(&cfg.stage_waiting)),
+                (Stage::ToBeTested, of(&cfg.stage_to_be_tested)),
                 (Stage::Done, of(&cfg.stage_done)),
             ],
         }
@@ -47,10 +47,12 @@ mod tests {
         let s = Stages::from_config(&Config::default());
         for (status, want) in [
             ("Prioritised Backlog", Stage::ToDo),
+            ("Next", Stage::Next),
+            ("Selected for Development", Stage::Next),
             ("in progress", Stage::InProgress),
-            (" Code Review ", Stage::InReview),
-            ("To Be Tested", Stage::Testing),
-            ("Blocked", Stage::Waiting),
+            (" Code Review ", Stage::InProgress),
+            ("To Be Tested", Stage::ToBeTested),
+            ("Blocked", Stage::Blocked),
             ("RESOLVED", Stage::Done),
             ("Ready for Release", Stage::InProgress),
             ("", Stage::InProgress),
