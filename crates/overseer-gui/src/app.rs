@@ -250,8 +250,8 @@ pub fn card_click(info: &SlotInfo) -> CardClick {
     }
 }
 
-/// What clicking a ticket card does: open its owner's session, start work
-/// in a slot, or report that no slot is free.
+/// What clicking a ticket card does: open its owner's session (Running or
+/// Resumable), start work in a slot, or report that no slot is free.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TicketClick {
     Open(SlotId),
@@ -278,10 +278,15 @@ pub fn start_slot(owner: Option<SlotId>, slots: &[SlotInfo]) -> Option<SlotId> {
 }
 
 pub fn ticket_click(owner: Option<SlotId>, slots: &[SlotInfo]) -> TicketClick {
-    let running = owner
-        .and_then(|o| slots.get(o as usize))
-        .filter(|i| matches!(i.state, SlotState::Running { .. }));
-    if let Some(info) = running {
+    // A Resumable owner opens too: its pop-over offers Resume, and a fresh
+    // start would throw that session away.
+    let live = owner.and_then(|o| slots.get(o as usize)).filter(|i| {
+        matches!(
+            i.state,
+            SlotState::Running { .. } | SlotState::Resumable { .. }
+        )
+    });
+    if let Some(info) = live {
         return TicketClick::Open(info.id);
     }
     match start_slot(owner, slots) {
@@ -2030,6 +2035,15 @@ mod tests {
         // An Exited owner is the target, even when a lower slot is free.
         let mut s = empty_slots();
         s[4].state = exited.clone();
+        assert_eq!(ticket_click(Some(4), &s), TicketClick::Start(4));
+        // A Resumable owner opens its pop-over, where Resume is offered.
+        s[4].state = SlotState::Resumable {
+            session_id: "demo-session".into(),
+            at: 0,
+        };
+        assert_eq!(ticket_click(Some(4), &s), TicketClick::Open(4));
+        // An Empty owner still starts in place.
+        s[4].state = SlotState::Empty;
         assert_eq!(ticket_click(Some(4), &s), TicketClick::Start(4));
         // No owner: the lowest free slot, skipping Running ones.
         let s = slots_with(&[1]);
