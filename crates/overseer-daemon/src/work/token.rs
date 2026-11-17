@@ -38,6 +38,27 @@ pub(crate) async fn jira_token_within(
     security: &str,
     timeout: Duration,
 ) -> Result<String, String> {
+    if let Some(tok) = keychain_token(email, vars, security, timeout).await? {
+        return Ok(tok);
+    }
+    vars.iter()
+        .find(|(k, _)| k == TOKEN_VAR)
+        .and_then(|(_, v)| v.to_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| format!("no Jira token: set it in Settings or {TOKEN_VAR}"))
+}
+
+/// The Keychain item for `email`, or `None` when there is none. The only
+/// error is a timeout: a hang means a locked Keychain or an access prompt,
+/// which is reported rather than quietly falling back.
+async fn keychain_token(
+    email: &str,
+    vars: &[(OsString, OsString)],
+    security: &str,
+    timeout: Duration,
+) -> Result<Option<String>, String> {
     let cmd = [
         security.to_owned(),
         "find-generic-password".into(),
@@ -48,20 +69,11 @@ pub(crate) async fn jira_token_within(
         "-w".into(),
     ];
     match run_source(&cmd, Path::new("/"), timeout, vars).await {
-        Ok(out) if !out.trim().is_empty() => return Ok(out.trim().to_owned()),
-        // A hang means a locked Keychain or an access prompt: say so rather
-        // than quietly using a stale environment token.
-        Err(e) if e.starts_with("timed out") => return Err(NO_ANSWER.into()),
-        // Not found (exit 44) or any other failure: try the environment.
-        _ => {}
+        Ok(out) if !out.trim().is_empty() => Ok(Some(out.trim().to_owned())),
+        Err(e) if e.starts_with("timed out") => Err(NO_ANSWER.into()),
+        // Not found (exit 44) or any other failure.
+        _ => Ok(None),
     }
-    vars.iter()
-        .find(|(k, _)| k == TOKEN_VAR)
-        .and_then(|(_, v)| v.to_str())
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(str::to_owned)
-        .ok_or_else(|| format!("no Jira token: set it in Settings or {TOKEN_VAR}"))
 }
 
 /// Quote `s` for a `security -i` command line.
@@ -90,6 +102,7 @@ async fn save_jira_token_within(
     security: &str,
     timeout: Duration,
 ) -> Result<(), String> {
+    let token = token.trim();
     // A line break would end the command early and start another one.
     if token.contains(['\n', '\r']) || email.contains(['\n', '\r']) {
         return Err("the Jira token and email must be one line".into());
@@ -102,8 +115,8 @@ async fn save_jira_token_within(
     let mut child = Command::new(security)
         .arg("-i")
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| format!("{security}: {e}"))?;
@@ -114,20 +127,32 @@ async fn save_jira_token_within(
             .await
             .map_err(|e| format!("security: {e}"))?;
         drop(stdin);
-        child.wait().await.map_err(|e| format!("security: {e}"))
+        child
+            .wait_with_output()
+            .await
+            .map_err(|e| format!("security: {e}"))
     };
-    let status = tokio::time::timeout(timeout, run)
+    // stdout and stderr are read but never shown: they could echo the token.
+    let out = tokio::time::timeout(timeout, run)
         .await
         .map_err(|_| NO_ANSWER.to_owned())??;
-    if status.success() {
-        Ok(())
-    } else {
-        let code = status
+    if !out.status.success() {
+        let code = out
+            .status
             .code()
             .map_or("a signal".to_owned(), |c| c.to_string());
-        Err(format!(
+        return Err(format!(
             "Keychain did not save the Jira token: security exited with {code}"
-        ))
+        ));
+    }
+    // `security -i` need not report a failed command in its exit status, so
+    // read the item back. This also catches quoting the parser mangled.
+    let vars: Vec<(OsString, OsString)> = std::env::var_os("PATH")
+        .map(|p| vec![("PATH".into(), p)])
+        .unwrap_or_default();
+    match keychain_token(email, &vars, security, timeout).await? {
+        Some(stored) if stored == token => Ok(()),
+        _ => Err("the Keychain did not store the token".into()),
     }
 }
 
@@ -193,22 +218,52 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let argv = t.path().join("argv");
         let stdin = t.path().join("stdin");
+        // `-i` records argv and stdin; the read-back prints the stored token.
         let sec = stub(
             t.path(),
             &format!(
-                "printf '%s\\n' \"$@\" > '{}'\ncat > '{}'",
-                argv.display(),
-                stdin.display()
+                "printf '%s\\n' \"$@\" >> '{argv}'\n\
+                 if [ \"$1\" = -i ]; then cat > '{stdin}'; \
+                 else printf '%s\\n' 'se\"cr\\et'; fi",
+                argv = argv.display(),
+                stdin = stdin.display()
             ),
         );
         save_jira_token("demo@example.test", r#"se"cr\et"#, &sec)
             .await
             .unwrap();
-        assert_eq!(std::fs::read_to_string(&argv).unwrap(), "-i\n");
+        let argv = std::fs::read_to_string(&argv).unwrap();
+        assert!(argv.starts_with("-i\nfind-generic-password\n"), "{argv}");
+        assert!(!argv.contains("cr"), "{argv}");
         assert_eq!(
             std::fs::read_to_string(&stdin).unwrap(),
             "add-generic-password -U -s overseer-jira -a \"demo@example.test\" -w \"se\\\"cr\\\\et\"\n"
         );
+    }
+
+    #[tokio::test]
+    async fn save_token_that_was_not_stored_is_an_error() {
+        let t = tempfile::tempdir().unwrap();
+        // `-i` swallows the command and exits 0; the read-back finds nothing.
+        let sec = stub(
+            t.path(),
+            "if [ \"$1\" = -i ]; then cat > /dev/null; exit 0; else exit 44; fi",
+        );
+        let e = save_jira_token("demo@example.test", "zq9", &sec)
+            .await
+            .unwrap_err();
+        assert_eq!(e, "the Keychain did not store the token");
+
+        // A read-back that differs is also an error.
+        let t2 = tempfile::tempdir().unwrap();
+        let sec = stub(
+            t2.path(),
+            "if [ \"$1\" = -i ]; then cat > /dev/null; else echo other; fi",
+        );
+        let e = save_jira_token("demo@example.test", "zq9", &sec)
+            .await
+            .unwrap_err();
+        assert_eq!(e, "the Keychain did not store the token");
     }
 
     #[tokio::test]
