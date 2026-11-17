@@ -39,7 +39,7 @@ Jonathan's calls:
 
 ## Non-goals
 
-- Bitbucket through the API. PRs stay on `bb` for now, and that is listed as follow-up.
+- Bitbucket through the API was a non-goal at first; it was added later, see "Addendum: Bitbucket by API".
 - A prebuilt, notarised download. Kasia builds with `make install` like Jonathan.
 - Writing to Jira, such as status changes or comments.
 - Syncing into Jonathan's existing vault folders. His sprint-sync skill owns those.
@@ -163,3 +163,39 @@ Settings gets a "Jira token" field that writes the Keychain item through `securi
 - Where the sprint-sync code lives.
 - Exact Settings layout.
 - Whether `brain_*` names are renamed in code or only in config.
+
+## Addendum: Bitbucket by API (added 17 Nov 2026)
+
+Jonathan's call, after looking at Teamwork Graph: make the app self-sufficient, so PRs come from Bitbucket's REST API instead of the `bb` tool. Teamwork Graph's `twg` CLI was considered and rejected for the daemon. It is another installed tool, it still needs a separate Bitbucket token, and its browser sign-in suits a person at a terminal, not a daemon running for days. It may still be useful inside sessions, as follow-up.
+
+### Approaches
+
+1. **Direct REST calls from the daemon (picked).** This uses the same `ureq` client and Keychain pattern as Jira, and one code path for everyone.
+2. **`twg bb` as the PR command.** Rejected for the reasons above.
+3. **Keep `bb` and document it.** Rejected, because it leaves the app depending on an installed tool.
+
+### Design
+
+- **Token.** A scoped Atlassian API token for the Bitbucket app, with the scopes `read:repository:bitbucket` and `read:pullrequest:bitbucket`. It is a separate token from Jira's, because a scoped token covers one app.
+  - It is stored in the Keychain with service `overseer-bitbucket`, and the account is `jira_email`, the Atlassian account email.
+  - The env fallback is `BITBUCKET_API_TOKEN`.
+  - Auth is basic, with email and token.
+- **When the API is used.** The API is used when a Bitbucket token is found. Otherwise `pr_command` (`bb`) is used, as today, so Jonathan's setup is unchanged until he saves a token.
+  - **Error handling:**
+    - A 401 or 403 is an error on the board: "Bitbucket token rejected (401): check the token and its scopes".
+    - Any other non-2xx gives the status and the first line of the body.
+    - Errors never carry the token.
+- **Requests,** to `https://api.bitbucket.org/2.0/`:
+  - **Repo list for `pr_workspace`:** `GET repositories/{workspace}?pagelen=100&sort=-updated_on`, plus `q=project.key="{pr_project}"` when `pr_project` is set. It follows `next`, and the result feeds the existing `parse_repos`.
+  - **Open PRs per repo:** `GET repositories/{workspace}/{slug}/pullrequests?state=OPEN&pagelen=50`. It follows `next`, and the result feeds the existing `parse_prs`. The response shape is the one `bb --output json` already passes through.
+  - **`pr_repos` folders.** The workspace and slug come from the folder's git remote (`origin` first). Both the `https://` and `git@bitbucket.org:` forms are read. A folder with no Bitbucket remote gives a per-repo error.
+- **Parallelism, timeouts and keep-last-good** stay as they are for the PR source: `PR_PARALLEL`, `SOURCE_TIMEOUT` and the repo list cache.
+- **Settings.** A "Bitbucket token" row works like the Jira one: write-only, showing set or not set. `Request::SetJiraToken` becomes a general token request that names which token it sets.
+- **README.** It covers making the Bitbucket token, its scopes and the Settings step, and says `bb` is now optional.
+
+### Not in scope
+
+- Creating or merging PRs.
+- Bitbucket Data Center.
+- OAuth.
+- Using Teamwork Graph in sessions.

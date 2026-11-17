@@ -372,3 +372,63 @@ Update the reference sections below for the new keys. Fix any links into moved d
 - [ ] **Step 1:** Write the docs, LICENSE and moves.
 - [ ] **Step 2:** Run `grep -rn $'\u2014' README.md docs/internal/README.md LICENSE`, expecting no output. Run the link grep, expecting only `docs/internal` paths. Run the gates.
 - [ ] **Step 3:** Commit: `Add a getting started guide and licence, and move maintainer docs aside`.
+
+### Task 9: Bitbucket by API
+
+**Spec:** "Addendum: Bitbucket by API" in the design doc (approved by Jonathan on 17 Nov 2026).
+
+**Files:**
+- Create: `crates/overseer-daemon/src/work/bitbucket_api.rs`
+- Modify: `crates/overseer-daemon/src/work/token.rs` (generalise to two token kinds)
+- Modify: `crates/overseer-daemon/src/work/store.rs` (PR source picks the API or `pr_command`)
+- Modify: `crates/overseer-proto/src/msg.rs` (`Request::SetJiraToken` becomes `Request::SetToken { kind: TokenKind, token: String }`, `TokenKind::{Jira, Bitbucket}`; the settings view carries `bitbucket_token_set: bool` next to `jira_token_set`)
+- Modify: `crates/overseer-daemon/src/server.rs`, `crates/overseer-daemon/src/settings.rs`, `crates/overseer-gui/src/settings_view.rs`
+- Modify: `README.md` ("Getting started": the Bitbucket token, its scopes, `bb` optional)
+
+**Interfaces:**
+- Consumes:
+  - `jira_token` and `save_jira_token` (Task 3)
+  - `Request::SetJiraToken` and the "Jira token" Settings row (Task 7)
+  - `parse_prs`, `parse_repos`, `active_repos`, `poll_prs`, `PR_PARALLEL`, `SOURCE_TIMEOUT` and `REPO_LIST_MAX_AGE` (existing, in `store.rs` and `sources.rs`)
+  - the `ureq` 2 and `base64` crates (Task 3)
+  - `run_blocking` (Task 3)
+- Produces, in `token.rs`:
+  - `pub enum TokenKind { Jira, Bitbucket }`, with the Keychain service `overseer-jira` or `overseer-bitbucket` and the env var `ATLASSIAN_API_TOKEN` or `BITBUCKET_API_TOKEN`.
+  - `token(kind, email, vars, security)` and `save_token(kind, email, token, security)`. The Jira functions become thin wrappers, or are replaced at their call sites.
+- Produces, in `bitbucket_api.rs`:
+  - `BitbucketApi { email, base: String }`. `base` defaults to `https://api.bitbucket.org/2.0/`; tests point it at a local server.
+  - `fn repos(&self, token, workspace, project: &str) -> Result<String, String>`. It gets `repositories/{workspace}?pagelen=100&sort=-updated_on`, plus `&q=project.key="{project}"` (URL-encoded) when the project is set. It follows `next` and returns a JSON text `{"values":[...]}` that `parse_repos` accepts.
+  - `fn open_prs(&self, token, workspace, slug) -> Result<String, String>`. It gets `repositories/{workspace}/{slug}/pullrequests?state=OPEN&pagelen=50`, follows `next`, and returns `{"values":[...]}` for `parse_prs`.
+  - `fn classify(status, body) -> String`:
+    - 401 or 403 gives `Bitbucket token rejected ({status}): check the token and its scopes`.
+    - Any other status gives `Bitbucket {status}: {first line of body}`.
+    - A transport error gives the error text.
+    - No message ever contains the token.
+  - `fn remote_target(remote_url) -> Option<(String, String)>`. It reads the workspace and slug from `https://[user@]bitbucket.org/ws/slug(.git)` and `git@bitbucket.org:ws/slug(.git)`, and gives `None` for anything else.
+- Store wiring:
+  - At each PR poll the store looks up the Bitbucket token with `TokenKind::Bitbucket` and `jira_email`.
+    - When the token is found, the repo list and each target use the API, run off the async thread through `run_blocking`, with the same parallelism and keep-last-good.
+    - `PrTarget::Folder` resolves through `git -C <dir> remote get-url origin` and `remote_target`. With no Bitbucket remote it gives the per-repo error `no Bitbucket remote`.
+    - When no token is found, `pr_command` runs exactly as today.
+  - A token lookup error other than "not found" is shown, not swallowed.
+- Settings: a "Bitbucket token" row in a `Bitbucket` group (or with the PR rows). It shows `set` or `not set`, has a masked field and Save, and is never filled back in.
+  - `SetToken`'s Debug prints `<hidden>` for the token.
+  - An empty `jira_email` gives `set jira_email first`.
+
+- [ ] **Step 1: Write the failing tests:**
+  - `bitbucket_api.rs`:
+    - `repos_follows_next_and_filters_project`
+    - `open_prs_follows_next`
+    - `rejected_token_is_an_error_not_an_empty_list` (401 gives the exact message)
+    - `errors_never_hold_the_token`
+    - `remote_target_reads_https_and_ssh` (with a `user@` form and a `.git` suffix) and `remote_target_rejects_github`
+    - All of these use a local `TcpListener` stub, never the network.
+  - `token.rs`: `bitbucket_kind_uses_its_own_service_and_env`, using the existing fake-`security` pattern and never the real binary.
+  - `store.rs`:
+    - `prs_use_the_api_when_a_bitbucket_token_is_set`, with the base pointed at a stub
+    - `prs_use_pr_command_when_no_bitbucket_token`
+  - `msg.rs`: `set_token_debug_hides_the_token` for both kinds.
+- [ ] **Step 2:** Run `cargo test --workspace` and expect the new tests to fail.
+- [ ] **Step 3:** Implement it.
+- [ ] **Step 4:** Run the gates.
+- [ ] **Step 5:** Commit: `Read pull requests from the Bitbucket API when a token is saved`.
