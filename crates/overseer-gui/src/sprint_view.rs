@@ -8,10 +8,12 @@ use gpui::{
     SharedString, Window,
 };
 use overseer_proto::{
-    slot_name, ItemKind, SlotId, SlotInfo, SlotState, Stage, WorkItem, WorkView, PRS_OFF,
+    slot_name, ItemKind, PullRequest, SlotId, SlotInfo, SlotState, Stage, WorkItem, WorkView,
+    PRS_OFF,
 };
 
-use crate::app::{colors, open_external, OverseerApp};
+use crate::app::{colors, open_external, ticket_click, OverseerApp, TicketClick};
+use crate::board::{activity_state, format_elapsed};
 
 const DAY: i64 = 86_400;
 /// Height of the kanban block. Fixed so the board never grows with the
@@ -97,6 +99,14 @@ pub struct TicketCard {
     /// stage list named that status.
     pub raw_status: Option<String>,
     pub folder: Option<PathBuf>,
+    /// The Jira status as Jira names it, always.
+    pub status: String,
+    /// The Jira priority, when set.
+    pub priority: Option<String>,
+    /// The column the card sits in.
+    pub stage: Stage,
+    /// The oldest linked PR, the one the chip shows.
+    pub linked_pr: Option<PullRequest>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -106,7 +116,7 @@ pub struct Column {
     pub cards: Vec<TicketCard>,
 }
 
-fn card(view: &WorkView, t: &WorkItem, now: i64) -> TicketCard {
+fn card(view: &WorkView, t: &WorkItem, stage: Stage, now: i64) -> TicketCard {
     let mut linked: Vec<_> = view
         .prs
         .iter()
@@ -141,6 +151,91 @@ fn card(view: &WorkView, t: &WorkItem, now: i64) -> TicketCard {
             .count(),
         raw_status,
         folder: t.folder.clone(),
+        status: t.status.clone(),
+        priority: t.priority.clone(),
+        stage,
+        linked_pr: linked.first().map(|p| (*p).clone()),
+    }
+}
+
+/// What the hover card on a ticket shows: label and value rows, the key,
+/// the full title and the click hint.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HoverModel {
+    pub lines: Vec<(String, String)>,
+    pub title: String,
+    pub key: String,
+    pub hint: String,
+}
+
+/// The hover card's last line: what a click and a Cmd+click do.
+pub fn hover_hint(click: &TicketClick, has_folder: bool) -> String {
+    let mut hint = match click {
+        TicketClick::Open(s) => format!("Click: open {}", slot_name(*s)),
+        TicketClick::Start(s) => format!("Click: start in {}", slot_name(*s)),
+        TicketClick::NoSlot => "Click: no free slot".to_string(),
+    };
+    if has_folder {
+        hint.push_str(" · Cmd+click: folder");
+    }
+    hint
+}
+
+/// `S2 · Your turn 1m 00s`: the owner and what its session is doing, or
+/// `Not started` with no owner.
+fn session_text(owner: Option<SlotId>, slots: &[SlotInfo], now: i64) -> String {
+    let Some(o) = owner else {
+        return "Not started".into();
+    };
+    let state = match slots.get(o as usize) {
+        Some(info) => match (&info.state, &info.activity) {
+            (SlotState::Running { .. }, Some(a)) => activity_state(a, now),
+            (SlotState::Running { since, .. }, None) => {
+                format!("Running {}", format_elapsed(now - since))
+            }
+            (SlotState::Resumable { .. }, _) => "Resumable".into(),
+            (SlotState::Exited { .. }, _) => "Exited".into(),
+            (SlotState::Empty, _) => "Not running".into(),
+        },
+        None => "Not running".into(),
+    };
+    format!("{} · {state}", slot_name(o))
+}
+
+/// The hover card for a ticket card, given the slots (for the session and
+/// what a click would do).
+pub fn hover_model(c: &TicketCard, slots: &[SlotInfo], now: i64) -> HoverModel {
+    let mut lines = vec![
+        ("Status".to_string(), c.status.clone()),
+        (
+            "Priority".to_string(),
+            c.priority.clone().unwrap_or_else(|| "Not set".into()),
+        ),
+        (
+            "Stage".to_string(),
+            match &c.age {
+                Some(a) => format!("{} · {a}", c.stage.label()),
+                None => c.stage.label().to_string(),
+            },
+        ),
+        ("Session".to_string(), session_text(c.slot, slots, now)),
+    ];
+    if let Some(p) = &c.linked_pr {
+        let mut text = format!("{} #{} {}", p.repo, p.id, p.title);
+        if let Some(created) = p.created {
+            text.push(' ');
+            text.push_str(&age_text(now - created));
+        }
+        lines.push(("PR".to_string(), text));
+    }
+    if c.beads > 0 {
+        lines.push(("Beads".to_string(), c.beads.to_string()));
+    }
+    HoverModel {
+        lines,
+        title: c.title.clone(),
+        key: c.key.clone(),
+        hint: hover_hint(&ticket_click(c.slot, slots), c.folder.is_some()),
     }
 }
 
@@ -172,7 +267,10 @@ pub fn columns(view: &WorkView, now: i64) -> Vec<Column> {
             Column {
                 stage,
                 total,
-                cards: mine.into_iter().map(|t| card(view, t, now)).collect(),
+                cards: mine
+                    .into_iter()
+                    .map(|t| card(view, t, stage, now))
+                    .collect(),
             }
         })
         .collect()
@@ -468,6 +566,50 @@ impl Render for TextTooltip {
     }
 }
 
+/// The hover card on a ticket: the key in the accent colour, the title
+/// wrapped, label and value rows, and the click hint in grey.
+struct HoverCard(HoverModel);
+
+impl Render for HoverCard {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let m = &self.0;
+        div()
+            .max_w(px(360.))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .rounded(px(4.))
+            .text_xs()
+            .bg(rgb(colors::CARD_HOVER))
+            .border_1()
+            .border_color(rgb(colors::BORDER_COORD))
+            .text_color(rgb(colors::TEXT))
+            .child(
+                div()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(colors::ACCENT))
+                    .child(m.key.clone()),
+            )
+            .child(div().child(m.title.clone()))
+            .children(m.lines.iter().map(|(label, value)| {
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(56.))
+                            .text_color(rgb(colors::MUTED))
+                            .child(label.clone()),
+                    )
+                    .child(div().flex_1().min_w(px(0.)).child(value.clone()))
+            }))
+            .child(div().text_color(rgb(colors::MUTED)).child(m.hint.clone()))
+    }
+}
+
 /// Small caps-style section heading in the accent colour.
 fn heading(text: impl Into<SharedString>) -> gpui::Div {
     div()
@@ -491,7 +633,11 @@ fn chip(text: impl Into<SharedString>, bg: u32, fg: u32) -> gpui::Div {
 
 /// One kanban card: priority chip and key, the title on up to two lines,
 /// then slot, PR, beads, raw status and the age.
-fn ticket_card(c: TicketCard, cx: &mut Context<OverseerApp>) -> impl IntoElement {
+fn ticket_card(
+    c: TicketCard,
+    hover: HoverModel,
+    cx: &mut Context<OverseerApp>,
+) -> impl IntoElement {
     let (prio, bg, fg) = prio_chip(c.prio);
     let pr_key = c.key.clone();
     let click_key = c.key.clone();
@@ -580,6 +726,7 @@ fn ticket_card(c: TicketCard, cx: &mut Context<OverseerApp>) -> impl IntoElement
         )
         .cursor_pointer()
         .hover(|s| s.bg(rgb(colors::CARD_HOVER)))
+        .tooltip(move |_, cx| cx.new(|_| HoverCard(hover.clone())).into())
         .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
             // Cmd+click keeps the ticket-folder shortcut.
             if ev.modifiers().platform {
@@ -851,7 +998,8 @@ impl OverseerApp {
                         if done {
                             done_card(c, cx).into_any_element()
                         } else {
-                            ticket_card(c, cx).into_any_element()
+                            let hover = hover_model(&c, &self.slots, now);
+                            ticket_card(c, hover, cx).into_any_element()
                         }
                     })
                     .collect();
@@ -1039,6 +1187,80 @@ mod tests {
         let c = &columns(&v, 1000)[3].cards[0];
         assert_eq!(c.pr, Some(("#7 3d".to_string(), AgeTone::Ageing)));
         assert_eq!(c.beads, 1);
+    }
+
+    #[test]
+    fn hover_hints() {
+        assert_eq!(
+            hover_hint(&TicketClick::Open(3), true),
+            "Click: open S3 · Cmd+click: folder"
+        );
+        assert_eq!(
+            hover_hint(&TicketClick::Start(4), false),
+            "Click: start in S4"
+        );
+        assert_eq!(
+            hover_hint(&TicketClick::NoSlot, false),
+            "Click: no free slot"
+        );
+    }
+
+    fn row<'a>(m: &'a HoverModel, label: &str) -> Option<&'a str> {
+        m.lines
+            .iter()
+            .find(|(l, _)| l == label)
+            .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn hover_model_for_an_owned_ticket_with_a_pr() {
+        let now = 10 * 86_400;
+        let mut t = ticket("DEMO-1", Stage::InProgress, Some("High"));
+        t.owner = Some(2);
+        t.stage_since = Some(now - 5 * 3600);
+        t.folder = Some(PathBuf::from("/demo/DEMO-1"));
+        let mut v = view(vec![t]);
+        let mut p = pr(12, Some(now - 3 * 86_400));
+        p.title = "Add the demo endpoint".into();
+        p.ticket = Some("DEMO-1".into());
+        v.prs = vec![p];
+        let mut slots = crate::app::empty_slots();
+        slots[2].state = SlotState::Running { pid: 1, since: 0 };
+        slots[2].activity = Some(overseer_proto::Activity {
+            kind: overseer_proto::ActivityKind::Idle,
+            since: now - 60,
+            now_doing: None,
+            reason: None,
+            idle_wait: false,
+        });
+        let c = &columns(&v, now)[3].cards[0];
+        let m = hover_model(c, &slots, now);
+        assert_eq!(m.key, "DEMO-1");
+        assert_eq!(m.title, "DEMO-1 title");
+        assert_eq!(row(&m, "Status"), Some("In Progress"));
+        assert_eq!(row(&m, "Priority"), Some("High"));
+        assert_eq!(row(&m, "Stage"), Some("IN PROGRESS · 5h"));
+        assert_eq!(row(&m, "Session"), Some("S2 · Your turn 1m 00s"));
+        assert_eq!(row(&m, "PR"), Some("demo-api #12 Add the demo endpoint 3d"));
+        assert_eq!(row(&m, "Beads"), None);
+        assert_eq!(m.hint, "Click: open S2 · Cmd+click: folder");
+    }
+
+    #[test]
+    fn hover_model_for_an_unowned_ticket() {
+        let mut v = view(vec![ticket("DEMO-2", Stage::ToDo, None)]);
+        let mut bead = ticket("demo-b1", Stage::ToDo, None);
+        bead.kind = ItemKind::Bead;
+        bead.parent = Some("DEMO-2".into());
+        v.items.push(bead);
+        let slots = crate::app::empty_slots();
+        let c = &columns(&v, 100)[0].cards[0];
+        let m = hover_model(c, &slots, 100);
+        assert_eq!(row(&m, "Session"), Some("Not started"));
+        assert_eq!(row(&m, "Stage"), Some("TODO"));
+        assert_eq!(row(&m, "PR"), None);
+        assert_eq!(row(&m, "Beads"), Some("1"));
+        assert_eq!(m.hint, "Click: start in S1");
     }
 
     #[test]
