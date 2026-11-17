@@ -1,9 +1,9 @@
-//! Reading Claude Code's input box from a slot's output bytes.
+//! Reading Claude Code's input box from a slot's screen.
 //!
 //! The courier must know, before typing a relay, whether the input box is
 //! empty, holds text the user typed, or cannot be found (a permission or
-//! question dialog replaces the box). The reader is pure: it replays bytes
-//! into a terminal grid and classifies what it sees. Best effort, tuned to
+//! question dialog replaces the box). The reader is pure: it classifies a
+//! snapshot of the slot's live screen (`Slot::screen`). Best effort, tuned to
 //! Claude Code 2.1's prompt; anything it does not understand reads as
 //! `NotFound`, and a relay then waits.
 //!
@@ -26,8 +26,8 @@ pub enum InputBox {
     NotFound,
 }
 
-/// Replay `Slot::snapshot()` bytes (preamble plus ring) into a fresh grid.
-/// Built only when a relay is due, never on every output chunk.
+/// Replay output bytes into a fresh grid. Only right for a whole stream:
+/// replaying a wrapped ring loses rows drawn before its oldest byte.
 pub fn screen_of(snapshot_bytes: &[u8], cols: u16, rows: u16) -> (Snapshot, TermModes) {
     let mut bridge = TermBridge::new(cols as usize, rows as usize, 0);
     bridge.feed(snapshot_bytes);

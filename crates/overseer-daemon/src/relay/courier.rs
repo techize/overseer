@@ -21,7 +21,7 @@ use overseer_term::encode_paste;
 use tokio::sync::{broadcast, Notify};
 use tokio::time::Instant;
 
-use super::screen::{input_box, screen_of, shows_working, InputBox};
+use super::screen::{input_box, shows_working, InputBox};
 use crate::ledger::Ledger;
 use crate::locks::table::{mark_delivered_on, pending_relays_on};
 use crate::locks::LockService;
@@ -256,17 +256,12 @@ impl Courier {
             *answered = None;
         }
         let slot = self.manager.lock().unwrap().slot(id).ok_or(NOT_RUNNING)?;
-        let (cols, rows) = (info.cols, info.rows);
-        // The ring with its mode preamble, as a client attaching would see it.
-        let reader = slot.clone();
-        let screen = tokio::task::spawn_blocking(move || {
-            let (bytes, _) = reader.attach();
-            let (snap, modes) = screen_of(&bytes, cols, rows);
-            (input_box(&snap), shows_working(&snap), modes)
-        })
-        .await;
+        // The live screen, not a replay of the ring: the ring loses the box's
+        // rules once it wraps, as they are drawn only once (#21).
+        let (snap, modes) = slot.screen();
+        let (found, working) = (input_box(&snap), shows_working(&snap));
         if at_prompt {
-            if !matches!(screen, Ok((InputBox::Empty, false, _))) {
+            if found != InputBox::Empty || working {
                 *answered = None;
                 return Err(AT_PROMPT);
             }
@@ -276,11 +271,11 @@ impl Courier {
                 return Err(AT_PROMPT);
             }
         }
-        let modes = match screen {
-            Ok((InputBox::Empty, _, modes)) => modes,
-            Ok((InputBox::Typed, _, _)) => return Err(TYPED),
-            Ok((InputBox::NotFound, _, _)) | Err(_) => return Err(NO_BOX),
-        };
+        match found {
+            InputBox::Empty => {}
+            InputBox::Typed => return Err(TYPED),
+            InputBox::NotFound => return Err(NO_BOX),
+        }
         // A hook may have come in while the screen was read.
         let text = strip_controls(&compose(relays, id, &self.user));
         if text.contains('\n') && !modes.bracketed_paste {
