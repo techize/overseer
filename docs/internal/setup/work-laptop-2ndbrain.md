@@ -8,7 +8,7 @@ done by code: each step changes something outside the Overseer repo (the
 vault's git hooks, Obsidian's settings, the global hooks and skills) and is
 applied by hand, with your approval, one at a time.
 
-Run the acceptance list (`docs/acceptance/phase-5.md`) on the home Mac before
+Run the acceptance list (`docs/internal/acceptance/phase-5.md`) on the home Mac before
 step 4: it starts real sessions, and a global hook that is not Overseer-aware
 yet must not see them. Do the steps in order. Steps 1 to 4 are safe with the writer still off. Do not
 do step 6 until 1 to 5 are done, or Obsidian Git and the daemon will both
@@ -222,7 +222,7 @@ in S1, then `grep -E 'role template|brain_rules' ~/Library/Logs/Overseer/daemon.
    then grep the log).
 5. The board's bottom strip should read `2ndBrain: nothing yet`, then
    `2ndBrain: committed HH:MM` after the first commit. See the acceptance list
-   (`docs/acceptance/phase-5.md`) for the checks to run on the home Mac before
+   (`docs/internal/acceptance/phase-5.md`) for the checks to run on the home Mac before
    doing this on the work laptop.
 
 To turn it off again: `brain_writer = false` and restart. The hook stops

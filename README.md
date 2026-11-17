@@ -4,13 +4,116 @@ A macOS app (GPUI GUI plus a background daemon) for hosting Claude Code sessions
 The daemon owns up to seven Claude Code sessions (S0 to S6). The app shows them,
 and quitting or closing the app never stops a session.
 
+## Getting started
+
+### What Overseer is
+
+S0 is the coordinator session: it reads your sprint, proposes a plan and relays
+requests. S1 to S6 are worker sessions, one per ticket, each in its own git
+worktree. The board shows the sessions, your sprint tickets by Jira status, and
+open pull requests. Sessions keep running when you close the app.
+
+### Requirements
+
+- macOS 13 or later.
+- Xcode command line tools: `xcode-select --install`. The full Xcode app is not needed.
+- Rust through rustup. `make install` installs it for you if it is missing (it asks first).
+- Claude Code (`claude` on your `PATH`).
+- An Atlassian API token with scopes (create one at
+  https://id.atlassian.com/manage-profile/security/api-tokens, "Create API token
+  with scopes") for Jira Software, with `read:jira-work`,
+  `read:sprint:jira-software` and `read:board-scope:jira-software`.
+- Optional: `bb` for pull requests, and `bd` (beads) for task tracking. See
+  "What each optional tool adds" below.
+
+### Install
+
+```
+git clone https://github.com/techize/overseer.git
+cd overseer
+make install
+```
+
+This builds the app, puts it in `~/Applications/Overseer.app` and starts the
+background daemon. Details are under Install below.
+
+### First run
+
+Create `~/.config/overseer/config.toml` (the folder may not exist yet; create it)
+with your own site, email and board:
+
+```toml
+jira_site = "demo.atlassian.net"
+jira_email = "demo@example.test"
+jira_board = "1"
+```
+
+`jira_board` is optional. The board id is the number in the board's URL
+(`.../boards/1`). With it, the sprint name and dates come from Jira.
+
+Restart the daemon (`overseer ctl restart`), open the app, then press `Cmd+,`
+for Settings. In the Jira group, type your API token into the "Jira token" row
+and Save. The token goes into the macOS Keychain (service `overseer-jira`,
+account = your `jira_email`). It is never written to `config.toml` or the logs.
+You can instead set `ATLASSIAN_API_TOKEN` in your shell environment.
+
+If you change `jira_email` in Settings, restart the daemon before saving the
+token, since the token is stored under the email the running daemon has.
+
+When `jira_site` is set Overseer uses the Jira API. With it empty it falls back
+to the `acli` command, and without `acli` installed the board says
+`acli not found`: set `jira_site`. `ticket_pattern`, when left empty, is built
+from your Jira project keys. `user_name` defaults to the first word of your
+macOS full name.
+
+### The notes folder
+
+Overseer keeps journals, session notes and sprint files in a notes folder
+(`notes_dir`, also accepted as `brain_dir`).
+
+- With no `notes_dir` set, it uses `~/Repos/2ndBrain` if that folder exists,
+  else `~/Overseer`. `~/Overseer` is created for you with a `.overseer-notes`
+  marker file and its own local git history.
+- To use an existing folder, set `notes_dir = "~/path/to/notes"`. Overseer only
+  syncs into a folder holding the `.overseer-notes` marker, so create that empty
+  file there if you want it to manage the folder.
+- With `jira_board` set, Overseer keeps
+  `Sprints/sprint-<slug>/<KEY>-<slug>/ticket.md` in the notes folder, one per
+  ticket, in step with Jira. `ticket.md` is the only file it writes there, so
+  your own notes in a ticket folder are left alone.
+
+### What each optional tool adds
+
+- `bb` (Bitbucket CLI): the Open PRs panel and links from tickets to their PRs.
+  Set `pr_repos` to your clones. Without it the panel stays off.
+- `bd` (beads): the task list sessions read and write, shown on the board.
+  Without it that source is off; sessions and the Jira board still work.
+
+### Troubleshooting
+
+- Token rejected. The board says `Jira token rejected (401): check the token and
+  its scopes` (or 403). Make sure the token is a scoped one with the three
+  scopes above, that `jira_email` is the account that created it, and that
+  `jira_site` is the site host only, such as `demo.atlassian.net`.
+- No tickets. The default `jql` is `sprint in openSprints() AND assignee =
+  currentUser() ORDER BY priority DESC`. Check you have an open sprint with
+  tickets assigned to you, run the JQL in Jira's search, and check `jira_board`
+  is a board of that sprint. If Jira returns none after a poll that had some,
+  Overseer keeps the last list once and says so.
+- Keychain prompt. The first read of the token may ask to allow `security` to
+  use the item; choose Always Allow. If it is left unanswered the source says
+  `Keychain did not answer`. Unlock your login keychain and wait for the next
+  poll, or use `ATLASSIAN_API_TOKEN` instead.
+- Notifications not showing. Allow Overseer in System Settings > Notifications,
+  and check Focus is not hiding them.
+
 ## Install (no admin rights needed)
 
 You need the Xcode Command Line Tools (`xcode-select --install`). The full
 Xcode app is not needed: GPUI is built with `runtime_shaders`.
 
 ```
-git clone <repo> ~/overseer
+git clone https://github.com/techize/overseer.git ~/overseer
 cd ~/overseer
 make install
 ```
@@ -167,6 +270,25 @@ changed since the view read it, and says to close and reopen Settings.
 
 The About block shows the app's build and the running daemon's, and says when
 they differ.
+
+## Jira and notes keys
+
+These live in `config.toml`, and most show in Settings (Jira group, and Brain
+group for the notes keys). They apply after a daemon restart.
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `jira_site` | `""` | Your site host, such as `demo.atlassian.net`. Set: the Jira API is used. Empty: `jira_command` (`acli`) is used. |
+| `jira_email` | `""` | The account that owns the token; also the Keychain account name. |
+| `jira_board` | `""` | Optional board id. With it, sprint name and dates come from Jira and `Sprints/sprint-<slug>/<KEY>-<slug>/ticket.md` is kept in the notes folder. |
+| `jira_cloud_id` | `""` | Optional. Looked up from `jira_site` when empty. |
+| `jql` | open sprints, assigned to you | The ticket query. |
+| `ticket_pattern` | `""` | Empty: built from your Jira project keys, as `(DEMO|OPS)-\d+`. |
+| `user_name` | first word of your macOS full name | The name used in prompts and messages. |
+| `notes_dir` (alias `brain_dir`) | `~/Repos/2ndBrain` if it exists, else `~/Overseer` | The notes folder. Overseer only syncs into one holding a `.overseer-notes` marker. |
+
+The Jira token is not a config key. Set it in Settings (Keychain) or with
+`ATLASSIAN_API_TOKEN`.
 
 ## Sprint board and open PRs
 

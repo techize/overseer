@@ -46,7 +46,7 @@ kube:uat-eu/demo	kubectl --context uat-eu -n demo apply -f x.yaml
 -	cat <<'EOF' > notes.md\ngit push origin main\nEOF
 kube:staging-eu/default	cat <<EOF | kubectl apply -f -\nkind: ConfigMap\nEOF
 repo:demo-api:feature-x,tf:default	make build && git push; terraform apply
-# Known limits (docs/acceptance/phase-4.md, L8 and L9). These pin what happens
+# Known limits (docs/internal/acceptance/phase-4.md, L8 and L9). These pin what happens
 # today, not what is right. --kubeconfig is ignored, so the context is the
 # current one and two kubeconfigs share a target.
 kube:staging-eu/default	kubectl --kubeconfig other.yaml apply -f x.yaml
