@@ -24,6 +24,8 @@ pub struct SettingsFiles {
     pub targets: PathBuf,
     pub targets_note: String,
     pub targets_error: Option<String>,
+    /// The `security` tool that holds the Jira token; tests point it at a stub.
+    pub security: String,
 }
 
 impl SettingsFiles {
@@ -36,6 +38,7 @@ impl SettingsFiles {
             targets: dir.join("targets.toml"),
             targets_note: String::new(),
             targets_error: None,
+            security: crate::work::store::SECURITY.to_owned(),
         }
     }
 }
@@ -86,7 +89,8 @@ fn int(n: u64) -> SettingValue {
 const WORK: &str = "Work items";
 const SPRINT: &str = "Sprint";
 const LOCKS: &str = "Locks and worktrees";
-const BRAIN: &str = "2ndBrain";
+const JIRA: &str = "Jira";
+const BRAIN: &str = "Notes";
 const COMMANDS: &str = "Commands";
 const TERMINAL: &str = "Terminal";
 const EDITOR: &str = "Editor";
@@ -103,6 +107,23 @@ const fn daemon(
         kind,
         applies: Applies::Restart,
         note: None,
+        get: Some(get),
+    }
+}
+
+const fn daemon_note(
+    key: &'static str,
+    group: &'static str,
+    kind: SettingKind,
+    note: &'static str,
+    get: fn(&Config) -> SettingValue,
+) -> Spec {
+    Spec {
+        key,
+        group,
+        kind,
+        applies: Applies::Restart,
+        note: Some(note),
         get: Some(get),
     }
 }
@@ -137,6 +158,7 @@ const fn app(key: &'static str, group: &'static str, kind: SettingKind) -> Spec 
 
 const POLL: SettingKind = SettingKind::Int { min: 5, max: 3600 };
 const NOT_EMPTY: SettingKind = SettingKind::Text { allow_empty: false };
+const EMPTY_OK: SettingKind = SettingKind::Text { allow_empty: true };
 const COMMAND_NOTE: &str = "A typo turns this source off, so change it in config.toml.";
 
 /// Every key Settings shows, in the order and groups it shows them.
@@ -172,9 +194,17 @@ pub const CATALOGUE: &[Spec] = &[
         SettingKind::Text { allow_empty: true },
         |c| text(&c.pr_author),
     ),
-    daemon("ticket_pattern", WORK, SettingKind::Pattern, |c| {
-        text(&c.ticket_pattern)
-    }),
+    daemon_note(
+        "ticket_pattern",
+        WORK,
+        SettingKind::Pattern,
+        "Empty: built from your Jira project keys",
+        |c| text(&c.ticket_pattern),
+    ),
+    daemon("jira_site", JIRA, EMPTY_OK, |c| text(&c.jira_site)),
+    daemon("jira_email", JIRA, EMPTY_OK, |c| text(&c.jira_email)),
+    daemon("jira_board", JIRA, EMPTY_OK, |c| text(&c.jira_board)),
+    daemon("jira_cloud_id", JIRA, EMPTY_OK, |c| text(&c.jira_cloud_id)),
     daemon(
         "sprint_name",
         SPRINT,
@@ -217,7 +247,8 @@ pub const CATALOGUE: &[Spec] = &[
     daemon("worktree_root", LOCKS, SettingKind::Path, |c| {
         path(&c.worktree_root)
     }),
-    daemon("brain_dir", BRAIN, SettingKind::Path, |c| {
+    daemon("user_name", BRAIN, EMPTY_OK, |c| text(&c.user_name)),
+    daemon("notes_dir", BRAIN, SettingKind::Path, |c| {
         path(&c.brain_dir)
     }),
     daemon("beads_dir", BRAIN, SettingKind::Path, |c| {
@@ -356,7 +387,18 @@ fn split(key: &str) -> (Option<&str>, &str) {
     }
 }
 
+/// The key the file uses for `key`: `notes_dir` is `brain_dir` in a file
+/// written before the rename, and edits keep that spelling.
+fn file_key<'a>(doc: &DocumentMut, key: &'a str) -> &'a str {
+    if key == "notes_dir" && doc.get("notes_dir").is_none() && doc.get("brain_dir").is_some() {
+        "brain_dir"
+    } else {
+        key
+    }
+}
+
 fn lookup<'a>(doc: &'a DocumentMut, key: &str) -> Option<&'a Item> {
+    let key = file_key(doc, key);
     match split(key) {
         (Some(t), k) => doc.get(t)?.get(k),
         (None, k) => doc.get(k),
@@ -446,6 +488,7 @@ pub fn read(
         targets_note: files.targets_note.clone(),
         targets_error: files.targets_error.clone(),
         daemon,
+        jira_token_set: false,
     }
 }
 
@@ -594,9 +637,13 @@ pub fn save(
         match edit {
             SettingEdit::Set { value, .. } => {
                 check(spec, value)?;
-                set(&mut doc, key, to_toml(spec, value))?;
+                let at = file_key(&doc, key).to_string();
+                set(&mut doc, &at, to_toml(spec, value))?;
             }
-            SettingEdit::Reset { .. } => remove(&mut doc, key),
+            SettingEdit::Reset { .. } => {
+                let at = file_key(&doc, key).to_string();
+                remove(&mut doc, &at);
+            }
         }
     }
     if edits.is_empty() {
@@ -1151,6 +1198,59 @@ mod tests {
         rig.save(&[put("jira_poll_secs", SettingValue::Int(60))])
             .unwrap();
         assert_eq!(rig.text(), "jira_poll_secs = 60\n");
+    }
+
+    #[test]
+    fn notes_dir_saves_into_old_key() {
+        // A file from before the rename keeps its `brain_dir` spelling.
+        let rig = Rig::new(Some("brain_dir = \"~/old\"\n"));
+        let v = rig.view(&running_defaults());
+        let row_ = row(&v, "notes_dir");
+        assert!(row_.in_file);
+        assert_eq!(row_.value, SettingValue::Text("~/old".into()));
+        rig.save(&[put("notes_dir", SettingValue::Text("~/new".into()))])
+            .unwrap();
+        assert_eq!(rig.text(), "brain_dir = \"~/new\"\n");
+        rig.save(&[SettingEdit::Reset {
+            key: "notes_dir".into(),
+        }])
+        .unwrap();
+        assert_eq!(rig.text(), "");
+        // A file with neither key gets the new name.
+        rig.save(&[put("notes_dir", SettingValue::Text("~/n".into()))])
+            .unwrap();
+        assert_eq!(rig.text(), "notes_dir = \"~/n\"\n");
+        // A file already on the new key keeps it.
+        let rig = Rig::new(Some("notes_dir = \"~/a\"\n"));
+        rig.save(&[put("notes_dir", SettingValue::Text("~/b".into()))])
+            .unwrap();
+        assert_eq!(rig.text(), "notes_dir = \"~/b\"\n");
+    }
+
+    #[test]
+    fn jira_and_notes_rows_and_an_empty_ticket_pattern() {
+        let rig = Rig::new(None);
+        let v = rig.view(&running_defaults());
+        for key in ["jira_site", "jira_email", "jira_board", "jira_cloud_id"] {
+            assert_eq!(row(&v, key).group, "Jira", "{key}");
+            assert_eq!(row(&v, key).applies, Applies::Restart, "{key}");
+        }
+        assert_eq!(row(&v, "user_name").group, "Notes");
+        assert_eq!(row(&v, "notes_dir").group, "Notes");
+        assert!(v.settings.iter().all(|s| s.group != "2ndBrain"));
+        assert_eq!(
+            row(&v, "ticket_pattern").note.as_deref(),
+            Some("Empty: built from your Jira project keys")
+        );
+        rig.save(&[
+            put("ticket_pattern", SettingValue::Text(String::new())),
+            put("jira_site", SettingValue::Text("demo.atlassian.net".into())),
+            put("jira_email", SettingValue::Text("demo@example.test".into())),
+            put("jira_board", SettingValue::Text(String::new())),
+        ])
+        .unwrap();
+        assert!(rig.text().contains("ticket_pattern = \"\""));
+        assert!(rig.text().contains("jira_site = \"demo.atlassian.net\""));
     }
 
     #[test]

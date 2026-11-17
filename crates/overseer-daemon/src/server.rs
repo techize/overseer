@@ -62,6 +62,7 @@ struct SettingsCtx {
     running: crate::config::Config,
     home: PathBuf,
     save: Mutex<()>,
+    env: BaseEnv,
 }
 
 impl SettingsCtx {
@@ -78,6 +79,44 @@ impl SettingsCtx {
         let _one = self.save.lock().unwrap();
         match crate::settings::save(&self.files, &self.home, base_hash, edits) {
             Ok(()) => self.view(info),
+            Err(message) => Response::Error { message },
+        }
+    }
+
+    /// Whether a Jira token is stored for the running `jira_email`. The
+    /// Keychain read is bounded, so a locked Keychain reads as not set.
+    async fn token_set(&self) -> bool {
+        let email = self.running.jira_email.trim();
+        if email.is_empty() {
+            return false;
+        }
+        let vars = self.env.get();
+        crate::work::token::jira_token(email, &vars, &self.files.security)
+            .await
+            .is_ok()
+    }
+
+    /// `resp` with `jira_token_set` filled in when it is a Settings view.
+    async fn with_token_state(&self, resp: Response) -> Response {
+        match resp {
+            Response::Settings(mut v) => {
+                v.jira_token_set = self.token_set().await;
+                Response::Settings(v)
+            }
+            other => other,
+        }
+    }
+
+    /// Stores `token` in the Keychain. It is not logged or answered.
+    async fn set_token(&self, token: &str) -> Response {
+        let email = self.running.jira_email.trim();
+        if email.is_empty() {
+            return Response::Error {
+                message: "set jira_email first".into(),
+            };
+        }
+        match crate::work::token::save_jira_token(email, token, &self.files.security).await {
+            Ok(()) => Response::Ok,
             Err(message) => Response::Error { message },
         }
     }
@@ -131,16 +170,17 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
         started_at: unix_now(),
         exe: std::env::current_exe().unwrap_or_default(),
     });
+    // Resolved in the background so clients can connect at once; a
+    // StartSlot waits for it.
+    let env = BaseEnv::start(&cfg.env);
     let settings = Arc::new(SettingsCtx {
         files: cfg.files,
         running: cfg.settings.clone(),
         // The same home `main` expands `config.toml` against.
         home: crate::config::home_from_env(),
         save: Mutex::new(()),
+        env: env.clone(),
     });
-    // Resolved in the background so clients can connect at once; a
-    // StartSlot waits for it.
-    let env = BaseEnv::start(&cfg.env);
     let (events, _) = broadcast::channel::<Event>(EVENT_CHANNEL_CAP);
     let db = cfg.state_dir.join("overseer.db");
     let ledger = match Ledger::open(&db) {
@@ -654,7 +694,7 @@ struct Ctx<'a> {
     state_dir: &'a Path,
     brain: Option<&'a Arc<BrainService>>,
     info: &'a DaemonInfo,
-    settings: &'a SettingsCtx,
+    settings: &'a Arc<SettingsCtx>,
 }
 
 fn handle_frame(
@@ -680,6 +720,43 @@ fn handle_frame(
                     seq,
                     resp: Response::Work(task_store.view()),
                 });
+            });
+        }
+        // The Settings view says whether a token is stored, which reads the
+        // Keychain (bounded, but not instant), so the settings requests are
+        // answered from a task. Saves stay one at a time inside `save`.
+        Frame::Request {
+            seq,
+            req: Request::GetSettings,
+        } => {
+            let (settings, info) = (ctx.settings.clone(), ctx.info.clone());
+            let outbox = outbox.clone();
+            store.spawn(async move {
+                let resp = settings.with_token_state(settings.view(&info)).await;
+                outbox.send(Frame::Response { seq, resp });
+            });
+        }
+        Frame::Request {
+            seq,
+            req: Request::SaveSettings { base_hash, edits },
+        } => {
+            let (settings, info) = (ctx.settings.clone(), ctx.info.clone());
+            let outbox = outbox.clone();
+            store.spawn(async move {
+                let saved = settings.save(&info, &base_hash, &edits);
+                let resp = settings.with_token_state(saved).await;
+                outbox.send(Frame::Response { seq, resp });
+            });
+        }
+        Frame::Request {
+            seq,
+            req: Request::SetJiraToken { token },
+        } => {
+            let settings = ctx.settings.clone();
+            let outbox = outbox.clone();
+            store.spawn(async move {
+                let resp = settings.set_token(token.expose()).await;
+                outbox.send(Frame::Response { seq, resp });
             });
         }
         // Approving a plan creates worktrees and starts sessions, so it is
@@ -869,13 +946,15 @@ fn handle_request(
         }
         Request::ListSlots => Response::Slots(manager.lock().unwrap().list()),
         Request::DaemonInfo => Response::DaemonInfo(ctx.info.clone()),
-        Request::GetSettings => ctx.settings.view(ctx.info),
-        Request::SaveSettings { base_hash, edits } => {
-            ctx.settings.save(ctx.info, &base_hash, &edits)
-        }
-        // RefreshWorkItems is answered in `handle_frame` once the sources
-        // have run; this arm only keeps the match whole.
+        // RefreshWorkItems and the settings requests are answered in
+        // `handle_frame` from a task of their own (they can wait on the
+        // Keychain); this arm only keeps the match whole.
         Request::ListWorkItems | Request::RefreshWorkItems => Response::Work(store.view()),
+        Request::GetSettings | Request::SaveSettings { .. } | Request::SetJiraToken { .. } => {
+            Response::Error {
+                message: "settings requests are answered by the connection".into(),
+            }
+        }
         Request::Assign {
             key,
             slot,

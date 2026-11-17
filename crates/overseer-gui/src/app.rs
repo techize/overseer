@@ -1666,7 +1666,9 @@ impl OverseerApp {
             .slots
             .get(id as usize)
             .filter(|i| matches!(i.state, SlotState::Exited { .. }));
-        let dialog = cx.new(|cx| StartDialog::new(id, client, last, prefill, cx));
+        let notes_dir = self.brain.brain_dir.clone();
+        let dialog =
+            cx.new(|cx| StartDialog::new(id, client, last, prefill, notes_dir.as_deref(), cx));
         let sub = cx.subscribe_in(&dialog, window, |this, _, ev: &DialogEvent, window, cx| {
             this.dialog = None;
             match ev {

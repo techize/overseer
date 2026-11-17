@@ -402,7 +402,7 @@ fn print_text_or_queued(resp: Response) -> anyhow::Result<()> {
     }
 }
 
-/// `$OVERSEER_SLOT`, when it names a slot: who a 2ndBrain write is from.
+/// `$OVERSEER_SLOT`, when it names a slot: who a notes write is from.
 fn env_slot() -> Option<SlotId> {
     std::env::var("OVERSEER_SLOT")
         .ok()
@@ -1268,13 +1268,14 @@ mod tests {
             file_hash: String::new(),
             load_error: Some("bad line 3".into()),
             settings: vec![
-                row("shared_files", "2ndBrain", Applies::Restart, true, true),
+                row("shared_files", "Notes", Applies::Restart, true, true),
                 row("jira_command", "Commands", Applies::ReadOnly, false, false),
                 row("bd_command", "Commands", Applies::ReadOnly, true, false),
             ],
             targets_path: "/tmp/demo/targets.toml".into(),
             targets_note: "3 built-in patterns; /tmp/demo/targets.toml does not exist".into(),
             targets_error: Some("broken".into()),
+            jira_token_set: false,
             daemon: DaemonInfo {
                 version: "0.1.0".into(),
                 build: "dev".into(),
@@ -1287,7 +1288,7 @@ mod tests {
             format_settings(&v),
             vec![
                 "config.toml: /tmp/demo/config.toml",
-                "2ndBrain",
+                "Notes",
                 r#"  shared_files = ["a.md"]  (from the file)  restart needed"#,
                 "Commands",
                 r#"  jira_command = ["a.md"]  (default)  read-only"#,

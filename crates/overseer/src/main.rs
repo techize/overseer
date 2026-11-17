@@ -120,6 +120,7 @@ fn main() {
                 config_error,
                 targets,
                 targets_error,
+                security: overseer_daemon::work::store::SECURITY.to_owned(),
             };
             let result = runtime().and_then(|rt| {
                 rt.block_on(overseer_daemon::run(DaemonConfig {

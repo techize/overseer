@@ -242,6 +242,107 @@ async fn daemon_info_reports_pid_and_start() {
     assert!((now - info.started_at).abs() <= 5, "{}", info.started_at);
 }
 
+/// A daemon whose Settings use `security` for the Jira token.
+async fn start_daemon_with_security(email: &str, security: String) -> Daemon {
+    let socket = temp_socket();
+    let state_dir = socket.parent().unwrap().join("state");
+    let mut files = overseer_daemon::SettingsFiles::in_dir(&state_dir);
+    files.security = security;
+    let cfg = DaemonConfig {
+        socket: socket.clone(),
+        default_command: vec![SCRIPT.to_string()],
+        // An empty token variable hides one from the developer's shell.
+        env: overseer_daemon::EnvSource::InheritWith(vec![(
+            "ATLASSIAN_API_TOKEN".into(),
+            String::new(),
+        )]),
+        state_dir: state_dir.clone(),
+        files,
+        hook_program: PathBuf::from("/bin/true"),
+        settings: overseer_daemon::Config {
+            jira_email: email.into(),
+            ..offline_settings()
+        },
+        patterns: default_patterns(),
+    };
+    let task = tokio::spawn(run(cfg));
+    for _ in 0..100 {
+        if UnixStream::connect(&socket).await.is_ok() {
+            return Daemon {
+                socket,
+                state_dir,
+                task,
+            };
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    panic!("daemon did not come up");
+}
+
+#[tokio::test]
+async fn jira_token_is_saved_through_security_and_never_answered() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("overseer-token-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // A stand-in for `security`: `-i` keeps the command it is given, and
+    // the read-back prints the token from it (nothing before a save).
+    let stub = dir.join("security");
+    let kept = dir.join("kept");
+    std::fs::write(
+        &stub,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = -i ]; then cat > '{k}'; exit 0; fi\n\
+             [ -f '{k}' ] || exit 44\n\
+             sed -n 's/.* -w \"\\(.*\\)\"$/\\1/p' '{k}'\n",
+            k = kept.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let d = start_daemon_with_security("demo@example.test", stub.to_str().unwrap().into()).await;
+    let mut c = Client::connect(&d.socket).await;
+    let Response::Settings(v) = c.request(Request::GetSettings).await else {
+        panic!("not a Settings reply");
+    };
+    assert!(!v.jira_token_set, "no token yet");
+    let resp = c
+        .request(Request::SetJiraToken {
+            token: "demo-token-123".into(),
+        })
+        .await;
+    assert_eq!(resp, Response::Ok);
+    let Response::Settings(v) = c.request(Request::GetSettings).await else {
+        panic!("not a Settings reply");
+    };
+    assert!(v.jira_token_set);
+    assert!(!format!("{v:?}").contains("demo-token-123"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn jira_token_needs_an_email_first() {
+    // The stub would fail the test if it ran: no email means no Keychain call.
+    let d = start_daemon_with_security(" ", "/nonexistent/overseer-security".into()).await;
+    let mut c = Client::connect(&d.socket).await;
+    let resp = c
+        .request(Request::SetJiraToken {
+            token: "demo-token-123".into(),
+        })
+        .await;
+    assert_eq!(
+        resp,
+        Response::Error {
+            message: "set jira_email first".into()
+        }
+    );
+    let Response::Settings(v) = c.request(Request::GetSettings).await else {
+        panic!("not a Settings reply");
+    };
+    assert!(!v.jira_token_set);
+}
+
 #[tokio::test]
 async fn settings_round_trip_over_the_socket() {
     use overseer_proto::settings::{SettingEdit, SettingValue};

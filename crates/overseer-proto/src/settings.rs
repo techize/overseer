@@ -89,6 +89,10 @@ pub struct SettingsView {
     pub targets_note: String,
     pub targets_error: Option<String>,
     pub daemon: DaemonInfo,
+    /// A Jira token is stored (Keychain or the environment). The token
+    /// itself never leaves the daemon.
+    #[serde(default)]
+    pub jira_token_set: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]

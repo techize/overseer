@@ -27,6 +27,32 @@ use crate::start_dialog::{edit_key, DialogKey, TextField};
 // Pure logic
 // ---------------------------------------------------------------------------
 
+/// The row in the Jira group that takes the API token. It has no entry in
+/// `config.toml`: the token goes to the Keychain through the daemon.
+const TOKEN_KEY: &str = "jira_token";
+const JIRA_GROUP: &str = "Jira";
+
+/// `set` or `not set`, for the token row.
+fn token_status(set: bool) -> &'static str {
+    if set {
+        "set"
+    } else {
+        "not set"
+    }
+}
+
+/// The field with every character shown as a bullet, cursor and selection
+/// kept, so a token is never on screen.
+fn masked(f: &TextField) -> TextField {
+    const BULLET: char = '\u{2022}';
+    let before = f.text[..f.cursor].chars().count();
+    TextField {
+        text: f.text.chars().map(|_| BULLET).collect(),
+        cursor: before * BULLET.len_utf8(),
+        selected: f.selected,
+    }
+}
+
 /// A value as the view shows and edits it: a list as comma-separated items,
 /// everything else as `ctl settings` prints it.
 fn value_text(v: &SettingValue) -> String {
@@ -71,6 +97,8 @@ pub struct SettingRow {
     pub can_reset: bool,
     /// Changed here and not saved yet.
     pub edited: bool,
+    /// What the daemon says about the key, for a row that can be edited.
+    pub note: Option<String>,
 }
 
 impl SettingsDraft {
@@ -200,6 +228,7 @@ impl SettingsDraft {
                     restart_needed: s.restart_needed,
                     can_reset: s.in_file && !reset && s.applies != Applies::ReadOnly,
                     edited: change.is_some(),
+                    note: s.note.clone(),
                 }
             })
             .collect()
@@ -389,6 +418,9 @@ pub struct SettingsPanel {
     closed: bool,
     scroll: ScrollHandle,
     focus_handle: FocusHandle,
+    /// The token row's answer after a send, until the next view replaces it.
+    token_set: Option<bool>,
+    token_busy: bool,
 }
 
 impl EventEmitter<SettingsEvent> for SettingsPanel {}
@@ -425,6 +457,8 @@ impl SettingsPanel {
             closed: false,
             scroll: ScrollHandle::new(),
             focus_handle: cx.focus_handle(),
+            token_set: None,
+            token_busy: false,
         };
         if !old {
             panel.load(cx);
@@ -505,6 +539,7 @@ impl SettingsPanel {
 
     /// A fresh draft over `view`, keeping the row being edited.
     fn show(&mut self, view: SettingsView) {
+        self.token_set = None;
         self.mode = Mode::Ready(Box::new(SettingsDraft::new(view)));
         self.esc.clear();
         let key = self.active.take();
@@ -540,13 +575,19 @@ impl SettingsPanel {
 
     /// Text and toggle rows, in order: what Tab moves between.
     fn editable_keys(&self) -> Vec<String> {
-        self.draft()
-            .map(|d| d.rows())
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|r| !matches!(r.value, RowValue::ReadOnly { .. }))
-            .map(|r| r.key)
-            .collect()
+        let rows = self.draft().map(|d| d.rows()).unwrap_or_default();
+        let last_jira = rows.iter().rposition(|r| r.group == JIRA_GROUP);
+        let mut keys = Vec::new();
+        for (i, r) in rows.into_iter().enumerate() {
+            if !matches!(r.value, RowValue::ReadOnly { .. }) {
+                keys.push(r.key);
+            }
+            // The token field follows the last Jira row.
+            if Some(i) == last_jira {
+                keys.push(TOKEN_KEY.to_string());
+            }
+        }
+        keys
     }
 
     fn activate(&mut self, key: Option<String>) {
@@ -604,6 +645,48 @@ impl SettingsPanel {
             d.set_text(&key, &text);
         }
         self.error = None;
+    }
+
+    /// Sends the typed token to the daemon, which stores it in the
+    /// Keychain. The field is cleared at once and never filled back in.
+    fn send_token(&mut self, cx: &mut Context<Self>) {
+        let token = std::mem::take(&mut self.field.text);
+        self.field = TextField::default();
+        let token = token.trim().to_string();
+        if token.is_empty() {
+            self.note = Some("Type the Jira token first.".to_string());
+            cx.notify();
+            return;
+        }
+        if self.token_busy {
+            return;
+        }
+        self.token_busy = true;
+        self.error = None;
+        self.note = None;
+        let client = self.client.clone();
+        cx.spawn(async move |this, cx| {
+            let reply = client
+                .request(Request::SetJiraToken {
+                    token: token.into(),
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.token_busy = false;
+                match reply {
+                    Ok(Response::Ok) => {
+                        this.token_set = Some(true);
+                        this.note = Some("Jira token saved to the Keychain.".to_string());
+                    }
+                    Ok(Response::Error { message }) => this.error = Some(message),
+                    Ok(other) => this.error = Some(format!("Unexpected reply: {other:?}")),
+                    Err(e) => this.error = Some(lost(e)),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
     fn active_is_toggle(&self) -> bool {
@@ -766,6 +849,7 @@ impl SettingsPanel {
                     self.typed();
                 }
             }
+            DialogKey::Submit if self.active.as_deref() == Some(TOKEN_KEY) => self.send_token(cx),
             DialogKey::Submit => self.save(cx),
             DialogKey::NextField
             | DialogKey::PrevField
@@ -853,10 +937,8 @@ impl SettingsPanel {
                     gpui::StyledText::new(t.clone())
                 };
                 let k = key.clone();
-                div()
+                let field = div()
                     .id(("field", i))
-                    .flex_1()
-                    .min_w(px(0.))
                     .px_2()
                     .py_1()
                     .rounded(px(4.))
@@ -873,7 +955,14 @@ impl SettingsPanel {
                         this.esc.clear();
                         this.activate(Some(k.clone()));
                         cx.notify();
-                    }))
+                    }));
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .flex()
+                    .flex_col()
+                    .child(field)
+                    .children(row.note.clone().map(|n| muted(n).px_2()))
                     .into_any_element()
             }
             RowValue::Toggle(b) => {
@@ -958,6 +1047,67 @@ impl SettingsPanel {
                     .child("restart needed")
             }))
             .children(reset)
+            .into_any_element()
+    }
+
+    /// The "Jira token" row: `set` or `not set`, a masked field and Save.
+    /// What is typed here is sent to the daemon and never shown or kept.
+    fn render_token_row(
+        &self,
+        set: bool,
+        focused: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let active = self.active.as_deref() == Some(TOKEN_KEY);
+        let text = if active {
+            masked(&self.field).display(focused)
+        } else {
+            gpui::StyledText::new(String::new())
+        };
+        let field = div()
+            .id("token-field")
+            .flex_1()
+            .min_w(px(0.))
+            .min_h(px(26.))
+            .px_2()
+            .py_1()
+            .rounded(px(4.))
+            .bg(rgb(colors::FIELD))
+            .border_1()
+            .border_color(rgb(if active {
+                colors::ACCENT
+            } else {
+                colors::BORDER
+            }))
+            .cursor_text()
+            .child(text)
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.esc.clear();
+                this.activate(Some(TOKEN_KEY.to_string()));
+                cx.notify();
+            }));
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(div().w(px(170.)).flex_none().child("Jira token"))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .flex()
+                    .flex_col()
+                    .child(div().flex().items_center().gap_2().child(field).child(
+                        button("save-token", "Save", false, !self.token_busy).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.esc.clear();
+                                this.send_token(cx);
+                            }),
+                        ),
+                    ))
+                    .child(muted("Stored in the macOS Keychain, never in config.toml").px_2()),
+            )
+            .child(muted(token_status(set)).w(px(84.)).flex_none())
             .into_any_element()
     }
 
@@ -1048,8 +1198,12 @@ impl Render for SettingsPanel {
                         .into_any_element()
                 }));
                 let mut group = String::new();
+                let token_set = self.token_set.unwrap_or(view.jira_token_set);
                 for (i, row) in d.rows().into_iter().enumerate() {
                     if row.group != group {
+                        if group == JIRA_GROUP {
+                            body.push(self.render_token_row(token_set, focused, cx));
+                        }
                         group = row.group.clone();
                         body.push(heading(&group).into_any_element());
                     }
@@ -1229,7 +1383,7 @@ mod tests {
         jql.in_file = true;
         let mut writer = setting(
             "brain_writer",
-            "2ndBrain",
+            "Notes",
             SettingKind::Bool,
             Applies::ReadOnly,
             SettingValue::Bool(false),
@@ -1257,14 +1411,14 @@ mod tests {
                 ),
                 setting(
                     "shared_files",
-                    "2ndBrain",
+                    "Notes",
                     SettingKind::List,
                     Applies::Restart,
                     SettingValue::List(vec!["CURRENT.md".into()]),
                 ),
                 setting(
                     "push",
-                    "2ndBrain",
+                    "Notes",
                     SettingKind::Bool,
                     Applies::Restart,
                     SettingValue::Bool(true),
@@ -1284,6 +1438,7 @@ mod tests {
             targets_path: "/tmp/demo/targets.toml".into(),
             targets_note: "3 built-in patterns; /tmp/demo/targets.toml does not exist".into(),
             targets_error: None,
+            jira_token_set: false,
             daemon: DaemonInfo {
                 version: "0.1.0".into(),
                 build: "b1".into(),
@@ -1299,6 +1454,41 @@ mod tests {
             key: key.into(),
             value,
         }
+    }
+
+    #[test]
+    fn the_token_row_says_set_or_not_set() {
+        assert_eq!(token_status(true), "set");
+        assert_eq!(token_status(false), "not set");
+    }
+
+    #[test]
+    fn a_masked_token_shows_no_characters() {
+        let f = TextField::new("demo-secret");
+        let m = masked(&f);
+        assert!(!m.text.contains("demo") && !m.text.contains('s'));
+        assert_eq!(m.text.chars().count(), 11);
+        assert_eq!(m.cursor, m.text.len());
+        // The cursor stays between the same characters.
+        let mut f = TextField::new("abcd");
+        f.left();
+        f.left();
+        let m = masked(&f);
+        assert_eq!(m.text.chars().count(), 4);
+        assert_eq!(m.cursor, 2 * '\u{2022}'.len_utf8());
+        assert!(masked(&TextField::default()).text.is_empty());
+    }
+
+    #[test]
+    fn rows_carry_the_daemons_note() {
+        let mut v = view();
+        v.settings[0].note = Some("Empty: built from your Jira project keys".into());
+        let d = SettingsDraft::new(v);
+        let row = d.rows().into_iter().find(|r| r.key == "jql").unwrap();
+        assert_eq!(
+            row.note.as_deref(),
+            Some("Empty: built from your Jira project keys")
+        );
     }
 
     #[test]

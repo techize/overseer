@@ -16,8 +16,8 @@ use overseer_proto::{slot_name, Client, Request, Response, SlotId, SlotInfo};
 use crate::app::colors;
 use crate::board::tilde;
 
-/// Starting cwd.
-pub const DEFAULT_CWD: &str = "~/Repos/2ndBrain";
+/// Starting cwd when the notes folder is not known yet.
+pub const FALLBACK_CWD: &str = "~";
 /// Starting command. Left as is, the request names no command, so the daemon
 /// runs its default (`claude`, or `OVERSEER_DEFAULT_COMMAND`).
 pub const DEFAULT_COMMAND: &str = "claude";
@@ -252,8 +252,14 @@ pub fn expand_tilde(s: &str, home: Option<&Path>) -> PathBuf {
 
 /// Label, folder and command the dialog starts with: those of `last` when
 /// it ran before, else the defaults, with the label `coordinator` for S0
-/// and empty for the others.
-pub fn initial_fields(slot: SlotId, last: Option<&SlotInfo>, home: Option<&Path>) -> [String; 3] {
+/// and empty for the others. The default folder is the notes folder
+/// (`notes_dir`, once the daemon has said where it is), else `~`.
+pub fn initial_fields(
+    slot: SlotId,
+    last: Option<&SlotInfo>,
+    home: Option<&Path>,
+    notes_dir: Option<&Path>,
+) -> [String; 3] {
     match last.and_then(|i| Some((i, i.cwd.as_deref()?))) {
         Some((info, cwd)) => [
             info.label.clone(),
@@ -264,7 +270,8 @@ pub fn initial_fields(slot: SlotId, last: Option<&SlotInfo>, home: Option<&Path>
         ],
         None => {
             let label = if slot == 0 { "coordinator" } else { "" };
-            [label.into(), DEFAULT_CWD.into(), DEFAULT_COMMAND.into()]
+            let cwd = notes_dir.map_or_else(|| FALLBACK_CWD.to_string(), |d| tilde(d, home));
+            [label.into(), cwd, DEFAULT_COMMAND.into()]
         }
     }
 }
@@ -286,8 +293,9 @@ pub fn prefilled_fields(
     last: Option<&SlotInfo>,
     home: Option<&Path>,
     prefill: Option<&Prefill>,
+    notes_dir: Option<&Path>,
 ) -> [String; 3] {
-    let mut fields = initial_fields(slot, last, home);
+    let mut fields = initial_fields(slot, last, home, notes_dir);
     if let Some(p) = prefill {
         fields[0] = p.label.clone();
     }
@@ -433,16 +441,19 @@ impl Focusable for StartDialog {
 impl StartDialog {
     /// The dialog for `slot`, filled in from `last` (the slot's previous
     /// run) when there is one, else with the defaults. With `prefill` the
-    /// label is its own and the session starts with its prompt.
+    /// label is its own and the session starts with its prompt. A new
+    /// session starts in `notes_dir` when it is known.
     pub fn new(
         slot: SlotId,
         client: Arc<Client>,
         last: Option<&SlotInfo>,
         prefill: Option<Prefill>,
+        notes_dir: Option<&Path>,
         cx: &mut Context<Self>,
     ) -> Self {
         let home = std::env::var_os("HOME").map(PathBuf::from);
-        let [label, cwd, command] = prefilled_fields(slot, last, home.as_deref(), prefill.as_ref());
+        let [label, cwd, command] =
+            prefilled_fields(slot, last, home.as_deref(), prefill.as_ref(), notes_dir);
         StartDialog {
             slot,
             client,
@@ -756,7 +767,7 @@ mod tests {
             session_note: None,
         };
         assert_eq!(
-            initial_fields(2, Some(&last), home),
+            initial_fields(2, Some(&last), home, notes()),
             [
                 "eks".to_string(),
                 "~/Repos/eks".into(),
@@ -764,15 +775,47 @@ mod tests {
             ]
         );
         last.command = None;
-        assert_eq!(initial_fields(2, Some(&last), home)[2], DEFAULT_COMMAND);
+        assert_eq!(
+            initial_fields(2, Some(&last), home, notes())[2],
+            DEFAULT_COMMAND
+        );
         last.cwd = None;
         assert_eq!(
-            initial_fields(2, Some(&last), home),
-            [String::new(), DEFAULT_CWD.into(), DEFAULT_COMMAND.into()]
+            initial_fields(2, Some(&last), home, notes()),
+            [String::new(), "~/notes".into(), DEFAULT_COMMAND.into()]
         );
-        assert_eq!(initial_fields(2, None, home)[1], "~/Repos/2ndBrain");
-        assert_eq!(initial_fields(0, None, home)[0], "coordinator");
-        assert_eq!(initial_fields(2, None, home)[0], "");
+        assert_eq!(initial_fields(0, None, home, notes())[0], "coordinator");
+        assert_eq!(initial_fields(2, None, home, notes())[0], "");
+    }
+
+    #[test]
+    fn the_folder_defaults_to_the_given_notes_folder_else_home() {
+        let home = Some(Path::new("/Users/me"));
+        assert_eq!(
+            initial_fields(2, None, home, Some(Path::new("/Users/me/notes")))[1],
+            "~/notes"
+        );
+        assert_eq!(
+            initial_fields(2, None, home, Some(Path::new("/srv/demo-notes")))[1],
+            "/srv/demo-notes"
+        );
+        assert_eq!(initial_fields(2, None, home, None)[1], "~");
+        // A stopped session keeps its own folder, whatever the notes folder is.
+        let last = SlotInfo {
+            id: 2,
+            label: "eks".into(),
+            cwd: Some("/Users/me/Repos/eks".into()),
+            command: None,
+            state: overseer_proto::SlotState::Exited { code: None, at: 1 },
+            cols: 80,
+            rows: 24,
+            activity: None,
+            session_note: None,
+        };
+        assert_eq!(
+            initial_fields(2, Some(&last), home, Some(Path::new("/srv/demo-notes")))[1],
+            "~/Repos/eks"
+        );
     }
 
     #[test]
@@ -903,15 +946,19 @@ mod tests {
         Some(Path::new("/Users/me"))
     }
 
+    fn notes() -> Option<&'static Path> {
+        Some(Path::new("/Users/me/notes"))
+    }
+
     #[test]
     fn defaults_build_a_default_command_request() {
-        let r = build_request(5, "", DEFAULT_CWD, DEFAULT_COMMAND, None, home(), |_| true).unwrap();
+        let r = build_request(5, "", "~/notes", DEFAULT_COMMAND, None, home(), |_| true).unwrap();
         assert_eq!(
             r,
             Request::StartSlot {
                 id: 5,
-                label: "2ndBrain".into(),
-                cwd: "/Users/me/Repos/2ndBrain".into(),
+                label: "notes".into(),
+                cwd: "/Users/me/notes".into(),
                 command: None,
                 prompt: None,
             }
@@ -950,9 +997,9 @@ mod tests {
             prompt: kickoff.into(),
             keys: vec!["DEMO-12".into(), "ov-3".into()],
         };
-        let [label, cwd, command] = prefilled_fields(3, None, home(), Some(&prefill));
+        let [label, cwd, command] = prefilled_fields(3, None, home(), Some(&prefill), notes());
         assert_eq!(label, "DEMO-12");
-        assert_eq!(cwd, DEFAULT_CWD);
+        assert_eq!(cwd, "~/notes");
         let r = build_request(
             3,
             &label,
@@ -968,7 +1015,7 @@ mod tests {
             Request::StartSlot {
                 id: 3,
                 label: "DEMO-12".into(),
-                cwd: "/Users/me/Repos/2ndBrain".into(),
+                cwd: "/Users/me/notes".into(),
                 command: None,
                 prompt: Some(kickoff.into()),
             }
@@ -986,7 +1033,7 @@ mod tests {
             session_note: None,
         };
         assert_eq!(
-            prefilled_fields(3, Some(&last), home(), Some(&prefill)),
+            prefilled_fields(3, Some(&last), home(), Some(&prefill), notes()),
             [
                 "DEMO-12".to_string(),
                 "~/Repos/eks".into(),

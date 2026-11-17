@@ -619,6 +619,43 @@ pub enum Request {
         base_hash: String,
         edits: Vec<SettingEdit>,
     },
+    /// Store the Jira API token in the Keychain for `jira_email`; answers
+    /// `Response::Ok` or an error. The token is never shown in a `Debug`
+    /// dump, and the daemon never logs or answers it.
+    SetJiraToken {
+        token: SecretText,
+    },
+}
+
+/// A secret in a request. It travels as a plain string, but `Debug` shows
+/// `"<hidden>"`, so a logged request cannot leak it.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SecretText(String);
+
+impl SecretText {
+    /// The secret itself, for the one place that must use it.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for SecretText {
+    fn from(s: String) -> Self {
+        SecretText(s)
+    }
+}
+
+impl From<&str> for SecretText {
+    fn from(s: &str) -> Self {
+        SecretText(s.to_owned())
+    }
+}
+
+impl std::fmt::Debug for SecretText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("\"<hidden>\"")
+    }
 }
 
 /// One write target a plan has a slot claim.
@@ -1514,6 +1551,24 @@ mod tests {
     }
 
     #[test]
+    fn set_jira_token_debug_hides_the_token() {
+        let req = Request::SetJiraToken {
+            token: "demo-secret-token".into(),
+        };
+        let shown = format!("{req:?}");
+        assert_eq!(shown, r#"SetJiraToken { token: "<hidden>" }"#);
+        assert!(!shown.contains("demo-secret"));
+        // On the wire it is a plain string, and it round-trips.
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("demo-secret-token"));
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, req);
+        // A frame holding it hides it too.
+        let frame = format!("{:?}", crate::Frame::Request { seq: 1, req });
+        assert!(!frame.contains("demo-secret"), "{frame}");
+    }
+
+    #[test]
     fn settings_messages_round_trip() {
         use crate::settings::{Applies, Setting, SettingKind, SettingValue};
         for req in [
@@ -1539,7 +1594,7 @@ mod tests {
             load_error: None,
             settings: vec![Setting {
                 key: "shared_files".into(),
-                group: "2ndBrain".into(),
+                group: "Notes".into(),
                 kind: SettingKind::List,
                 applies: Applies::Restart,
                 value: SettingValue::List(vec!["a.md".into()]),
@@ -1551,6 +1606,7 @@ mod tests {
             targets_path: "/tmp/demo/targets.toml".into(),
             targets_note: "3 built-in patterns; /tmp/demo/targets.toml does not exist".into(),
             targets_error: None,
+            jira_token_set: false,
             daemon: DaemonInfo {
                 version: "0.1.0".into(),
                 build: "dev".into(),
