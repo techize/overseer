@@ -229,3 +229,54 @@ async fn catch_up_fills_a_lag_gap_from_the_ring() {
     }
     assert_eq!(expect, 200000);
 }
+
+/// Claude Code redraws only the cells that change, so the input box's rules
+/// are drawn once. After 4 MiB of later output the ring no longer holds
+/// them, and replaying it loses the box (#21). The slot's live screen keeps
+/// it.
+#[tokio::test]
+async fn the_live_screen_keeps_the_box_after_the_ring_wraps() {
+    use overseer_daemon::relay::screen::{input_box, screen_of, InputBox};
+    let (tx, _keep) = broadcast::channel(16);
+    // The box once, then ~5 MB of updates to row 1 only, then DONE on row 2.
+    let script = r#"BEGIN {
+        rule = ""; for (i = 0; i < 80; i++) rule = rule "─";
+        x = ""; for (i = 0; i < 80; i++) x = x "x";
+        printf "\033[2J\033[10;1H%s\033[11;1H❯ \033[12;1H%s", rule, rule;
+        for (i = 0; i < 60000; i++) printf "\033[1;1H%s", x;
+        printf "\033[2;1HDONE";
+        fflush();
+        system("sleep 30");
+    }"#;
+    let slot = Slot::spawn(
+        6,
+        "wrap".into(),
+        Path::new("/tmp"),
+        &["/usr/bin/awk".into(), script.into()],
+        80,
+        24,
+        tx,
+    )
+    .unwrap();
+    let snap = timeout(Duration::from_secs(30), async {
+        loop {
+            let (snap, _) = slot.screen();
+            let row2: String = snap.cells[snap.cols..2 * snap.cols]
+                .iter()
+                .map(|c| c.ch)
+                .collect();
+            if row2.starts_with("DONE") {
+                break snap;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the script finished drawing");
+    assert_eq!(input_box(&snap), InputBox::Empty);
+    // The ring has wrapped: a replay of it no longer finds the box.
+    let (bytes, _) = slot.attach();
+    let (replayed, _) = screen_of(&bytes, 80, 24);
+    assert_eq!(input_box(&replayed), InputBox::NotFound);
+    slot.kill();
+}

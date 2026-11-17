@@ -1,4 +1,5 @@
-//! A single PTY-backed slot: child process, output ring and output broadcast.
+//! A single PTY-backed slot: child process, output ring, live screen and
+//! output broadcast.
 
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
@@ -9,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context};
 use bytes::Bytes;
 use overseer_proto::{slot_name, SlotId, SlotInfo, SlotState};
+use overseer_term::{Snapshot, TermBridge, TermModes};
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use tokio::sync::{broadcast, watch};
 
@@ -48,6 +50,10 @@ pub struct Slot {
     writer: Mutex<Box<dyn Write + Send>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     ring: Arc<Mutex<RingBuffer>>,
+    /// The screen as a terminal following the whole output would show it,
+    /// fed every chunk. Claude Code redraws only the cells that change, so a
+    /// replay of the ring alone loses rows drawn before its oldest byte.
+    screen: Arc<Mutex<TermBridge>>,
     /// Weak so the channel still closes when the reader thread ends.
     out: broadcast::WeakSender<Bytes>,
     exit_rx: watch::Receiver<ExitValue>,
@@ -133,6 +139,8 @@ impl Slot {
         let ring = Arc::new(Mutex::new(RingBuffer::new(RING_CAP)));
         let out_weak = out.downgrade();
         let reader_ring = ring.clone();
+        let screen = Arc::new(Mutex::new(TermBridge::new(cols as usize, rows as usize, 0)));
+        let reader_screen = screen.clone();
         std::thread::Builder::new()
             .name(format!("pty-read-{}", slot_name(id)))
             .spawn(move || {
@@ -144,9 +152,16 @@ impl Slot {
                             // Push and broadcast under one lock so `attach` sees
                             // each chunk either in its snapshot or on its
                             // receiver, never both and never neither.
-                            let mut ring = reader_ring.lock().unwrap();
-                            ring.push(&buf[..n]);
-                            let _ = out.send(Bytes::copy_from_slice(&buf[..n]));
+                            {
+                                let mut ring = reader_ring.lock().unwrap();
+                                ring.push(&buf[..n]);
+                                let _ = out.send(Bytes::copy_from_slice(&buf[..n]));
+                            }
+                            // Replies to terminal queries are the attached
+                            // clients' to send; this screen only watches.
+                            let mut screen = reader_screen.lock().unwrap();
+                            screen.feed(&buf[..n]);
+                            screen.take_pty_writes();
                         }
                         Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                         Err(_) => break,
@@ -193,6 +208,7 @@ impl Slot {
             writer: Mutex::new(writer),
             killer: Mutex::new(killer),
             ring,
+            screen,
             out: out_weak,
             exit_rx,
             exited_at,
@@ -212,6 +228,9 @@ impl Slot {
     }
 
     pub fn resize(&self, cols: u16, rows: u16) -> anyhow::Result<()> {
+        // Held across the PTY resize, so the redraw the program sends on
+        // SIGWINCH is fed to the screen at the new size.
+        let mut screen = self.screen.lock().unwrap();
         self.master
             .lock()
             .unwrap()
@@ -222,6 +241,7 @@ impl Slot {
                 pixel_height: 0,
             })
             .context("resize pty")?;
+        screen.resize(cols as usize, rows as usize);
         *self.size.lock().unwrap() = (cols, rows);
         Ok(())
     }
@@ -231,6 +251,15 @@ impl Slot {
         if let Err(e) = self.killer.lock().unwrap().kill() {
             tracing::debug!("kill: {e}");
         }
+    }
+
+    /// The live screen and its terminal modes. A synchronized update that
+    /// has timed out is flushed first; one still open shows the screen as it
+    /// was before it began.
+    pub fn screen(&self) -> (Snapshot, TermModes) {
+        let mut screen = self.screen.lock().unwrap();
+        screen.tick();
+        (screen.snapshot(), screen.modes())
     }
 
     /// Current ring contents. For attaching a client use [`Slot::attach`],
