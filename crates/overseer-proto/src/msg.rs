@@ -923,6 +923,10 @@ pub struct BrainView {
     /// session note. `None` while the writer is off.
     #[serde(default)]
     pub brain_dir: Option<std::path::PathBuf>,
+    /// The notes folder when it exists, whether or not the writer is on:
+    /// where a new session starts.
+    #[serde(default)]
+    pub notes_dir: Option<std::path::PathBuf>,
 }
 
 /// A file write the `PreToolUse` hook asks the daemon to check.
@@ -1849,6 +1853,7 @@ mod tests {
             }),
             push_problem: None,
             brain_dir: None,
+            notes_dir: Some(PathBuf::from("/tmp/vault")),
         }
     }
 

@@ -1431,7 +1431,12 @@ async fn writer_off_answers_with_the_config_hint() {
         );
     }
     match ask(&socket, Request::BrainStatus).await {
-        Response::Brain(view) => assert!(!view.on),
+        Response::Brain(view) => {
+            assert!(!view.on);
+            assert_eq!(view.brain_dir, None);
+            // A new session still starts in the notes folder.
+            assert_eq!(view.notes_dir.as_deref(), Some(v.vault.as_path()));
+        }
         other => panic!("{other:?}"),
     }
     let check = WriteCheck {

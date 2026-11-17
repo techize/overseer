@@ -1350,6 +1350,7 @@ mod tests {
             last_sync: None,
             push_problem: None,
             brain_dir: None,
+            notes_dir: None,
         }
     }
 

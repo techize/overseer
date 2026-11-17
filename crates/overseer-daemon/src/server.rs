@@ -1096,9 +1096,10 @@ fn handle_request(
         | Request::EditShared { .. }
         | Request::UpdateCurrentSession { .. }
         | Request::RunBd { .. } => err(WRITER_OFF.to_string()),
-        Request::BrainStatus => {
-            Response::Brain(ctx.brain.map_or_else(BrainService::off_view, |b| b.view()))
-        }
+        Request::BrainStatus => Response::Brain(ctx.brain.map_or_else(
+            || BrainService::off_view(&ctx.settings.running.brain_dir),
+            |b| b.view(),
+        )),
         // While the writer is off the hook applies none of its checks.
         Request::CheckWrite(check) => Response::Verdict {
             deny: ctx

@@ -296,8 +296,9 @@ impl BrainService {
         Some(svc)
     }
 
-    /// The view the board shows while the writer is off.
-    pub fn off_view() -> BrainView {
+    /// The view the board shows while the writer is off. `notes_dir` is
+    /// the configured notes folder, sent only when it exists.
+    pub fn off_view(notes_dir: &Path) -> BrainView {
         BrainView {
             on: false,
             entries: Vec::new(),
@@ -305,6 +306,7 @@ impl BrainService {
             last_sync: None,
             push_problem: None,
             brain_dir: None,
+            notes_dir: notes_dir.is_dir().then(|| notes_dir.to_path_buf()),
         }
     }
 
@@ -355,6 +357,7 @@ impl BrainService {
             last_sync: run("sync"),
             push_problem: self.rt().push_problem.clone(),
             brain_dir: Some(self.cfg.brain.clone()),
+            notes_dir: Some(self.cfg.brain.clone()),
         }
     }
 
@@ -1641,6 +1644,17 @@ async fn run_program(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn off_view_names_the_notes_folder_only_when_it_exists() {
+        let t = tempfile::tempdir().unwrap();
+        let v = BrainService::off_view(t.path());
+        assert!(!v.on);
+        assert_eq!(v.brain_dir, None);
+        assert_eq!(v.notes_dir.as_deref(), Some(t.path()));
+        let gone = t.path().join("missing");
+        assert_eq!(BrainService::off_view(&gone).notes_dir, None);
+    }
 
     #[test]
     fn messages_lose_em_dashes_and_forged_trailers() {
