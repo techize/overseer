@@ -4,8 +4,8 @@
 use std::path::PathBuf;
 
 use gpui::{
-    div, prelude::*, px, relative, rgb, rgba, ClickEvent, Context, ElementId, FontWeight, Rgba,
-    SharedString, Window,
+    canvas, div, prelude::*, px, relative, rgb, rgba, ClickEvent, Context, CursorStyle, ElementId,
+    FontWeight, MouseButton, MouseDownEvent, Rgba, SharedString, Window,
 };
 use overseer_proto::{
     slot_name, ItemKind, PullRequest, SlotId, SlotInfo, SlotState, Stage, WorkItem, WorkView,
@@ -19,7 +19,6 @@ const DAY: i64 = 86_400;
 /// Height of the kanban block. Fixed so the board never grows with the
 /// ticket count: the header, the six session cards and this fit a 1440 by
 /// 900 window, and each column scrolls inside it.
-const KANBAN_HEIGHT: f32 = 340.;
 /// Rows the PR panel shows before `+N more`.
 const MAX_PR_ROWS: usize = 8;
 
@@ -1037,22 +1036,70 @@ impl OverseerApp {
                     )
             })
             .collect();
-        // A fixed height: a column with more than fits scrolls in place, so
-        // the session cards above never move and the footer stays on screen.
+        // A column with more than fits scrolls in place. The kanban fills
+        // the space left below the session cards, or keeps the height its
+        // top edge was dragged to; either way it shrinks to fit the window
+        // before the cards or the footer would move off screen.
+        let measured = self.kanban_measured.clone();
+        let panel = div()
+            .flex_1()
+            .min_h(px(0.))
+            .relative()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_2()
+            .rounded(px(6.))
+            .bg(rgb(colors::CARD))
+            .border_1()
+            .border_color(rgb(colors::BORDER))
+            .child(
+                canvas(
+                    move |b, _, _| measured.set(b.size.height.into()),
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
+            .child(header)
+            .child(div().flex_1().min_h(px(0.)).flex().gap_2().children(cols));
+        let handle = div()
+            .id("kanban-resize")
+            .flex_none()
+            .h(px(6.))
+            .mb(px(-3.))
+            .mt(px(-3.))
+            .rounded(px(3.))
+            .cursor(CursorStyle::ResizeUpDown)
+            .when(self.kanban_drag.is_some(), |d| d.bg(rgb(colors::ACCENT)))
+            .hover(|s| s.bg(rgb(colors::BORDER)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                    let y: f32 = ev.position.y.into();
+                    this.kanban_drag = Some((y, this.kanban_measured.get()));
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .on_click(cx.listener(|this, ev: &ClickEvent, _, cx| {
+                if ev.click_count() == 2 {
+                    this.kanban_drag = None;
+                    this.set_kanban_height(None);
+                    cx.notify();
+                }
+            }));
+        let sized = match self.kanban_height {
+            Some(h) => div().flex_shrink().h(px(h)),
+            None => div().flex_1(),
+        };
         Some(
-            div()
-                .flex_none()
-                .h(px(KANBAN_HEIGHT))
+            sized
+                .min_h(px(crate::kanban_size::MIN))
                 .flex()
                 .flex_col()
-                .gap_2()
-                .p_2()
-                .rounded(px(6.))
-                .bg(rgb(colors::CARD))
-                .border_1()
-                .border_color(rgb(colors::BORDER))
-                .child(header)
-                .child(div().flex_1().min_h(px(0.)).flex().gap_2().children(cols)),
+                .child(handle)
+                .child(panel),
         )
     }
 }
