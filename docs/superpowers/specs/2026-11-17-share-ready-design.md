@@ -106,7 +106,7 @@ Settings gets a "Jira token" field that writes the Keychain item through `securi
 
 **`notes_dir`** replaces `brain_dir` (`brain_dir` stays as an alias). Default:
 - `~/Repos/2ndBrain` if that folder exists (Jonathan's case, unchanged).
-- Otherwise `~/Overseer`, created on first use.
+- Otherwise `~/OverseerNotes`, created on first use. (Not `~/Overseer`: on a case-insensitive volume that is the source clone at `~/overseer`.)
 
 `beads_dir` defaults to the notes folder as today. A missing `bd` or no beads data is not an error for a folder Overseer owns.
 

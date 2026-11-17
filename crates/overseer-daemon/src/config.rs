@@ -23,7 +23,7 @@ pub struct Config {
     pub jira_board: String,
     pub jira_cloud_id: String,
     /// True when `brain_dir` is a folder Overseer owns (it holds the
-    /// `.overseer-notes` marker, or was defaulted to `~/Overseer`).
+    /// `.overseer-notes` marker, or was defaulted to `~/OverseerNotes`).
     #[serde(skip)]
     pub notes_owned: bool,
     /// Minutes a lock may go unused before the board flags it as long-held.
@@ -268,7 +268,7 @@ impl Config {
             if vault.is_dir() {
                 config.brain_dir = vault;
             } else {
-                config.brain_dir = home.join("Overseer");
+                config.brain_dir = home.join("OverseerNotes");
                 defaulted_overseer = true;
             }
         }
@@ -616,15 +616,18 @@ mod tests {
     }
 
     #[test]
-    fn no_file_without_vault_owns_overseer_folder() {
+    fn no_file_without_vault_owns_overseer_notes_folder() {
         let h = fresh_home();
         let (c, _) = Config::load_with(&missing(), &h.0, Some("Demo Person"));
-        assert_eq!(c.brain_dir, h.0.join("Overseer"));
-        assert_eq!(c.beads_dir, h.0.join("Overseer"));
+        assert_eq!(c.brain_dir, h.0.join("OverseerNotes"));
+        assert_eq!(c.beads_dir, h.0.join("OverseerNotes"));
         assert!(c.notes_owned);
         assert!(c.brain_writer);
         assert!(!c.push);
-        assert_eq!(c.current_session, h.0.join("Overseer/CURRENT_SESSION.md"));
+        assert_eq!(
+            c.current_session,
+            h.0.join("OverseerNotes/CURRENT_SESSION.md")
+        );
     }
 
     #[test]

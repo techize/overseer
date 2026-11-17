@@ -97,16 +97,11 @@ fn main() {
             );
             let home = overseer_daemon::config::home_from_env();
             let config = overseer_proto::paths::config_path();
-            let (mut settings, config_error) = overseer_daemon::Config::load(&config, &home);
+            // The daemon readies an owned notes folder itself, and puts a
+            // notice on the board when it cannot.
+            let (settings, config_error) = overseer_daemon::Config::load(&config, &home);
             if let Some(e) = &config_error {
                 tracing::warn!("config not loaded, using defaults: {e}");
-            }
-            if settings.notes_owned {
-                if let Err(e) = overseer_daemon::notes::ensure_owned(&settings.brain_dir) {
-                    tracing::warn!("notes folder not ready, sprint notes are off: {e}");
-                    settings.brain_writer = false;
-                    settings.notes_owned = false;
-                }
             }
             let targets = overseer_proto::paths::targets_path();
             let (patterns, targets_error) =

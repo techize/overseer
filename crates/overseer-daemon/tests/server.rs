@@ -4695,3 +4695,40 @@ async fn check_plan_recomputes_warnings_for_an_edited_plan() {
     // Checking records nothing.
     assert!(c.coord().await.plans.is_empty());
 }
+
+#[tokio::test]
+async fn a_refused_notes_folder_puts_a_notice_on_the_board() {
+    // The default notes folder already holds someone else's files.
+    let notes = tempfile::tempdir().unwrap();
+    std::fs::write(notes.path().join("README.md"), "not notes\n").unwrap();
+    let settings = overseer_daemon::Config {
+        brain_dir: notes.path().to_path_buf(),
+        notes_owned: true,
+        brain_writer: true,
+        ..offline_settings()
+    };
+    let socket = temp_socket();
+    let d = start_daemon_cfg(
+        socket.clone(),
+        overseer_daemon::EnvSource::Inherit,
+        settings.clone(),
+    )
+    .await;
+    let mut c = Client::connect(&d.socket).await;
+    let v = c.work().await;
+    let for_s0: Vec<_> = v.notices.iter().filter(|n| n.slot == 0).collect();
+    assert_eq!(for_s0.len(), 1, "{:?}", v.notices);
+    let text = &for_s0[0].text;
+    assert!(text.contains(&notes.path().display().to_string()), "{text}");
+    assert!(text.contains("no .overseer-notes marker"), "{text}");
+    assert!(text.contains("set notes_dir"), "{text}");
+    assert!(!notes.path().join(".overseer-notes").exists());
+    assert!(!notes.path().join(".git").exists());
+    drop(c);
+    drop(d);
+    // A restart with the folder still refused does not stack a second copy.
+    let d = start_daemon_cfg(socket, overseer_daemon::EnvSource::Inherit, settings).await;
+    let mut c = Client::connect(&d.socket).await;
+    let v = c.work().await;
+    assert_eq!(v.notices.iter().filter(|n| n.slot == 0).count(), 1);
+}

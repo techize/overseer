@@ -14,9 +14,16 @@ const MARKER_TEXT: &str = "This folder is kept by Overseer. Delete this file to 
 
 /// Make `dir` an Overseer notes folder: the marker, `Sprints/`, and a git repo
 /// with one commit. A folder that has other entries and no marker is left alone.
-pub fn ensure_owned(dir: &Path) -> io::Result<()> {
-    let marker = dir.join(OWNED_MARKER);
-    if dir.exists() && !marker.exists() && std::fs::read_dir(dir)?.next().is_some() {
+/// When git has no identity, the repo gets a local one: `user` and
+/// `overseer@localhost`, so every later commit there works too.
+pub fn ensure_owned(dir: &Path, user: &str) -> io::Result<()> {
+    ensure_owned_with(dir, user, &[])
+}
+
+/// `ensure_owned` with extra variables for every git run (tests point
+/// `GIT_CONFIG_GLOBAL` away from the developer's own identity).
+fn ensure_owned_with(dir: &Path, user: &str, env: &[(&str, &str)]) -> io::Result<()> {
+    if foreign(dir) {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
             format!(
@@ -25,57 +32,121 @@ pub fn ensure_owned(dir: &Path) -> io::Result<()> {
             ),
         ));
     }
+    let marker = dir.join(OWNED_MARKER);
     std::fs::create_dir_all(dir.join("Sprints"))?;
     if !marker.exists() {
         std::fs::write(&marker, MARKER_TEXT)?;
     }
+    let git = Git { dir, env };
     if !dir.join(".git").exists() {
-        init_repo(dir)?;
+        git.run(&["init", "-q", "-b", "main"])?;
+    }
+    git.ensure_identity(user)?;
+    // A first commit that failed earlier left `.git` with no commits.
+    if !git.ok(&["rev-parse", "--verify", "-q", "HEAD"]) {
+        git.run(&["add", OWNED_MARKER])?;
+        git.run(&["commit", "-q", "-m", "Start Overseer notes"])?;
     }
     Ok(())
 }
 
-fn git(dir: &Path, args: &[&str]) -> io::Result<()> {
-    let out = Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .stdin(Stdio::null())
-        .output()?;
-    if out.status.success() {
-        Ok(())
+/// A folder Overseer will not take: it exists, has other entries and no
+/// `.overseer-notes` marker.
+pub fn foreign(dir: &Path) -> bool {
+    dir.is_dir()
+        && !dir.join(OWNED_MARKER).exists()
+        && std::fs::read_dir(dir).is_ok_and(|mut d| d.next().is_some())
+}
+
+/// Turns the notes writer and the sprint sync off, for a notes folder
+/// Overseer could not take.
+pub fn disown(config: &mut crate::Config) {
+    config.brain_writer = false;
+    config.notes_owned = false;
+}
+
+/// Readies the owned notes folder at daemon start. When that fails, the
+/// writer and sync are turned off and the text for a board notice comes
+/// back: which folder, why, and how to fix it.
+pub fn prepare(config: &mut crate::Config) -> Option<String> {
+    if !config.notes_owned {
+        return None;
+    }
+    let dir = config.brain_dir.clone();
+    let err = ensure_owned(&dir, config.user()).err()?;
+    tracing::warn!("notes folder not ready, sprint notes are off: {err}");
+    disown(config);
+    Some(refused_text(&dir, &err))
+}
+
+fn refused_text(dir: &Path, err: &io::Error) -> String {
+    if err.kind() == io::ErrorKind::AlreadyExists {
+        format!(
+            "Notes are off: {d} already holds other files and no {OWNED_MARKER} marker, so Overseer will not write there. \
+             To fix it, set notes_dir in Settings to another folder, or move {d} aside, then restart the daemon.",
+            d = dir.display()
+        )
     } else {
-        Err(io::Error::other(format!(
-            "git {} failed: {}",
-            args.first().copied().unwrap_or(""),
-            String::from_utf8_lossy(&out.stderr).trim()
-        )))
+        format!(
+            "Notes are off: Overseer could not set up {d}: {err}. Fix the folder, or set notes_dir in Settings to another one, then restart the daemon.",
+            d = dir.display()
+        )
     }
 }
 
-fn has_identity(dir: &Path) -> bool {
-    Command::new("git")
-        .args(["config", "user.name"])
-        .current_dir(dir)
-        .stdin(Stdio::null())
-        .output()
-        .map(|o| o.status.success() && !o.stdout.iter().all(u8::is_ascii_whitespace))
-        .unwrap_or(false)
+struct Git<'a> {
+    dir: &'a Path,
+    env: &'a [(&'a str, &'a str)],
 }
 
-fn init_repo(dir: &Path) -> io::Result<()> {
-    git(dir, &["init", "-q", "-b", "main"])?;
-    git(dir, &["add", OWNED_MARKER])?;
-    let mut args = Vec::new();
-    if !has_identity(dir) {
-        args.extend([
-            "-c",
-            "user.name=Overseer",
-            "-c",
-            "user.email=overseer@localhost",
-        ]);
+impl Git<'_> {
+    fn output(&self, args: &[&str]) -> io::Result<std::process::Output> {
+        Command::new("git")
+            .args(args)
+            .current_dir(self.dir)
+            .envs(self.env.iter().copied())
+            .stdin(Stdio::null())
+            .output()
     }
-    args.extend(["commit", "-q", "-m", "Start Overseer notes"]);
-    git(dir, &args)
+
+    fn run(&self, args: &[&str]) -> io::Result<()> {
+        let out = self.output(args)?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "git {} failed: {}",
+                args.first().copied().unwrap_or(""),
+                String::from_utf8_lossy(&out.stderr).trim()
+            )))
+        }
+    }
+
+    fn ok(&self, args: &[&str]) -> bool {
+        self.output(args).is_ok_and(|o| o.status.success())
+    }
+
+    /// Whether git has a non-blank value for `key` from any config file.
+    fn has(&self, key: &str) -> bool {
+        self.output(&["config", key])
+            .map(|o| o.status.success() && !o.stdout.iter().all(u8::is_ascii_whitespace))
+            .unwrap_or(false)
+    }
+
+    /// Writes a local `user.name` and `user.email` where git has none.
+    fn ensure_identity(&self, user: &str) -> io::Result<()> {
+        if !self.has("user.name") {
+            let name = match user.trim() {
+                "" => "Overseer",
+                n => n,
+            };
+            self.run(&["config", "--local", "user.name", name])?;
+        }
+        if !self.has("user.email") {
+            self.run(&["config", "--local", "user.email", "overseer@localhost"])?;
+        }
+        Ok(())
+    }
 }
 
 /// The longest title slug in a ticket folder name.
@@ -139,6 +210,10 @@ pub fn sync_sprint(
     site: &str,
     now: i64,
 ) -> io::Result<usize> {
+    // Checked on every sync, so deleting the marker stops writes at once.
+    if !dir.join(OWNED_MARKER).exists() {
+        return Ok(0);
+    }
     let folders = list_folders(dir);
     let sprint_dir = dir.join("Sprints").join(sprint);
     let stamp = local_stamp(now);
@@ -177,7 +252,7 @@ mod tests {
     fn creates_marks_and_inits() {
         let t = tempfile::tempdir().unwrap();
         let dir = t.path().join("notes");
-        ensure_owned(&dir).unwrap();
+        ensure_owned(&dir, "Demo").unwrap();
         assert!(dir.join(OWNED_MARKER).is_file());
         assert!(dir.join("Sprints").is_dir());
         assert!(dir.join(".git").is_dir());
@@ -188,9 +263,9 @@ mod tests {
     fn second_call_changes_nothing() {
         let t = tempfile::tempdir().unwrap();
         let dir = t.path().join("notes");
-        ensure_owned(&dir).unwrap();
+        ensure_owned(&dir, "Demo").unwrap();
         let head = out(&dir, &["rev-parse", "HEAD"]);
-        ensure_owned(&dir).unwrap();
+        ensure_owned(&dir, "Demo").unwrap();
         assert_eq!(out(&dir, &["rev-parse", "HEAD"]), head);
     }
 
@@ -198,7 +273,7 @@ mod tests {
     fn refuses_a_foreign_folder() {
         let t = tempfile::tempdir().unwrap();
         std::fs::write(t.path().join("a.md"), "x").unwrap();
-        let e = ensure_owned(t.path()).unwrap_err();
+        let e = ensure_owned(t.path(), "Demo").unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
         assert!(e.to_string().contains("is not an Overseer notes folder"));
         assert!(!t.path().join(OWNED_MARKER).exists());
@@ -207,9 +282,108 @@ mod tests {
     #[test]
     fn adopts_an_empty_folder() {
         let t = tempfile::tempdir().unwrap();
-        ensure_owned(t.path()).unwrap();
+        ensure_owned(t.path(), "Demo").unwrap();
         assert!(t.path().join(OWNED_MARKER).is_file());
         assert!(t.path().join(".git").is_dir());
+    }
+
+    /// Git variables for a machine with no identity anywhere.
+    fn no_identity(home: &Path) -> Vec<(&'static str, String)> {
+        vec![
+            ("GIT_CONFIG_GLOBAL", "/dev/null".into()),
+            ("GIT_CONFIG_NOSYSTEM", "1".into()),
+            ("HOME", home.display().to_string()),
+            ("XDG_CONFIG_HOME", home.display().to_string()),
+        ]
+    }
+
+    #[test]
+    fn no_git_identity_gets_a_local_one_and_later_commits_work() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("notes");
+        let vars = no_identity(t.path());
+        let env: Vec<(&str, &str)> = vars.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        ensure_owned_with(&dir, "Demo", &env).unwrap();
+        let git = |args: &[&str]| {
+            let o = Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .envs(env.iter().copied())
+                .output()
+                .unwrap();
+            (
+                o.status.success(),
+                String::from_utf8_lossy(&o.stdout).trim().to_string(),
+            )
+        };
+        assert_eq!(git(&["config", "--local", "user.name"]).1, "Demo");
+        assert_eq!(
+            git(&["config", "--local", "user.email"]).1,
+            "overseer@localhost"
+        );
+        assert_eq!(
+            git(&["log", "--format=%an <%ae>"]).1,
+            "Demo <overseer@localhost>"
+        );
+        // A later commit, as the writer makes, needs no identity of its own.
+        std::fs::write(dir.join("a.md"), "x").unwrap();
+        assert!(git(&["add", "a.md"]).0);
+        assert!(git(&["commit", "-q", "-m", "a"]).0);
+        assert_eq!(git(&["log", "--oneline"]).1.lines().count(), 2);
+    }
+
+    #[test]
+    fn a_repo_with_no_commits_gets_the_marker_commit() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("notes");
+        let vars = no_identity(t.path());
+        let env: Vec<(&str, &str)> = vars.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(OWNED_MARKER), MARKER_TEXT).unwrap();
+        Git {
+            dir: &dir,
+            env: &env,
+        }
+        .run(&["init", "-q", "-b", "main"])
+        .unwrap();
+        ensure_owned_with(&dir, "Demo", &env).unwrap();
+        assert_eq!(out(&dir, &["log", "--oneline"]).lines().count(), 1);
+    }
+
+    #[test]
+    fn prepare_turns_notes_off_with_a_notice_for_a_foreign_folder() {
+        let t = tempfile::tempdir().unwrap();
+        std::fs::write(t.path().join("a.md"), "x").unwrap();
+        let mut c = crate::Config {
+            brain_dir: t.path().to_path_buf(),
+            notes_owned: true,
+            brain_writer: true,
+            ..crate::Config::default()
+        };
+        let text = prepare(&mut c).unwrap();
+        assert!(!c.notes_owned && !c.brain_writer);
+        assert!(text.contains(&t.path().display().to_string()), "{text}");
+        assert!(text.contains("no .overseer-notes marker"), "{text}");
+        assert!(text.contains("set notes_dir"), "{text}");
+        assert!(!t.path().join(OWNED_MARKER).exists());
+
+        let mut c = crate::Config {
+            notes_owned: false,
+            ..crate::Config::default()
+        };
+        assert_eq!(prepare(&mut c), None);
+    }
+
+    #[test]
+    fn deleting_the_marker_stops_the_sync() {
+        let t = owned();
+        std::fs::remove_file(t.path().join(OWNED_MARKER)).unwrap();
+        let ts = [ticket("DEMO-1", "Fix", "To Do")];
+        assert_eq!(
+            sync_sprint(t.path(), "sprint-demo-1", &ts, SITE, T0).unwrap(),
+            0
+        );
+        assert!(!t.path().join("Sprints/sprint-demo-1").exists());
     }
 
     fn ticket(key: &str, title: &str, status: &str) -> Ticket {
@@ -223,7 +397,7 @@ mod tests {
 
     fn owned() -> tempfile::TempDir {
         let t = tempfile::tempdir().unwrap();
-        ensure_owned(t.path()).unwrap();
+        ensure_owned(t.path(), "Demo").unwrap();
         t
     }
 

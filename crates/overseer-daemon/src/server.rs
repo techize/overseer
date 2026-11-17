@@ -197,8 +197,28 @@ async fn bind(path: &PathBuf) -> anyhow::Result<UnixListener> {
     Ok(listener)
 }
 
-pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
+/// The notes folder notice goes to S0, whose role works in that folder.
+const NOTES_NOTICE_SLOT: SlotId = 0;
+
+/// Leaves `text` for `slot` unless the same notice is still waiting, so a
+/// restart does not stack copies.
+fn notice_once(ledger: &Ledger, slot: SlotId, text: &str) {
+    let waiting = ledger
+        .notices()
+        .map(|n| n.iter().any(|n| n.slot == slot && n.text == text))
+        .unwrap_or(false);
+    if !waiting {
+        if let Err(e) = ledger.add_notice(slot, unix_now(), text) {
+            tracing::warn!("could not store the notes notice: {e:#}");
+        }
+    }
+}
+
+pub async fn run(mut cfg: DaemonConfig) -> anyhow::Result<()> {
     let listener = bind(&cfg.socket).await?;
+    // Before anything reads the settings: a refused folder turns the notes
+    // writer and the sprint sync off.
+    let notes_refused = crate::notes::prepare(&mut cfg.settings);
     let info = Arc::new(DaemonInfo {
         version: env!("CARGO_PKG_VERSION").to_string(),
         build: overseer_proto::current_build().to_string(),
@@ -228,6 +248,9 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
         }
     };
     let ledger = Arc::new(ledger);
+    if let Some(text) = &notes_refused {
+        notice_once(&ledger, NOTES_NOTICE_SLOT, text);
+    }
     let store = WorkStore::new(&cfg.settings, ledger.clone(), events.clone(), env.clone());
     let locks = LockService::new(
         ledger.clone(),

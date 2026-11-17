@@ -104,13 +104,20 @@ Overseer keeps journals, session notes and sprint files in a notes folder
   It reads any other folder, such as an existing vault, but never creates sprint
   or ticket folders there.
 - It creates and marks a folder itself in one case: when `notes_dir` is unset
-  and `~/Repos/2ndBrain` does not exist, it uses `~/Overseer`, creating it if
-  needed. It then adds the marker, a `Sprints/` folder and its own local git
+  and `~/Repos/2ndBrain` does not exist, it uses `~/OverseerNotes`, creating it
+  if needed. It then adds the marker, a `Sprints/` folder and its own local git
   history (one starting commit, no push), and turns on the notes writer, which
   writes the journal and session notes and, with `jira_board` set, the sprint
   and ticket folders.
-- If `~/Overseer` already holds other files and no marker, Overseer leaves it
-  alone and turns the notes writer off, with a warning in `daemon.log`.
+- If `~/OverseerNotes` already holds other files and no marker, Overseer leaves
+  it alone, turns the notes writer off and leaves a notice on the board (in
+  S0's panel) that names the folder and says how to fix it: set `notes_dir` to
+  another folder, or move that one aside, then restart the daemon.
+- When git has no `user.name` or `user.email` set, Overseer writes them into
+  the owned folder's own git config (your `user_name` and `overseer@localhost`),
+  so its commits work on a machine with no git identity.
+- Deleting the marker stops Overseer writing sprint and ticket folders there at
+  the next sync, without a restart.
 - A folder Overseer marked stays owned if you later set `notes_dir` to it
   explicitly, for example after moving it.
 - With `jira_board` set, Overseer keeps
@@ -124,7 +131,9 @@ Overseer keeps journals, session notes and sprint files in a notes folder
   Open PRs panel runs `bb` instead of calling the Bitbucket API. With neither,
   the panel shows the error from `bb`.
 - `bd` (beads): the task list sessions read and write, shown on the board.
-  Without it that source is off; sessions and the Jira board still work.
+  In a notes folder Overseer owns, a missing `bd` shows as `beads not set up
+  here`. In a folder Overseer doesn't own, a missing `bd` shows as a source
+  error (`bd not found`). Either way sessions and the Jira board still work.
 
 ### Troubleshooting
 
@@ -337,7 +346,7 @@ group for the notes keys). They apply after a daemon restart.
 | `jql` | open sprints, assigned to you | The ticket query. |
 | `ticket_pattern` | `""` | Empty: built from your Jira project keys, as `(DEMO|OPS)-\d+`. |
 | `user_name` | first word of your macOS full name | The name used in prompts and messages. |
-| `notes_dir` (alias `brain_dir`) | `~/Repos/2ndBrain` if it exists, else `~/Overseer` | The notes folder. Overseer owns a folder only when it holds the `.overseer-notes` marker; it creates one itself only for the default `~/Overseer`. |
+| `notes_dir` (alias `brain_dir`) | `~/Repos/2ndBrain` if it exists, else `~/OverseerNotes` | The notes folder. Overseer owns a folder only when it holds the `.overseer-notes` marker; it creates one itself only for the default `~/OverseerNotes`. |
 
 The tokens are not config keys. Set them in Settings (Keychain) or in the
 environment:
