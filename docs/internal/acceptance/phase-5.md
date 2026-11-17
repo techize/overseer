@@ -16,7 +16,7 @@ and the rest are scripted from a terminal. The Result column is empty or
 The examples in this file (`DEMO-12`, `ov-3`, `demo-api`, `sprint-26-01`, the
 `demo` label) are invented.
 
-The setup checklist for the work laptop is `docs/setup/work-laptop-2ndbrain.md`.
+The setup checklist for the work laptop is `docs/internal/setup/work-laptop-2ndbrain.md`.
 The rows here check the build; the checklist is applied by hand there.
 
 ## Setup for the checks

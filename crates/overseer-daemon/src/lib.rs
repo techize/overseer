@@ -9,6 +9,7 @@ pub mod launch;
 pub mod ledger;
 pub mod locks;
 pub mod manager;
+pub mod notes;
 pub mod relay;
 pub mod ring;
 pub mod server;

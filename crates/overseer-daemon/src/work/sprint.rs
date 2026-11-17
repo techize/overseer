@@ -1,7 +1,7 @@
 //! The sprint name and day shown in the board header.
 //!
-//! The name is `sprint_name` or the newest `Sprints/sprint-*` folder; the day
-//! counts weekdays from `sprint_start`. The label takes `today` as an
+//! The name is `sprint_name`, the board's active sprint or the newest
+//! `Sprints/sprint-*` folder; the day counts weekdays from the start. The label takes `today` as an
 //! argument so tests never read the clock.
 
 use std::path::Path;
@@ -129,6 +129,56 @@ pub fn sprint_day(start: Ymd, days: u32, today: Ymd) -> Option<SprintDay> {
     Some(SprintDay { day, days })
 }
 
+/// Monday-to-Friday days from `start` through `end`, both counted; at
+/// least 1, so a sprint read from Jira always has a length.
+pub fn weekdays_between(start: Ymd, end: Ymd) -> u32 {
+    let (first, last) = (to_days(start), to_days(end));
+    if last < first {
+        return 1;
+    }
+    let span = last - first + 1;
+    let wd = weekday(first);
+    let n = span / 7 * 5 + (0..span % 7).filter(|i| (wd + i) % 7 < 5).count() as i64;
+    n.max(1) as u32
+}
+
+/// The longest sprint folder name made from a Jira sprint name.
+const FOLDER_NAME_MAX: usize = 50;
+
+/// The folder name for a Jira sprint: `sprint-<slug>`, where the slug is the
+/// name lowercased with every run of characters other than ASCII letters
+/// and digits made one `-`, trimmed of `-`. A slug that already starts with
+/// `sprint` gets no second prefix. At most 50 characters; `sprint` when
+/// nothing is left.
+pub fn sprint_folder_name(jira_name: &str) -> String {
+    let slug = slug(jira_name);
+    let mut name = if slug.starts_with("sprint") {
+        slug
+    } else if slug.is_empty() {
+        "sprint".to_owned()
+    } else {
+        format!("sprint-{slug}")
+    };
+    // Every character is ASCII, so this cuts on a character boundary.
+    name.truncate(FOLDER_NAME_MAX);
+    name.trim_end_matches('-').to_owned()
+}
+
+/// The text lowercased, with every run of characters other than ASCII
+/// letters and digits made one `-`, and no `-` at either end.
+pub(crate) fn slug(text: &str) -> String {
+    let mut slug = String::new();
+    for c in text.chars() {
+        if c.is_ascii_alphanumeric() {
+            slug.push(c.to_ascii_lowercase());
+        } else if !slug.is_empty() && !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    slug.truncate(slug.trim_end_matches('-').len());
+    slug
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,6 +274,42 @@ mod tests {
             assert_eq!(to_days(from_days(days)), days);
         }
         assert_eq!(short_date(to_days(ymd(2026, 11, 9))), "Mon 9 Nov");
+    }
+
+    #[test]
+    fn weekdays_between_counts_both_ends() {
+        // Mon 9 Nov to Fri 20 Nov 2026.
+        assert_eq!(weekdays_between(ymd(2026, 11, 9), ymd(2026, 11, 20)), 10);
+        // Wed 11 Nov to Tue 17 Nov: Wed, Thu, Fri, Mon, Tue.
+        assert_eq!(weekdays_between(ymd(2026, 11, 11), ymd(2026, 11, 17)), 5);
+        // Wed 11 Nov to Wed 18 Nov.
+        assert_eq!(weekdays_between(ymd(2026, 11, 11), ymd(2026, 11, 18)), 6);
+        // A weekend alone, or an end before the start, is still one day.
+        assert_eq!(weekdays_between(ymd(2026, 11, 14), ymd(2026, 11, 15)), 1);
+        assert_eq!(weekdays_between(ymd(2026, 11, 20), ymd(2026, 11, 9)), 1);
+    }
+
+    #[test]
+    fn sprint_folder_name_is_a_safe_slug() {
+        assert_eq!(
+            sprint_folder_name("DEMO Sprint 26-01"),
+            "sprint-demo-sprint-26-01"
+        );
+        assert_eq!(sprint_folder_name("Sprint 4"), "sprint-4");
+        assert_eq!(
+            sprint_folder_name("../evil/Sprint 1 \u{1F680}"),
+            "sprint-evil-sprint-1"
+        );
+        let name: String = "Ab ".repeat(67).chars().take(200).collect();
+        assert_eq!(name.chars().count(), 200);
+        let long = sprint_folder_name(&name);
+        assert!(long.len() <= 50, "{long}");
+        assert!(
+            long.starts_with("sprint-") && !long.ends_with('-'),
+            "{long}"
+        );
+        assert_eq!(sprint_folder_name(""), "sprint");
+        assert_eq!(sprint_folder_name("  /  "), "sprint");
     }
 
     #[test]

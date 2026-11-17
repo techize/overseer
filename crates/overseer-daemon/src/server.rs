@@ -8,8 +8,10 @@ use std::time::Duration;
 use anyhow::Context;
 use bytes::Bytes;
 use overseer_proto::{
-    read_frame, settings::SettingEdit, slot_name, write_frame, BoardView, DaemonInfo, Event, Frame,
-    Request, Response, SlotId, SlotState,
+    read_frame,
+    settings::{SettingEdit, TokenStatus},
+    slot_name, write_frame, BoardView, DaemonInfo, Event, Frame, Request, Response, SlotId,
+    SlotState, TokenKind,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
@@ -28,6 +30,7 @@ use crate::relay::courier::Courier;
 use crate::settings::SettingsFiles;
 use crate::slot::CatchUp;
 use crate::work::store::{unix_now, KickoffFacts};
+use crate::work::token::{save_token, token_status};
 use crate::work::WorkStore;
 
 /// Frames queued per connection before it is considered too slow.
@@ -62,6 +65,9 @@ struct SettingsCtx {
     running: crate::config::Config,
     home: PathBuf,
     save: Mutex<()>,
+    env: BaseEnv,
+    /// The last token read, used for a save's reply.
+    tokens: Mutex<Option<Tokens>>,
 }
 
 impl SettingsCtx {
@@ -81,6 +87,75 @@ impl SettingsCtx {
             Err(message) => Response::Error { message },
         }
     }
+
+    /// Where each token is for the running `jira_email`, read now. Both
+    /// reads run at once, each waiting at most `STATUS_TIMEOUT` on the
+    /// Keychain, so a locked Keychain costs Settings a few seconds, not 30.
+    async fn read_tokens(&self) -> Tokens {
+        let email = self.running.jira_email.trim();
+        if email.is_empty() {
+            return Tokens::default();
+        }
+        let vars = self.env.get();
+        let security = &self.files.security;
+        let (jira, bitbucket) = tokio::join!(
+            token_status(TokenKind::Jira, email, &vars, security),
+            token_status(TokenKind::Bitbucket, email, &vars, security),
+        );
+        let read = Tokens { jira, bitbucket };
+        *self.tokens.lock().unwrap() = Some(read);
+        read
+    }
+
+    /// `resp` with the token states filled in when it is a Settings view.
+    /// `fresh` reads them again; otherwise the last read is used (a settings
+    /// save cannot change a token), and only the first view reads them.
+    async fn with_token_state(&self, resp: Response, fresh: bool) -> Response {
+        match resp {
+            Response::Settings(mut v) => {
+                let known = *self.tokens.lock().unwrap();
+                let t = match known {
+                    Some(t) if !fresh => t,
+                    _ => self.read_tokens().await,
+                };
+                v.jira_token = t.jira;
+                v.bitbucket_token = t.bitbucket;
+                Response::Settings(v)
+            }
+            other => other,
+        }
+    }
+
+    /// Stores the `kind` token in the Keychain. It is not logged or
+    /// answered. The save reads the item back, so a success is recorded as
+    /// stored without asking the Keychain again.
+    async fn set_token(&self, kind: TokenKind, token: &str) -> Response {
+        let email = self.running.jira_email.trim();
+        if email.is_empty() {
+            return Response::Error {
+                message: "set jira_email first".into(),
+            };
+        }
+        match save_token(kind, email, token, &self.files.security).await {
+            Ok(()) => {
+                if let Some(t) = self.tokens.lock().unwrap().as_mut() {
+                    match kind {
+                        TokenKind::Jira => t.jira = TokenStatus::Keychain,
+                        TokenKind::Bitbucket => t.bitbucket = TokenStatus::Keychain,
+                    }
+                }
+                Response::Ok
+            }
+            Err(message) => Response::Error { message },
+        }
+    }
+}
+
+/// Where each API token was last found, for the Settings view.
+#[derive(Clone, Copy, Default)]
+struct Tokens {
+    jira: TokenStatus,
+    bitbucket: TokenStatus,
 }
 
 /// `run` found another daemon serving the socket. Not a failure: the daemon
@@ -122,8 +197,36 @@ async fn bind(path: &PathBuf) -> anyhow::Result<UnixListener> {
     Ok(listener)
 }
 
-pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
+/// The work source a saved token is for.
+fn source_for(kind: TokenKind) -> crate::work::store::Source {
+    match kind {
+        TokenKind::Jira => crate::work::store::Source::Jira,
+        TokenKind::Bitbucket => crate::work::store::Source::Prs,
+    }
+}
+
+/// The notes folder notice goes to S0, whose role works in that folder.
+const NOTES_NOTICE_SLOT: SlotId = 0;
+
+/// Leaves `text` for `slot` unless the same notice is still waiting, so a
+/// restart does not stack copies.
+fn notice_once(ledger: &Ledger, slot: SlotId, text: &str) {
+    let waiting = ledger
+        .notices()
+        .map(|n| n.iter().any(|n| n.slot == slot && n.text == text))
+        .unwrap_or(false);
+    if !waiting {
+        if let Err(e) = ledger.add_notice(slot, unix_now(), text) {
+            tracing::warn!("could not store the notes notice: {e:#}");
+        }
+    }
+}
+
+pub async fn run(mut cfg: DaemonConfig) -> anyhow::Result<()> {
     let listener = bind(&cfg.socket).await?;
+    // Before anything reads the settings: a refused folder turns the notes
+    // writer and the sprint sync off.
+    let notes_refused = crate::notes::prepare(&mut cfg.settings);
     let info = Arc::new(DaemonInfo {
         version: env!("CARGO_PKG_VERSION").to_string(),
         build: overseer_proto::current_build().to_string(),
@@ -131,16 +234,18 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
         started_at: unix_now(),
         exe: std::env::current_exe().unwrap_or_default(),
     });
+    // Resolved in the background so clients can connect at once; a
+    // StartSlot waits for it.
+    let env = BaseEnv::start(&cfg.env);
     let settings = Arc::new(SettingsCtx {
         files: cfg.files,
         running: cfg.settings.clone(),
         // The same home `main` expands `config.toml` against.
         home: crate::config::home_from_env(),
         save: Mutex::new(()),
+        env: env.clone(),
+        tokens: Mutex::new(None),
     });
-    // Resolved in the background so clients can connect at once; a
-    // StartSlot waits for it.
-    let env = BaseEnv::start(&cfg.env);
     let (events, _) = broadcast::channel::<Event>(EVENT_CHANNEL_CAP);
     let db = cfg.state_dir.join("overseer.db");
     let ledger = match Ledger::open(&db) {
@@ -151,6 +256,9 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
         }
     };
     let ledger = Arc::new(ledger);
+    if let Some(text) = &notes_refused {
+        notice_once(&ledger, NOTES_NOTICE_SLOT, text);
+    }
     let store = WorkStore::new(&cfg.settings, ledger.clone(), events.clone(), env.clone());
     let locks = LockService::new(
         ledger.clone(),
@@ -158,8 +266,13 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
         events.clone(),
         env.clone(),
         Duration::from_secs(cfg.settings.lock_idle_mins.saturating_mul(60)),
+        cfg.settings.user().to_string(),
     );
-    let coord = CoordService::new(ledger.clone(), events.clone());
+    let coord = CoordService::new(
+        ledger.clone(),
+        events.clone(),
+        cfg.settings.user().to_string(),
+    );
     let timeline = coord.watch(events.subscribe());
     let brain = BrainService::with_options(
         &cfg.settings,
@@ -186,6 +299,7 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
                 beads: cfg.settings.beads_dir.clone(),
                 brain_writer: cfg.settings.brain_writer,
                 current_session: cfg.settings.current_session.clone(),
+                user: cfg.settings.user().to_string(),
             },
         );
     mgr.restore();
@@ -209,7 +323,7 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
             Box::pin(async move {
                 match weak.upgrade() {
                     Some(b) => b.write_label(args).await,
-                    None => Err("the 2ndBrain writer has stopped".into()),
+                    None => Err("the notes writer has stopped".into()),
                 }
             })
         }));
@@ -218,7 +332,13 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
         let manager = manager.clone();
         move || sessionless(&manager.lock().unwrap().list())
     });
-    let courier = Courier::spawn(ledger, manager.clone(), locks.clone(), courier_events);
+    let courier = Courier::spawn(
+        ledger,
+        manager.clone(),
+        locks.clone(),
+        courier_events,
+        cfg.settings.user().to_string(),
+    );
     store.on_relays_queued({
         let (locks, courier) = (locks.clone(), courier.clone());
         move || {
@@ -642,7 +762,7 @@ struct Ctx<'a> {
     state_dir: &'a Path,
     brain: Option<&'a Arc<BrainService>>,
     info: &'a DaemonInfo,
-    settings: &'a SettingsCtx,
+    settings: &'a Arc<SettingsCtx>,
 }
 
 fn handle_frame(
@@ -668,6 +788,50 @@ fn handle_frame(
                     seq,
                     resp: Response::Work(task_store.view()),
                 });
+            });
+        }
+        // The Settings view says whether a token is stored, which reads the
+        // Keychain (bounded, but not instant), so the settings requests are
+        // answered from a task. Saves stay one at a time inside `save`.
+        Frame::Request {
+            seq,
+            req: Request::GetSettings,
+        } => {
+            let (settings, info) = (ctx.settings.clone(), ctx.info.clone());
+            let outbox = outbox.clone();
+            store.spawn(async move {
+                let resp = settings.with_token_state(settings.view(&info), true).await;
+                outbox.send(Frame::Response { seq, resp });
+            });
+        }
+        Frame::Request {
+            seq,
+            req: Request::SaveSettings { base_hash, edits },
+        } => {
+            let (settings, info) = (ctx.settings.clone(), ctx.info.clone());
+            let outbox = outbox.clone();
+            store.spawn(async move {
+                let saved = settings.save(&info, &base_hash, &edits);
+                let resp = settings.with_token_state(saved, false).await;
+                outbox.send(Frame::Response { seq, resp });
+            });
+        }
+        Frame::Request {
+            seq,
+            req: Request::SetToken { kind, token },
+        } => {
+            let settings = ctx.settings.clone();
+            let outbox = outbox.clone();
+            let task_store = store.clone();
+            store.spawn(async move {
+                let resp = settings.set_token(kind, token.expose()).await;
+                let saved = resp == Response::Ok;
+                outbox.send(Frame::Response { seq, resp });
+                // The source that uses the token reads again now, not at
+                // its next poll.
+                if saved {
+                    task_store.refresh(source_for(kind)).await;
+                }
             });
         }
         // Approving a plan creates worktrees and starts sessions, so it is
@@ -837,7 +1001,7 @@ async fn brain_request(brain: &BrainService, req: Request, label: &str) -> Respo
         }
         Request::RunBd { args, stdin, .. } => brain.run_bd(args, stdin).await,
         other => Response::Error {
-            message: format!("not a 2ndBrain writer request: {other:?}"),
+            message: format!("not a notes writer request: {other:?}"),
         },
     }
 }
@@ -857,13 +1021,15 @@ fn handle_request(
         }
         Request::ListSlots => Response::Slots(manager.lock().unwrap().list()),
         Request::DaemonInfo => Response::DaemonInfo(ctx.info.clone()),
-        Request::GetSettings => ctx.settings.view(ctx.info),
-        Request::SaveSettings { base_hash, edits } => {
-            ctx.settings.save(ctx.info, &base_hash, &edits)
-        }
-        // RefreshWorkItems is answered in `handle_frame` once the sources
-        // have run; this arm only keeps the match whole.
+        // RefreshWorkItems and the settings requests are answered in
+        // `handle_frame` from a task of their own (they can wait on the
+        // Keychain); this arm only keeps the match whole.
         Request::ListWorkItems | Request::RefreshWorkItems => Response::Work(store.view()),
+        Request::GetSettings | Request::SaveSettings { .. } | Request::SetToken { .. } => {
+            Response::Error {
+                message: "settings requests are answered by the connection".into(),
+            }
+        }
         Request::Assign {
             key,
             slot,
@@ -945,9 +1111,10 @@ fn handle_request(
         | Request::EditShared { .. }
         | Request::UpdateCurrentSession { .. }
         | Request::RunBd { .. } => err(WRITER_OFF.to_string()),
-        Request::BrainStatus => {
-            Response::Brain(ctx.brain.map_or_else(BrainService::off_view, |b| b.view()))
-        }
+        Request::BrainStatus => Response::Brain(ctx.brain.map_or_else(
+            || BrainService::off_view(&ctx.settings.running.brain_dir),
+            |b| b.view(),
+        )),
         // While the writer is off the hook applies none of its checks.
         Request::CheckWrite(check) => Response::Verdict {
             deny: ctx
@@ -1260,6 +1427,13 @@ fn slot_worktree(plans: &PlanCtx, manager: &Mutex<SlotManager>, slot: SlotId) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_saved_token_refreshes_its_own_source() {
+        use crate::work::store::Source;
+        assert_eq!(source_for(TokenKind::Jira), Source::Jira);
+        assert_eq!(source_for(TokenKind::Bitbucket), Source::Prs);
+    }
 
     fn outbox() -> (Outbox, mpsc::Receiver<Frame>) {
         let (tx, rx) = mpsc::channel(16);

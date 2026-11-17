@@ -34,7 +34,7 @@ use paths::{
 use shared::FileLocks;
 
 /// The answer to every writer request while `brain_writer` is off (Ruling 1).
-pub const WRITER_OFF: &str = "the 2ndBrain writer is off (brain_writer in config.toml)";
+pub const WRITER_OFF: &str = "the notes writer is off (brain_writer in config.toml)";
 
 const CURRENT_SESSION_DENY: &str =
     "CURRENT_SESSION.md is written by Overseer. Use update_current_session for your section.";
@@ -52,15 +52,15 @@ const REPLY_WAIT: Duration = Duration::from_secs(600);
 const BD_TIMEOUT: Duration = Duration::from_secs(120);
 const SYNC_TIMEOUT: Duration = Duration::from_secs(600);
 
-const GIT_DENY: &str = "use the commit_2ndbrain tool; Overseer commits and pushes 2ndBrain";
-const BD_COMPOUND_DENY: &str = "Overseer: run bd writes on their own, without $(...), backticks, redirects or env prefixes, so the daemon can run them under the vault lock";
+const GIT_DENY: &str = "use the commit_2ndbrain tool; Overseer commits and pushes the notes folder";
+const BD_COMPOUND_DENY: &str = "Overseer: run bd writes on their own, without $(...), backticks, redirects or env prefixes, so the daemon can run them under the notes folder lock";
 
 fn deny_shared(rel: &str) -> String {
-    format!("{rel} is a shared 2ndBrain file. Use append_journal for the journal or edit_shared_file for an exact replacement.")
+    format!("{rel} is a shared notes file. Use append_journal for the journal or edit_shared_file for an exact replacement.")
 }
 
-fn deny_owned(rel: &str, slot: SlotId, what: &str) -> String {
-    format!("{rel} belongs to S{slot} ({what}). Ask Jonathan before writing it.")
+fn deny_owned(rel: &str, slot: SlotId, what: &str, user: &str) -> String {
+    format!("{rel} belongs to S{slot} ({what}). Ask {user} before writing it.")
 }
 
 /// The `brain_runs` row that says a `bd sync` is owed: `ok` is true while
@@ -74,7 +74,7 @@ fn unix_now() -> i64 {
 }
 
 /// `2026-11-13 09:30` in local time, from `localtime_r`.
-fn local_stamp(now: i64) -> String {
+pub(crate) fn local_stamp(now: i64) -> String {
     // SAFETY: localtime_r only writes the `tm` we pass it.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     let t = now as libc::time_t;
@@ -165,7 +165,7 @@ impl BrainOptions {
 }
 
 /// What the service needs to know about the slots: who owns what, which
-/// slots are running and which of those are working or waiting on Jonathan.
+/// slots are running and which of those are working or waiting on the user.
 #[derive(Debug, Clone, Default)]
 pub struct BrainContext {
     pub owners: Owners,
@@ -184,6 +184,8 @@ struct Settings {
     push: bool,
     sync_command: Vec<String>,
     bd_command: Vec<String>,
+    /// The name denials use for the person to ask.
+    user: String,
 }
 
 #[derive(Default)]
@@ -277,6 +279,7 @@ impl BrainService {
                 push: cfg.push,
                 sync_command: cfg.sync_command.clone(),
                 bd_command: cfg.bd_command.clone(),
+                user: cfg.user().to_string(),
             },
             opts,
             git,
@@ -293,8 +296,9 @@ impl BrainService {
         Some(svc)
     }
 
-    /// The view the board shows while the writer is off.
-    pub fn off_view() -> BrainView {
+    /// The view the board shows while the writer is off. `notes_dir` is
+    /// the configured notes folder, sent only when it exists.
+    pub fn off_view(notes_dir: &Path) -> BrainView {
         BrainView {
             on: false,
             entries: Vec::new(),
@@ -302,6 +306,7 @@ impl BrainService {
             last_sync: None,
             push_problem: None,
             brain_dir: None,
+            notes_dir: notes_dir.is_dir().then(|| notes_dir.to_path_buf()),
         }
     }
 
@@ -352,6 +357,7 @@ impl BrainService {
             last_sync: run("sync"),
             push_problem: self.rt().push_problem.clone(),
             brain_dir: Some(self.cfg.brain.clone()),
+            notes_dir: Some(self.cfg.brain.clone()),
         }
     }
 
@@ -392,7 +398,8 @@ impl BrainService {
                 if list.iter().any(|(s, _)| *s == slot) {
                     None
                 } else {
-                    list.first().map(|(s, what)| deny_owned(&rel(), *s, what))
+                    list.first()
+                        .map(|(s, what)| deny_owned(&rel(), *s, what, &self.cfg.user))
                 }
             }
         }
@@ -410,12 +417,12 @@ impl BrainService {
         };
         for (s, note) in &owners.notes {
             if *s != slot && holds(note) {
-                return Some(deny_owned(note, *s, "session note"));
+                return Some(deny_owned(note, *s, "session note", &self.cfg.user));
             }
         }
         for (s, f, key) in &owners.folders {
             if *s != slot && holds(f) {
-                return Some(deny_owned(f, *s, key));
+                return Some(deny_owned(f, *s, key, &self.cfg.user));
             }
         }
         let depth = if folder.is_empty() {
@@ -428,7 +435,7 @@ impl BrainService {
             depth < segs.len() && (depth == 0 || shared_match(&[segs[..depth].join("/")], folder))
         });
         if holds_shared {
-            return Some(format!("{} holds shared 2ndBrain files. Use append_journal for the journal or edit_shared_file for an exact replacement.", if folder.is_empty() { "2ndBrain" } else { folder }));
+            return Some(format!("{} holds shared notes files. Use append_journal for the journal or edit_shared_file for an exact replacement.", if folder.is_empty() { "the notes folder" } else { folder }));
         }
         let cs = canon(&self.cfg.current_session);
         let root = canon(&self.cfg.brain).join(folder);
@@ -602,7 +609,7 @@ impl BrainService {
 
     /// Queues a pathspec commit of `paths` and waits for it to be committed
     /// (not pushed). A slot may not commit what another slot owns, a shared
-    /// file or `CURRENT_SESSION.md`; Jonathan may commit anything inside.
+    /// file or `CURRENT_SESSION.md`; the user may commit anything inside.
     pub async fn commit(
         &self,
         from: Sender,
@@ -676,7 +683,7 @@ impl BrainService {
         };
         if !shared_match(&self.cfg.shared_files, &rel) {
             return err(format!(
-                "{rel} is not a shared 2ndBrain file; write it directly and commit it with commit_2ndbrain"
+                "{rel} is not a shared notes file; write it directly and commit it with commit_2ndbrain"
             ));
         }
         let abs = self.cfg.brain.join(&rel);
@@ -735,7 +742,7 @@ impl BrainService {
         }
     }
 
-    /// Runs `bd_command` with `args` in `beads_dir`, under the vault lock
+    /// Runs `bd_command` with `args` in `beads_dir`, under the notes folder lock
     /// when the beads live in the vault, then queues a `bd sync` for the
     /// next drain (Ruling 10).
     pub async fn run_bd(&self, args: Vec<String>, stdin: Option<String>) -> Response {
@@ -818,7 +825,7 @@ impl BrainService {
     }
 
     /// A bead label change from the work store, run like a session's `bd`
-    /// write: under the vault lock, followed by a `bd sync` at the next drain.
+    /// write: under the notes folder lock, followed by a `bd sync` at the next drain.
     pub async fn write_label(&self, args: Vec<String>) -> Result<(), String> {
         match self.run_bd(args, None).await {
             Response::BdOutput { code: 0, .. } => Ok(()),
@@ -1183,7 +1190,7 @@ impl BrainService {
                 .retain(|p| !unmerged.contains(p) && self.backup_takes(p, &ctx));
         } else if !unmerged.is_empty() {
             let msg = format!(
-                "held: 2ndBrain has unresolved conflicts in {}; committed once they are resolved",
+                "held: the notes folder has unresolved conflicts in {}; committed once they are resolved",
                 list_paths(&unmerged)
             );
             return self.hold_queued(e.id, &msg);
@@ -1212,7 +1219,7 @@ impl BrainService {
             tracing::warn!("2ndBrain: {text}");
             let _ = self
                 .ledger
-                .log(unix_now(), "2ndBrain", None, "index.lock", text);
+                .log(unix_now(), "Notes", None, "index.lock", text);
         }
         match result {
             Ok(Some(sha)) => {
@@ -1294,7 +1301,7 @@ impl BrainService {
                     return;
                 }
                 let text = format!(
-                    "2ndBrain push needs you: unresolved conflicts in {}. Resolve them in 2ndBrain (git status); Overseer holds its commits, backup and sync of them until then.",
+                    "Notes push needs you: unresolved conflicts in {}. Resolve them in the notes folder (git status); Overseer holds its commits, backup and sync of them until then.",
                     list_paths(unmerged)
                 );
                 rt.push_problem = Some(text.clone());
@@ -1374,7 +1381,7 @@ impl BrainService {
         if !self.cfg.push {
             return;
         }
-        // A pull would stop on the unmerged index; wait for Jonathan.
+        // A pull would stop on the unmerged index; wait for the user.
         match self.git.unmerged(g).await {
             Ok(u) if !u.is_empty() => {
                 self.note_unmerged(&u);
@@ -1420,11 +1427,11 @@ impl BrainService {
                 };
                 let text = match &err {
                     GitError::Conflict(m) if m.contains("stash") => format!(
-                        "2ndBrain push needs you: {m}. Resolve the conflicted files in 2ndBrain (git status), then drop that stash (git stash list --format='%gd %H' shows its stash@{{n}}); Overseer holds its commits, backup and sync until then."
+                        "Notes push needs you: {m}. Resolve the conflicted files in the notes folder (git status), then drop that stash (git stash list --format='%gd %H' shows its stash@{{n}}); Overseer holds its commits, backup and sync until then."
                     ),
-                    GitError::Conflict(m) => format!("2ndBrain push needs you: {m}"),
+                    GitError::Conflict(m) => format!("Notes push needs you: {m}"),
                     _ => format!(
-                        "2ndBrain push failed: {line}; it is tried again after the next commit or backup"
+                        "Notes push failed: {line}; it is tried again after the next commit or backup"
                     ),
                 };
                 tracing::warn!("{text}");
@@ -1637,6 +1644,17 @@ async fn run_program(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn off_view_names_the_notes_folder_only_when_it_exists() {
+        let t = tempfile::tempdir().unwrap();
+        let v = BrainService::off_view(t.path());
+        assert!(!v.on);
+        assert_eq!(v.brain_dir, None);
+        assert_eq!(v.notes_dir.as_deref(), Some(t.path()));
+        let gone = t.path().join("missing");
+        assert_eq!(BrainService::off_view(&gone).notes_dir, None);
+    }
 
     #[test]
     fn messages_lose_em_dashes_and_forged_trailers() {

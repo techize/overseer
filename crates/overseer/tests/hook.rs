@@ -331,7 +331,7 @@ fn pre_tool_use_ignores_other_tools() {
 #[test]
 fn pre_tool_use_asks_about_file_writes_and_prints_the_deny() {
     let home = temp_home("pedit");
-    let reason = "j.md is a shared 2ndBrain file. Use append_journal.";
+    let reason = "j.md is a shared notes file. Use append_journal.";
     let answer = Response::Verdict {
         deny: Some(reason.into()),
         rewrite: None,

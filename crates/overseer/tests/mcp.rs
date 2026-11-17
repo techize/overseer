@@ -24,6 +24,8 @@ impl TempDaemon {
         let home = std::path::PathBuf::from(format!("/tmp/ovmcp-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&home).unwrap();
         let socket = home.join("overseer.sock");
+        // `overseer mcp` names the user from this file.
+        std::fs::write(home.join("config.toml"), "user_name = \"Demo\"\n").unwrap();
         let rt = tokio::runtime::Runtime::new().unwrap();
         let task = rt.spawn(run(DaemonConfig {
             socket: socket.clone(),
@@ -38,6 +40,7 @@ impl TempDaemon {
                 beads_dir: "/nonexistent/overseer-test-beads".into(),
                 brain_dir: "/nonexistent/overseer-test-brain".into(),
                 jira_command: vec![],
+                user_name: "Demo".into(),
                 ..overseer_daemon::Config::default()
             },
         }));
@@ -83,6 +86,7 @@ impl Mcp {
             .env("OVERSEER_LAUNCHCTL", NO_LAUNCHCTL)
             .arg("mcp")
             .env("OVERSEER_HOME", home)
+            .env("OVERSEER_CONFIG", home.join("config.toml"))
             .env("OVERSEER_SLOT", slot)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -222,14 +226,11 @@ fn s0_proposes_and_gets_the_board() {
         json!({"summary": "one lane", "slots": [{"slot": "S3", "label": "demo lane", "cwd": "/tmp"}]}),
     );
     assert!(!err, "{text}");
-    assert_eq!(text, "Plan 1 is waiting for Jonathan.");
+    assert_eq!(text, "Plan 1 is waiting for Demo.");
     let (text, err) = s0.tool("get_board", json!({}));
     assert!(!err, "{text}");
     assert!(text.starts_with("Summary: none yet"), "{text}");
-    assert!(
-        text.contains("Plan 1 waiting for Jonathan since "),
-        "{text}"
-    );
+    assert!(text.contains("Plan 1 waiting for Demo since "), "{text}");
     let (text, err) = s0.tool("set_board_summary", json!({"text": "One lane waits."}));
     assert!(!err, "{text}");
     let (text, _) = s0.tool("get_board", json!({}));

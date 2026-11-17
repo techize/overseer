@@ -184,13 +184,13 @@ mod tests {
         let a = set_section("body\n", 3, "a", "one");
         let a = a.replace(
             "<!-- /overseer:sections -->",
-            "Jonathan's note\n<!-- /overseer:sections -->",
+            "Demo's note\n<!-- /overseer:sections -->",
         );
         let b = set_section(&a, 1, "b", "two");
-        assert!(b.contains("Jonathan's note\n<!-- /overseer:sections -->"));
+        assert!(b.contains("Demo's note\n<!-- /overseer:sections -->"));
         assert!(b.find("S1 -->").unwrap() < b.find("S3 -->").unwrap());
         let c = clear_section(&b, 3);
-        assert!(c.contains("Jonathan's note"));
+        assert!(c.contains("Demo's note"));
         assert!(c.ends_with("body\n"));
     }
 

@@ -56,6 +56,7 @@ fn offline_settings() -> overseer_daemon::Config {
         beads_dir: PathBuf::from("/nonexistent/overseer-test-beads"),
         brain_dir: PathBuf::from("/nonexistent/overseer-test-brain"),
         jira_command: vec![],
+        user_name: "Demo".into(),
         ..overseer_daemon::Config::default()
     }
 }
@@ -239,6 +240,143 @@ async fn daemon_info_reports_pid_and_start() {
     assert_eq!(info.build, "dev");
     assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
     assert!((now - info.started_at).abs() <= 5, "{}", info.started_at);
+}
+
+/// A daemon whose Settings use `security` for the Jira token.
+async fn start_daemon_with_security(email: &str, security: String) -> Daemon {
+    let socket = temp_socket();
+    let state_dir = socket.parent().unwrap().join("state");
+    let mut files = overseer_daemon::SettingsFiles::in_dir(&state_dir);
+    files.security = security;
+    let cfg = DaemonConfig {
+        socket: socket.clone(),
+        default_command: vec![SCRIPT.to_string()],
+        // Empty token variables hide any from the developer's shell.
+        env: overseer_daemon::EnvSource::InheritWith(vec![
+            ("ATLASSIAN_API_TOKEN".into(), String::new()),
+            ("BITBUCKET_API_TOKEN".into(), String::new()),
+        ]),
+        state_dir: state_dir.clone(),
+        files,
+        hook_program: PathBuf::from("/bin/true"),
+        settings: overseer_daemon::Config {
+            jira_email: email.into(),
+            ..offline_settings()
+        },
+        patterns: default_patterns(),
+    };
+    let task = tokio::spawn(run(cfg));
+    for _ in 0..100 {
+        if UnixStream::connect(&socket).await.is_ok() {
+            return Daemon {
+                socket,
+                state_dir,
+                task,
+            };
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    panic!("daemon did not come up");
+}
+
+#[tokio::test]
+async fn tokens_are_saved_through_security_and_never_answered() {
+    use overseer_proto::settings::TokenStatus;
+    use overseer_proto::TokenKind;
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("overseer-token-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // A stand-in for `security`: `-i` keeps the command it is given under
+    // its service, and the read-back prints that service's token (nothing
+    // before a save).
+    let stub = dir.join("security");
+    std::fs::write(
+        &stub,
+        format!(
+            "#!/bin/sh\nd='{d}'\n\
+             if [ \"$1\" = -i ]; then read -r line; \
+             svc=$(printf '%s' \"$line\" | sed -n 's/.* -s \\([^ ]*\\) .*/\\1/p'); \
+             printf '%s\\n' \"$line\" > \"$d/$svc\"; exit 0; fi\n\
+             [ -f \"$d/$3\" ] || exit 44\n\
+             sed -n 's/.* -w \"\\(.*\\)\"$/\\1/p' \"$d/$3\"\n",
+            d = dir.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let d = start_daemon_with_security("demo@example.test", stub.to_str().unwrap().into()).await;
+    let mut c = Client::connect(&d.socket).await;
+    let Response::Settings(v) = c.request(Request::GetSettings).await else {
+        panic!("not a Settings reply");
+    };
+    assert_eq!(v.jira_token, TokenStatus::NotSet, "no token yet");
+    assert_eq!(v.bitbucket_token, TokenStatus::NotSet);
+    let resp = c
+        .request(Request::SetToken {
+            kind: TokenKind::Jira,
+            token: "demo-token-123".into(),
+        })
+        .await;
+    assert_eq!(resp, Response::Ok);
+    let Response::Settings(v) = c.request(Request::GetSettings).await else {
+        panic!("not a Settings reply");
+    };
+    assert_eq!(v.jira_token, TokenStatus::Keychain);
+    assert_eq!(v.bitbucket_token, TokenStatus::NotSet);
+    let resp = c
+        .request(Request::SetToken {
+            kind: TokenKind::Bitbucket,
+            token: "demo-bb-456".into(),
+        })
+        .await;
+    assert_eq!(resp, Response::Ok);
+    assert!(dir.join("overseer-bitbucket").exists());
+    // A settings save answers the states it knows without asking again:
+    // the stub is gone, yet the reply still says both are set.
+    std::fs::remove_file(&stub).unwrap();
+    let resp = c
+        .request(Request::SaveSettings {
+            base_hash: v.file_hash.clone(),
+            edits: vec![],
+        })
+        .await;
+    let Response::Settings(v) = resp else {
+        panic!("not a Settings reply: {resp:?}");
+    };
+    assert_eq!(v.jira_token, TokenStatus::Keychain);
+    assert_eq!(v.bitbucket_token, TokenStatus::Keychain);
+    let shown = format!("{v:?}");
+    assert!(!shown.contains("demo-token-123") && !shown.contains("demo-bb-456"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn jira_token_needs_an_email_first() {
+    // The stub would fail the test if it ran: no email means no Keychain call.
+    let d = start_daemon_with_security(" ", "/nonexistent/overseer-security".into()).await;
+    let mut c = Client::connect(&d.socket).await;
+    let resp = c
+        .request(Request::SetToken {
+            kind: overseer_proto::TokenKind::Bitbucket,
+            token: "demo-token-123".into(),
+        })
+        .await;
+    assert_eq!(
+        resp,
+        Response::Error {
+            message: "set jira_email first".into()
+        }
+    );
+    let Response::Settings(v) = c.request(Request::GetSettings).await else {
+        panic!("not a Settings reply");
+    };
+    assert_eq!(v.jira_token, overseer_proto::settings::TokenStatus::NotSet);
+    assert_eq!(
+        v.bitbucket_token,
+        overseer_proto::settings::TokenStatus::NotSet
+    );
 }
 
 #[tokio::test]
@@ -1408,6 +1546,7 @@ impl Sources {
             ],
             jql: "project = DEMO".into(),
             ticket_pattern: r"DEMO-\d+".into(),
+            user_name: "Demo".into(),
             ..overseer_daemon::Config::default()
         }
     }
@@ -1791,7 +1930,10 @@ async fn missing_jira_program_reports_status_and_beads_still_load() {
     let v = c.refresh().await;
     let jira = source(&v, "jira");
     assert!(!jira.ok, "{jira:?}");
-    assert_eq!(jira.message.as_deref(), Some("no-such-jira-xyz not found"));
+    assert_eq!(
+        jira.message.as_deref(),
+        Some("no-such-jira-xyz not found: set jira_site")
+    );
     let beads = source(&v, "beads");
     assert!(beads.ok && beads.count == 4, "{beads:?}");
     // Beads still group under ticket nodes made from their own keys.
@@ -2004,7 +2146,7 @@ async fn kickoff_request_returns_text() {
         "{text}"
     );
     assert!(text.contains("DEMO-12-widget"), "{text}");
-    // The template is written for Jonathan to edit.
+    // The template is written for Demo to edit.
     assert!(d.state_dir.join("roles/assignment.md").is_file());
 }
 
@@ -2051,7 +2193,10 @@ async fn bead_kickoff_names_its_tickets_folder() {
     };
     let folder = s.dir.join("brain/Sprints/sprint-1/DEMO-12-widget");
     assert!(
-        text.contains(&format!("Ticket folders in 2ndBrain: {}", folder.display())),
+        text.contains(&format!(
+            "Ticket folders in the notes folder: {}",
+            folder.display()
+        )),
         "{text}"
     );
 }
@@ -2415,7 +2560,7 @@ async fn release_grants_the_waiter_and_queues_a_relay() {
         holds(&c.locks().await),
         [(t("custom:z"), 3, ClaimKind::Claim)]
     );
-    // Jonathan was shown S1 holding it; S3 holds it now, so nothing goes.
+    // Demo was shown S1 holding it; S3 holds it now, so nothing goes.
     assert_eq!(
         c.request(Request::ForceRelease {
             target: t("custom:z"),
@@ -2843,7 +2988,7 @@ async fn worker_cannot_start_a_conversation() {
         &c.relay(Some(2), 2, "hi").await,
         "you cannot message yourself"
     ));
-    // A relay from Jonathan is not a message from S0 to answer.
+    // A relay from Demo is not a message from S0 to answer.
     assert_eq!(c.relay(None, 2, "hello").await, queued_for(2));
     let v = c.locks().await;
     deliver_all(&d, 2, &v);
@@ -3103,7 +3248,7 @@ impl Client {
     }
 }
 
-const HELLO: &str = "Message from Jonathan via Overseer: hello";
+const HELLO: &str = "Message from Demo via Overseer: hello";
 
 #[tokio::test]
 async fn idle_slot_gets_the_relay_with_bracketed_paste_then_enter() {
@@ -3154,12 +3299,12 @@ async fn permission_prompt_never_gets_a_relay() {
     )
     .await;
     assert_eq!(c.relay(None, 2, "hello").await, queued_for(2));
-    c.held_for(2, "waiting at a prompt for Jonathan").await;
+    c.held_for(2, "waiting at a prompt for Demo").await;
     stub.reads_nothing_for(3).await;
     let v = c.locks().await;
     assert_eq!(
         v.relays[0].held.as_deref(),
-        Some("waiting at a prompt for Jonathan")
+        Some("waiting at a prompt for Demo")
     );
     assert_eq!(v.relays[0].state, RelayState::Pending);
     // Answered Yes: the tool runs under the working line, still no hook.
@@ -3188,7 +3333,7 @@ async fn prompt_answered_no_gets_the_relay() {
     )
     .await;
     assert_eq!(c.relay(None, 2, "hello").await, queued_for(2));
-    c.held_for(2, "waiting at a prompt for Jonathan").await;
+    c.held_for(2, "waiting at a prompt for Demo").await;
     stub.reads_nothing_for(2).await;
     stub.set_box(None, pid).await;
     assert_eq!(stub.read_until(&pasted(HELLO)).await, pasted(HELLO));
@@ -3221,7 +3366,7 @@ async fn typed_input_box_waits_until_empty() {
     assert_eq!(c.relay(None, 2, "hello").await, queued_for(2));
     c.held_for(2, "input box has text").await;
     stub.reads_nothing_for(2).await;
-    // Jonathan clears his draft; the next look finds the box empty.
+    // Demo clears his draft; the next look finds the box empty.
     stub.set_box(None, pid).await;
     assert_eq!(stub.read_until(&pasted(HELLO)).await, pasted(HELLO));
     c.all_delivered(2).await;
@@ -3553,7 +3698,7 @@ async fn notice_for_a_holder_with_no_session_is_queued_dropped() {
         relay_states(&v),
         [(
             3,
-            t("Jonathan released custom:z, which you held."),
+            t("Demo released custom:z, which you held."),
             RelayState::Dropped
         )]
     );
@@ -3625,7 +3770,7 @@ fn verdict(resp: Response) -> (Option<String>, Option<String>) {
 }
 
 const JOURNAL: &str = "06-Daily/2026/11-November/2026-11-13-journal.md";
-const JOURNAL_DENY: &str = "06-Daily/2026/11-November/2026-11-13-journal.md is a shared 2ndBrain file. Use append_journal for the journal or edit_shared_file for an exact replacement.";
+const JOURNAL_DENY: &str = "06-Daily/2026/11-November/2026-11-13-journal.md is a shared notes file. Use append_journal for the journal or edit_shared_file for an exact replacement.";
 
 #[tokio::test]
 async fn vault_write_checks_deny_shared_files_and_git_and_rewrite_bd() {
@@ -3653,7 +3798,7 @@ async fn vault_write_checks_deny_shared_files_and_git_and_rewrite_bd() {
     let (deny, _) = verdict(c.request(bash_in(1, &cmd, "/tmp")).await);
     assert_eq!(
         deny.as_deref(),
-        Some("use the commit_2ndbrain tool; Overseer commits and pushes 2ndBrain")
+        Some("use the commit_2ndbrain tool; Overseer commits and pushes the notes folder")
     );
     let cmd = format!("git -C {} log", vault.display());
     assert_eq!(
@@ -3663,7 +3808,7 @@ async fn vault_write_checks_deny_shared_files_and_git_and_rewrite_bd() {
     std::fs::create_dir_all(vault.join("06-Daily")).unwrap();
     let cmd = format!("rm -rf {}/06-Daily", vault.display());
     let (deny, _) = verdict(c.request(bash_in(1, &cmd, "/tmp")).await);
-    assert!(deny.unwrap().contains("holds shared 2ndBrain files"));
+    assert!(deny.unwrap().contains("holds shared notes files"));
     // bd writes are rewritten, compound ones denied, reads untouched.
     let (deny, rewrite) = verdict(c.request(bash_in(1, "bd close ov-3", "/tmp")).await);
     assert_eq!(deny, None);
@@ -3675,7 +3820,7 @@ async fn vault_write_checks_deny_shared_files_and_git_and_rewrite_bd() {
     );
     assert_eq!(
         deny.as_deref(),
-        Some("Overseer: run bd writes on their own, without $(...), backticks, redirects or env prefixes, so the daemon can run them under the vault lock")
+        Some("Overseer: run bd writes on their own, without $(...), backticks, redirects or env prefixes, so the daemon can run them under the notes folder lock")
     );
     assert_eq!(rewrite, None);
     assert_eq!(
@@ -3796,7 +3941,7 @@ async fn summary_from_s0_shows_on_the_board() {
     let board = c.board().await;
     assert_eq!(board.coord.summary.unwrap().text, "Two lanes - both green");
     assert_eq!(board.slots.len(), 7);
-    // Jonathan, through ctl, may set it too.
+    // Demo, through ctl, may set it too.
     assert_eq!(c.set_summary(None, "  Quiet  ").await, Response::Ok);
     assert_eq!(c.coord().await.summary.unwrap().text, "Quiet");
 }
@@ -4147,7 +4292,7 @@ async fn proposed_plan_is_pending_and_announced() {
     assert_eq!(
         resp,
         Response::Text {
-            text: "Plan 1 is waiting for Jonathan.".into()
+            text: "Plan 1 is waiting for Demo.".into()
         }
     );
     let event = c.coord_event().await;
@@ -4168,13 +4313,13 @@ async fn new_plan_supersedes_the_old() {
     assert_eq!(
         first,
         Response::Text {
-            text: "Plan 1 is waiting for Jonathan.".into()
+            text: "Plan 1 is waiting for Demo.".into()
         }
     );
     let second = c.propose(Some(0), plan_of(vec![rig.slot5()])).await;
     match second {
         Response::Text { text } => assert!(
-            text == "Plan 2 is waiting for Jonathan. It replaces plan 1.",
+            text == "Plan 2 is waiting for Demo. It replaces plan 1.",
             "{text}"
         ),
         other => panic!("{other:?}"),
@@ -4236,7 +4381,7 @@ async fn approve_runs_every_step() {
     );
 
     s3.read_until("Pick this up next.").await;
-    let told = s0.read_until("Jonathan approved plan 1.").await;
+    let told = s0.read_until("Demo approved plan 1.").await;
     assert!(told.contains("S4: holds repo:demo-api:main"), "{told}");
     assert!(told.contains("S3: kickoff queued"), "{told}");
 
@@ -4259,7 +4404,7 @@ async fn approve_with_edits_says_so() {
     let edited = plan_of(vec![rig.slot4()]);
     let resp = c.approve(1, edited.clone()).await;
     assert!(matches!(resp, Response::Text { .. }), "{resp:?}");
-    s0.read_until("Jonathan approved plan 1 with edits.").await;
+    s0.read_until("Demo approved plan 1 with edits.").await;
     let record = c.plan_record(1).await;
     assert!(record.edited);
     assert_eq!(record.plan, edited);
@@ -4279,7 +4424,7 @@ async fn approval_revalidates() {
         c.propose(Some(0), plan.clone()).await,
         Response::Text { .. }
     ));
-    // Jonathan assigns the ticket by hand before approving.
+    // Demo assigns the ticket by hand before approving.
     assert_eq!(c.assign("DEMO-12", 2, false, false).await, Response::Ok);
     let resp = c.approve(1, plan).await;
     assert_eq!(
@@ -4378,7 +4523,7 @@ async fn reject_tells_s0() {
         Response::Text { .. }
     ));
     assert_eq!(c.reject(1, "not today").await, Response::Ok);
-    s0.read_until("Jonathan rejected plan 1: not today").await;
+    s0.read_until("Demo rejected plan 1: not today").await;
     assert_eq!(c.plan_record(1).await.state, PlanState::Rejected);
     assert_eq!(rig.starts(), 0);
     // A decided plan cannot be decided again.
@@ -4409,7 +4554,7 @@ async fn decide_from_a_slot_is_refused() {
             })
             .await;
         assert!(
-            is_error(&resp, "only Jonathan can approve or reject a plan"),
+            is_error(&resp, "only Demo can approve or reject a plan"),
             "{resp:?}"
         );
     }
@@ -4552,4 +4697,81 @@ async fn check_plan_recomputes_warnings_for_an_edited_plan() {
     );
     // Checking records nothing.
     assert!(c.coord().await.plans.is_empty());
+}
+
+#[tokio::test]
+async fn a_refused_notes_folder_puts_a_notice_on_the_board() {
+    // The default notes folder already holds someone else's files.
+    let notes = tempfile::tempdir().unwrap();
+    std::fs::write(notes.path().join("README.md"), "not notes\n").unwrap();
+    let settings = overseer_daemon::Config {
+        brain_dir: notes.path().to_path_buf(),
+        notes_owned: true,
+        brain_writer: true,
+        ..offline_settings()
+    };
+    let socket = temp_socket();
+    let d = start_daemon_cfg(
+        socket.clone(),
+        overseer_daemon::EnvSource::Inherit,
+        settings.clone(),
+    )
+    .await;
+    let mut c = Client::connect(&d.socket).await;
+    let v = c.work().await;
+    let for_s0: Vec<_> = v.notices.iter().filter(|n| n.slot == 0).collect();
+    assert_eq!(for_s0.len(), 1, "{:?}", v.notices);
+    let text = &for_s0[0].text;
+    assert!(text.contains(&notes.path().display().to_string()), "{text}");
+    assert!(text.contains("no .overseer-notes marker"), "{text}");
+    assert!(text.contains("set notes_dir"), "{text}");
+    assert!(!notes.path().join(".overseer-notes").exists());
+    assert!(!notes.path().join(".git").exists());
+    drop(c);
+    drop(d);
+    // A restart with the folder still refused does not stack a second copy.
+    let d = start_daemon_cfg(socket, overseer_daemon::EnvSource::Inherit, settings).await;
+    let mut c = Client::connect(&d.socket).await;
+    let v = c.work().await;
+    assert_eq!(v.notices.iter().filter(|n| n.slot == 0).count(), 1);
+}
+
+#[tokio::test]
+async fn sessions_start_without_the_api_tokens() {
+    let dir = std::env::temp_dir().join(format!("ovs-tokens-env-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("env.log");
+    let bin = dir.join("show-env");
+    write_script(
+        &bin,
+        &format!(
+            "env > '{tmp}'; mv '{tmp}' '{log}'; exec cat",
+            tmp = dir.join("env.tmp").display(),
+            log = log.display()
+        ),
+    );
+    let env = overseer_daemon::EnvSource::InheritWith(vec![
+        ("ATLASSIAN_API_TOKEN".into(), "demo-jira-secret".into()),
+        ("BITBUCKET_API_TOKEN".into(), "demo-bb-secret".into()),
+        ("DEMO_KEPT".into(), "yes".into()),
+    ]);
+    let d = start_daemon_with(temp_socket(), env).await;
+    let mut c = Client::connect(&d.socket).await;
+    let start = Request::StartSlot {
+        id: 4,
+        label: "env".into(),
+        cwd: dir.clone(),
+        command: Some(vec![bin.to_string_lossy().into_owned()]),
+        prompt: None,
+    };
+    assert_eq!(c.request(start).await, Response::Ok);
+    let lines = wait_for_log(&log, 1).await;
+    assert!(lines.iter().any(|l| l == "DEMO_KEPT=yes"), "{lines:?}");
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.starts_with("ATLASSIAN_API_TOKEN=") || l.starts_with("BITBUCKET_API_TOKEN=")),
+        "{lines:?}"
+    );
 }

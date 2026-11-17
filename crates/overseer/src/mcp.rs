@@ -50,7 +50,7 @@ fn tools() -> Value {
                 "type": "object",
                 "properties": {
                     "target": {"type": "string", "description": "The target key, for example repo:demo-api:main."},
-                    "reason": {"type": "string", "description": "What you are going to do with it. Optional, but it tells Jonathan and other sessions why you hold it."},
+                    "reason": {"type": "string", "description": "What you are going to do with it. Optional, but it tells the user and other sessions why you hold it."},
                     "item": {"type": "string", "description": "The work item the claim is for, for example DEMO-33 or ov-3."}
                 },
                 "required": ["target"]
@@ -86,11 +86,11 @@ fn tools() -> Value {
         },
         {
             "name": "commit_2ndbrain",
-            "description": "Commit and push files in the 2ndBrain vault. Overseer commits only the paths you name, one commit at a time, so you never sweep up another session's half-finished edits. Use this instead of git. Replies with the commit, or says the commit is queued and will land.",
+            "description": "Commit and push files in the notes folder. Overseer commits only the paths you name, one commit at a time, so you never sweep up another session's half-finished edits. Use this instead of git. Replies with the commit, or says the commit is queued and will land.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "paths": {"type": "array", "items": {"type": "string"}, "description": "Files to commit, relative to the vault or absolute. Deletions count."},
+                    "paths": {"type": "array", "items": {"type": "string"}, "description": "Files to commit, relative to the notes folder or absolute. Deletions count."},
                     "message": {"type": "string", "description": "The commit message."}
                 },
                 "required": ["paths", "message"]
@@ -110,11 +110,11 @@ fn tools() -> Value {
         },
         {
             "name": "edit_shared_file",
-            "description": "Replace one exact piece of text in a shared 2ndBrain file (a sprint dashboard, a journal) and commit it. `old_text` must occur exactly once; if the file has changed since you read it the edit fails and shows you the current text.",
+            "description": "Replace one exact piece of text in a shared notes file (a sprint dashboard, a journal) and commit it. `old_text` must occur exactly once; if the file has changed since you read it the edit fails and shows you the current text.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "The shared file, relative to the vault or absolute."},
+                    "path": {"type": "string", "description": "The shared file, relative to the notes folder or absolute."},
                     "old_text": {"type": "string", "description": "The exact text to replace. It must occur once."},
                     "new_text": {"type": "string", "description": "What to put there."}
                 },
@@ -134,7 +134,7 @@ fn tools() -> Value {
         },
         {
             "name": "get_board",
-            "description": "The whole board in one answer: the coordinator's summary, every slot with its state, owned items, held targets and last report, the work items, the locks and any plan waiting for Jonathan. Read-only.",
+            "description": "The whole board in one answer: the coordinator's summary, every slot with its state, owned items, held targets and last report, the work items, the locks and any plan waiting for the user. Read-only.",
             "inputSchema": {"type": "object", "properties": {}}
         },
         {
@@ -144,7 +144,7 @@ fn tools() -> Value {
         },
         {
             "name": "propose_plan",
-            "description": "Coordinator only. Propose a plan for Jonathan to approve: which slot takes which items, which targets it claims, where it works and what it is told. Nothing runs until Jonathan approves. A new plan replaces a pending one.",
+            "description": "Coordinator only. Propose a plan for the user to approve: which slot takes which items, which targets it claims, where it works and what it is told. Nothing runs until the user approves. A new plan replaces a pending one.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -214,7 +214,7 @@ fn tools() -> Value {
         },
         {
             "name": "set_board_summary",
-            "description": "Coordinator only. Set the board summary Jonathan sees at the top of the board. It replaces the previous one.",
+            "description": "Coordinator only. Set the board summary the user sees at the top of the board. It replaces the previous one.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -448,7 +448,7 @@ fn call_tool(params: &Value, slot: Option<SlotId>, call: &mut Call) -> Result<Va
         Ok(Response::Queued { message }) => tool_result(message, false),
         Ok(Response::Locks(view)) => tool_result(format_locks(&view), false),
         Ok(Response::Board(view)) => tool_result(
-            crate::ctl::format_board(&view, crate::ctl::now_secs()),
+            crate::ctl::format_board(&view, crate::ctl::now_secs(), &crate::ctl::user_name()),
             false,
         ),
         Ok(Response::Work(view)) => {
@@ -756,7 +756,7 @@ mod tests {
             &tool("commit_2ndbrain", args),
             Some(1),
             Ok(Response::Error {
-                message: "the 2ndBrain writer is off (brain_writer in config.toml)".into(),
+                message: "the notes writer is off (brain_writer in config.toml)".into(),
             }),
         );
         let out = out.unwrap();

@@ -133,7 +133,7 @@ pub(crate) fn locate(
     p: &Path,
     home: &Path,
 ) -> Result<(String, bool), String> {
-    let outside = || format!("{} is outside 2ndBrain", p.display());
+    let outside = || format!("{} is outside the notes folder", p.display());
     let root = resolve(brain, None, brain, home).ok_or_else(outside)?;
     let full = resolve(brain, cwd, p, home).ok_or_else(outside)?;
     let rel = full.strip_prefix(&root).map_err(|_| outside())?;
@@ -468,7 +468,7 @@ mod tests {
 
         assert_eq!(
             rel("../../outside.md").unwrap_err(),
-            "../../outside.md is outside 2ndBrain"
+            "../../outside.md is outside the notes folder"
         );
         assert_eq!(
             vault_rel(
@@ -482,10 +482,10 @@ mod tests {
         );
         assert!(rel("../link/secret.md")
             .unwrap_err()
-            .ends_with("is outside 2ndBrain"));
+            .ends_with("is outside the notes folder"));
         assert!(rel("../link/new.md")
             .unwrap_err()
-            .ends_with("is outside 2ndBrain"));
+            .ends_with("is outside the notes folder"));
         assert_eq!(
             rel("notes/demo api é.md").unwrap(),
             "Sessions/notes/demo api é.md"
@@ -496,18 +496,20 @@ mod tests {
         std::os::unix::fs::symlink(brain.join("c/d"), brain.join("inlink")).unwrap();
         assert!(rel("../link/../x")
             .unwrap_err()
-            .ends_with("is outside 2ndBrain"));
+            .ends_with("is outside the notes folder"));
         assert_eq!(rel("../inlink/../x").unwrap(), "c/x");
         // `..` out of a missing folder lands where symlinks count again.
         assert!(rel("../new/../link/x")
             .unwrap_err()
-            .ends_with("is outside 2ndBrain"));
+            .ends_with("is outside the notes folder"));
         assert_eq!(
             vault_rel(&brain, Some(&cwd), &brain.join("../vault/x"), &home).unwrap(),
             "x"
         );
         // `~` resolves against home; home here is outside the vault.
-        assert!(rel("~/a.md").unwrap_err().ends_with("is outside 2ndBrain"));
+        assert!(rel("~/a.md")
+            .unwrap_err()
+            .ends_with("is outside the notes folder"));
         // No cwd: a relative path is read against the vault.
         assert_eq!(
             vault_rel(&brain, None, Path::new("Sessions/a.md"), &home).unwrap(),

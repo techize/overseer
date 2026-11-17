@@ -42,6 +42,19 @@ pub const SESSION_VARS: &[&str] = &[
     "AI_AGENT",
 ];
 
+/// Overseer's own API tokens. The daemon reads them from its base
+/// environment as a fallback to the Keychain, but a session never gets
+/// them: they are removed from every slot's environment at launch.
+pub const TOKEN_VARS: &[&str] = &["ATLASSIAN_API_TOKEN", "BITBUCKET_API_TOKEN"];
+
+/// `vars` without [`TOKEN_VARS`]: the environment a session starts with.
+pub fn for_session(vars: &[(OsString, OsString)]) -> Vars {
+    vars.iter()
+        .filter(|(k, _)| !k.to_str().is_some_and(|k| TOKEN_VARS.contains(&k)))
+        .cloned()
+        .collect()
+}
+
 /// Prefixes of session-scoped variables, removed like [`SESSION_VARS`]
 /// (`CLAUDE_CODE_SESSION_ID`, `CLAUDE_CODE_SESSION_ATTENDED` and so on).
 pub const SESSION_PREFIXES: &[&str] = &["CLAUDE_CODE_SESSION"];
@@ -360,6 +373,23 @@ impl BaseEnv {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_session_never_gets_the_api_tokens() {
+        let vars: Vars = [
+            ("ATLASSIAN_API_TOKEN", "demo-secret"),
+            ("BITBUCKET_API_TOKEN", "demo-secret"),
+            ("PATH", "/usr/bin"),
+        ]
+        .iter()
+        .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+        .collect();
+        let got = for_session(&vars);
+        assert_eq!(
+            got,
+            vec![(OsString::from("PATH"), OsString::from("/usr/bin"))]
+        );
+    }
 
     fn v(pairs: &[(&str, &str)]) -> Vars {
         pairs

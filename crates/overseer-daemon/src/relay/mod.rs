@@ -1,4 +1,4 @@
-//! Relays: messages queued for a session, from Jonathan, S0, a worker
+//! Relays: messages queued for a session, from the user, S0, a worker
 //! answering one, or Overseer itself. This module decides who may send and
 //! queues the relay in the ledger; the courier types it into the terminal.
 
@@ -21,7 +21,7 @@ fn error(message: impl Into<String>) -> Response {
     }
 }
 
-/// Whether `from` may message `to`. Jonathan (`None`) and S0 always may.
+/// Whether `from` may message `to`. The user (`None`) and S0 always may.
 /// A worker may only answer a delivered relay from `to` that it has not
 /// answered yet (`unanswered`), and the answer carries that relay as its
 /// `reply_to`. Workers can therefore never start a conversation.

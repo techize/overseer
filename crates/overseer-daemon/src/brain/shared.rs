@@ -270,7 +270,7 @@ mod tests {
         let dir = temp("stale");
         let f = dir.join("SPRINT-DASHBOARD.md");
         write_atomic(&f, "status: todo\n").unwrap();
-        // Jonathan edits in Obsidian after the session last read it.
+        // The user edits in Obsidian after the session last read it.
         write_atomic(&f, "status: doing\n").unwrap();
         let locks = FileLocks::new();
         let e = edit_file(&f, "status: todo", "status: done", &locks)

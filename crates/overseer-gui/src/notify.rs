@@ -32,7 +32,7 @@ pub fn should_notify(prev: Option<&SlotInfo>, next: &SlotInfo, first_sync: bool)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Note {
     pub slot: SlotId,
-    /// The 2ndBrain push notice: it has its own identifier and a click
+    /// The Notes push notice: it has its own identifier and a click
     /// opens the board, not a session.
     pub push: bool,
     /// S0 proposed a plan: a click opens the board and the plan.
@@ -100,8 +100,8 @@ pub fn new_waits(prev: &LockView, next: &LockView) -> Vec<Note> {
 /// The notification for the push problem `next`, if it has not been
 /// announced yet. `notified` is the text last announced: it is set when a
 /// note is returned and cleared when the problem is gone, so a recurrence
-/// notifies again. The daemon's text already starts `2ndBrain push needs
-/// you:`, so the title is just `2ndBrain` and the body is the text in full.
+/// notifies again. The daemon's text already starts `Notes push needs
+/// you:`, so the title is just `Notes` and the body is the text in full.
 pub fn push_problem_note(notified: &mut Option<String>, next: Option<&str>) -> Option<Note> {
     let Some(next) = next else {
         *notified = None;
@@ -115,7 +115,7 @@ pub fn push_problem_note(notified: &mut Option<String>, next: Option<&str>) -> O
         slot: 0,
         push: true,
         plan: false,
-        title: "2ndBrain".into(),
+        title: "Notes".into(),
         body: next.to_string(),
     })
 }
@@ -640,18 +640,17 @@ mod tests {
     fn push_problem_notifies_once_per_occurrence() {
         let mut seen = None;
         // Already there at connect: notifies.
-        let n = push_problem_note(&mut seen, Some("2ndBrain push needs you: rejected")).unwrap();
-        assert_eq!(n.title, "2ndBrain");
-        assert_eq!(n.body, "2ndBrain push needs you: rejected");
+        let n = push_problem_note(&mut seen, Some("Notes push needs you: rejected")).unwrap();
+        assert_eq!(n.title, "Notes");
+        assert_eq!(n.body, "Notes push needs you: rejected");
         assert!(n.push);
         // The same text on a later event does not.
         assert_eq!(
-            push_problem_note(&mut seen, Some("2ndBrain push needs you: rejected")),
+            push_problem_note(&mut seen, Some("Notes push needs you: rejected")),
             None
         );
         // Different text (the autostash notice, in full) is news.
-        let full =
-            "2ndBrain push needs you: x. Resolve the conflicted files, then drop that stash.";
+        let full = "Notes push needs you: x. Resolve the conflicted files, then drop that stash.";
         assert_eq!(push_problem_note(&mut seen, Some(full)).unwrap().body, full);
         // Cleared, then recurring, notifies again.
         assert_eq!(push_problem_note(&mut seen, None), None);

@@ -360,7 +360,15 @@ pub fn empty_brain() -> BrainView {
         last_sync: None,
         push_problem: None,
         brain_dir: None,
+        notes_dir: None,
     }
+}
+
+/// Where a new session starts: the notes folder, whether or not the
+/// writer is on, else the writer's folder (a daemon that predates
+/// `notes_dir`).
+pub fn dialog_notes_dir(v: &BrainView) -> Option<std::path::PathBuf> {
+    v.notes_dir.clone().or_else(|| v.brain_dir.clone())
 }
 
 /// The coordinator view before the daemon's first answer.
@@ -1718,7 +1726,9 @@ impl OverseerApp {
             .slots
             .get(id as usize)
             .filter(|i| matches!(i.state, SlotState::Exited { .. }));
-        let dialog = cx.new(|cx| StartDialog::new(id, client, last, prefill, cx));
+        let notes_dir = dialog_notes_dir(&self.brain);
+        let dialog =
+            cx.new(|cx| StartDialog::new(id, client, last, prefill, notes_dir.as_deref(), cx));
         let sub = cx.subscribe_in(&dialog, window, |this, _, ev: &DialogEvent, window, cx| {
             this.dialog = None;
             match ev {
@@ -1811,6 +1821,35 @@ pub fn install(cx: &mut App) {
 mod tests {
     use super::*;
     use gpui::{KeyContext, Keymap, Keystroke};
+
+    #[test]
+    fn a_new_session_starts_in_the_notes_folder_with_the_writer_off() {
+        use crate::start_dialog::{initial_fields, FALLBACK_CWD};
+        let home = Some(std::path::Path::new("/Users/demo"));
+        // Writer off, vault present: the daemon still names the folder.
+        let off = BrainView {
+            notes_dir: Some("/Users/demo/Repos/2ndBrain".into()),
+            ..empty_brain()
+        };
+        let dir = dialog_notes_dir(&off);
+        assert_eq!(
+            initial_fields(0, None, home, dir.as_deref())[1],
+            "~/Repos/2ndBrain"
+        );
+        // A daemon that predates `notes_dir` still gives the writer's folder.
+        let old = BrainView {
+            on: true,
+            brain_dir: Some("/Users/demo/notes".into()),
+            ..empty_brain()
+        };
+        assert_eq!(dialog_notes_dir(&old), Some("/Users/demo/notes".into()));
+        // Neither: home.
+        let none = dialog_notes_dir(&empty_brain());
+        assert_eq!(
+            initial_fields(0, None, home, none.as_deref())[1],
+            FALLBACK_CWD
+        );
+    }
 
     #[test]
     fn slots_before_the_first_list_are_unknown() {

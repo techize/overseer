@@ -619,6 +619,62 @@ pub enum Request {
         base_hash: String,
         edits: Vec<SettingEdit>,
     },
+    /// Store an API token in the Keychain for `jira_email`; answers
+    /// `Response::Ok` or an error. The token is never shown in a `Debug`
+    /// dump, and the daemon never logs or answers it.
+    SetToken {
+        kind: TokenKind,
+        token: SecretText,
+    },
+}
+
+/// Which API token a `SetToken` stores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenKind {
+    Jira,
+    Bitbucket,
+}
+
+impl TokenKind {
+    /// The name people know the token by: `Jira` or `Bitbucket`.
+    pub fn label(self) -> &'static str {
+        match self {
+            TokenKind::Jira => "Jira",
+            TokenKind::Bitbucket => "Bitbucket",
+        }
+    }
+}
+
+/// A secret in a request. It travels as a plain string, but `Debug` shows
+/// `"<hidden>"`, so a logged request cannot leak it.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SecretText(String);
+
+impl SecretText {
+    /// The secret itself, for the one place that must use it.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for SecretText {
+    fn from(s: String) -> Self {
+        SecretText(s)
+    }
+}
+
+impl From<&str> for SecretText {
+    fn from(s: &str) -> Self {
+        SecretText(s.to_owned())
+    }
+}
+
+impl std::fmt::Debug for SecretText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("\"<hidden>\"")
+    }
 }
 
 /// One write target a plan has a slot claim.
@@ -867,6 +923,10 @@ pub struct BrainView {
     /// session note. `None` while the writer is off.
     #[serde(default)]
     pub brain_dir: Option<std::path::PathBuf>,
+    /// The notes folder when it exists, whether or not the writer is on:
+    /// where a new session starts.
+    #[serde(default)]
+    pub notes_dir: Option<std::path::PathBuf>,
 }
 
 /// A file write the `PreToolUse` hook asks the daemon to check.
@@ -1514,6 +1574,39 @@ mod tests {
     }
 
     #[test]
+    fn set_token_debug_hides_the_token() {
+        for (kind, name) in [
+            (TokenKind::Jira, "Jira"),
+            (TokenKind::Bitbucket, "Bitbucket"),
+        ] {
+            let req = Request::SetToken {
+                kind,
+                token: "demo-secret-token".into(),
+            };
+            let shown = format!("{req:?}");
+            assert_eq!(
+                shown,
+                format!(r#"SetToken {{ kind: {name}, token: "<hidden>" }}"#)
+            );
+            assert!(!shown.contains("demo-secret"));
+            // On the wire it is a plain string, and it round-trips.
+            let json = serde_json::to_string(&req).unwrap();
+            assert!(json.contains("demo-secret-token"));
+            let back: Request = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, req);
+            // A frame holding it hides it too.
+            let frame = format!("{:?}", crate::Frame::Request { seq: 1, req });
+            assert!(!frame.contains("demo-secret"), "{frame}");
+        }
+        let json = serde_json::to_string(&Request::SetToken {
+            kind: TokenKind::Bitbucket,
+            token: "x".into(),
+        })
+        .unwrap();
+        assert!(json.contains(r#""kind":"bitbucket""#), "{json}");
+    }
+
+    #[test]
     fn settings_messages_round_trip() {
         use crate::settings::{Applies, Setting, SettingKind, SettingValue};
         for req in [
@@ -1539,7 +1632,7 @@ mod tests {
             load_error: None,
             settings: vec![Setting {
                 key: "shared_files".into(),
-                group: "2ndBrain".into(),
+                group: "Notes".into(),
                 kind: SettingKind::List,
                 applies: Applies::Restart,
                 value: SettingValue::List(vec!["a.md".into()]),
@@ -1551,6 +1644,8 @@ mod tests {
             targets_path: "/tmp/demo/targets.toml".into(),
             targets_note: "3 built-in patterns; /tmp/demo/targets.toml does not exist".into(),
             targets_error: None,
+            jira_token: Default::default(),
+            bitbucket_token: Default::default(),
             daemon: DaemonInfo {
                 version: "0.1.0".into(),
                 build: "dev".into(),
@@ -1758,6 +1853,7 @@ mod tests {
             }),
             push_problem: None,
             brain_dir: None,
+            notes_dir: Some(PathBuf::from("/tmp/vault")),
         }
     }
 

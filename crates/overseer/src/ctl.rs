@@ -91,7 +91,7 @@ pub enum CtlCmd {
     Refresh,
     /// Print the kickoff text for a slot's assigned items.
     Kickoff { n: SlotId },
-    /// Commit and push files in the 2ndBrain through the daemon's queue.
+    /// Commit and push files in the notes folder through the daemon's queue.
     /// Paths are relative to the vault or absolute.
     Commit {
         #[arg(short, long)]
@@ -113,14 +113,14 @@ pub enum CtlCmd {
         #[arg(allow_hyphen_values = true)]
         text: String,
     },
-    /// Run a bd write under the 2ndBrain lock: `ctl bd -- update ov-3 ...`.
+    /// Run a bd write under the notes folder lock: `ctl bd -- update ov-3 ...`.
     /// Prints bd's output and exits with its code. Stdin, when it is not a
     /// terminal, is passed to bd.
     Bd {
         #[arg(last = true, allow_hyphen_values = true, required = true)]
         args: Vec<String>,
     },
-    /// The 2ndBrain writer: commit queue, last backup and sync, push trouble.
+    /// The notes writer: commit queue, last backup and sync, push trouble.
     Brain {
         /// Print the raw BrainView as JSON.
         #[arg(long)]
@@ -187,9 +187,9 @@ pub enum SettingsCmd {
 
 #[derive(Subcommand)]
 pub enum PlanCmd {
-    /// Approve plan <id> as it is stored. Only Jonathan can.
+    /// Approve plan <id> as it is stored. Only you can.
     Approve { id: i64 },
-    /// Reject plan <id>, with a reason if you have one. Only Jonathan can.
+    /// Reject plan <id>, with a reason if you have one. Only you can.
     Reject { id: i64, reason: Option<String> },
     /// Propose a plan from a JSON file, or `-` for stdin.
     Propose { source: String },
@@ -402,7 +402,7 @@ fn print_text_or_queued(resp: Response) -> anyhow::Result<()> {
     }
 }
 
-/// `$OVERSEER_SLOT`, when it names a slot: who a 2ndBrain write is from.
+/// `$OVERSEER_SLOT`, when it names a slot: who a notes write is from.
 fn env_slot() -> Option<SlotId> {
     std::env::var("OVERSEER_SLOT")
         .ok()
@@ -467,7 +467,7 @@ fn print_brain_text(resp: Response) -> anyhow::Result<()> {
 /// A short human summary of the writer.
 pub fn format_brain(v: &BrainView) -> Vec<String> {
     if !v.on {
-        return vec!["2ndBrain writer is off (brain_writer in config.toml)".into()];
+        return vec!["Notes writer is off (brain_writer in config.toml)".into()];
     }
     let count = |st: QueueState| v.entries.iter().filter(|e| e.state == st).count();
     let run = |name: &str, r: &Option<BrainRun>| match r {
@@ -476,7 +476,7 @@ pub fn format_brain(v: &BrainView) -> Vec<String> {
         None => format!("last {name}  never"),
     };
     let mut out = vec![
-        "2ndBrain writer is on".to_string(),
+        "Notes writer is on".to_string(),
         format!(
             "queue  {} queued  {} committed  {} nothing to commit  {} failed",
             count(QueueState::Queued),
@@ -580,10 +580,17 @@ fn board_state(s: &SlotInfo, now: i64) -> String {
     }
 }
 
+/// The name of the person at the keyboard, from the config file.
+pub fn user_name() -> String {
+    let home = overseer_daemon::config::home_from_env();
+    let (config, _) = overseer_daemon::Config::load(&overseer_proto::paths::config_path(), &home);
+    config.user().to_string()
+}
+
 /// The board as text, shared by `get_board` and `ctl board`: the summary,
 /// one line per slot (with its last report beneath), work items, locks and
-/// the plan waiting for Jonathan.
-pub fn format_board(view: &BoardView, now: i64) -> String {
+/// the plan waiting for the user.
+pub fn format_board(view: &BoardView, now: i64, user: &str) -> String {
     let mut out = Vec::new();
     out.push(match &view.coord.summary {
         Some(s) => format!("Summary ({}): {}", local_hhmm(s.at), s.text),
@@ -657,7 +664,7 @@ pub fn format_board(view: &BoardView, now: i64) -> String {
     out.extend(format_locks(&view.locks, now));
     if let Some(p) = view.coord.pending_plan() {
         out.push(format!(
-            "Plan {} waiting for Jonathan since {}",
+            "Plan {} waiting for {user} since {}",
             p.id,
             local_hhmm(p.at)
         ));
@@ -1195,7 +1202,7 @@ pub async fn run(cmd: CtlCmd) -> anyhow::Result<()> {
                 if json {
                     println!("{}", serde_json::to_string(&v)?);
                 } else {
-                    println!("{}", format_board(&v, now_secs()));
+                    println!("{}", format_board(&v, now_secs(), &user_name()));
                 }
                 Ok(())
             }
@@ -1261,13 +1268,15 @@ mod tests {
             file_hash: String::new(),
             load_error: Some("bad line 3".into()),
             settings: vec![
-                row("shared_files", "2ndBrain", Applies::Restart, true, true),
+                row("shared_files", "Notes", Applies::Restart, true, true),
                 row("jira_command", "Commands", Applies::ReadOnly, false, false),
                 row("bd_command", "Commands", Applies::ReadOnly, true, false),
             ],
             targets_path: "/tmp/demo/targets.toml".into(),
             targets_note: "3 built-in patterns; /tmp/demo/targets.toml does not exist".into(),
             targets_error: Some("broken".into()),
+            jira_token: Default::default(),
+            bitbucket_token: Default::default(),
             daemon: DaemonInfo {
                 version: "0.1.0".into(),
                 build: "dev".into(),
@@ -1280,7 +1289,7 @@ mod tests {
             format_settings(&v),
             vec![
                 "config.toml: /tmp/demo/config.toml",
-                "2ndBrain",
+                "Notes",
                 r#"  shared_files = ["a.md"]  (from the file)  restart needed"#,
                 "Commands",
                 r#"  jira_command = ["a.md"]  (default)  read-only"#,
@@ -1610,7 +1619,7 @@ mod tests {
             at: 300,
             text: "Two lanes running.".into(),
         }));
-        let text = format_board(&v, 1000);
+        let text = format_board(&v, 1000, "Demo");
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
             lines[0],
@@ -1641,7 +1650,7 @@ mod tests {
         assert!(lines[locks_at + 1].starts_with("repo:demo-api:main  S3  claim  since "));
         assert_eq!(
             lines.last().unwrap(),
-            &format!("Plan 2 waiting for Jonathan since {}", local_hhmm(400))
+            &format!("Plan 2 waiting for Demo since {}", local_hhmm(400))
         );
     }
 
@@ -1650,7 +1659,7 @@ mod tests {
         let mut v = board(None);
         // S3's report was made at 500; its session now started at 700.
         v.slots[3].state = SlotState::Running { pid: 2, since: 700 };
-        let text = format_board(&v, 1000);
+        let text = format_board(&v, 1000, "Demo");
         assert!(!text.contains("last report"), "{text}");
         // A report from the new session shows.
         v.coord.reports.push(overseer_proto::Report {
@@ -1660,7 +1669,7 @@ mod tests {
             kind: ReportKind::Report,
             text: "schema done".into(),
         });
-        let text = format_board(&v, 1000);
+        let text = format_board(&v, 1000, "Demo");
         assert!(
             text.contains(&format!("  last report {}: schema done", local_hhmm(800))),
             "{text}"
@@ -1672,9 +1681,9 @@ mod tests {
     fn board_text_without_summary_says_none_yet() {
         let mut v = board(None);
         v.coord.plans.clear();
-        let text = format_board(&v, 1000);
+        let text = format_board(&v, 1000, "Demo");
         assert_eq!(text.lines().next().unwrap(), "Summary: none yet");
-        assert!(!text.contains("waiting for Jonathan"), "{text}");
+        assert!(!text.contains("waiting for Demo"), "{text}");
     }
 
     #[test]

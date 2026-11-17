@@ -113,6 +113,7 @@ impl Vault {
             current_session: self.base.join("home/.claude/CURRENT_SESSION.md"),
             bd_command: vec![self.base.join("bd-stub.sh").to_string_lossy().into_owned()],
             jira_command: vec![],
+            user_name: "Demo".into(),
             ..Config::default()
         }
     }
@@ -229,7 +230,7 @@ async fn session_commit_is_queued_committed_and_pushed() {
     let v = Vault::new("commit");
     let svc = v.service(Arc::new(Ledger::in_memory()), v.options());
     write(&v.vault.join(S1_NOTE), "# S1\n");
-    write(&v.vault.join("unrelated.md"), "Jonathan's\n");
+    write(&v.vault.join("unrelated.md"), "Demo's\n");
     let before = v.commits();
     let r = svc
         .commit(
@@ -282,14 +283,14 @@ async fn commit_refuses_another_slots_folder_and_shared_files() {
         .await;
     assert_eq!(
         error(&r),
-        format!("{S2_NOTE} belongs to S2 (session note). Ask Jonathan before writing it.")
+        format!("{S2_NOTE} belongs to S2 (session note). Ask Demo before writing it.")
     );
     let r = svc
         .commit(s1, vec![folder_file.clone()], "S1: x".into(), &owners())
         .await;
     assert_eq!(
         error(&r),
-        format!("{folder_file} belongs to S2 (DEMO-12). Ask Jonathan before writing it.")
+        format!("{folder_file} belongs to S2 (DEMO-12). Ask Demo before writing it.")
     );
     let r = svc
         .commit(s1, vec![journal.into()], "S1: x".into(), &owners())
@@ -297,13 +298,13 @@ async fn commit_refuses_another_slots_folder_and_shared_files() {
     assert_eq!(
         error(&r),
         format!(
-            "{journal} is a shared 2ndBrain file. Use append_journal for the journal or edit_shared_file for an exact replacement."
+            "{journal} is a shared notes file. Use append_journal for the journal or edit_shared_file for an exact replacement."
         )
     );
     let r = svc
         .commit(s1, vec!["../outside.md".into()], "S1: x".into(), &owners())
         .await;
-    assert!(error(&r).contains("outside 2ndBrain"), "{r:?}");
+    assert!(error(&r).contains("outside the notes folder"), "{r:?}");
     assert_eq!(v.commits(), before, "nothing committed");
 
     // The hook's check gives the same texts, and lets a slot write its own.
@@ -316,13 +317,13 @@ async fn commit_refuses_another_slots_folder_and_shared_files() {
     assert_eq!(
         svc.check_write(&check(vec![v.vault.join(S2_NOTE)]), &owners()),
         Some(format!(
-            "{S2_NOTE} belongs to S2 (session note). Ask Jonathan before writing it."
+            "{S2_NOTE} belongs to S2 (session note). Ask Demo before writing it."
         ))
     );
     assert_eq!(
         svc.check_write(&check(vec![PathBuf::from(journal)]), &owners()),
         Some(format!(
-            "{journal} is a shared 2ndBrain file. Use append_journal for the journal or edit_shared_file for an exact replacement."
+            "{journal} is a shared notes file. Use append_journal for the journal or edit_shared_file for an exact replacement."
         ))
     );
     assert_eq!(
@@ -345,7 +346,7 @@ async fn commit_refuses_another_slots_folder_and_shared_files() {
         .check_write(&check(vec![v.vault.join("Sprints")]), &owners())
         .is_some_and(|d| d.contains("belongs to S2")));
 
-    // Jonathan has no ownership check.
+    // Demo has no ownership check.
     let r = svc
         .commit(Sender::You, vec![S2_NOTE.into()], "note".into(), &owners())
         .await;
@@ -417,7 +418,7 @@ async fn edit_shared_replaces_once_and_commits() {
     let r = svc
         .edit_shared(Sender::Slot { slot: 3 }, "README.md", "vault", "x")
         .await;
-    assert!(error(&r).contains("not a shared 2ndBrain file"), "{r:?}");
+    assert!(error(&r).contains("not a shared notes file"), "{r:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -425,7 +426,7 @@ async fn current_session_sections_are_written_and_cleared() {
     let v = Vault::new("current");
     let svc = v.service(Arc::new(Ledger::in_memory()), v.options());
     let cs = v.config().current_session;
-    write(&cs, "Jonathan's notes\n");
+    write(&cs, "Demo's notes\n");
     assert_eq!(
         svc.update_current_session(3, "demo lane", "working on DEMO-12")
             .await,
@@ -436,9 +437,9 @@ async fn current_session_sections_are_written_and_cleared() {
         file.contains("## S3 demo lane\nworking on DEMO-12\n"),
         "{file}"
     );
-    assert!(file.ends_with("Jonathan's notes\n"), "{file}");
+    assert!(file.ends_with("Demo's notes\n"), "{file}");
     svc.clear_current_session(3).await;
-    assert_eq!(std::fs::read_to_string(&cs).unwrap(), "Jonathan's notes\n");
+    assert_eq!(std::fs::read_to_string(&cs).unwrap(), "Demo's notes\n");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -827,7 +828,10 @@ async fn bd_runs_under_the_lock_then_syncs() {
         })
     };
     sleep(Duration::from_millis(300)).await;
-    assert!(v.log("bd.log").is_empty(), "bd waits for the vault lock");
+    assert!(
+        v.log("bd.log").is_empty(),
+        "bd waits for the notes folder lock"
+    );
     drop(guard);
     let r = task.await.unwrap();
     match r {
@@ -970,7 +974,7 @@ async fn push_conflict_keeps_the_commit_and_tells_jonathan() {
     assert!(
         view.push_problem
             .as_deref()
-            .is_some_and(|p| p.starts_with("2ndBrain push needs you: ")),
+            .is_some_and(|p| p.starts_with("Notes push needs you: ")),
         "{view:?}"
     );
     assert_eq!(sh(&v.vault, &["log", "-1", "--format=%s"]).trim(), "ours");
@@ -1011,7 +1015,7 @@ async fn autostash_conflict_holds_commits_backup_and_sync() {
     let svc = v.service(ledger.clone(), v.options());
     shared_context(&svc, BrainContext::default());
 
-    // Jonathan's own unsaved edit is stashed by the pull and does not re-apply.
+    // Demo's own unsaved edit is stashed by the pull and does not re-apply.
     write(&v.vault.join("README.md"), "ours, not committed\n");
     write(&v.vault.join("free.md"), "x\n");
     let r = svc
@@ -1084,7 +1088,7 @@ async fn autostash_conflict_holds_commits_backup_and_sync() {
         QueueState::Queued
     );
 
-    // Once Jonathan resolves it, the held entry commits and everything pushes.
+    // Once Demo resolves it, the held entry commits and everything pushes.
     let stash = problem
         .split("safe in stash ")
         .nth(1)
@@ -1387,7 +1391,7 @@ async fn writer_off_answers_with_the_config_hint() {
     assert!(BrainService::new(&off, Arc::new(Ledger::in_memory()), events).is_none());
     assert_eq!(
         WRITER_OFF,
-        "the 2ndBrain writer is off (brain_writer in config.toml)"
+        "the notes writer is off (brain_writer in config.toml)"
     );
     let (socket, task) = daemon(&v, off).await;
     write(&v.vault.join("free.md"), "x\n");
@@ -1427,7 +1431,12 @@ async fn writer_off_answers_with_the_config_hint() {
         );
     }
     match ask(&socket, Request::BrainStatus).await {
-        Response::Brain(view) => assert!(!view.on),
+        Response::Brain(view) => {
+            assert!(!view.on);
+            assert_eq!(view.brain_dir, None);
+            // A new session still starts in the notes folder.
+            assert_eq!(view.notes_dir.as_deref(), Some(v.vault.as_path()));
+        }
         other => panic!("{other:?}"),
     }
     let check = WriteCheck {
@@ -1491,7 +1500,7 @@ async fn daemon_serves_the_writer_requests() {
         cwd: None,
     };
     match ask(&socket, Request::CheckWrite(check)).await {
-        Response::Verdict { deny: Some(d), .. } => assert!(d.contains("shared 2ndBrain file")),
+        Response::Verdict { deny: Some(d), .. } => assert!(d.contains("shared notes file")),
         other => panic!("{other:?}"),
     }
     match ask(
@@ -1631,7 +1640,7 @@ async fn bash_copies_into_a_folder_are_judged_by_the_file_that_lands() {
     assert_eq!(check("cp x.md .", &v.vault), None);
     assert_eq!(check("cp x.md ./Sprints", &v.vault), None);
     // The same copy is denied when the file that lands is shared or owned.
-    let shared = format!("{SHARED_DASH} is a shared 2ndBrain file. Use append_journal for the journal or edit_shared_file for an exact replacement.");
+    let shared = format!("{SHARED_DASH} is a shared notes file. Use append_journal for the journal or edit_shared_file for an exact replacement.");
     assert_eq!(
         check(
             &format!("cp /tmp/SPRINT-DASHBOARD.md {vault}/Sprints/sprint-26-01/"),
@@ -1646,13 +1655,13 @@ async fn bash_copies_into_a_folder_are_judged_by_the_file_that_lands() {
         )
         .as_deref(),
         Some(&*format!(
-            "{S2_NOTE} belongs to S2 (session note). Ask Jonathan before writing it."
+            "{S2_NOTE} belongs to S2 (session note). Ask Demo before writing it."
         ))
     );
     // Sources of a move are deleted: moving a shared file away is a write.
     assert_eq!(
         check(&format!("mv {vault}/{JOURNAL} /tmp/"), &elsewhere)
-            .map(|d| d.contains("shared 2ndBrain file")),
+            .map(|d| d.contains("shared notes file")),
         Some(true)
     );
     assert!(check(
@@ -1677,7 +1686,7 @@ async fn bash_globs_are_expanded_and_each_match_judged() {
         let d = check(cmd);
         assert!(
             d.as_deref()
-                .is_some_and(|d| d.contains("shared 2ndBrain file")),
+                .is_some_and(|d| d.contains("shared notes file")),
             "{cmd}: {d:?}"
         );
     }
@@ -1696,7 +1705,7 @@ async fn bash_globs_are_expanded_and_each_match_judged() {
 async fn only_recursive_deletes_judge_a_folder_as_a_whole() {
     let (v, svc) = shared_vault("bashrm");
     let check = |c: &str| denied(svc.check_bash(&bash_check(&v, 1, c, &v.vault), &owners()));
-    assert!(check("rm -rf 06-Daily").is_some_and(|d| d.contains("holds shared 2ndBrain files")));
+    assert!(check("rm -rf 06-Daily").is_some_and(|d| d.contains("holds shared notes files")));
     assert!(check("rm -r Sprints").is_some());
     assert!(check("rmdir Sprints/sprint-26-01").is_some());
     // A plain rm of a folder fails in the shell anyway; a free folder is fine.
@@ -1710,15 +1719,14 @@ async fn bash_write_into_another_slots_path_is_denied_with_the_owned_text() {
     let (v, svc) = shared_vault("bashowned");
     let check =
         |slot: u8, c: &str| denied(svc.check_bash(&bash_check(&v, slot, c, &v.vault), &owners()));
-    let owned = format!("{S2_NOTE} belongs to S2 (session note). Ask Jonathan before writing it.");
+    let owned = format!("{S2_NOTE} belongs to S2 (session note). Ask Demo before writing it.");
     assert_eq!(
         check(1, &format!("echo x >> {S2_NOTE}")),
         Some(owned.clone())
     );
     assert_eq!(check(1, &format!("tee -a {S2_NOTE}")), Some(owned));
     assert_eq!(check(2, &format!("echo x >> {S2_NOTE}")), None);
-    let folder =
-        format!("{S2_FOLDER}/a.md belongs to S2 (DEMO-12). Ask Jonathan before writing it.");
+    let folder = format!("{S2_FOLDER}/a.md belongs to S2 (DEMO-12). Ask Demo before writing it.");
     assert_eq!(check(1, &format!("touch {S2_FOLDER}/a.md")), Some(folder));
     assert_eq!(check(2, &format!("touch {S2_FOLDER}/a.md")), None);
 }
@@ -1803,7 +1811,7 @@ async fn bd_in_a_repo_with_its_own_beads_is_left_alone() {
 async fn bd_lines_that_could_escape_the_vault_checks_are_denied() {
     let (v, svc) = shared_vault("bdescape");
     let run = |c: &str| svc.check_bash(&bash_check(&v, 1, c, &v.vault), &owners());
-    let text = "Overseer: run bd writes on their own, without $(...), backticks, redirects or env prefixes, so the daemon can run them under the vault lock";
+    let text = "Overseer: run bd writes on their own, without $(...), backticks, redirects or env prefixes, so the daemon can run them under the notes folder lock";
     for cmd in [
         "bd create \"x $(git -C ~/Repos/2ndBrain push)\"".to_string(),
         "bd create \"x `date`\"".to_string(),
@@ -1848,7 +1856,7 @@ async fn dev_dotdot_paths_reach_the_vault_checks() {
         let d = check(&cmd);
         assert!(
             d.as_deref()
-                .is_some_and(|d| d.contains("shared 2ndBrain file")),
+                .is_some_and(|d| d.contains("shared notes file")),
             "{cmd}: {d:?}"
         );
     }

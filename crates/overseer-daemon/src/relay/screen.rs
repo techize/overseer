@@ -1,7 +1,7 @@
 //! Reading Claude Code's input box from a slot's output bytes.
 //!
 //! The courier must know, before typing a relay, whether the input box is
-//! empty, holds text Jonathan typed, or cannot be found (a permission or
+//! empty, holds text the user typed, or cannot be found (a permission or
 //! question dialog replaces the box). The reader is pure: it replays bytes
 //! into a terminal grid and classifies what it sees. Best effort, tuned to
 //! Claude Code 2.1's prompt; anything it does not understand reads as

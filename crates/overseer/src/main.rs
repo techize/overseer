@@ -97,6 +97,8 @@ fn main() {
             );
             let home = overseer_daemon::config::home_from_env();
             let config = overseer_proto::paths::config_path();
+            // The daemon readies an owned notes folder itself, and puts a
+            // notice on the board when it cannot.
             let (settings, config_error) = overseer_daemon::Config::load(&config, &home);
             if let Some(e) = &config_error {
                 tracing::warn!("config not loaded, using defaults: {e}");
@@ -113,6 +115,7 @@ fn main() {
                 config_error,
                 targets,
                 targets_error,
+                security: overseer_daemon::work::store::SECURITY.to_owned(),
             };
             let result = runtime().and_then(|rt| {
                 rt.block_on(overseer_daemon::run(DaemonConfig {

@@ -89,6 +89,39 @@ pub struct SettingsView {
     pub targets_note: String,
     pub targets_error: Option<String>,
     pub daemon: DaemonInfo,
+    /// Where the Jira token was found. The token itself never leaves the
+    /// daemon.
+    #[serde(default)]
+    pub jira_token: TokenStatus,
+    /// Where the Bitbucket token was found.
+    #[serde(default)]
+    pub bitbucket_token: TokenStatus,
+}
+
+/// Where the daemon found an API token, for the Settings token rows.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenStatus {
+    #[default]
+    NotSet,
+    /// The Keychain item, the one Settings writes.
+    Keychain,
+    /// Only the environment variable holds one.
+    Environment,
+    /// The Keychain did not answer in time (locked, or a prompt is open).
+    Unknown,
+}
+
+impl TokenStatus {
+    /// What the token row shows.
+    pub fn text(self) -> &'static str {
+        match self {
+            TokenStatus::NotSet => "not set",
+            TokenStatus::Keychain => "set",
+            TokenStatus::Environment => "set (environment)",
+            TokenStatus::Unknown => "unknown (Keychain did not answer)",
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -187,8 +220,9 @@ pub fn check(key: &str, kind: &SettingKind, value: &SettingValue) -> Result<(), 
             }
         }
         (SettingKind::Pattern, SettingValue::Text(s)) => {
+            // Empty is valid: the pattern is then derived from the tickets.
             if s.is_empty() {
-                return empty();
+                return Ok(());
             }
             regex::Regex::new(s).map(|_| ()).map_err(|e| {
                 let text = e.to_string();
@@ -387,6 +421,7 @@ mod tests {
             Err("k must be a colour like #1e1e2e".to_string())
         );
         assert_eq!(t(&SettingKind::Pattern, r"DEMO-\d+"), Ok(()));
+        assert_eq!(t(&SettingKind::Pattern, ""), Ok(()));
         assert_eq!(
             t(&SettingKind::Pattern, "("),
             Err("k is not a valid pattern: error: unclosed group".to_string())

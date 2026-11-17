@@ -22,7 +22,7 @@ impl Env {
         let home = std::env::temp_dir().join(format!("ovc-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&home).unwrap();
         // Keep the daemon off the real beads and Jira.
-        std::fs::write(home.join("config.toml"), "beads_dir = \"/nonexistent/overseer-test-beads\"\nbrain_dir = \"/nonexistent/overseer-test-brain\"\njira_command = []\n").unwrap();
+        std::fs::write(home.join("config.toml"), "beads_dir = \"/nonexistent/overseer-test-beads\"\nbrain_dir = \"/nonexistent/overseer-test-brain\"\njira_command = []\nuser_name = \"Demo\"\n").unwrap();
         let env = Env { home, bin: None };
         // Every spawn names the stub, so an autostart never reaches launchd.
         env.write_launchctl_stub();
@@ -56,7 +56,7 @@ EOF
 "#,
         );
         let cfg = format!(
-            "beads_dir = \"{h}\"\nbrain_dir = \"{h}\"\njira_command = [\"{b}/jira-stub\"]\nticket_pattern = \"DEMO-[0-9]+\"\n",
+            "beads_dir = \"{h}\"\nbrain_dir = \"{h}\"\njira_command = [\"{b}/jira-stub\"]\nticket_pattern = \"DEMO-[0-9]+\"\nuser_name = \"Demo\"\n",
             h = env.home.display(),
             b = bin.display()
         );
@@ -118,7 +118,7 @@ EOF
         .unwrap();
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
         let cfg = format!(
-            "beads_dir = \"{beads}\"\nbrain_dir = \"{vault}\"\njira_command = []\nbrain_writer = true\nbackup_mins = 0\ncurrent_session = \"{cs}\"\nsync_command = [\"{vault}/no-such-sync\"]\nbd_command = [\"{stub}\"]\n",
+            "beads_dir = \"{beads}\"\nbrain_dir = \"{vault}\"\njira_command = []\nbrain_writer = true\nbackup_mins = 0\ncurrent_session = \"{cs}\"\nsync_command = [\"{vault}/no-such-sync\"]\nbd_command = [\"{stub}\"]\nuser_name = \"Demo\"\n",
             beads = beads.display(),
             vault = vault.display(),
             cs = h.join("CURRENT_SESSION.md").display(),
@@ -722,7 +722,7 @@ fn release_two_args_is_a_target() {
     env.ctl(&["force-release", "tf:demo"]).assert().success();
     let out = stdout_of(&mut env.ctl(&["locks"]));
     assert!(!out.contains("tf:demo  S3"), "{out}");
-    assert!(out.contains("Jonathan released tf:demo"), "{out}");
+    assert!(out.contains("Demo released tf:demo"), "{out}");
 }
 
 #[test]
@@ -834,7 +834,7 @@ fn ctl_commit_without_slot_is_jonathan() {
         .unwrap();
     assert_eq!(String::from_utf8_lossy(&status.stdout), "?? other.md\n");
     let human = stdout_of(&mut env.ctl(&["brain"]));
-    assert!(human.contains("2ndBrain writer is on"), "{human}");
+    assert!(human.contains("Notes writer is on"), "{human}");
     assert!(human.contains("0 queued  2 committed"), "{human}");
     assert!(human.contains("last backup  never"), "{human}");
 }
@@ -905,7 +905,7 @@ fn brain_commands_say_when_the_writer_is_off() {
         .get_output()
         .clone();
     assert!(
-        String::from_utf8_lossy(&err.stderr).contains("the 2ndBrain writer is off"),
+        String::from_utf8_lossy(&err.stderr).contains("the notes writer is off"),
         "{err:?}"
     );
     let out = stdout_of(&mut env.ctl(&["brain"]));
@@ -924,7 +924,7 @@ fn plan_approve_inside_a_session_is_refused() {
         .clone();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("only Jonathan can approve or reject a plan"),
+        stderr.contains("only Demo can approve or reject a plan"),
         "{stderr}"
     );
 }
@@ -935,14 +935,11 @@ fn plan_approve_as_jonathan_runs_it() {
     let plan =
         r#"{"summary": "one lane", "slots": [{"slot": "S3", "label": "demo", "cwd": "/tmp"}]}"#;
     let out = stdout_of(env.ctl(&["plan", "propose", "-"]).write_stdin(plan));
-    assert!(out.contains("Plan 1 is waiting for Jonathan."), "{out}");
+    assert!(out.contains("Plan 1 is waiting for Demo."), "{out}");
     let listed = stdout_of(&mut env.ctl(&["plan"]));
     assert!(listed.contains("Plan 1  pending"), "{listed}");
     let board = stdout_of(&mut env.ctl(&["board"]));
-    assert!(
-        board.contains("Plan 1 waiting for Jonathan since "),
-        "{board}"
-    );
+    assert!(board.contains("Plan 1 waiting for Demo since "), "{board}");
     stdout_of(&mut env.ctl(&["plan", "approve", "1"]));
     let status = stdout_of(&mut env.ctl(&["status"]));
     let s3 = status.lines().find(|l| l.starts_with("S3")).unwrap();

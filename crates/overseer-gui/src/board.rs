@@ -421,18 +421,18 @@ pub(crate) fn one_line(text: &str, max: usize) -> String {
     }
 }
 
-/// The 2ndBrain strip's text and colour. Writer off beats a push problem,
+/// The Notes strip's text and colour. Writer off beats a push problem,
 /// which beats a failure, which beats a queue, which beats the last
 /// commit time. Problems use the warning tone (orange).
 pub fn strip_text(v: &BrainView) -> (String, Tone) {
     if !v.on {
-        return ("2ndBrain: writer off".into(), Tone::Empty);
+        return ("Notes: writer off".into(), Tone::Empty);
     }
     if v.push_problem.is_some() {
-        return ("2ndBrain: push needs you".into(), Tone::NeedsYou);
+        return ("Notes: push needs you".into(), Tone::NeedsYou);
     }
     if let Some(why) = brain_failure(v) {
-        return (format!("2ndBrain: {why}"), Tone::NeedsYou);
+        return (format!("Notes: {why}"), Tone::NeedsYou);
     }
     let queued = v
         .entries
@@ -440,7 +440,7 @@ pub fn strip_text(v: &BrainView) -> (String, Tone) {
         .filter(|e| e.state == QueueState::Queued)
         .count();
     if queued > 0 {
-        return (format!("2ndBrain: {queued} queued"), Tone::Idle);
+        return (format!("Notes: {queued} queued"), Tone::Idle);
     }
     match v
         .entries
@@ -449,11 +449,8 @@ pub fn strip_text(v: &BrainView) -> (String, Tone) {
         .map(QueueEntry::when)
         .max()
     {
-        Some(at) => (
-            format!("2ndBrain: committed {}", local_hhmm(at)),
-            Tone::Idle,
-        ),
-        None => ("2ndBrain: nothing yet".into(), Tone::Idle),
+        Some(at) => (format!("Notes: committed {}", local_hhmm(at)), Tone::Idle),
+        None => ("Notes: nothing yet".into(), Tone::Idle),
     }
 }
 
@@ -1353,6 +1350,7 @@ mod tests {
             last_sync: None,
             push_problem: None,
             brain_dir: None,
+            notes_dir: None,
         }
     }
 
@@ -1364,7 +1362,7 @@ mod tests {
             q(1, 10, QueueState::Committed),
         ]);
         let (text, tone) = strip_text(&v);
-        assert_eq!(text, "2ndBrain: 2 queued");
+        assert_eq!(text, "Notes: 2 queued");
         assert_eq!(tone, Tone::Idle);
     }
 
@@ -1377,7 +1375,7 @@ mod tests {
             q(1, 5, QueueState::Failed),
         ]);
         let (text, tone) = strip_text(&v);
-        assert_eq!(text, format!("2ndBrain: committed {}", local_hhmm(2000)));
+        assert_eq!(text, format!("Notes: committed {}", local_hhmm(2000)));
         assert_eq!(tone, Tone::Idle);
     }
 
@@ -1387,7 +1385,7 @@ mod tests {
         let mut e = q(1, 1000, QueueState::Committed);
         e.committed_at = Some(4600);
         let (text, _) = strip_text(&brain(vec![e.clone()]));
-        assert_eq!(text, format!("2ndBrain: committed {}", local_hhmm(4600)));
+        assert_eq!(text, format!("Notes: committed {}", local_hhmm(4600)));
         assert!(entry_line(&e).starts_with(&format!("{} ", local_hhmm(4600))));
         // Still queued: the queue time.
         let e = q(2, 1000, QueueState::Queued);
@@ -1399,7 +1397,7 @@ mod tests {
         let mut v = brain(vec![q(1, 10, QueueState::Queued)]);
         v.push_problem = Some("push rejected".into());
         let (text, tone) = strip_text(&v);
-        assert_eq!(text, "2ndBrain: push needs you");
+        assert_eq!(text, "Notes: push needs you");
         assert_eq!(tone, Tone::NeedsYou);
         assert_eq!(tone_color(tone), colors::ORANGE);
     }
@@ -1416,7 +1414,7 @@ mod tests {
         let (text, tone) = strip_text(&v);
         assert_eq!(
             text,
-            "2ndBrain: commit failed: index.lock still held after 4 attempts"
+            "Notes: commit failed: index.lock still held after 4 attempts"
         );
         assert_eq!(tone, Tone::NeedsYou);
         assert_eq!(tone_color(tone), colors::ORANGE);
@@ -1425,7 +1423,7 @@ mod tests {
         long.error = Some(format!("pathspec {} did not match", "x".repeat(80)));
         let (text, _) = strip_text(&brain(vec![long]));
         assert!(
-            text.starts_with("2ndBrain: commit failed: pathspec xxx"),
+            text.starts_with("Notes: commit failed: pathspec xxx"),
             "{text}"
         );
         assert!(text.ends_with('…'), "{text}");
@@ -1445,7 +1443,7 @@ mod tests {
             detail: "sync-run.sh exited 1".into(),
         });
         let (text, tone) = strip_text(&v);
-        assert_eq!(text, "2ndBrain: backup failed: git status failed");
+        assert_eq!(text, "Notes: backup failed: git status failed");
         assert_eq!(tone, Tone::NeedsYou);
         // A good backup shows the commit time as before.
         v.last_backup.as_mut().unwrap().ok = true;
@@ -1462,11 +1460,11 @@ mod tests {
             detail: "held: git status failed".into(),
         });
         let (text, tone) = strip_text(&v);
-        assert_eq!(text, "2ndBrain: sync failed: held: git status failed");
+        assert_eq!(text, "Notes: sync failed: held: git status failed");
         assert_eq!(tone, Tone::NeedsYou);
         // A push problem still comes first.
         v.push_problem = Some("push rejected".into());
-        assert_eq!(strip_text(&v).0, "2ndBrain: push needs you");
+        assert_eq!(strip_text(&v).0, "Notes: push needs you");
     }
 
     #[test]
@@ -1475,7 +1473,7 @@ mod tests {
         v.on = false;
         v.push_problem = Some("push rejected".into());
         let (text, tone) = strip_text(&v);
-        assert_eq!(text, "2ndBrain: writer off");
+        assert_eq!(text, "Notes: writer off");
         assert_eq!(tone, Tone::Empty);
         assert_eq!(tone_color(tone), colors::GREY);
     }
@@ -1483,7 +1481,7 @@ mod tests {
     #[test]
     fn strip_with_nothing_yet() {
         let (text, tone) = strip_text(&brain(vec![q(1, 10, QueueState::NothingToCommit)]));
-        assert_eq!(text, "2ndBrain: nothing yet");
+        assert_eq!(text, "Notes: nothing yet");
         assert_eq!(tone, Tone::Idle);
     }
 
