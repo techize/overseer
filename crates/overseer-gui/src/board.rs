@@ -919,6 +919,13 @@ impl OverseerApp {
                     this.open_card(this.selected, window, cx)
                 }),
             )
+            .on_mouse_move(cx.listener(|this, ev: &gpui::MouseMoveEvent, window, cx| {
+                this.drag_kanban(ev, window, cx)
+            }))
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _: &gpui::MouseUpEvent, _, cx| this.end_kanban_drag(cx)),
+            )
             .size_full()
             .flex()
             .flex_col()
@@ -1039,7 +1046,7 @@ impl OverseerApp {
                     )
                     .children(pr_panel),
             )
-            .child(div().flex().flex_col().gap_2().child(top).child(bottom))
+            .child(div().flex_none().flex().flex_col().gap_2().child(top).child(bottom))
             .children(kanban)
             .children(self.status.clone().map(|s| {
                 div()
