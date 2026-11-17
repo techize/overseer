@@ -91,7 +91,7 @@ pub enum CtlCmd {
     Refresh,
     /// Print the kickoff text for a slot's assigned items.
     Kickoff { n: SlotId },
-    /// Commit and push files in the 2ndBrain through the daemon's queue.
+    /// Commit and push files in the notes folder through the daemon's queue.
     /// Paths are relative to the vault or absolute.
     Commit {
         #[arg(short, long)]
@@ -113,14 +113,14 @@ pub enum CtlCmd {
         #[arg(allow_hyphen_values = true)]
         text: String,
     },
-    /// Run a bd write under the 2ndBrain lock: `ctl bd -- update ov-3 ...`.
+    /// Run a bd write under the notes folder lock: `ctl bd -- update ov-3 ...`.
     /// Prints bd's output and exits with its code. Stdin, when it is not a
     /// terminal, is passed to bd.
     Bd {
         #[arg(last = true, allow_hyphen_values = true, required = true)]
         args: Vec<String>,
     },
-    /// The 2ndBrain writer: commit queue, last backup and sync, push trouble.
+    /// The notes writer: commit queue, last backup and sync, push trouble.
     Brain {
         /// Print the raw BrainView as JSON.
         #[arg(long)]
@@ -467,7 +467,7 @@ fn print_brain_text(resp: Response) -> anyhow::Result<()> {
 /// A short human summary of the writer.
 pub fn format_brain(v: &BrainView) -> Vec<String> {
     if !v.on {
-        return vec!["2ndBrain writer is off (brain_writer in config.toml)".into()];
+        return vec!["Notes writer is off (brain_writer in config.toml)".into()];
     }
     let count = |st: QueueState| v.entries.iter().filter(|e| e.state == st).count();
     let run = |name: &str, r: &Option<BrainRun>| match r {
@@ -476,7 +476,7 @@ pub fn format_brain(v: &BrainView) -> Vec<String> {
         None => format!("last {name}  never"),
     };
     let mut out = vec![
-        "2ndBrain writer is on".to_string(),
+        "Notes writer is on".to_string(),
         format!(
             "queue  {} queued  {} committed  {} nothing to commit  {} failed",
             count(QueueState::Queued),

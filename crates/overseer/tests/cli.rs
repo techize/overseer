@@ -834,7 +834,7 @@ fn ctl_commit_without_slot_is_jonathan() {
         .unwrap();
     assert_eq!(String::from_utf8_lossy(&status.stdout), "?? other.md\n");
     let human = stdout_of(&mut env.ctl(&["brain"]));
-    assert!(human.contains("2ndBrain writer is on"), "{human}");
+    assert!(human.contains("Notes writer is on"), "{human}");
     assert!(human.contains("0 queued  2 committed"), "{human}");
     assert!(human.contains("last backup  never"), "{human}");
 }
@@ -905,7 +905,7 @@ fn brain_commands_say_when_the_writer_is_off() {
         .get_output()
         .clone();
     assert!(
-        String::from_utf8_lossy(&err.stderr).contains("the 2ndBrain writer is off"),
+        String::from_utf8_lossy(&err.stderr).contains("the notes writer is off"),
         "{err:?}"
     );
     let out = stdout_of(&mut env.ctl(&["brain"]));

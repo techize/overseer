@@ -215,7 +215,7 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
             Box::pin(async move {
                 match weak.upgrade() {
                     Some(b) => b.write_label(args).await,
-                    None => Err("the 2ndBrain writer has stopped".into()),
+                    None => Err("the notes writer has stopped".into()),
                 }
             })
         }));
@@ -849,7 +849,7 @@ async fn brain_request(brain: &BrainService, req: Request, label: &str) -> Respo
         }
         Request::RunBd { args, stdin, .. } => brain.run_bd(args, stdin).await,
         other => Response::Error {
-            message: format!("not a 2ndBrain writer request: {other:?}"),
+            message: format!("not a notes writer request: {other:?}"),
         },
     }
 }

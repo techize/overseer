@@ -86,11 +86,11 @@ fn tools() -> Value {
         },
         {
             "name": "commit_2ndbrain",
-            "description": "Commit and push files in the 2ndBrain vault. Overseer commits only the paths you name, one commit at a time, so you never sweep up another session's half-finished edits. Use this instead of git. Replies with the commit, or says the commit is queued and will land.",
+            "description": "Commit and push files in the notes folder. Overseer commits only the paths you name, one commit at a time, so you never sweep up another session's half-finished edits. Use this instead of git. Replies with the commit, or says the commit is queued and will land.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "paths": {"type": "array", "items": {"type": "string"}, "description": "Files to commit, relative to the vault or absolute. Deletions count."},
+                    "paths": {"type": "array", "items": {"type": "string"}, "description": "Files to commit, relative to the notes folder or absolute. Deletions count."},
                     "message": {"type": "string", "description": "The commit message."}
                 },
                 "required": ["paths", "message"]
@@ -110,11 +110,11 @@ fn tools() -> Value {
         },
         {
             "name": "edit_shared_file",
-            "description": "Replace one exact piece of text in a shared 2ndBrain file (a sprint dashboard, a journal) and commit it. `old_text` must occur exactly once; if the file has changed since you read it the edit fails and shows you the current text.",
+            "description": "Replace one exact piece of text in a shared notes file (a sprint dashboard, a journal) and commit it. `old_text` must occur exactly once; if the file has changed since you read it the edit fails and shows you the current text.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "The shared file, relative to the vault or absolute."},
+                    "path": {"type": "string", "description": "The shared file, relative to the notes folder or absolute."},
                     "old_text": {"type": "string", "description": "The exact text to replace. It must occur once."},
                     "new_text": {"type": "string", "description": "What to put there."}
                 },
@@ -756,7 +756,7 @@ mod tests {
             &tool("commit_2ndbrain", args),
             Some(1),
             Ok(Response::Error {
-                message: "the 2ndBrain writer is off (brain_writer in config.toml)".into(),
+                message: "the notes writer is off (brain_writer in config.toml)".into(),
             }),
         );
         let out = out.unwrap();

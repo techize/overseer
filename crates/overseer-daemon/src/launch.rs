@@ -45,6 +45,7 @@ const PREVIOUS_KICKOFF: &[u64] = &[
 ];
 const PREVIOUS_ASSIGNMENT: &[u64] = &[
     0x7563493817edf95a, // phase 5
+    0x4f54f33f72ec31cf, // before the notes folder wording
 ];
 
 fn text_hash(text: &str) -> u64 {
@@ -1003,6 +1004,21 @@ mod tests {
     const BEFORE_USER_WORKER: &str = include_str!("../tests/fixtures/roles-before-user/worker.md");
     const BEFORE_USER_COORDINATOR: &str =
         include_str!("../tests/fixtures/roles-before-user/coordinator.md");
+
+    #[test]
+    fn assignment_from_before_the_notes_wording_upgrades() {
+        let old = include_str!("../tests/fixtures/roles-before-user/assignment.md");
+        assert!(PREVIOUS_ASSIGNMENT.contains(&text_hash(old)));
+        let dir = temp("assignold");
+        let roles = dir.join("roles");
+        std::fs::create_dir_all(&roles).unwrap();
+        std::fs::write(roles.join("assignment.md"), old).unwrap();
+        write_slot_files(&dir, 1, "x", Path::new("/o"), &RoleDirs::default(), None).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(roles.join("assignment.md")).unwrap(),
+            ASSIGNMENT
+        );
+    }
 
     #[test]
     fn roles_from_before_the_user_placeholder_upgrade() {

@@ -2,7 +2,7 @@ You are {slot}. Overseer has assigned you this work:
 
 {items}
 
-Ticket folders in 2ndBrain: {folders}
+Ticket folders in the notes folder: {folders}
 
 You hold these targets: {targets}
 Work in {worktree}.

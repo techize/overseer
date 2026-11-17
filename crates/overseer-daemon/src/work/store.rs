@@ -2639,7 +2639,7 @@ mod kickoff_tests {
             "{text}"
         );
         assert!(
-            text.contains("Ticket folders in 2ndBrain: /b/Sprints/s1/DEMO-12-widget\n"),
+            text.contains("Ticket folders in the notes folder: /b/Sprints/s1/DEMO-12-widget\n"),
             "{text}"
         );
         assert!(!text.contains('{'), "{text}");
@@ -2671,7 +2671,7 @@ mod kickoff_tests {
         )
         .unwrap();
         assert!(
-            text.contains("Ticket folders in 2ndBrain: none found"),
+            text.contains("Ticket folders in the notes folder: none found"),
             "{text}"
         );
         // Braces in a title are not expanded again.

@@ -2053,7 +2053,10 @@ async fn bead_kickoff_names_its_tickets_folder() {
     };
     let folder = s.dir.join("brain/Sprints/sprint-1/DEMO-12-widget");
     assert!(
-        text.contains(&format!("Ticket folders in 2ndBrain: {}", folder.display())),
+        text.contains(&format!(
+            "Ticket folders in the notes folder: {}",
+            folder.display()
+        )),
         "{text}"
     );
 }
@@ -3627,7 +3630,7 @@ fn verdict(resp: Response) -> (Option<String>, Option<String>) {
 }
 
 const JOURNAL: &str = "06-Daily/2026/11-November/2026-11-13-journal.md";
-const JOURNAL_DENY: &str = "06-Daily/2026/11-November/2026-11-13-journal.md is a shared 2ndBrain file. Use append_journal for the journal or edit_shared_file for an exact replacement.";
+const JOURNAL_DENY: &str = "06-Daily/2026/11-November/2026-11-13-journal.md is a shared notes file. Use append_journal for the journal or edit_shared_file for an exact replacement.";
 
 #[tokio::test]
 async fn vault_write_checks_deny_shared_files_and_git_and_rewrite_bd() {
@@ -3655,7 +3658,7 @@ async fn vault_write_checks_deny_shared_files_and_git_and_rewrite_bd() {
     let (deny, _) = verdict(c.request(bash_in(1, &cmd, "/tmp")).await);
     assert_eq!(
         deny.as_deref(),
-        Some("use the commit_2ndbrain tool; Overseer commits and pushes 2ndBrain")
+        Some("use the commit_2ndbrain tool; Overseer commits and pushes the notes folder")
     );
     let cmd = format!("git -C {} log", vault.display());
     assert_eq!(
@@ -3665,7 +3668,7 @@ async fn vault_write_checks_deny_shared_files_and_git_and_rewrite_bd() {
     std::fs::create_dir_all(vault.join("06-Daily")).unwrap();
     let cmd = format!("rm -rf {}/06-Daily", vault.display());
     let (deny, _) = verdict(c.request(bash_in(1, &cmd, "/tmp")).await);
-    assert!(deny.unwrap().contains("holds shared 2ndBrain files"));
+    assert!(deny.unwrap().contains("holds shared notes files"));
     // bd writes are rewritten, compound ones denied, reads untouched.
     let (deny, rewrite) = verdict(c.request(bash_in(1, "bd close ov-3", "/tmp")).await);
     assert_eq!(deny, None);
@@ -3677,7 +3680,7 @@ async fn vault_write_checks_deny_shared_files_and_git_and_rewrite_bd() {
     );
     assert_eq!(
         deny.as_deref(),
-        Some("Overseer: run bd writes on their own, without $(...), backticks, redirects or env prefixes, so the daemon can run them under the vault lock")
+        Some("Overseer: run bd writes on their own, without $(...), backticks, redirects or env prefixes, so the daemon can run them under the notes folder lock")
     );
     assert_eq!(rewrite, None);
     assert_eq!(
