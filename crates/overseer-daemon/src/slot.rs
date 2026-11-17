@@ -80,7 +80,8 @@ impl Slot {
         Slot::spawn_in(id, label, cwd, command, cols, rows, out, &env)
     }
 
-    /// Spawns `command` with exactly `env` (already scrubbed) plus
+    /// Spawns `command` with exactly `env` (already scrubbed), less
+    /// Overseer's API tokens (`env::TOKEN_VARS`), plus
     /// `OVERSEER_SLOT`, `OVERSEER_RUN`, `TERM` and `COLORTERM`.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_in(
@@ -109,7 +110,7 @@ impl Slot {
         cmd.args(args);
         cmd.cwd(cwd);
         cmd.env_clear();
-        for (k, v) in env {
+        for (k, v) in crate::env::for_session(env) {
             cmd.env(k, v);
         }
         cmd.env("OVERSEER_SLOT", slot_name(id));

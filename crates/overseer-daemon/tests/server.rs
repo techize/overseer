@@ -4732,3 +4732,43 @@ async fn a_refused_notes_folder_puts_a_notice_on_the_board() {
     let v = c.work().await;
     assert_eq!(v.notices.iter().filter(|n| n.slot == 0).count(), 1);
 }
+
+#[tokio::test]
+async fn sessions_start_without_the_api_tokens() {
+    let dir = std::env::temp_dir().join(format!("ovs-tokens-env-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("env.log");
+    let bin = dir.join("show-env");
+    write_script(
+        &bin,
+        &format!(
+            "env > '{tmp}'; mv '{tmp}' '{log}'; exec cat",
+            tmp = dir.join("env.tmp").display(),
+            log = log.display()
+        ),
+    );
+    let env = overseer_daemon::EnvSource::InheritWith(vec![
+        ("ATLASSIAN_API_TOKEN".into(), "demo-jira-secret".into()),
+        ("BITBUCKET_API_TOKEN".into(), "demo-bb-secret".into()),
+        ("DEMO_KEPT".into(), "yes".into()),
+    ]);
+    let d = start_daemon_with(temp_socket(), env).await;
+    let mut c = Client::connect(&d.socket).await;
+    let start = Request::StartSlot {
+        id: 4,
+        label: "env".into(),
+        cwd: dir.clone(),
+        command: Some(vec![bin.to_string_lossy().into_owned()]),
+        prompt: None,
+    };
+    assert_eq!(c.request(start).await, Response::Ok);
+    let lines = wait_for_log(&log, 1).await;
+    assert!(lines.iter().any(|l| l == "DEMO_KEPT=yes"), "{lines:?}");
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.starts_with("ATLASSIAN_API_TOKEN=") || l.starts_with("BITBUCKET_API_TOKEN=")),
+        "{lines:?}"
+    );
+}

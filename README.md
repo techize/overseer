@@ -60,6 +60,11 @@ and Save. The token goes into the macOS Keychain (service `overseer-jira`,
 account = your `jira_email`). It is never written to `config.toml` or the logs.
 You can instead set `ATLASSIAN_API_TOKEN` in your shell environment.
 
+Overseer removes `ATLASSIAN_API_TOKEN` and `BITBUCKET_API_TOKEN` from every
+session's environment. Sessions still run as you, though, so a session can read
+either token from the Keychain with `security find-generic-password`. Overseer
+does not block that read.
+
 If you change `jira_email` in Settings, restart the daemon before saving the
 token, since the token is stored under the email the running daemon has.
 
@@ -146,8 +151,9 @@ Overseer keeps journals, session notes and sprint files in a notes folder
   tickets assigned to you, run the JQL in Jira's search, and check `jira_board`
   is a board of that sprint. If Jira returns none after a poll that had some,
   Overseer keeps the last list once and says so.
-- Keychain prompt. The first read of the token may ask to allow `security` to
-  use the item; choose Always Allow. If it is left unanswered the source says
+- Keychain prompt. Overseer saves the token with `security`, so its own reads
+  normally get no prompt. If macOS does ask to allow `security` to use the
+  item, choose Always Allow. If it is left unanswered the source says
   `Keychain did not answer`. Unlock your login keychain and wait for the next
   poll, or use `ATLASSIAN_API_TOKEN` instead.
 - Bitbucket token rejected. The PR source says `Bitbucket token rejected (401):
