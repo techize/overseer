@@ -72,11 +72,17 @@ Overseer keeps journals, session notes and sprint files in a notes folder
 (`notes_dir`, also accepted as `brain_dir`).
 
 - With no `notes_dir` set, it uses `~/Repos/2ndBrain` if that folder exists,
-  else `~/Overseer`. `~/Overseer` is created for you with a `.overseer-notes`
-  marker file and its own local git history.
-- To use an existing folder, set `notes_dir = "~/path/to/notes"`. Overseer only
-  syncs into a folder holding the `.overseer-notes` marker, so create that empty
-  file there if you want it to manage the folder.
+  else `~/Overseer`.
+- A folder without the `.overseer-notes` marker, such as an existing vault, is
+  only read: Overseer does not create sprint or ticket folders there.
+- To have Overseer create and fill its own folder, leave `notes_dir` unset (so
+  `~/Overseer` is used, when `~/Repos/2ndBrain` does not exist) or point it at a
+  folder that does not exist yet. At start Overseer creates the folder with the
+  `.overseer-notes` marker, a `Sprints/` folder and its own local git history
+  (one starting commit, and it does not push). It then keeps the notes writer
+  on there, which writes the journal and session notes, and, with `jira_board`
+  set, the sprint and ticket folders. A folder that already has files and no
+  marker is left alone.
 - With `jira_board` set, Overseer keeps
   `Sprints/sprint-<slug>/<KEY>-<slug>/ticket.md` in the notes folder, one per
   ticket, in step with Jira. `ticket.md` is the only file it writes there, so
@@ -273,7 +279,7 @@ they differ.
 
 ## Jira and notes keys
 
-These live in `config.toml`, and most show in Settings (Jira group, and Brain
+These live in `config.toml`, and most show in Settings (Jira group, and Notes
 group for the notes keys). They apply after a daemon restart.
 
 | Key | Default | Meaning |
