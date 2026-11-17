@@ -204,7 +204,7 @@ fn session_text(owner: Option<SlotId>, slots: &[SlotInfo], now: i64) -> String {
 
 /// The hover card for a ticket card, given the slots (for the session and
 /// what a click would do).
-pub fn hover_model(c: &TicketCard, slots: &[SlotInfo], now: i64) -> HoverModel {
+pub fn hover_model(c: &TicketCard, slots: &[SlotInfo], work: &WorkView, now: i64) -> HoverModel {
     let mut lines = vec![
         ("Status".to_string(), c.status.clone()),
         (
@@ -235,7 +235,7 @@ pub fn hover_model(c: &TicketCard, slots: &[SlotInfo], now: i64) -> HoverModel {
         lines,
         title: c.title.clone(),
         key: c.key.clone(),
-        hint: hover_hint(&ticket_click(c.slot, slots), c.folder.is_some()),
+        hint: hover_hint(&ticket_click(c.slot, slots, work), c.folder.is_some()),
     }
 }
 
@@ -351,21 +351,29 @@ pub struct PrRow {
     pub age: Option<String>,
     pub tone: AgeTone,
     pub url: Option<String>,
-    /// The Running slot that owns the PR's ticket: a click opens it.
+    /// The Running or Resumable slot that owns the PR's ticket: a click
+    /// opens it.
     pub slot: Option<SlotId>,
 }
 
-/// The Running slot owning `ticket`, if any.
-fn running_owner(view: &WorkView, slots: &[SlotInfo], ticket: &str) -> Option<SlotId> {
+/// The Running or Resumable slot owning `ticket`, if any: the same owners
+/// a click on the ticket card opens.
+fn live_owner(view: &WorkView, slots: &[SlotInfo], ticket: &str) -> Option<SlotId> {
     let owner = view.items.iter().find(|i| i.key == ticket)?.owner?;
     slots
         .get(owner as usize)
-        .filter(|i| matches!(i.state, SlotState::Running { .. }))
+        .filter(|i| {
+            matches!(
+                i.state,
+                SlotState::Running { .. } | SlotState::Resumable { .. }
+            )
+        })
         .map(|i| i.id)
 }
 
 /// Open PRs oldest first (no date last), at most 8, and how many are left.
-/// A row is linked to its ticket's owner while that slot is Running.
+/// A row is linked to its ticket's owner while that slot is Running or
+/// Resumable.
 pub fn pr_rows(view: &WorkView, slots: &[SlotInfo], now: i64) -> (Vec<PrRow>, usize) {
     let mut prs: Vec<_> = view.prs.iter().collect();
     prs.sort_by_key(|p| (p.created.is_none(), p.created));
@@ -381,10 +389,7 @@ pub fn pr_rows(view: &WorkView, slots: &[SlotInfo], now: i64) -> (Vec<PrRow>, us
             age: p.created.map(|c| age_text(now - c)),
             tone: p.created.map_or(AgeTone::Unknown, |c| pr_age_tone(now - c)),
             url: p.url.clone(),
-            slot: p
-                .ticket
-                .as_deref()
-                .and_then(|t| running_owner(view, slots, t)),
+            slot: p.ticket.as_deref().and_then(|t| live_owner(view, slots, t)),
         })
         .collect();
     (rows, more)
@@ -998,7 +1003,7 @@ impl OverseerApp {
                         if done {
                             done_card(c, cx).into_any_element()
                         } else {
-                            let hover = hover_model(&c, &self.slots, now);
+                            let hover = hover_model(&c, &self.slots, &self.work, now);
                             ticket_card(c, hover, cx).into_any_element()
                         }
                     })
@@ -1234,7 +1239,7 @@ mod tests {
             idle_wait: false,
         });
         let c = &columns(&v, now)[3].cards[0];
-        let m = hover_model(c, &slots, now);
+        let m = hover_model(c, &slots, &v, now);
         assert_eq!(m.key, "DEMO-1");
         assert_eq!(m.title, "DEMO-1 title");
         assert_eq!(row(&m, "Status"), Some("In Progress"));
@@ -1255,7 +1260,7 @@ mod tests {
         v.items.push(bead);
         let slots = crate::app::empty_slots();
         let c = &columns(&v, 100)[0].cards[0];
-        let m = hover_model(c, &slots, 100);
+        let m = hover_model(c, &slots, &v, 100);
         assert_eq!(row(&m, "Session"), Some("Not started"));
         assert_eq!(row(&m, "Stage"), Some("TODO"));
         assert_eq!(row(&m, "PR"), None);
@@ -1344,24 +1349,42 @@ mod tests {
     }
 
     #[test]
-    fn pr_rows_link_a_running_owner() {
+    fn pr_rows_link_a_running_or_resumable_owner() {
         let now = 86_400;
-        let mut owned = ticket("DEMO-1", Stage::InProgress, None);
-        owned.owner = Some(3);
-        let mut idle = ticket("DEMO-2", Stage::InProgress, None);
-        idle.owner = Some(4);
-        let mut v = view(vec![owned, idle, ticket("DEMO-3", Stage::InProgress, None)]);
-        v.prs = (1..=4).map(|i| pr(i, Some(now - i as i64))).collect();
-        for (p, t) in v.prs.iter_mut().zip(["DEMO-1", "DEMO-2", "DEMO-3"]) {
+        let owner = |key: &str, slot| {
+            let mut t = ticket(key, Stage::InProgress, None);
+            t.owner = slot;
+            t
+        };
+        let mut v = view(vec![
+            owner("DEMO-1", Some(3)),
+            owner("DEMO-2", Some(4)),
+            owner("DEMO-3", Some(5)),
+            owner("DEMO-4", None),
+        ]);
+        v.prs = (1..=5).map(|i| pr(i, Some(now - i as i64))).collect();
+        for (p, t) in v
+            .prs
+            .iter_mut()
+            .zip(["DEMO-1", "DEMO-2", "DEMO-3", "DEMO-4"])
+        {
             p.ticket = Some(t.into());
         }
         let mut slots = crate::app::empty_slots();
-        slots[3].state = overseer_proto::SlotState::Running { pid: 1, since: 0 };
-        slots[4].state = overseer_proto::SlotState::Exited { code: None, at: 0 };
+        slots[3].state = SlotState::Running { pid: 1, since: 0 };
+        slots[4].state = SlotState::Exited { code: None, at: 0 };
+        slots[5].state = SlotState::Resumable {
+            session_id: "demo-session".into(),
+            at: 0,
+        };
         let (rows, _) = pr_rows(&v, &slots, now);
         let linked: Vec<_> = rows.iter().map(|r| (r.id, r.slot)).collect();
-        // Oldest first: PR 4 has no ticket, 3 is unowned, 2's owner exited.
-        assert_eq!(linked, [(4, None), (3, None), (2, None), (1, Some(3))]);
+        // Oldest first: PR 5 has no ticket, 4 is unowned, 3's owner is
+        // Resumable, 2's owner exited, 1's owner is Running.
+        assert_eq!(
+            linked,
+            [(5, None), (4, None), (3, Some(5)), (2, None), (1, Some(3))]
+        );
     }
 
     #[test]

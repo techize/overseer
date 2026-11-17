@@ -200,8 +200,11 @@ trimming):
 - Click a session card, or press Cmd+0 to Cmd+6, to open that session over the
   board. Cmd+Esc, the x button, or a click outside the panel closes it.
 - Click a ticket card to open its session, or to start one in a free slot.
-  Cmd+click opens its ticket folder, and hovering shows its details. A PR row
-  with a session chip opens that session.
+  Cmd+click opens its ticket folder, and hovering shows its details. A click
+  on a Done card still opens its folder. A PR row with a session chip opens
+  that session, and Cmd+click on any PR row opens it in the browser.
+- A running session waiting for its next prompt shows Your turn, and the
+  header counts them ("1 your turn") beside Needs you.
 - Pace needs `sprint_start` (a date like `2026-11-09`) and `sprint_days`
   (default 10). Without `sprint_start` the pace marker and the pace warning
   are hidden. The kanban is hidden when there are no sprint tickets.
