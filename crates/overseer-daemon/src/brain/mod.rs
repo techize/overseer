@@ -59,8 +59,8 @@ fn deny_shared(rel: &str) -> String {
     format!("{rel} is a shared 2ndBrain file. Use append_journal for the journal or edit_shared_file for an exact replacement.")
 }
 
-fn deny_owned(rel: &str, slot: SlotId, what: &str) -> String {
-    format!("{rel} belongs to S{slot} ({what}). Ask Jonathan before writing it.")
+fn deny_owned(rel: &str, slot: SlotId, what: &str, user: &str) -> String {
+    format!("{rel} belongs to S{slot} ({what}). Ask {user} before writing it.")
 }
 
 /// The `brain_runs` row that says a `bd sync` is owed: `ok` is true while
@@ -165,7 +165,7 @@ impl BrainOptions {
 }
 
 /// What the service needs to know about the slots: who owns what, which
-/// slots are running and which of those are working or waiting on Jonathan.
+/// slots are running and which of those are working or waiting on the user.
 #[derive(Debug, Clone, Default)]
 pub struct BrainContext {
     pub owners: Owners,
@@ -184,6 +184,8 @@ struct Settings {
     push: bool,
     sync_command: Vec<String>,
     bd_command: Vec<String>,
+    /// The name denials use for the person to ask.
+    user: String,
 }
 
 #[derive(Default)]
@@ -277,6 +279,7 @@ impl BrainService {
                 push: cfg.push,
                 sync_command: cfg.sync_command.clone(),
                 bd_command: cfg.bd_command.clone(),
+                user: cfg.user().to_string(),
             },
             opts,
             git,
@@ -392,7 +395,8 @@ impl BrainService {
                 if list.iter().any(|(s, _)| *s == slot) {
                     None
                 } else {
-                    list.first().map(|(s, what)| deny_owned(&rel(), *s, what))
+                    list.first()
+                        .map(|(s, what)| deny_owned(&rel(), *s, what, &self.cfg.user))
                 }
             }
         }
@@ -410,12 +414,12 @@ impl BrainService {
         };
         for (s, note) in &owners.notes {
             if *s != slot && holds(note) {
-                return Some(deny_owned(note, *s, "session note"));
+                return Some(deny_owned(note, *s, "session note", &self.cfg.user));
             }
         }
         for (s, f, key) in &owners.folders {
             if *s != slot && holds(f) {
-                return Some(deny_owned(f, *s, key));
+                return Some(deny_owned(f, *s, key, &self.cfg.user));
             }
         }
         let depth = if folder.is_empty() {
@@ -602,7 +606,7 @@ impl BrainService {
 
     /// Queues a pathspec commit of `paths` and waits for it to be committed
     /// (not pushed). A slot may not commit what another slot owns, a shared
-    /// file or `CURRENT_SESSION.md`; Jonathan may commit anything inside.
+    /// file or `CURRENT_SESSION.md`; the user may commit anything inside.
     pub async fn commit(
         &self,
         from: Sender,
@@ -1374,7 +1378,7 @@ impl BrainService {
         if !self.cfg.push {
             return;
         }
-        // A pull would stop on the unmerged index; wait for Jonathan.
+        // A pull would stop on the unmerged index; wait for the user.
         match self.git.unmerged(g).await {
             Ok(u) if !u.is_empty() => {
                 self.note_unmerged(&u);

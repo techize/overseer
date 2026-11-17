@@ -194,7 +194,29 @@ fn default_user_name(full_name: Option<&str>, env_user: Option<&str>) -> String 
         .to_string()
 }
 
+/// The name prompts and messages use: `configured` when it has any text, so
+/// an explicit empty `user_name` renders as the default, never as nothing.
+fn effective_user_name(
+    configured: &str,
+    full_name: Option<&str>,
+    env_user: Option<&str>,
+) -> String {
+    match configured.trim() {
+        "" => default_user_name(full_name, env_user),
+        name => name.to_string(),
+    }
+}
+
 impl Config {
+    /// The name to use in prompts and messages: `user_name`, or `you` when
+    /// it is empty (a config that did not come through `load`).
+    pub fn user(&self) -> &str {
+        match self.user_name.trim() {
+            "" => "you",
+            name => name,
+        }
+    }
+
     /// A missing file gives the defaults and `None`; an unreadable or invalid
     /// file gives the defaults and the error text. `~/` is expanded against `home`.
     pub fn load(path: &Path, home: &Path) -> (Config, Option<String>) {
@@ -266,9 +288,7 @@ impl Config {
                 config.current_session = config.brain_dir.join("CURRENT_SESSION.md");
             }
         }
-        if !set("user_name") {
-            config.user_name = default_user_name(full_name, env_user);
-        }
+        config.user_name = effective_user_name(&config.user_name, full_name, env_user);
         config.beads_dir = expand(&config.beads_dir, home);
         config.current_session = expand(&config.current_session, home);
         config.worktree_root = expand(&config.worktree_root, home);
@@ -655,5 +675,19 @@ mod tests {
             load("user_name = \"Sam\"\n", Some("Demo Person"), Some("dp")),
             "Sam"
         );
+        // An explicit empty name renders as the default, never as nothing.
+        assert_eq!(
+            load("user_name = \"\"\n", Some("Demo Person"), Some("dp")),
+            "Demo"
+        );
+        assert_eq!(load("user_name = \"  \"\n", None, None), "you");
+    }
+
+    #[test]
+    fn user_is_never_empty() {
+        let mut c = Config::default();
+        assert_eq!(c.user(), "you");
+        c.user_name = "Demo".into();
+        assert_eq!(c.user(), "Demo");
     }
 }

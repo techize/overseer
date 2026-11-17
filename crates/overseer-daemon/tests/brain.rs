@@ -113,6 +113,7 @@ impl Vault {
             current_session: self.base.join("home/.claude/CURRENT_SESSION.md"),
             bd_command: vec![self.base.join("bd-stub.sh").to_string_lossy().into_owned()],
             jira_command: vec![],
+            user_name: "Demo".into(),
             ..Config::default()
         }
     }
@@ -229,7 +230,7 @@ async fn session_commit_is_queued_committed_and_pushed() {
     let v = Vault::new("commit");
     let svc = v.service(Arc::new(Ledger::in_memory()), v.options());
     write(&v.vault.join(S1_NOTE), "# S1\n");
-    write(&v.vault.join("unrelated.md"), "Jonathan's\n");
+    write(&v.vault.join("unrelated.md"), "Demo's\n");
     let before = v.commits();
     let r = svc
         .commit(
@@ -282,14 +283,14 @@ async fn commit_refuses_another_slots_folder_and_shared_files() {
         .await;
     assert_eq!(
         error(&r),
-        format!("{S2_NOTE} belongs to S2 (session note). Ask Jonathan before writing it.")
+        format!("{S2_NOTE} belongs to S2 (session note). Ask Demo before writing it.")
     );
     let r = svc
         .commit(s1, vec![folder_file.clone()], "S1: x".into(), &owners())
         .await;
     assert_eq!(
         error(&r),
-        format!("{folder_file} belongs to S2 (DEMO-12). Ask Jonathan before writing it.")
+        format!("{folder_file} belongs to S2 (DEMO-12). Ask Demo before writing it.")
     );
     let r = svc
         .commit(s1, vec![journal.into()], "S1: x".into(), &owners())
@@ -316,7 +317,7 @@ async fn commit_refuses_another_slots_folder_and_shared_files() {
     assert_eq!(
         svc.check_write(&check(vec![v.vault.join(S2_NOTE)]), &owners()),
         Some(format!(
-            "{S2_NOTE} belongs to S2 (session note). Ask Jonathan before writing it."
+            "{S2_NOTE} belongs to S2 (session note). Ask Demo before writing it."
         ))
     );
     assert_eq!(
@@ -345,7 +346,7 @@ async fn commit_refuses_another_slots_folder_and_shared_files() {
         .check_write(&check(vec![v.vault.join("Sprints")]), &owners())
         .is_some_and(|d| d.contains("belongs to S2")));
 
-    // Jonathan has no ownership check.
+    // Demo has no ownership check.
     let r = svc
         .commit(Sender::You, vec![S2_NOTE.into()], "note".into(), &owners())
         .await;
@@ -425,7 +426,7 @@ async fn current_session_sections_are_written_and_cleared() {
     let v = Vault::new("current");
     let svc = v.service(Arc::new(Ledger::in_memory()), v.options());
     let cs = v.config().current_session;
-    write(&cs, "Jonathan's notes\n");
+    write(&cs, "Demo's notes\n");
     assert_eq!(
         svc.update_current_session(3, "demo lane", "working on DEMO-12")
             .await,
@@ -436,9 +437,9 @@ async fn current_session_sections_are_written_and_cleared() {
         file.contains("## S3 demo lane\nworking on DEMO-12\n"),
         "{file}"
     );
-    assert!(file.ends_with("Jonathan's notes\n"), "{file}");
+    assert!(file.ends_with("Demo's notes\n"), "{file}");
     svc.clear_current_session(3).await;
-    assert_eq!(std::fs::read_to_string(&cs).unwrap(), "Jonathan's notes\n");
+    assert_eq!(std::fs::read_to_string(&cs).unwrap(), "Demo's notes\n");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1011,7 +1012,7 @@ async fn autostash_conflict_holds_commits_backup_and_sync() {
     let svc = v.service(ledger.clone(), v.options());
     shared_context(&svc, BrainContext::default());
 
-    // Jonathan's own unsaved edit is stashed by the pull and does not re-apply.
+    // Demo's own unsaved edit is stashed by the pull and does not re-apply.
     write(&v.vault.join("README.md"), "ours, not committed\n");
     write(&v.vault.join("free.md"), "x\n");
     let r = svc
@@ -1084,7 +1085,7 @@ async fn autostash_conflict_holds_commits_backup_and_sync() {
         QueueState::Queued
     );
 
-    // Once Jonathan resolves it, the held entry commits and everything pushes.
+    // Once Demo resolves it, the held entry commits and everything pushes.
     let stash = problem
         .split("safe in stash ")
         .nth(1)
@@ -1646,7 +1647,7 @@ async fn bash_copies_into_a_folder_are_judged_by_the_file_that_lands() {
         )
         .as_deref(),
         Some(&*format!(
-            "{S2_NOTE} belongs to S2 (session note). Ask Jonathan before writing it."
+            "{S2_NOTE} belongs to S2 (session note). Ask Demo before writing it."
         ))
     );
     // Sources of a move are deleted: moving a shared file away is a write.
@@ -1710,15 +1711,14 @@ async fn bash_write_into_another_slots_path_is_denied_with_the_owned_text() {
     let (v, svc) = shared_vault("bashowned");
     let check =
         |slot: u8, c: &str| denied(svc.check_bash(&bash_check(&v, slot, c, &v.vault), &owners()));
-    let owned = format!("{S2_NOTE} belongs to S2 (session note). Ask Jonathan before writing it.");
+    let owned = format!("{S2_NOTE} belongs to S2 (session note). Ask Demo before writing it.");
     assert_eq!(
         check(1, &format!("echo x >> {S2_NOTE}")),
         Some(owned.clone())
     );
     assert_eq!(check(1, &format!("tee -a {S2_NOTE}")), Some(owned));
     assert_eq!(check(2, &format!("echo x >> {S2_NOTE}")), None);
-    let folder =
-        format!("{S2_FOLDER}/a.md belongs to S2 (DEMO-12). Ask Jonathan before writing it.");
+    let folder = format!("{S2_FOLDER}/a.md belongs to S2 (DEMO-12). Ask Demo before writing it.");
     assert_eq!(check(1, &format!("touch {S2_FOLDER}/a.md")), Some(folder));
     assert_eq!(check(2, &format!("touch {S2_FOLDER}/a.md")), None);
 }

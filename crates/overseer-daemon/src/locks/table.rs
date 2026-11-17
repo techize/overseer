@@ -47,11 +47,12 @@ pub(crate) enum ClaimOutcome {
 
 /// Who is releasing a target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Releaser {
+pub(crate) enum Releaser<'a> {
     Slot(SlotId),
-    /// Jonathan, from the GUI or `ctl force-release`. With a slot, only
-    /// while that slot still holds the target (the holder he was shown).
-    Force(Option<SlotId>),
+    /// The user (named for the notice), from the GUI or `ctl force-release`.
+    /// With a slot, only while that slot still holds the target (the holder
+    /// they were shown).
+    Force(Option<SlotId>, &'a str),
 }
 
 /// A target leaving its holder, and the waiter it went to, if any.
@@ -297,12 +298,12 @@ pub(crate) fn claim_on(conn: &Connection, c: &NewClaim, now: i64) -> Result<Clai
 
 /// Takes `target` from `holder` and gives it to the first waiter, queueing
 /// the relays that say so. `back_on` is the revision a pin went back to;
-/// `forced` means Jonathan released it.
+/// `forced` holds the name of the user who released it.
 fn hand_on(
     conn: &Connection,
     target: &str,
     holder: SlotId,
-    forced: bool,
+    forced: Option<&str>,
     back_on: Option<&str>,
     now: i64,
 ) -> Result<Handoff> {
@@ -310,8 +311,8 @@ fn hand_on(
     let back = back_on
         .map(|r| format!(" (back on {r})"))
         .unwrap_or_default();
-    if forced {
-        let text = format!("Jonathan released {target}{back}, which you held.");
+    if let Some(user) = forced {
+        let text = format!("{user} released {target}{back}, which you held.");
         queue_relay_on(conn, &Sender::Overseer, holder, &text, None, now)?;
     }
     let next = conn
@@ -338,8 +339,8 @@ fn hand_on(
         });
     };
     conn.execute("DELETE FROM waits WHERE id = ?1", params![wait_id])?;
-    let text = if forced {
-        format!("Jonathan released {target}{back}. You now hold it.")
+    let text = if let Some(user) = forced {
+        format!("{user} released {target}{back}. You now hold it.")
     } else {
         format!(
             "{} has released {target}{back}. You now hold it.",
@@ -371,22 +372,24 @@ fn hand_on(
 pub(crate) fn release_on(
     conn: &Connection,
     target: &str,
-    by: Releaser,
+    by: Releaser<'_>,
     back_on: Option<&str>,
     now: i64,
 ) -> Result<Option<Handoff>> {
     let holder = holder_on(conn, target)?.map(|h| h.slot);
     match (by, holder) {
-        (Releaser::Force(Some(seen)), Some(h)) if seen != h => {
+        (Releaser::Force(Some(seen), _), Some(h)) if seen != h => {
             bail!(
                 "{target} is now held by {}; nothing released.",
                 slot_name(h)
             )
         }
-        (Releaser::Force(_), Some(h)) => Ok(Some(hand_on(conn, target, h, true, back_on, now)?)),
-        (Releaser::Force(_), None) => bail!("{target} is not held"),
+        (Releaser::Force(_, user), Some(h)) => {
+            Ok(Some(hand_on(conn, target, h, Some(user), back_on, now)?))
+        }
+        (Releaser::Force(..), None) => bail!("{target} is not held"),
         (Releaser::Slot(s), Some(h)) if h == s => {
-            Ok(Some(hand_on(conn, target, h, false, back_on, now)?))
+            Ok(Some(hand_on(conn, target, h, None, back_on, now)?))
         }
         (Releaser::Slot(s), _) => {
             let left = conn.execute(
@@ -460,7 +463,7 @@ fn release_all(
 ) -> Result<Vec<Handoff>> {
     targets
         .iter()
-        .map(|(t, back_on)| hand_on(conn, t, slot, false, back_on.as_deref(), now))
+        .map(|(t, back_on)| hand_on(conn, t, slot, None, back_on.as_deref(), now))
         .collect()
 }
 
@@ -549,7 +552,7 @@ pub(crate) fn drop_relays_to_on(conn: &Connection, to: SlotId, now: i64) -> Resu
 pub(crate) fn release_item_on(conn: &Connection, item: &str, now: i64) -> Result<Vec<Handoff>> {
     claims_where(conn, "WHERE item = ?1", params![item])?
         .iter()
-        .map(|c| hand_on(conn, &c.target, c.slot, false, None, now))
+        .map(|c| hand_on(conn, &c.target, c.slot, None, None, now))
         .collect()
 }
 
@@ -802,15 +805,15 @@ mod tests {
         with(|c| {
             take(c, T, 1, ClaimKind::Claim, 10);
             queue(c, T, 2, Via::Tool, 11);
-            let h = release_on(c, T, Releaser::Force(None), None, 20)?;
+            let h = release_on(c, T, Releaser::Force(None, "Demo"), None, 20)?;
             assert_eq!(h.map(|h| (h.from, h.to)), Some((1, Some(2))));
             assert_eq!(
                 texts(c, 2),
-                vec!["Jonathan released argo:uat/root. You now hold it."]
+                vec!["Demo released argo:uat/root. You now hold it."]
             );
             assert_eq!(
                 texts(c, 1),
-                vec!["Jonathan released argo:uat/root, which you held."]
+                vec!["Demo released argo:uat/root, which you held."]
             );
             assert_eq!(holders(c), vec![(T.into(), 2, ClaimKind::Claim)]);
             Ok(())
@@ -829,12 +832,12 @@ mod tests {
             release_on(
                 c,
                 "repo:demo-api:main",
-                Releaser::Force(Some(slot)),
+                Releaser::Force(Some(slot), "Demo"),
                 None,
                 20,
             )
         };
-        // Jonathan saw S2 hold it, but it is S1's now.
+        // The user saw S2 hold it, but it is S1's now.
         let err = l.transaction(|c| mine(c, 2)).unwrap_err();
         assert_eq!(
             err.to_string(),
@@ -886,7 +889,15 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.to_string(), "repo:demo-api:main is not held by S2");
         let err = l
-            .transaction(|c| release_on(c, "repo:demo-api:main", Releaser::Force(None), None, 20))
+            .transaction(|c| {
+                release_on(
+                    c,
+                    "repo:demo-api:main",
+                    Releaser::Force(None, "Demo"),
+                    None,
+                    20,
+                )
+            })
             .unwrap_err();
         assert_eq!(err.to_string(), "repo:demo-api:main is not held");
     }

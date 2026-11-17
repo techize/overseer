@@ -50,7 +50,7 @@ fn tools() -> Value {
                 "type": "object",
                 "properties": {
                     "target": {"type": "string", "description": "The target key, for example repo:demo-api:main."},
-                    "reason": {"type": "string", "description": "What you are going to do with it. Optional, but it tells Jonathan and other sessions why you hold it."},
+                    "reason": {"type": "string", "description": "What you are going to do with it. Optional, but it tells the user and other sessions why you hold it."},
                     "item": {"type": "string", "description": "The work item the claim is for, for example DEMO-33 or ov-3."}
                 },
                 "required": ["target"]
@@ -134,7 +134,7 @@ fn tools() -> Value {
         },
         {
             "name": "get_board",
-            "description": "The whole board in one answer: the coordinator's summary, every slot with its state, owned items, held targets and last report, the work items, the locks and any plan waiting for Jonathan. Read-only.",
+            "description": "The whole board in one answer: the coordinator's summary, every slot with its state, owned items, held targets and last report, the work items, the locks and any plan waiting for the user. Read-only.",
             "inputSchema": {"type": "object", "properties": {}}
         },
         {
@@ -144,7 +144,7 @@ fn tools() -> Value {
         },
         {
             "name": "propose_plan",
-            "description": "Coordinator only. Propose a plan for Jonathan to approve: which slot takes which items, which targets it claims, where it works and what it is told. Nothing runs until Jonathan approves. A new plan replaces a pending one.",
+            "description": "Coordinator only. Propose a plan for the user to approve: which slot takes which items, which targets it claims, where it works and what it is told. Nothing runs until the user approves. A new plan replaces a pending one.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -214,7 +214,7 @@ fn tools() -> Value {
         },
         {
             "name": "set_board_summary",
-            "description": "Coordinator only. Set the board summary Jonathan sees at the top of the board. It replaces the previous one.",
+            "description": "Coordinator only. Set the board summary the user sees at the top of the board. It replaces the previous one.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -448,7 +448,7 @@ fn call_tool(params: &Value, slot: Option<SlotId>, call: &mut Call) -> Result<Va
         Ok(Response::Queued { message }) => tool_result(message, false),
         Ok(Response::Locks(view)) => tool_result(format_locks(&view), false),
         Ok(Response::Board(view)) => tool_result(
-            crate::ctl::format_board(&view, crate::ctl::now_secs()),
+            crate::ctl::format_board(&view, crate::ctl::now_secs(), &crate::ctl::user_name()),
             false,
         ),
         Ok(Response::Work(view)) => {

@@ -3,12 +3,12 @@
 //!
 //! A relay goes when the session is idle, or waits at an idle-input
 //! `Notification`, and its input box is empty. It waits while the session
-//! works, at a permission or question prompt, while Jonathan has text in
+//! works, at a permission or question prompt, while the user has text in
 //! the box, and whenever the box cannot be found. Every pending relay for a
 //! slot goes in one paste, then Return.
 //!
 //! Answering a permission prompt with No ends the turn without a `Stop`
-//! hook, so the slot still reads as needing Jonathan. A relay goes anyway
+//! hook, so the slot still reads as needing the user. A relay goes anyway
 //! once the screen has shown the empty box, with no working line, on two
 //! looks in a row.
 
@@ -37,7 +37,9 @@ const RETURN_DELAY: Duration = Duration::from_millis(100);
 const COOLDOWN: Duration = Duration::from_secs(10);
 
 const NOT_RUNNING: &str = "slot is not running";
-const AT_PROMPT: &str = "waiting at a prompt for Jonathan";
+/// The hold reason for a slot at a prompt. The board shows it as
+/// `waiting at a prompt for <user>`: see `held_text`.
+pub(crate) const AT_PROMPT: &str = "waiting at a prompt";
 const TYPED: &str = "input box has text";
 const NO_BOX: &str = "input box not found";
 /// Inside the cooldown after a delivery.
@@ -61,9 +63,22 @@ pub fn ready(state: &SlotState, activity: Option<&Activity>) -> Result<(), &'sta
     }
 }
 
+/// A hold reason as the board shows it: the prompt one names `user`.
+pub(crate) fn held_text(reason: &str, user: &str) -> String {
+    if reason == AT_PROMPT {
+        format!("{reason} for {user}")
+    } else {
+        reason.to_string()
+    }
+}
+
 /// Overseer's own relays that already read as a message from Overseer.
+/// The user's release is told by its shape, not by the name in it:
+/// `<user> released <target>, which you held.` or `... You now hold it.`
 fn speaks_for_itself(text: &str) -> bool {
-    if text.starts_with("Jonathan released") {
+    if text.contains(" released ")
+        && (text.ends_with(", which you held.") || text.ends_with(". You now hold it."))
+    {
         return true;
     }
     let Some(rest) = text.strip_prefix('S') else {
@@ -82,7 +97,7 @@ pub fn strip_controls(text: &str) -> String {
 }
 
 /// The text typed into slot `to` for `relays`, one paragraph each.
-pub fn compose(relays: &[Relay], to: SlotId) -> String {
+pub fn compose(relays: &[Relay], to: SlotId, user: &str) -> String {
     let one = |r: &Relay| match r.from {
         Sender::Slot { slot } => {
             let mut s = format!("Message from {} via Overseer: {}", slot_name(slot), r.text);
@@ -91,7 +106,7 @@ pub fn compose(relays: &[Relay], to: SlotId) -> String {
             }
             s
         }
-        Sender::You => format!("Message from Jonathan via Overseer: {}", r.text),
+        Sender::You => format!("Message from {user} via Overseer: {}", r.text),
         Sender::Overseer if speaks_for_itself(&r.text) => r.text.clone(),
         Sender::Overseer => format!("Overseer: {}", r.text),
     };
@@ -108,6 +123,7 @@ pub struct Courier {
     ledger: Arc<Ledger>,
     manager: Arc<Mutex<SlotManager>>,
     locks: Arc<LockService>,
+    user: String,
     wake: Notify,
 }
 
@@ -119,11 +135,13 @@ impl Courier {
         manager: Arc<Mutex<SlotManager>>,
         locks: Arc<LockService>,
         events: broadcast::Receiver<Event>,
+        user: String,
     ) -> Arc<Courier> {
         let courier = Arc::new(Courier {
             ledger,
             manager,
             locks,
+            user,
             wake: Notify::new(),
         });
         tokio::spawn(courier.clone().run(events));
@@ -264,7 +282,7 @@ impl Courier {
             Ok((InputBox::NotFound, _, _)) | Err(_) => return Err(NO_BOX),
         };
         // A hook may have come in while the screen was read.
-        let text = strip_controls(&compose(relays, id));
+        let text = strip_controls(&compose(relays, id, &self.user));
         if text.contains('\n') && !modes.bracketed_paste {
             return Err(NO_BRACKETS);
         }
@@ -321,7 +339,7 @@ mod tests {
             (Idle, false, Ok(())),
             (Idle, true, Ok(())),
             (NeedsYou, true, Ok(())),
-            (NeedsYou, false, Err("waiting at a prompt for Jonathan")),
+            (NeedsYou, false, Err("waiting at a prompt")),
             (Working, false, Err("session is working")),
             (Working, true, Err("session is working")),
         ];
@@ -365,21 +383,21 @@ mod tests {
     #[test]
     fn compose_names_the_sender() {
         assert_eq!(
-            compose(&[relay(Sender::Slot { slot: 0 }, "status?")], 2),
+            compose(&[relay(Sender::Slot { slot: 0 }, "status?")], 2, "Demo"),
             "Message from S0 via Overseer: status?\n(You can answer once with notify_session.)"
         );
         // S0 is not a worker: no reply line.
         assert_eq!(
-            compose(&[relay(Sender::Slot { slot: 2 }, "on it")], 0),
+            compose(&[relay(Sender::Slot { slot: 2 }, "on it")], 0, "Demo"),
             "Message from S2 via Overseer: on it"
         );
         assert_eq!(
-            compose(&[relay(Sender::You, "hello")], 2),
-            "Message from Jonathan via Overseer: hello"
+            compose(&[relay(Sender::You, "hello")], 2, "Demo"),
+            "Message from Demo via Overseer: hello"
         );
         assert_eq!(
-            compose(&[relay(Sender::You, "hello")], 0),
-            "Message from Jonathan via Overseer: hello"
+            compose(&[relay(Sender::You, "hello")], 0, "Demo"),
+            "Message from Demo via Overseer: hello"
         );
     }
 
@@ -388,18 +406,34 @@ mod tests {
         for text in [
             "S1 has released deploy:demo/api. You now hold it.",
             "S12 has released repo:demo-api:main. You now hold it.",
-            "Jonathan released custom:z. You now hold it.",
+            "Demo released custom:z. You now hold it.",
+            "Demo released custom:z (back on main), which you held.",
         ] {
-            assert_eq!(compose(&[relay(Sender::Overseer, text)], 2), text);
+            assert_eq!(compose(&[relay(Sender::Overseer, text)], 2, "Demo"), text);
+        }
+        // Routing does not depend on the name, so a renamed user still routes.
+        for user in ["Sam", "Mary Ann", "you"] {
+            let text = format!("{user} released custom:z. You now hold it.");
+            assert_eq!(compose(&[relay(Sender::Overseer, &text)], 2, user), text);
         }
         assert_eq!(
-            compose(&[relay(Sender::Overseer, "DEMO-40 was moved to S2")], 1),
+            compose(
+                &[relay(Sender::Overseer, "DEMO-40 was moved to S2")],
+                1,
+                "Demo"
+            ),
             "Overseer: DEMO-40 was moved to S2"
         );
         assert_eq!(
-            compose(&[relay(Sender::Overseer, "S has released x")], 1),
+            compose(&[relay(Sender::Overseer, "S has released x")], 1, "Demo"),
             "Overseer: S has released x"
         );
+    }
+
+    #[test]
+    fn the_prompt_hold_names_the_user() {
+        assert_eq!(held_text(AT_PROMPT, "Demo"), "waiting at a prompt for Demo");
+        assert_eq!(held_text(TYPED, "Demo"), TYPED);
     }
 
     #[test]
@@ -420,11 +454,12 @@ mod tests {
                 relay(Sender::Overseer, "DEMO-40 was moved to S2"),
             ],
             2,
+            "Demo",
         );
         assert_eq!(
             text,
             "Message from S0 via Overseer: status?\n(You can answer once with notify_session.)\n\n\
-             Message from Jonathan via Overseer: and the tests\n\n\
+             Message from Demo via Overseer: and the tests\n\n\
              Overseer: DEMO-40 was moved to S2"
         );
     }

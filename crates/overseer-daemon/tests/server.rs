@@ -56,6 +56,7 @@ fn offline_settings() -> overseer_daemon::Config {
         beads_dir: PathBuf::from("/nonexistent/overseer-test-beads"),
         brain_dir: PathBuf::from("/nonexistent/overseer-test-brain"),
         jira_command: vec![],
+        user_name: "Demo".into(),
         ..overseer_daemon::Config::default()
     }
 }
@@ -1408,6 +1409,7 @@ impl Sources {
             ],
             jql: "project = DEMO".into(),
             ticket_pattern: r"DEMO-\d+".into(),
+            user_name: "Demo".into(),
             ..overseer_daemon::Config::default()
         }
     }
@@ -2004,7 +2006,7 @@ async fn kickoff_request_returns_text() {
         "{text}"
     );
     assert!(text.contains("DEMO-12-widget"), "{text}");
-    // The template is written for Jonathan to edit.
+    // The template is written for Demo to edit.
     assert!(d.state_dir.join("roles/assignment.md").is_file());
 }
 
@@ -2415,7 +2417,7 @@ async fn release_grants_the_waiter_and_queues_a_relay() {
         holds(&c.locks().await),
         [(t("custom:z"), 3, ClaimKind::Claim)]
     );
-    // Jonathan was shown S1 holding it; S3 holds it now, so nothing goes.
+    // Demo was shown S1 holding it; S3 holds it now, so nothing goes.
     assert_eq!(
         c.request(Request::ForceRelease {
             target: t("custom:z"),
@@ -2843,7 +2845,7 @@ async fn worker_cannot_start_a_conversation() {
         &c.relay(Some(2), 2, "hi").await,
         "you cannot message yourself"
     ));
-    // A relay from Jonathan is not a message from S0 to answer.
+    // A relay from Demo is not a message from S0 to answer.
     assert_eq!(c.relay(None, 2, "hello").await, queued_for(2));
     let v = c.locks().await;
     deliver_all(&d, 2, &v);
@@ -3103,7 +3105,7 @@ impl Client {
     }
 }
 
-const HELLO: &str = "Message from Jonathan via Overseer: hello";
+const HELLO: &str = "Message from Demo via Overseer: hello";
 
 #[tokio::test]
 async fn idle_slot_gets_the_relay_with_bracketed_paste_then_enter() {
@@ -3154,12 +3156,12 @@ async fn permission_prompt_never_gets_a_relay() {
     )
     .await;
     assert_eq!(c.relay(None, 2, "hello").await, queued_for(2));
-    c.held_for(2, "waiting at a prompt for Jonathan").await;
+    c.held_for(2, "waiting at a prompt for Demo").await;
     stub.reads_nothing_for(3).await;
     let v = c.locks().await;
     assert_eq!(
         v.relays[0].held.as_deref(),
-        Some("waiting at a prompt for Jonathan")
+        Some("waiting at a prompt for Demo")
     );
     assert_eq!(v.relays[0].state, RelayState::Pending);
     // Answered Yes: the tool runs under the working line, still no hook.
@@ -3188,7 +3190,7 @@ async fn prompt_answered_no_gets_the_relay() {
     )
     .await;
     assert_eq!(c.relay(None, 2, "hello").await, queued_for(2));
-    c.held_for(2, "waiting at a prompt for Jonathan").await;
+    c.held_for(2, "waiting at a prompt for Demo").await;
     stub.reads_nothing_for(2).await;
     stub.set_box(None, pid).await;
     assert_eq!(stub.read_until(&pasted(HELLO)).await, pasted(HELLO));
@@ -3221,7 +3223,7 @@ async fn typed_input_box_waits_until_empty() {
     assert_eq!(c.relay(None, 2, "hello").await, queued_for(2));
     c.held_for(2, "input box has text").await;
     stub.reads_nothing_for(2).await;
-    // Jonathan clears his draft; the next look finds the box empty.
+    // Demo clears his draft; the next look finds the box empty.
     stub.set_box(None, pid).await;
     assert_eq!(stub.read_until(&pasted(HELLO)).await, pasted(HELLO));
     c.all_delivered(2).await;
@@ -3553,7 +3555,7 @@ async fn notice_for_a_holder_with_no_session_is_queued_dropped() {
         relay_states(&v),
         [(
             3,
-            t("Jonathan released custom:z, which you held."),
+            t("Demo released custom:z, which you held."),
             RelayState::Dropped
         )]
     );
@@ -3796,7 +3798,7 @@ async fn summary_from_s0_shows_on_the_board() {
     let board = c.board().await;
     assert_eq!(board.coord.summary.unwrap().text, "Two lanes - both green");
     assert_eq!(board.slots.len(), 7);
-    // Jonathan, through ctl, may set it too.
+    // Demo, through ctl, may set it too.
     assert_eq!(c.set_summary(None, "  Quiet  ").await, Response::Ok);
     assert_eq!(c.coord().await.summary.unwrap().text, "Quiet");
 }
@@ -4147,7 +4149,7 @@ async fn proposed_plan_is_pending_and_announced() {
     assert_eq!(
         resp,
         Response::Text {
-            text: "Plan 1 is waiting for Jonathan.".into()
+            text: "Plan 1 is waiting for Demo.".into()
         }
     );
     let event = c.coord_event().await;
@@ -4168,13 +4170,13 @@ async fn new_plan_supersedes_the_old() {
     assert_eq!(
         first,
         Response::Text {
-            text: "Plan 1 is waiting for Jonathan.".into()
+            text: "Plan 1 is waiting for Demo.".into()
         }
     );
     let second = c.propose(Some(0), plan_of(vec![rig.slot5()])).await;
     match second {
         Response::Text { text } => assert!(
-            text == "Plan 2 is waiting for Jonathan. It replaces plan 1.",
+            text == "Plan 2 is waiting for Demo. It replaces plan 1.",
             "{text}"
         ),
         other => panic!("{other:?}"),
@@ -4236,7 +4238,7 @@ async fn approve_runs_every_step() {
     );
 
     s3.read_until("Pick this up next.").await;
-    let told = s0.read_until("Jonathan approved plan 1.").await;
+    let told = s0.read_until("Demo approved plan 1.").await;
     assert!(told.contains("S4: holds repo:demo-api:main"), "{told}");
     assert!(told.contains("S3: kickoff queued"), "{told}");
 
@@ -4259,7 +4261,7 @@ async fn approve_with_edits_says_so() {
     let edited = plan_of(vec![rig.slot4()]);
     let resp = c.approve(1, edited.clone()).await;
     assert!(matches!(resp, Response::Text { .. }), "{resp:?}");
-    s0.read_until("Jonathan approved plan 1 with edits.").await;
+    s0.read_until("Demo approved plan 1 with edits.").await;
     let record = c.plan_record(1).await;
     assert!(record.edited);
     assert_eq!(record.plan, edited);
@@ -4279,7 +4281,7 @@ async fn approval_revalidates() {
         c.propose(Some(0), plan.clone()).await,
         Response::Text { .. }
     ));
-    // Jonathan assigns the ticket by hand before approving.
+    // Demo assigns the ticket by hand before approving.
     assert_eq!(c.assign("DEMO-12", 2, false, false).await, Response::Ok);
     let resp = c.approve(1, plan).await;
     assert_eq!(
@@ -4378,7 +4380,7 @@ async fn reject_tells_s0() {
         Response::Text { .. }
     ));
     assert_eq!(c.reject(1, "not today").await, Response::Ok);
-    s0.read_until("Jonathan rejected plan 1: not today").await;
+    s0.read_until("Demo rejected plan 1: not today").await;
     assert_eq!(c.plan_record(1).await.state, PlanState::Rejected);
     assert_eq!(rig.starts(), 0);
     // A decided plan cannot be decided again.
@@ -4409,7 +4411,7 @@ async fn decide_from_a_slot_is_refused() {
             })
             .await;
         assert!(
-            is_error(&resp, "only Jonathan can approve or reject a plan"),
+            is_error(&resp, "only Demo can approve or reject a plan"),
             "{resp:?}"
         );
     }

@@ -32,6 +32,8 @@ const VIEW_PLANS: usize = 20;
 pub struct CoordService {
     ledger: Arc<Ledger>,
     events: broadcast::Sender<Event>,
+    /// The name plan notices use for the person who approves.
+    user: String,
 }
 
 fn error(message: impl Into<String>) -> Response {
@@ -54,7 +56,7 @@ pub fn clean_text(text: &str, what: &str) -> Result<String, String> {
     Ok(text.to_string())
 }
 
-/// Refuses anyone but S0 and Jonathan (`from` of `None`, through `ctl`).
+/// Refuses anyone but S0 and the user (`from` of `None`, through `ctl`).
 /// `what` completes the refusal, such as `set the board summary`.
 pub fn coordinator_only(from: Option<SlotId>, what: &str) -> Result<(), String> {
     match from {
@@ -64,8 +66,12 @@ pub fn coordinator_only(from: Option<SlotId>, what: &str) -> Result<(), String> 
 }
 
 impl CoordService {
-    pub fn new(ledger: Arc<Ledger>, events: broadcast::Sender<Event>) -> Arc<Self> {
-        Arc::new(CoordService { ledger, events })
+    pub fn new(ledger: Arc<Ledger>, events: broadcast::Sender<Event>, user: String) -> Arc<Self> {
+        Arc::new(CoordService {
+            ledger,
+            events,
+            user,
+        })
     }
 
     pub fn view(&self) -> CoordView {
@@ -94,7 +100,7 @@ impl CoordService {
         })
     }
 
-    /// `set_board_summary`: S0 (or Jonathan) replaces the summary.
+    /// `set_board_summary`: S0 (or the user) replaces the summary.
     pub fn set_summary(&self, from: Option<SlotId>, text: &str, now: i64) -> Response {
         if let Err(message) = coordinator_only(from, "set the board summary") {
             return error(message);

@@ -158,8 +158,13 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
         events.clone(),
         env.clone(),
         Duration::from_secs(cfg.settings.lock_idle_mins.saturating_mul(60)),
+        cfg.settings.user().to_string(),
     );
-    let coord = CoordService::new(ledger.clone(), events.clone());
+    let coord = CoordService::new(
+        ledger.clone(),
+        events.clone(),
+        cfg.settings.user().to_string(),
+    );
     let timeline = coord.watch(events.subscribe());
     let brain = BrainService::with_options(
         &cfg.settings,
@@ -186,6 +191,7 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
                 beads: cfg.settings.beads_dir.clone(),
                 brain_writer: cfg.settings.brain_writer,
                 current_session: cfg.settings.current_session.clone(),
+                user: cfg.settings.user().to_string(),
             },
         );
     mgr.restore();
@@ -218,7 +224,13 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
         let manager = manager.clone();
         move || sessionless(&manager.lock().unwrap().list())
     });
-    let courier = Courier::spawn(ledger, manager.clone(), locks.clone(), courier_events);
+    let courier = Courier::spawn(
+        ledger,
+        manager.clone(),
+        locks.clone(),
+        courier_events,
+        cfg.settings.user().to_string(),
+    );
     store.on_relays_queued({
         let (locks, courier) = (locks.clone(), courier.clone());
         move || {

@@ -8,11 +8,11 @@ use std::path::{Path, PathBuf};
 use overseer_proto::msg::{slot_name, SlotId};
 
 /// Compiled-in defaults, written to `<state>/roles/` on first use so
-/// Jonathan can edit the copies. S0 uses the coordinator role, S1 to S6 the
+/// the user can edit the copies. S0 uses the coordinator role, S1 to S6 the
 /// worker role, and kickoff.md is the first prompt S0 starts with.
 const WORKER_ROLE: &str = include_str!("roles/worker.md");
 const COORDINATOR_ROLE: &str = include_str!("roles/coordinator.md");
-/// What `{brain_rules}` expands to while the 2ndBrain writer is on.
+/// What `{brain_rules}` expands to while the notes writer is on.
 const BRAIN_RULES_WORKER: &str = include_str!("roles/brain_worker.md");
 const BRAIN_RULES_COORDINATOR: &str = include_str!("roles/brain_coordinator.md");
 const KICKOFF: &str = include_str!("roles/kickoff.md");
@@ -31,12 +31,14 @@ const PREVIOUS_COORDINATOR: &[u64] = &[
     0xf98858507513ed2d,
     0x551d58f77936ffa0, // phase 4
     0xbbd3513e7aa77734, // phase 5
+    0x44b728f090b64d9f, // before the user's name was a placeholder
 ];
 const PREVIOUS_WORKER: &[u64] = &[
     0x215de771dfd84eb4,
     0xbd3ab0020d4d25b1,
     0xe8deae3b8fe65917,
     0x751ce33e657e6c1f, // phase 5
+    0xaba64201957d69d7, // before the user's name was a placeholder
 ];
 const PREVIOUS_KICKOFF: &[u64] = &[
     0x05db44420ef92039, // phase 5
@@ -302,8 +304,9 @@ fn mcp_json(overseer_bin: &Path, slot: SlotId) -> String {
     .expect("mcp config serialises")
 }
 
-/// The folders a role names, from the daemon's config: `{brain}` is the
-/// 2ndBrain folder S0 works in and reads the journal from, `{beads}` where
+/// The folders and name a role names, from the daemon's config: `{user}` is
+/// the person at the keyboard, `{brain}` is the
+/// notes folder S0 works in and reads the journal from, `{beads}` where
 /// it runs `bd`. The rest is the 2ndBrain writer's: whether it is on (so
 /// `{brain_rules}` has content), the session note template and the
 /// `CURRENT_SESSION.md` path the rules name.
@@ -313,6 +316,8 @@ pub struct RoleDirs {
     pub beads: PathBuf,
     pub brain_writer: bool,
     pub current_session: PathBuf,
+    /// What `{user}` expands to. Never empty: use `Config::user`.
+    pub user: String,
 }
 
 impl Default for RoleDirs {
@@ -323,6 +328,7 @@ impl Default for RoleDirs {
             beads: PathBuf::from("~/Repos/2ndBrain"),
             brain_writer: false,
             current_session: PathBuf::from("~/.claude/CURRENT_SESSION.md"),
+            user: "you".into(),
         }
     }
 }
@@ -337,7 +343,7 @@ fn lacks_brain_rules(template: &str, writer_on: bool) -> bool {
 /// `state_dir`, replacing them on every start. The role is copied from
 /// `roles/coordinator.md` for S0 and `roles/worker.md` otherwise (created from the compiled-in default if missing;
 /// an unedited older default is upgraded, an edited file is kept) with `{slot}`, `{label}`, `{overseer}`,
-/// `{brain}`, `{beads}`, `{session_note}` (`note`, vault-relative) and `{current_session}` filled in,
+/// `{brain}`, `{beads}`, `{user}`, `{session_note}` (`note`, vault-relative) and `{current_session}` filled in,
 /// and `{brain_rules}` expanded when the 2ndBrain writer is on.
 pub fn write_slot_files(
     state_dir: &Path,
@@ -348,7 +354,7 @@ pub fn write_slot_files(
     note: Option<&str>,
 ) -> io::Result<LaunchFiles> {
     let roles = state_dir.join("roles");
-    // All defaults are written so Jonathan finds every file to edit.
+    // All defaults are written so the user finds every file to edit.
     let worker = ensure_template(&roles, "worker.md", WORKER_ROLE, PREVIOUS_WORKER)?;
     let coordinator = ensure_template(
         &roles,
@@ -397,6 +403,10 @@ pub fn write_slot_files(
             .filter(|l| !l.contains("{session_note}"))
             .collect(),
     };
+    let user = match dirs.user.trim() {
+        "" => "you",
+        name => name,
+    };
     // The label goes in last so braces inside it are not expanded again.
     let role_text = template
         .replace("{current_session}", &dirs.current_session.to_string_lossy())
@@ -404,6 +414,7 @@ pub fn write_slot_files(
         .replace("{overseer}", &overseer_bin.to_string_lossy())
         .replace("{brain}", &dirs.brain.to_string_lossy())
         .replace("{beads}", &dirs.beads.to_string_lossy())
+        .replace("{user}", user)
         .replace("{label}", label);
 
     let dir = state_dir.join("slots").join(slot_name(slot));
@@ -946,6 +957,74 @@ mod tests {
         assert!(role.contains("Call `notify_session`"), "{role}");
     }
 
+    #[test]
+    fn role_names_the_user() {
+        let dir = temp("user");
+        let dirs = RoleDirs {
+            user: "Demo".into(),
+            ..brain_dirs(true)
+        };
+        for slot in [0, 2] {
+            let f = write_slot_files(&dir, slot, "x", Path::new("/o"), &dirs, Some(NOTE)).unwrap();
+            let role = std::fs::read_to_string(f.role).unwrap();
+            assert!(
+                !role.contains("Jonathan") && !role.contains("{user}"),
+                "{role}"
+            );
+            assert!(role.contains("Demo runs up to six"), "{role}");
+        }
+        // An empty name still reads as a sentence.
+        let nameless = RoleDirs {
+            user: String::new(),
+            ..RoleDirs::default()
+        };
+        let f = write_slot_files(&dir, 0, "x", Path::new("/o"), &nameless, None).unwrap();
+        let role = std::fs::read_to_string(f.role).unwrap();
+        assert!(role.contains("you runs up to six"), "{role}");
+        let f = write_slot_files(&dir, 0, "x", Path::new("/o"), &dirs, None).unwrap();
+        let role = std::fs::read_to_string(f.role).unwrap();
+        assert!(role.contains("once Demo approves"), "{role}");
+        assert!(role.contains("Notes rules."), "{role}");
+        assert!(
+            role.contains("the notes folder at /tmp/demo-brain"),
+            "{role}"
+        );
+        assert!(
+            !role.contains("2ndBrain rules") && !role.contains("vault"),
+            "{role}"
+        );
+        // The tool names are unchanged.
+        assert!(role.contains("`commit_2ndbrain`"), "{role}");
+        let f = write_slot_files(&dir, 3, "x", Path::new("/o"), &dirs, Some(NOTE)).unwrap();
+        let role = std::fs::read_to_string(f.role).unwrap();
+        assert!(role.contains("ask Demo."), "{role}");
+    }
+
+    const BEFORE_USER_WORKER: &str = include_str!("../tests/fixtures/roles-before-user/worker.md");
+    const BEFORE_USER_COORDINATOR: &str =
+        include_str!("../tests/fixtures/roles-before-user/coordinator.md");
+
+    #[test]
+    fn roles_from_before_the_user_placeholder_upgrade() {
+        assert!(PREVIOUS_WORKER.contains(&text_hash(BEFORE_USER_WORKER)));
+        assert!(PREVIOUS_COORDINATOR.contains(&text_hash(BEFORE_USER_COORDINATOR)));
+        let dir = temp("beforeuser");
+        let roles = dir.join("roles");
+        std::fs::create_dir_all(&roles).unwrap();
+        std::fs::write(roles.join("worker.md"), BEFORE_USER_WORKER).unwrap();
+        std::fs::write(roles.join("coordinator.md"), BEFORE_USER_COORDINATOR).unwrap();
+        write_slot_files(&dir, 1, "x", Path::new("/o"), &RoleDirs::default(), None).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(roles.join("worker.md")).unwrap(),
+            WORKER_ROLE
+        );
+        write_slot_files(&dir, 0, "x", Path::new("/o"), &RoleDirs::default(), None).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(roles.join("coordinator.md")).unwrap(),
+            COORDINATOR_ROLE
+        );
+    }
+
     const PHASE_3_WORKER: &str = include_str!("../tests/fixtures/roles-phase3/worker.md");
     const PHASE_3_COORDINATOR: &str = include_str!("../tests/fixtures/roles-phase3/coordinator.md");
 
@@ -1169,6 +1248,7 @@ mod tests {
             beads: PathBuf::from("/tmp/demo-brain"),
             brain_writer: on,
             current_session: PathBuf::from("/tmp/demo-home/CURRENT_SESSION.md"),
+            ..RoleDirs::default()
         }
     }
 

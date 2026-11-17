@@ -1,4 +1,4 @@
-//! Coordinator plans: S0 proposes, Jonathan approves, edits or rejects, and
+//! Coordinator plans: S0 proposes, the user approves, edits or rejects, and
 //! an approved plan runs slot by slot (Rulings 1, 4, 5 and 7).
 //!
 //! `validate` is a pure check against the board as it is at that moment. It
@@ -322,14 +322,14 @@ impl CoordService {
             Err(e) => return error(format!("ledger: {e:#}")),
         };
         self.announce();
-        let mut text = format!("Plan {id} is waiting for Jonathan.");
+        let mut text = format!("Plan {id} is waiting for {}.", self.user);
         if let Some(old) = replaced {
             text.push_str(&format!(" It replaces plan {old}."));
         }
         Response::Text { text }
     }
 
-    /// Jonathan's answer to plan `id`. Approving re-validates `plan` against
+    /// The user's answer to plan `id`. Approving re-validates `plan` against
     /// the board now, marks the plan approved in one ledger transaction
     /// (a second approval finds it no longer pending), then runs the steps.
     pub async fn decide(
@@ -341,7 +341,7 @@ impl CoordService {
         now: i64,
     ) -> Response {
         if from.is_some() {
-            return error("only Jonathan can approve or reject a plan");
+            return error(format!("only {} can approve or reject a plan", self.user));
         }
         let record = match self.ledger.plan(id) {
             Ok(Some(r)) => r,
@@ -370,7 +370,7 @@ impl CoordService {
                 };
                 self.announce();
                 if ctx.live_s0() {
-                    let text = format!("Jonathan rejected plan {id}: {reason}");
+                    let text = format!("{} rejected plan {id}: {reason}", self.user);
                     if let Err(e) = self.tell(&ctx.locks, 0, &text, now) {
                         tracing::warn!("could not tell S0 about plan {id}: {e:#}");
                     }
@@ -424,7 +424,11 @@ impl CoordService {
         self.announce();
         let with = if edited { " with edits" } else { "" };
         if ctx.live_s0() {
-            let text = format!("Jonathan approved plan {id}{with}.\n{}", outcome.join("\n"));
+            let text = format!(
+                "{} approved plan {id}{with}.\n{}",
+                self.user,
+                outcome.join("\n")
+            );
             let text: String = text.trim_end().chars().take(RELAY_MAX).collect();
             if let Err(e) = self.tell(&ctx.locks, 0, &text, now) {
                 tracing::warn!("could not tell S0 about plan {id}: {e:#}");

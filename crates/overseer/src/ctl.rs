@@ -187,9 +187,9 @@ pub enum SettingsCmd {
 
 #[derive(Subcommand)]
 pub enum PlanCmd {
-    /// Approve plan <id> as it is stored. Only Jonathan can.
+    /// Approve plan <id> as it is stored. Only you can.
     Approve { id: i64 },
-    /// Reject plan <id>, with a reason if you have one. Only Jonathan can.
+    /// Reject plan <id>, with a reason if you have one. Only you can.
     Reject { id: i64, reason: Option<String> },
     /// Propose a plan from a JSON file, or `-` for stdin.
     Propose { source: String },
@@ -580,10 +580,17 @@ fn board_state(s: &SlotInfo, now: i64) -> String {
     }
 }
 
+/// The name of the person at the keyboard, from the config file.
+pub fn user_name() -> String {
+    let home = overseer_daemon::config::home_from_env();
+    let (config, _) = overseer_daemon::Config::load(&overseer_proto::paths::config_path(), &home);
+    config.user().to_string()
+}
+
 /// The board as text, shared by `get_board` and `ctl board`: the summary,
 /// one line per slot (with its last report beneath), work items, locks and
-/// the plan waiting for Jonathan.
-pub fn format_board(view: &BoardView, now: i64) -> String {
+/// the plan waiting for the user.
+pub fn format_board(view: &BoardView, now: i64, user: &str) -> String {
     let mut out = Vec::new();
     out.push(match &view.coord.summary {
         Some(s) => format!("Summary ({}): {}", local_hhmm(s.at), s.text),
@@ -657,7 +664,7 @@ pub fn format_board(view: &BoardView, now: i64) -> String {
     out.extend(format_locks(&view.locks, now));
     if let Some(p) = view.coord.pending_plan() {
         out.push(format!(
-            "Plan {} waiting for Jonathan since {}",
+            "Plan {} waiting for {user} since {}",
             p.id,
             local_hhmm(p.at)
         ));
@@ -1195,7 +1202,7 @@ pub async fn run(cmd: CtlCmd) -> anyhow::Result<()> {
                 if json {
                     println!("{}", serde_json::to_string(&v)?);
                 } else {
-                    println!("{}", format_board(&v, now_secs()));
+                    println!("{}", format_board(&v, now_secs(), &user_name()));
                 }
                 Ok(())
             }
@@ -1610,7 +1617,7 @@ mod tests {
             at: 300,
             text: "Two lanes running.".into(),
         }));
-        let text = format_board(&v, 1000);
+        let text = format_board(&v, 1000, "Demo");
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
             lines[0],
@@ -1641,7 +1648,7 @@ mod tests {
         assert!(lines[locks_at + 1].starts_with("repo:demo-api:main  S3  claim  since "));
         assert_eq!(
             lines.last().unwrap(),
-            &format!("Plan 2 waiting for Jonathan since {}", local_hhmm(400))
+            &format!("Plan 2 waiting for Demo since {}", local_hhmm(400))
         );
     }
 
@@ -1650,7 +1657,7 @@ mod tests {
         let mut v = board(None);
         // S3's report was made at 500; its session now started at 700.
         v.slots[3].state = SlotState::Running { pid: 2, since: 700 };
-        let text = format_board(&v, 1000);
+        let text = format_board(&v, 1000, "Demo");
         assert!(!text.contains("last report"), "{text}");
         // A report from the new session shows.
         v.coord.reports.push(overseer_proto::Report {
@@ -1660,7 +1667,7 @@ mod tests {
             kind: ReportKind::Report,
             text: "schema done".into(),
         });
-        let text = format_board(&v, 1000);
+        let text = format_board(&v, 1000, "Demo");
         assert!(
             text.contains(&format!("  last report {}: schema done", local_hhmm(800))),
             "{text}"
@@ -1672,9 +1679,9 @@ mod tests {
     fn board_text_without_summary_says_none_yet() {
         let mut v = board(None);
         v.coord.plans.clear();
-        let text = format_board(&v, 1000);
+        let text = format_board(&v, 1000, "Demo");
         assert_eq!(text.lines().next().unwrap(), "Summary: none yet");
-        assert!(!text.contains("waiting for Jonathan"), "{text}");
+        assert!(!text.contains("waiting for Demo"), "{text}");
     }
 
     #[test]

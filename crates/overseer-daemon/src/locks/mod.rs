@@ -42,6 +42,8 @@ pub struct LockService {
     events: broadcast::Sender<Event>,
     env: BaseEnv,
     flag_after: Duration,
+    /// The name Overseer's messages use for the person at the keyboard.
+    user: String,
     /// Set by `shutdown`: the daemon is killing every session, and those
     /// exits must not drop their locks.
     stopping: AtomicBool,
@@ -126,6 +128,7 @@ impl LockService {
         events: broadcast::Sender<Event>,
         env: BaseEnv,
         flag_after: Duration,
+        user: String,
     ) -> Arc<LockService> {
         Arc::new(LockService {
             ledger,
@@ -133,6 +136,7 @@ impl LockService {
             events,
             env,
             flag_after,
+            user,
             stopping: AtomicBool::new(false),
             held: Mutex::new([None; SLOT_COUNT]),
             sessionless: OnceLock::new(),
@@ -193,7 +197,11 @@ impl LockService {
         let held = *self.held.lock().unwrap();
         for r in &mut view.relays {
             if r.state == RelayState::Pending {
-                r.held = held.get(r.to as usize).copied().flatten().map(String::from);
+                r.held = held
+                    .get(r.to as usize)
+                    .copied()
+                    .flatten()
+                    .map(|why| crate::relay::courier::held_text(why, &self.user));
             }
         }
         view
@@ -290,13 +298,14 @@ impl LockService {
         self.released(target, done)
     }
 
-    /// Jonathan's release of `target`: from whatever holds it when
+    /// The user's release of `target`: from whatever holds it when
     /// `holder` is `None`, else only while `holder` still does. The notice
     /// to a holder with no session is queued already dropped.
     pub fn force_release(&self, target: &str, holder: Option<SlotId>, now: i64) -> Response {
         let dead = self.sessionless();
         let done = self.ledger.transaction(|conn| {
-            let h = table::release_on(conn, target, Releaser::Force(holder), None, now)?;
+            let h =
+                table::release_on(conn, target, Releaser::Force(holder, &self.user), None, now)?;
             for &slot in &dead {
                 table::drop_relays_to_on(conn, slot, now)?;
             }
@@ -589,6 +598,7 @@ mod tests {
             events,
             BaseEnv::ready(Vec::new()),
             Duration::from_secs(3600),
+            "Demo".into(),
         )
     }
 
@@ -659,6 +669,7 @@ mod tests {
             events,
             BaseEnv::ready(Vec::new()),
             Duration::from_secs(3600),
+            "Demo".into(),
         );
         let queue = |to: SlotId, text: &str| {
             locks

@@ -355,7 +355,7 @@ pub fn decide_plan_on(
 }
 
 /// A queue row, or `None` (logged) when its sender or state cannot be read:
-/// a row nobody can attribute is left out rather than shown as Jonathan's.
+/// a row nobody can attribute is left out rather than shown as the user's.
 fn queue_entry(r: &rusqlite::Row) -> rusqlite::Result<Option<QueueEntry>> {
     let id: i64 = r.get(0)?;
     let sender: String = r.get(2)?;
