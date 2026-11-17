@@ -703,6 +703,9 @@ pub fn format_plan(rec: &PlanRecord) -> String {
         if !s.items.is_empty() {
             line.push_str(&format!("  items {}", s.items.join(", ")));
         }
+        if !s.moves.is_empty() {
+            line.push_str(&format!("  moves {}", s.moves.join(", ")));
+        }
         if !s.targets.is_empty() {
             let t: Vec<&str> = s.targets.iter().map(|t| t.target.as_str()).collect();
             line.push_str(&format!("  targets {}", t.join(", ")));
@@ -1698,6 +1701,7 @@ mod tests {
                     slot: 3,
                     label: "demo lane".into(),
                     items: vec!["DEMO-12".into(), "ov-3".into()],
+                    moves: vec![],
                     targets: vec![PlanTarget {
                         target: "repo:demo-api:main".into(),
                         reason: None,

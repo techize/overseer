@@ -157,7 +157,8 @@ fn tools() -> Value {
                             "properties": {
                                 "slot": {"type": ["string", "integer"], "description": "The slot, as S3 or 3."},
                                 "label": {"type": "string", "description": "A short name for the slot's work."},
-                                "items": {"type": "array", "items": {"type": "string"}, "description": "Work item keys to assign, for example DEMO-12 or ov-3."},
+                                "items": {"type": "array", "items": {"type": "string"}, "description": "Work item keys to assign, for example DEMO-12 or ov-3. An item another slot owns is refused here; put it in moves."},
+                                "moves": {"type": "array", "items": {"type": "string"}, "description": "Work item keys another slot owns that this slot takes over. Approving the plan moves them, and the user sees each move before approving."},
                                 "targets": {
                                     "type": "array",
                                     "items": {
