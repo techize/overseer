@@ -4,7 +4,7 @@ Tuesday 17 November 2026.
 
 ## Intent and why
 
-Kasia wants to use Overseer. She uses the same Jira as Jonathan but has no Obsidian vault. Today Overseer assumes his machine:
+A second user wants to use Overseer. She uses the same Jira as Jonathan but has no Obsidian vault. Today Overseer assumes his machine:
 - his name is in the session prompts
 - the defaults point at his 2ndBrain vault and its layout
 - Jira comes through `acli`
@@ -40,7 +40,7 @@ Jonathan's calls:
 ## Non-goals
 
 - Bitbucket through the API was a non-goal at first; it was added later, see "Addendum: Bitbucket by API".
-- A prebuilt, notarised download. Kasia builds with `make install` like Jonathan.
+- A prebuilt, notarised download. The second user builds with `make install` like Jonathan.
 - Writing to Jira, such as status changes or comments.
 - Syncing into Jonathan's existing vault folders. His sprint-sync skill owns those.
 
@@ -152,7 +152,7 @@ Settings gets a "Jira token" field that writes the Keychain item through `securi
   - When no sprint is active, there is no sprint header and no sync, and the board shows "No active sprint".
   - `sprint_days` is worked out from the start and end dates.
 - **Sprint folder name.** `sprint-<slug>`, where the slug is the Jira name in lower case with anything other than letters and digits turned into `-`. A name that already starts with "sprint" is not prefixed twice. This keeps `newest_sprint_folder` and the `Sprints/*/sprint-*.md` locking default working.
-- **Ticket pattern.** No fixed default. The pattern is built from the project keys of the tickets Jira returns (for example `(PLAT)-\d+`), so Jonathan gets `PLAT-\d+` as today, Kasia gets her project's keys, and strings like `UTF-8` don't match. A `ticket_pattern` in config still overrides it. Before the first poll, and with no tickets, the generic `[A-Z][A-Z0-9]+-\d+` is used.
+- **Ticket pattern.** No fixed default. The pattern is built from the project keys of the tickets Jira returns (for example `(PLAT)-\d+`), so Jonathan gets `PLAT-\d+` as today, the second user gets her project's keys, and strings like `UTF-8` don't match. A `ticket_pattern` in config still overrides it. Before the first poll, and with no tickets, the generic `[A-Z][A-Z0-9]+-\d+` is used.
 
 ## Left to the builder
 
