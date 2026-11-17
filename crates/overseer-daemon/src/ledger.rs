@@ -1265,6 +1265,7 @@ mod tests {
                 slot,
                 label: String::new(),
                 items: vec![],
+                moves: vec![],
                 targets: vec![],
                 worktree: None,
                 cwd: None,

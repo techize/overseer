@@ -700,6 +700,10 @@ pub struct PlanSlot {
     pub label: String,
     #[serde(default)]
     pub items: Vec<String>,
+    /// Items another slot owns that this slot takes over. Approving the
+    /// plan moves them; naming one in `items` instead is refused.
+    #[serde(default)]
+    pub moves: Vec<String>,
     #[serde(default)]
     pub targets: Vec<PlanTarget>,
     #[serde(default)]
@@ -1066,6 +1070,7 @@ mod tests {
                 slot: 3,
                 label: "demo".into(),
                 items: vec!["DEMO-12".into()],
+                moves: vec![],
                 targets: vec![PlanTarget {
                     target: "repo:demo-api:main".into(),
                     reason: Some("merge".into()),

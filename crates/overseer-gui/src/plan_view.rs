@@ -55,6 +55,7 @@ impl PlanDraft {
     pub fn remove_item(&mut self, slot: SlotId, key: &str) {
         if let Some(s) = self.slot_mut(slot) {
             s.items.retain(|k| k != key);
+            s.moves.retain(|k| k != key);
         }
     }
 
@@ -92,6 +93,14 @@ impl PlanDraft {
     }
 }
 
+/// A work item as shown: the key, marked when the slot takes it over from
+/// another slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemPill {
+    pub key: String,
+    pub text: String,
+}
+
 /// A target as shown: the target, then its reason when it has one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetPill {
@@ -110,7 +119,7 @@ pub enum PlanRow {
     },
     Items {
         slot: SlotId,
-        keys: Vec<String>,
+        pills: Vec<ItemPill>,
     },
     Targets {
         slot: SlotId,
@@ -148,10 +157,18 @@ pub fn rows(rec: &PlanRecord, editor: &Editor) -> Vec<PlanRow> {
             slot: s.slot,
             title,
         });
-        if !s.items.is_empty() {
+        if !s.items.is_empty() || !s.moves.is_empty() {
+            let take = s.items.iter().map(|k| ItemPill {
+                key: k.clone(),
+                text: k.clone(),
+            });
+            let moved = s.moves.iter().map(|k| ItemPill {
+                key: k.clone(),
+                text: format!("{k} (move)"),
+            });
             out.push(PlanRow::Items {
                 slot: s.slot,
-                keys: s.items.clone(),
+                pills: take.chain(moved).collect(),
             });
         }
         if !s.targets.is_empty() {
@@ -699,20 +716,24 @@ impl Render for PlanView {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(title)
                     .into_any_element(),
-                PlanRow::Items { slot, keys } => div()
+                PlanRow::Items { slot, pills } => div()
                     .flex()
                     .flex_wrap()
                     .gap_1()
-                    .children(keys.into_iter().enumerate().map(|(i, key)| {
+                    .children(pills.into_iter().enumerate().map(|(i, p)| {
                         let entity = cx.entity();
-                        let k = key.clone();
-                        pill(("item", usize::from(slot) * 100 + i), key, move |_, cx| {
-                            entity.update(cx, |this, cx| {
-                                this.editor.draft.remove_item(slot, &k);
-                                this.recheck(cx);
-                                cx.notify();
-                            })
-                        })
+                        let k = p.key;
+                        pill(
+                            ("item", usize::from(slot) * 100 + i),
+                            p.text,
+                            move |_, cx| {
+                                entity.update(cx, |this, cx| {
+                                    this.editor.draft.remove_item(slot, &k);
+                                    this.recheck(cx);
+                                    cx.notify();
+                                })
+                            },
+                        )
                     }))
                     .into_any_element(),
                 PlanRow::Targets { slot, targets } => div()
@@ -880,6 +901,7 @@ mod tests {
             slot: n,
             label: "demo lane".into(),
             items: vec!["DEMO-12".into(), "ov-3".into()],
+            moves: vec![],
             targets: vec![PlanTarget {
                 target: "repo:demo-api:main".into(),
                 reason: Some("merge".into()),
@@ -911,6 +933,31 @@ mod tests {
         assert_eq!(d.plan(), rec.plan);
         assert!(!d.edited());
         assert!(d.can_approve());
+    }
+
+    #[test]
+    fn a_move_shows_as_a_marked_pill_and_can_be_removed() {
+        let mut rec = record();
+        rec.plan.slots[0].moves = vec!["DEMO-14".into()];
+        let e = Editor::new(&rec);
+        let rows = rows(&rec, &e);
+        let Some(PlanRow::Items { pills, .. }) = rows
+            .iter()
+            .find(|r| matches!(r, PlanRow::Items { slot: 3, .. }))
+        else {
+            panic!("no items row for S3: {rows:?}");
+        };
+        assert_eq!(
+            pills.last(),
+            Some(&ItemPill {
+                key: "DEMO-14".into(),
+                text: "DEMO-14 (move)".into()
+            })
+        );
+        let mut d = PlanDraft::new(&rec.plan);
+        d.remove_item(3, "DEMO-14");
+        assert!(d.plan().slots[0].moves.is_empty());
+        assert!(d.edited());
     }
 
     #[test]
@@ -961,7 +1008,12 @@ mod tests {
         }));
         assert!(rows.contains(&PlanRow::Items {
             slot: 3,
-            keys: vec!["DEMO-12".into(), "ov-3".into()]
+            pills: ["DEMO-12", "ov-3"]
+                .map(|k| ItemPill {
+                    key: k.into(),
+                    text: k.into()
+                })
+                .to_vec()
         }));
         assert!(rows.contains(&PlanRow::Worktree {
             slot: 3,

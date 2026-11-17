@@ -4172,6 +4172,7 @@ impl PlanRig {
             slot: 4,
             label: String::new(),
             items: vec!["DEMO-12".into()],
+            moves: vec![],
             targets: vec![PlanTarget {
                 target: "repo:demo-api:main".into(),
                 reason: Some("merge".into()),
@@ -4191,6 +4192,7 @@ impl PlanRig {
             slot: 3,
             label: String::new(),
             items: vec!["ov-4".into()],
+            moves: vec![],
             targets: vec![],
             worktree: None,
             cwd: None,
@@ -4204,6 +4206,7 @@ impl PlanRig {
             slot: 5,
             label: "lane five".into(),
             items: vec![],
+            moves: vec![],
             targets: vec![],
             worktree: None,
             cwd: Some(self.work5.clone()),
@@ -4413,6 +4416,34 @@ async fn approve_with_edits_says_so() {
     assert_eq!(rig.starts(), 1);
     assert_eq!(item(&c.work().await, "ov-4").owner, None);
     s3.reads_nothing_for(1).await;
+}
+
+#[tokio::test]
+async fn approve_moves_an_item_another_slot_owns() {
+    let rig = PlanRig::new("moves");
+    let (_d, mut c) = rig.start().await;
+    assert_eq!(c.assign("DEMO-12", 2, false, false).await, Response::Ok);
+    let mut s5 = rig.slot5();
+    s5.moves = vec!["DEMO-12".into()];
+    let plan = plan_of(vec![s5]);
+    assert!(matches!(
+        c.propose(Some(0), plan.clone()).await,
+        Response::Text { .. }
+    ));
+    assert_eq!(
+        c.plan_record(1).await.warnings,
+        ["DEMO-12 moves S2 -> S5".to_string()]
+    );
+    let text = match c.approve(1, plan).await {
+        Response::Text { text } => text,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        text.lines().next(),
+        Some("S5: assigned DEMO-12 (moved from S2)"),
+        "{text}"
+    );
+    assert_eq!(item(&c.work().await, "DEMO-12").owner, Some(5));
 }
 
 #[tokio::test]

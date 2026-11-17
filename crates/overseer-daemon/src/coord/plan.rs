@@ -120,10 +120,19 @@ pub fn validate(plan: &Plan, facts: &Facts) -> Result<Vec<String>, String> {
         }
     }
     // Every item's decision, in plan order; the first unknown item refuses.
+    // An item in `moves` may come from another slot; one in `items` may not.
     let mut decisions: Vec<(SlotId, &str, Decision)> = Vec::new();
     for s in &plan.slots {
-        for key in &s.items {
-            let d = decide(&facts.work.items, facts.owners, key, s.slot, false, false)?;
+        let keys = s.items.iter().map(|k| (k, false));
+        for (key, move_owner) in keys.chain(s.moves.iter().map(|k| (k, true))) {
+            let d = decide(
+                &facts.work.items,
+                facts.owners,
+                key,
+                s.slot,
+                false,
+                move_owner,
+            )?;
             decisions.push((s.slot, key, d));
         }
     }
@@ -142,11 +151,8 @@ pub fn validate(plan: &Plan, facts: &Facts) -> Result<Vec<String>, String> {
         }
     }
     for (_, key, d) in &decisions {
-        match d {
-            Decision::Refuse { owner } | Decision::Move { from: owner } => {
-                return Err(owned_by_message(key, *owner));
-            }
-            _ => {}
+        if let Decision::Refuse { owner } = d {
+            return Err(owned_by_message(key, *owner));
         }
     }
     for s in &plan.slots {
@@ -203,9 +209,15 @@ pub fn validate(plan: &Plan, facts: &Facts) -> Result<Vec<String>, String> {
 
     let mut warnings = Vec::new();
     for s in &plan.slots {
-        for (slot, _, d) in &decisions {
-            if let (true, Decision::Warn { message, .. }) = (*slot == s.slot, d) {
-                warnings.push(message.clone());
+        for (slot, key, d) in decisions.iter().filter(|(slot, ..)| *slot == s.slot) {
+            match d {
+                Decision::Warn { message, .. } => warnings.push(message.clone()),
+                Decision::Move { from } => warnings.push(format!(
+                    "{key} moves {} -> {}",
+                    slot_name(*from),
+                    slot_name(*slot)
+                )),
+                _ => {}
             }
         }
         for t in &s.targets {
@@ -289,6 +301,15 @@ impl PlanCtx {
 }
 
 impl CoordService {
+    /// The slot that owns `key` now, if any.
+    fn owner_of(&self, key: &str) -> Option<SlotId> {
+        let all = self.ledger.assignments().unwrap_or_else(|e| {
+            tracing::warn!("assignments unreadable: {e:#}");
+            Vec::new()
+        });
+        all.into_iter().find(|(k, _)| k == key).map(|(_, s)| s)
+    }
+
     /// A copy of the board for `validate`.
     pub fn gather(&self, ctx: &PlanCtx) -> OwnedFacts {
         let owners = self
@@ -471,11 +492,20 @@ impl CoordService {
             ctx.locks.on_session_ended(slot, now);
         }
 
-        // 1. Items.
-        let mut assigned = Vec::new();
-        for key in &ps.items {
-            match ctx.store.assign(key, slot, true, false, now) {
-                Response::Ok => assigned.push(key.as_str()),
+        // 1. Items, then the items this slot takes over from another.
+        let mut assigned: Vec<String> = Vec::new();
+        let keys = ps.items.iter().map(|k| (k, false));
+        for (key, move_owner) in keys.chain(ps.moves.iter().map(|k| (k, true))) {
+            let from = if move_owner {
+                self.owner_of(key).filter(|o| *o != slot)
+            } else {
+                None
+            };
+            match ctx.store.assign(key, slot, true, move_owner, now) {
+                Response::Ok => assigned.push(match from {
+                    Some(f) => format!("{key} (moved from {})", slot_name(f)),
+                    None => key.clone(),
+                }),
                 Response::Error { message } => {
                     if !assigned.is_empty() {
                         out.push(format!("{name}: assigned {}", assigned.join(", ")));
@@ -586,7 +616,10 @@ impl CoordService {
         let label = if !ps.label.trim().is_empty() {
             ps.label.trim().to_string()
         } else {
-            ps.items.first().cloned().unwrap_or_else(|| "work".into())
+            (ps.items.iter().chain(&ps.moves))
+                .next()
+                .cloned()
+                .unwrap_or_else(|| "work".into())
         };
         // The same two steps as a start from the GUI: the login shell's
         // environment, and a fresh CURRENT_SESSION section.
@@ -712,6 +745,7 @@ mod tests {
             slot: n,
             label: String::new(),
             items: vec![],
+            moves: vec![],
             targets: vec![],
             worktree: None,
             cwd: Some(std::env::temp_dir()),
@@ -810,6 +844,50 @@ mod tests {
         let mut s = slot(3);
         s.items = vec!["DEMO-12".into()];
         assert_eq!(refusal(&b, &plan(vec![s])), "DEMO-12 is owned by S2");
+    }
+
+    #[test]
+    fn a_move_is_a_warning_not_a_refusal() {
+        let mut b = Board::new();
+        b.own("DEMO-12", 6);
+        let mut s = slot(2);
+        s.moves = vec!["DEMO-12".into()];
+        assert_eq!(
+            b.check(&plan(vec![s])),
+            Ok(vec!["DEMO-12 moves S6 -> S2".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_move_of_a_free_or_own_item_is_quiet() {
+        let mut b = Board::new();
+        b.own("DEMO-13", 2);
+        let mut s = slot(2);
+        s.moves = vec!["DEMO-12".into(), "DEMO-13".into()];
+        assert_eq!(b.check(&plan(vec![s])), Ok(vec![]));
+    }
+
+    #[test]
+    fn refuses_an_unknown_move() {
+        let mut s = slot(3);
+        s.moves = vec!["DEMO-99".into()];
+        assert_eq!(
+            refusal(&Board::new(), &plan(vec![s])),
+            "no work item DEMO-99"
+        );
+    }
+
+    #[test]
+    fn refuses_a_move_another_slot_also_takes() {
+        let mut b = Board::new();
+        b.own("DEMO-12", 6);
+        let (mut a, mut c) = (slot(2), slot(3));
+        a.moves = vec!["DEMO-12".into()];
+        c.moves = vec!["DEMO-12".into()];
+        assert_eq!(
+            refusal(&b, &plan(vec![a, c])),
+            "DEMO-12 appears in S2 and S3"
+        );
     }
 
     #[test]
