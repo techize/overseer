@@ -449,6 +449,13 @@ pub struct OverseerApp {
     /// The strip's list shows while hovered, or until clicked away.
     pub(crate) brain_hover: bool,
     pub(crate) brain_pinned: bool,
+    /// The kanban's dragged height; `None` fills the space left.
+    pub(crate) kanban_height: Option<f32>,
+    /// While its edge is dragged: where the pointer went down and the
+    /// kanban's height then.
+    pub(crate) kanban_drag: Option<(f32, f32)>,
+    /// The kanban's height as last laid out.
+    pub(crate) kanban_measured: std::rc::Rc<std::cell::Cell<f32>>,
     pub(crate) screen: Screen,
     pub(crate) selected: SlotId,
     pub(crate) home: Option<PathBuf>,
@@ -538,6 +545,9 @@ impl OverseerApp {
             notified_push: None,
             brain_hover: false,
             brain_pinned: false,
+            kanban_height: crate::kanban_size::load_from(&crate::kanban_size::path()),
+            kanban_drag: None,
+            kanban_measured: Default::default(),
             screen: Screen::Board,
             selected: 1,
             home: std::env::var_os("HOME").map(PathBuf::from),
@@ -1482,6 +1492,48 @@ impl OverseerApp {
         });
         self.entry = None;
         self.ensure_ticker(cx);
+    }
+
+    /// Sets the kanban's height (`None` fills) and saves it; a failed save
+    /// only costs the height on the next start, so it goes to the status line.
+    pub(crate) fn set_kanban_height(&mut self, height: Option<f32>) {
+        self.kanban_height = height;
+        if let Err(e) = crate::kanban_size::save_to(&crate::kanban_size::path(), height) {
+            self.status = Some(format!("cannot save the kanban height: {e}"));
+        }
+    }
+
+    /// The pointer moved while the kanban's edge is held: resize it. A move
+    /// with the button already up (released outside the window) ends the drag.
+    pub(crate) fn drag_kanban(
+        &mut self,
+        ev: &gpui::MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((start_y, start_h)) = self.kanban_drag else {
+            return;
+        };
+        if !ev.dragging() {
+            self.end_kanban_drag(cx);
+            return;
+        }
+        let max: f32 = window.viewport_size().height.into();
+        let y: f32 = ev.position.y.into();
+        self.kanban_height = Some(crate::kanban_size::dragged(start_h, start_y, y, max));
+        cx.notify();
+    }
+
+    /// The edge was let go: keep the height the kanban actually got, so a
+    /// height the window could not fit is not saved.
+    pub(crate) fn end_kanban_drag(&mut self, cx: &mut Context<Self>) {
+        if self.kanban_drag.take().is_some() {
+            let got = self.kanban_measured.get();
+            if got > 0. {
+                self.set_kanban_height(Some(got));
+            }
+            cx.notify();
+        }
     }
 
     pub(crate) fn go_board(&mut self, window: &mut Window, cx: &mut Context<Self>) {

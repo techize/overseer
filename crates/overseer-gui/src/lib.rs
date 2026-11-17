@@ -3,6 +3,7 @@
 pub mod app;
 pub mod board;
 pub mod daemon_info;
+pub mod kanban_size;
 pub mod locks_view;
 pub mod notify;
 pub mod picker;
