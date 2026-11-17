@@ -4,10 +4,12 @@
 use std::path::PathBuf;
 
 use gpui::{
-    div, prelude::*, px, relative, rgb, rgba, Context, ElementId, FontWeight, Rgba, SharedString,
-    Window,
+    div, prelude::*, px, relative, rgb, rgba, ClickEvent, Context, ElementId, FontWeight, Rgba,
+    SharedString, Window,
 };
-use overseer_proto::{slot_name, ItemKind, SlotId, Stage, WorkItem, WorkView, PRS_OFF};
+use overseer_proto::{
+    slot_name, ItemKind, SlotId, SlotInfo, SlotState, Stage, WorkItem, WorkView, PRS_OFF,
+};
 
 use crate::app::{colors, open_external, OverseerApp};
 
@@ -251,10 +253,22 @@ pub struct PrRow {
     pub age: Option<String>,
     pub tone: AgeTone,
     pub url: Option<String>,
+    /// The Running slot that owns the PR's ticket: a click opens it.
+    pub slot: Option<SlotId>,
+}
+
+/// The Running slot owning `ticket`, if any.
+fn running_owner(view: &WorkView, slots: &[SlotInfo], ticket: &str) -> Option<SlotId> {
+    let owner = view.items.iter().find(|i| i.key == ticket)?.owner?;
+    slots
+        .get(owner as usize)
+        .filter(|i| matches!(i.state, SlotState::Running { .. }))
+        .map(|i| i.id)
 }
 
 /// Open PRs oldest first (no date last), at most 8, and how many are left.
-pub fn pr_rows(view: &WorkView, now: i64) -> (Vec<PrRow>, usize) {
+/// A row is linked to its ticket's owner while that slot is Running.
+pub fn pr_rows(view: &WorkView, slots: &[SlotInfo], now: i64) -> (Vec<PrRow>, usize) {
     let mut prs: Vec<_> = view.prs.iter().collect();
     prs.sort_by_key(|p| (p.created.is_none(), p.created));
     let more = prs.len().saturating_sub(MAX_PR_ROWS);
@@ -269,6 +283,10 @@ pub fn pr_rows(view: &WorkView, now: i64) -> (Vec<PrRow>, usize) {
             age: p.created.map(|c| age_text(now - c)),
             tone: p.created.map_or(AgeTone::Unknown, |c| pr_age_tone(now - c)),
             url: p.url.clone(),
+            slot: p
+                .ticket
+                .as_deref()
+                .and_then(|t| running_owner(view, slots, t)),
         })
         .collect();
     (rows, more)
@@ -476,6 +494,9 @@ fn chip(text: impl Into<SharedString>, bg: u32, fg: u32) -> gpui::Div {
 fn ticket_card(c: TicketCard, cx: &mut Context<OverseerApp>) -> impl IntoElement {
     let (prio, bg, fg) = prio_chip(c.prio);
     let pr_key = c.key.clone();
+    let click_key = c.key.clone();
+    let owner = c.slot;
+    let folder = c.folder.clone();
     div()
         .id(ElementId::Name(format!("kanban-{}", c.key).into()))
         .flex_none()
@@ -557,15 +578,18 @@ fn ticket_card(c: TicketCard, cx: &mut Context<OverseerApp>) -> impl IntoElement
                         .child(a)
                 })),
         )
-        .when_some(c.folder, |d, folder| {
-            d.cursor_pointer()
-                .hover(|s| s.bg(rgb(colors::CARD_HOVER)))
-                .on_click(
-                    cx.listener(move |_, _, _, _| {
-                        open_external(folder.clone(), "the ticket folder")
-                    }),
-                )
-        })
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(colors::CARD_HOVER)))
+        .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
+            // Cmd+click keeps the ticket-folder shortcut.
+            if ev.modifiers().platform {
+                if let Some(folder) = &folder {
+                    open_external(folder.clone(), "the ticket folder");
+                }
+                return;
+            }
+            this.click_ticket(click_key.clone(), owner, window, cx);
+        }))
 }
 
 /// A Done card: the key and the title on one line each.
@@ -637,7 +661,7 @@ impl OverseerApp {
         if !pr_panel_shown(&self.work) {
             return None;
         }
-        let (rows, more) = pr_rows(&self.work, now);
+        let (rows, more) = pr_rows(&self.work, &self.slots, now);
         let empty = rows.is_empty();
         let note = pr_source_note(&self.work);
         let answered = pr_answered(&self.work);
@@ -647,6 +671,8 @@ impl OverseerApp {
             .map(|(n, r)| {
                 let tone = tone_color(r.tone);
                 let word = tone_word(r.tone);
+                let url = r.url.clone().filter(|u| is_http_url(u));
+                let slot = r.slot;
                 div()
                     .id(("pr-row", n))
                     .flex()
@@ -672,6 +698,15 @@ impl OverseerApp {
                         r.ticket
                             .map(|t| div().flex_none().text_color(rgb(colors::ACCENT)).child(t)),
                     )
+                    .children(r.slot.map(|s| {
+                        div()
+                            .flex_none()
+                            .px_1()
+                            .rounded(px(4.))
+                            .bg(rgb(colors::ACCENT_BG))
+                            .text_color(rgb(colors::ACCENT))
+                            .child(slot_name(s))
+                    }))
                     .child(
                         div()
                             .flex_1()
@@ -687,11 +722,23 @@ impl OverseerApp {
                             .text_color(rgb(tone))
                             .child(a)
                     }))
-                    .when_some(r.url.filter(|u| is_http_url(u)), |d, url| {
+                    .when(url.is_some() || r.slot.is_some(), |d| {
                         d.cursor_pointer()
                             .hover(|s| s.bg(rgb(colors::CARD_HOVER)))
-                            .on_click(cx.listener(move |_, _, _, _| {
-                                open_external(url.clone(), "the pull request")
+                            .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
+                                // A linked row opens its session; Cmd+click
+                                // always opens the browser.
+                                match (slot, &url) {
+                                    (Some(id), _) if !ev.modifiers().platform => {
+                                        if !this.modal_open() {
+                                            this.go_session(id, window, cx);
+                                        }
+                                    }
+                                    (_, Some(url)) => {
+                                        open_external(url.clone(), "the pull request")
+                                    }
+                                    _ => {}
+                                }
                             }))
                     })
             })
@@ -1049,7 +1096,7 @@ mod tests {
             .map(|i| pr(i, Some(now - i as i64 * 86_400)))
             .collect();
         v.prs.push(pr(10, None));
-        let (rows, more) = pr_rows(&v, now);
+        let (rows, more) = pr_rows(&v, &[], now);
         assert_eq!((rows.len(), more), (8, 2));
         assert_eq!(rows[0].id, 9);
         assert_eq!(rows[0].tone, AgeTone::Old);
@@ -1059,6 +1106,7 @@ mod tests {
                 prs: vec![pr(1, None), pr(2, Some(now))],
                 ..view(vec![])
             },
+            &[],
             now,
         );
         assert_eq!((rows[0].id, rows[1].id), (2, 1));
@@ -1071,6 +1119,27 @@ mod tests {
             .collect();
         assert_eq!(pr_header(&v, now), "OPEN PRS · 10 · oldest 6d");
         assert_eq!(pr_header(&view(vec![]), now), "OPEN PRS · 0");
+    }
+
+    #[test]
+    fn pr_rows_link_a_running_owner() {
+        let now = 86_400;
+        let mut owned = ticket("DEMO-1", Stage::InProgress, None);
+        owned.owner = Some(3);
+        let mut idle = ticket("DEMO-2", Stage::InProgress, None);
+        idle.owner = Some(4);
+        let mut v = view(vec![owned, idle, ticket("DEMO-3", Stage::InProgress, None)]);
+        v.prs = (1..=4).map(|i| pr(i, Some(now - i as i64))).collect();
+        for (p, t) in v.prs.iter_mut().zip(["DEMO-1", "DEMO-2", "DEMO-3"]) {
+            p.ticket = Some(t.into());
+        }
+        let mut slots = crate::app::empty_slots();
+        slots[3].state = overseer_proto::SlotState::Running { pid: 1, since: 0 };
+        slots[4].state = overseer_proto::SlotState::Exited { code: None, at: 0 };
+        let (rows, _) = pr_rows(&v, &slots, now);
+        let linked: Vec<_> = rows.iter().map(|r| (r.id, r.slot)).collect();
+        // Oldest first: PR 4 has no ticket, 3 is unowned, 2's owner exited.
+        assert_eq!(linked, [(4, None), (3, None), (2, None), (1, Some(3))]);
     }
 
     #[test]

@@ -250,6 +250,46 @@ pub fn card_click(info: &SlotInfo) -> CardClick {
     }
 }
 
+/// What clicking a ticket card does: open its owner's session, start work
+/// in a slot, or report that no slot is free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TicketClick {
+    Open(SlotId),
+    Start(SlotId),
+    NoSlot,
+}
+
+/// The slot starting work on a ticket uses: its owner when that owner is
+/// not Running, else the lowest Empty or Exited slot in S1 to S6. S0 and
+/// Running slots are never picked.
+pub fn start_slot(owner: Option<SlotId>, slots: &[SlotInfo]) -> Option<SlotId> {
+    if let Some(o) = owner.filter(|&o| o != 0) {
+        if let Some(info) = slots.get(o as usize) {
+            if !matches!(info.state, SlotState::Running { .. }) {
+                return Some(o);
+            }
+        }
+    }
+    slots
+        .iter()
+        .filter(|i| (1..=6).contains(&i.id))
+        .find(|i| matches!(i.state, SlotState::Empty | SlotState::Exited { .. }))
+        .map(|i| i.id)
+}
+
+pub fn ticket_click(owner: Option<SlotId>, slots: &[SlotInfo]) -> TicketClick {
+    let running = owner
+        .and_then(|o| slots.get(o as usize))
+        .filter(|i| matches!(i.state, SlotState::Running { .. }));
+    if let Some(info) = running {
+        return TicketClick::Open(info.id);
+    }
+    match start_slot(owner, slots) {
+        Some(slot) => TicketClick::Start(slot),
+        None => TicketClick::NoSlot,
+    }
+}
+
 /// Whether assigning to this slot goes on to start it with the kickoff
 /// ("Assign and start"): it has no session running.
 pub fn assign_starts(info: &SlotInfo) -> bool {
@@ -359,7 +399,7 @@ fn app_settings(path: &std::path::Path) -> Result<(Theme, String), String> {
     Ok((theme, crate::terminal_view::editor_from_toml(&text)))
 }
 
-fn empty_slots() -> Vec<SlotInfo> {
+pub(crate) fn empty_slots() -> Vec<SlotInfo> {
     (0..7)
         .map(|id| SlotInfo {
             id,
@@ -1089,7 +1129,7 @@ impl OverseerApp {
 
     /// The start dialog, the picker, the plan view or Settings is up;
     /// navigation waits for it.
-    fn modal_open(&self) -> bool {
+    pub(crate) fn modal_open(&self) -> bool {
         self.dialog.is_some()
             || self.picker.is_some()
             || self.plan_view.is_some()
@@ -1306,6 +1346,82 @@ impl OverseerApp {
             });
         })
         .detach();
+    }
+
+    /// A click on a ticket card that is not Running anywhere: assign the
+    /// ticket to `start_slot` (unless that slot owns it already), then fetch
+    /// the kickoff and open the start dialog, as the picker does.
+    pub(crate) fn start_ticket(
+        &mut self,
+        key: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.modal_open() {
+            return;
+        }
+        let owner = self
+            .work
+            .items
+            .iter()
+            .find(|i| i.key == key)
+            .and_then(|i| i.owner);
+        let Some(slot) = start_slot(owner, &self.slots) else {
+            self.status = Some(format!(
+                "No free slot for {key}: stop or clear a session first."
+            ));
+            cx.notify();
+            return;
+        };
+        self.status = None;
+        if owner == Some(slot) {
+            self.assign_and_start(slot, key, window, cx);
+            return;
+        }
+        let client = self.client.clone();
+        let req = Request::Assign {
+            key: key.clone(),
+            slot,
+            confirm: true,
+            move_owner: false,
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            let reply = client.request(req).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                match reply {
+                    Ok(Response::Ok) => this.assign_and_start(slot, key, window, cx),
+                    Ok(Response::NeedsConfirm { message }) | Ok(Response::Error { message }) => {
+                        this.status = Some(message)
+                    }
+                    Ok(other) => {
+                        this.status = Some(format!("unexpected reply to assign: {other:?}"))
+                    }
+                    Err(e) => {
+                        this.status = Some(format!("{} ({e:#})", crate::terminal_view::LOST_DAEMON))
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// A click on a ticket card that is not Done.
+    pub(crate) fn click_ticket(
+        &mut self,
+        key: String,
+        owner: Option<SlotId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match ticket_click(owner, &self.slots) {
+            TicketClick::Open(id) => {
+                if !self.modal_open() {
+                    self.go_session(id, window, cx);
+                }
+            }
+            TicketClick::Start(_) | TicketClick::NoSlot => self.start_ticket(key, window, cx),
+        }
     }
 
     /// Stop, wait for Exited, then start with the same label, cwd and
@@ -1903,6 +2019,31 @@ mod tests {
         let mut ex = s[2].clone();
         ex.state = SlotState::Exited { code: None, at: 0 };
         assert_eq!(card_click(&ex), CardClick::Open(2));
+    }
+
+    #[test]
+    fn ticket_clicks() {
+        let exited = SlotState::Exited { code: None, at: 0 };
+        // A Running owner opens its pop-over.
+        let s = slots_with(&[4]);
+        assert_eq!(ticket_click(Some(4), &s), TicketClick::Open(4));
+        // An Exited owner is the target, even when a lower slot is free.
+        let mut s = empty_slots();
+        s[4].state = exited.clone();
+        assert_eq!(ticket_click(Some(4), &s), TicketClick::Start(4));
+        // No owner: the lowest free slot, skipping Running ones.
+        let s = slots_with(&[1]);
+        assert_eq!(ticket_click(None, &s), TicketClick::Start(2));
+        // S0 is never picked.
+        let s = slots_with(&[1, 2, 3, 4, 5, 6]);
+        assert_eq!(s[0].state, SlotState::Empty);
+        assert_eq!(ticket_click(None, &s), TicketClick::NoSlot);
+        assert_eq!(start_slot(None, &s), None);
+        // An Exited slot counts as free.
+        let mut s = slots_with(&[1, 2]);
+        s[3].state = exited;
+        assert_eq!(ticket_click(None, &s), TicketClick::Start(3));
+        assert_eq!(start_slot(None, &s), Some(3));
     }
     /// Contexts that take the keyboard for themselves; window-wide
     /// navigation waits while one is open. A new modal is one line here.
