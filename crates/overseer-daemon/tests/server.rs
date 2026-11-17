@@ -251,11 +251,11 @@ async fn start_daemon_with_security(email: &str, security: String) -> Daemon {
     let cfg = DaemonConfig {
         socket: socket.clone(),
         default_command: vec![SCRIPT.to_string()],
-        // An empty token variable hides one from the developer's shell.
-        env: overseer_daemon::EnvSource::InheritWith(vec![(
-            "ATLASSIAN_API_TOKEN".into(),
-            String::new(),
-        )]),
+        // Empty token variables hide any from the developer's shell.
+        env: overseer_daemon::EnvSource::InheritWith(vec![
+            ("ATLASSIAN_API_TOKEN".into(), String::new()),
+            ("BITBUCKET_API_TOKEN".into(), String::new()),
+        ]),
         state_dir: state_dir.clone(),
         files,
         hook_program: PathBuf::from("/bin/true"),
@@ -280,22 +280,27 @@ async fn start_daemon_with_security(email: &str, security: String) -> Daemon {
 }
 
 #[tokio::test]
-async fn jira_token_is_saved_through_security_and_never_answered() {
+async fn tokens_are_saved_through_security_and_never_answered() {
+    use overseer_proto::settings::TokenStatus;
+    use overseer_proto::TokenKind;
     use std::os::unix::fs::PermissionsExt;
     let dir = std::env::temp_dir().join(format!("overseer-token-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    // A stand-in for `security`: `-i` keeps the command it is given, and
-    // the read-back prints the token from it (nothing before a save).
+    // A stand-in for `security`: `-i` keeps the command it is given under
+    // its service, and the read-back prints that service's token (nothing
+    // before a save).
     let stub = dir.join("security");
-    let kept = dir.join("kept");
     std::fs::write(
         &stub,
         format!(
-            "#!/bin/sh\nif [ \"$1\" = -i ]; then cat > '{k}'; exit 0; fi\n\
-             [ -f '{k}' ] || exit 44\n\
-             sed -n 's/.* -w \"\\(.*\\)\"$/\\1/p' '{k}'\n",
-            k = kept.display()
+            "#!/bin/sh\nd='{d}'\n\
+             if [ \"$1\" = -i ]; then read -r line; \
+             svc=$(printf '%s' \"$line\" | sed -n 's/.* -s \\([^ ]*\\) .*/\\1/p'); \
+             printf '%s\\n' \"$line\" > \"$d/$svc\"; exit 0; fi\n\
+             [ -f \"$d/$3\" ] || exit 44\n\
+             sed -n 's/.* -w \"\\(.*\\)\"$/\\1/p' \"$d/$3\"\n",
+            d = dir.display()
         ),
     )
     .unwrap();
@@ -306,9 +311,11 @@ async fn jira_token_is_saved_through_security_and_never_answered() {
     let Response::Settings(v) = c.request(Request::GetSettings).await else {
         panic!("not a Settings reply");
     };
-    assert!(!v.jira_token_set, "no token yet");
+    assert_eq!(v.jira_token, TokenStatus::NotSet, "no token yet");
+    assert_eq!(v.bitbucket_token, TokenStatus::NotSet);
     let resp = c
-        .request(Request::SetJiraToken {
+        .request(Request::SetToken {
+            kind: TokenKind::Jira,
             token: "demo-token-123".into(),
         })
         .await;
@@ -316,8 +323,32 @@ async fn jira_token_is_saved_through_security_and_never_answered() {
     let Response::Settings(v) = c.request(Request::GetSettings).await else {
         panic!("not a Settings reply");
     };
-    assert!(v.jira_token_set);
-    assert!(!format!("{v:?}").contains("demo-token-123"));
+    assert_eq!(v.jira_token, TokenStatus::Keychain);
+    assert_eq!(v.bitbucket_token, TokenStatus::NotSet);
+    let resp = c
+        .request(Request::SetToken {
+            kind: TokenKind::Bitbucket,
+            token: "demo-bb-456".into(),
+        })
+        .await;
+    assert_eq!(resp, Response::Ok);
+    assert!(dir.join("overseer-bitbucket").exists());
+    // A settings save answers the states it knows without asking again:
+    // the stub is gone, yet the reply still says both are set.
+    std::fs::remove_file(&stub).unwrap();
+    let resp = c
+        .request(Request::SaveSettings {
+            base_hash: v.file_hash.clone(),
+            edits: vec![],
+        })
+        .await;
+    let Response::Settings(v) = resp else {
+        panic!("not a Settings reply: {resp:?}");
+    };
+    assert_eq!(v.jira_token, TokenStatus::Keychain);
+    assert_eq!(v.bitbucket_token, TokenStatus::Keychain);
+    let shown = format!("{v:?}");
+    assert!(!shown.contains("demo-token-123") && !shown.contains("demo-bb-456"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -327,7 +358,8 @@ async fn jira_token_needs_an_email_first() {
     let d = start_daemon_with_security(" ", "/nonexistent/overseer-security".into()).await;
     let mut c = Client::connect(&d.socket).await;
     let resp = c
-        .request(Request::SetJiraToken {
+        .request(Request::SetToken {
+            kind: overseer_proto::TokenKind::Bitbucket,
             token: "demo-token-123".into(),
         })
         .await;
@@ -340,7 +372,11 @@ async fn jira_token_needs_an_email_first() {
     let Response::Settings(v) = c.request(Request::GetSettings).await else {
         panic!("not a Settings reply");
     };
-    assert!(!v.jira_token_set);
+    assert_eq!(v.jira_token, overseer_proto::settings::TokenStatus::NotSet);
+    assert_eq!(
+        v.bitbucket_token,
+        overseer_proto::settings::TokenStatus::NotSet
+    );
 }
 
 #[tokio::test]

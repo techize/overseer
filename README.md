@@ -23,8 +23,11 @@ open pull requests. Sessions keep running when you close the app.
   https://id.atlassian.com/manage-profile/security/api-tokens, "Create API token
   with scopes") for Jira Software, with `read:jira-work`,
   `read:sprint:jira-software` and `read:board-scope:jira-software`.
-- Optional: `bb` for pull requests, and `bd` (beads) for task tracking. See
-  "What each optional tool adds" below.
+- Optional, for the Open PRs panel: a second Atlassian API token with scopes,
+  this one for Bitbucket, with `read:repository:bitbucket` and
+  `read:pullrequest:bitbucket`. See "Pull requests from Bitbucket" below.
+- Optional: `bd` (beads) for task tracking. `bb` (the Bitbucket CLI) is no
+  longer needed for pull requests. See "What each optional tool adds" below.
 
 ### Install
 
@@ -66,6 +69,32 @@ to the `acli` command, and without `acli` installed the board says
 from your Jira project keys. `user_name` defaults to the first word of your
 macOS full name.
 
+### Pull requests from Bitbucket
+
+The Open PRs panel reads Bitbucket's REST API with its own token, so `bb` is
+optional.
+
+1. At https://id.atlassian.com/manage-profile/security/api-tokens choose
+   "Create API token with scopes", pick the Bitbucket app, and give it
+   `read:repository:bitbucket` and `read:pullrequest:bitbucket`. A scoped token
+   covers one app, so this is a separate token from the Jira one.
+2. In Settings, type it into the "Bitbucket token" row (under the Bitbucket
+   heading, after the Jira group) and Save. It goes into the Keychain with
+   service `overseer-bitbucket` and your `jira_email` as the account. You can
+   instead set `BITBUCKET_API_TOKEN` in your shell environment.
+3. Tell Overseer which repos to watch, in `config.toml`:
+
+```toml
+pr_workspace = "demo-ws"
+```
+
+or list clones with `pr_repos = ["~/Repos/demo-api"]`; each folder's `origin`
+remote (`https://bitbucket.org/demo-ws/demo-api.git` or
+`git@bitbucket.org:demo-ws/demo-api.git`) names the repo. Restart the daemon.
+
+With no Bitbucket token saved, the PR source runs `pr_command` (`bb`) as
+before.
+
 ### The notes folder
 
 Overseer keeps journals, session notes and sprint files in a notes folder
@@ -91,8 +120,9 @@ Overseer keeps journals, session notes and sprint files in a notes folder
 
 ### What each optional tool adds
 
-- `bb` (Bitbucket CLI): the Open PRs panel and links from tickets to their PRs.
-  Set `pr_repos` to your clones. Without it the panel stays off.
+- `bb` (Bitbucket CLI): only needed when no Bitbucket token is saved. Then the
+  Open PRs panel runs `bb` instead of calling the Bitbucket API. With neither,
+  the panel shows the error from `bb`.
 - `bd` (beads): the task list sessions read and write, shown on the board.
   Without it that source is off; sessions and the Jira board still work.
 
@@ -111,6 +141,18 @@ Overseer keeps journals, session notes and sprint files in a notes folder
   use the item; choose Always Allow. If it is left unanswered the source says
   `Keychain did not answer`. Unlock your login keychain and wait for the next
   poll, or use `ATLASSIAN_API_TOKEN` instead.
+- Bitbucket token rejected. The PR source says `Bitbucket token rejected (401):
+  check the token and its scopes` (or 403). Make sure the token was made for
+  the Bitbucket app with `read:repository:bitbucket` and
+  `read:pullrequest:bitbucket`, and that `jira_email` is the account that
+  created it.
+- `no Bitbucket remote`. A `pr_repos` folder whose `origin` is not on
+  `bitbucket.org` cannot be read through the API. Point `origin` at Bitbucket,
+  or poll it through `pr_workspace` instead.
+- Token status in Settings. Each token row says `set` (in the Keychain),
+  `set (environment)` (only the environment variable holds one), `not set`, or
+  `unknown (Keychain did not answer)` when the Keychain is locked or waiting on
+  a prompt.
 - Notifications not showing. Allow Overseer in System Settings > Notifications,
   and check Focus is not hiding them.
 
@@ -264,6 +306,9 @@ unsaved edits the first `Esc` only warns).
   such a key `restart needed` until then. Restart the daemon in the view asks
   first, naming the sessions a restart would end (each comes back as
   resumable), then runs `overseer ctl restart --yes`.
+- The Jira token and Bitbucket token rows send a token to the daemon, which
+  stores it in the Keychain. They show only whether a token is found, never
+  the token itself.
 - Read-only here: `brain_writer` (it has a setup checklist), `jira_command`,
   `bd_command` and `sync_command` (a typo turns a source off) and
   `terminal.ansi` (the 16 colours). Change them in `config.toml`; Open opens
@@ -294,8 +339,13 @@ group for the notes keys). They apply after a daemon restart.
 | `user_name` | first word of your macOS full name | The name used in prompts and messages. |
 | `notes_dir` (alias `brain_dir`) | `~/Repos/2ndBrain` if it exists, else `~/Overseer` | The notes folder. Overseer owns a folder only when it holds the `.overseer-notes` marker; it creates one itself only for the default `~/Overseer`. |
 
-The Jira token is not a config key. Set it in Settings (Keychain) or with
-`ATLASSIAN_API_TOKEN`.
+The tokens are not config keys. Set them in Settings (Keychain) or in the
+environment:
+
+| Token | Keychain service (account = `jira_email`) | Environment variable | Scopes |
+|-------|-------------------------------------------|----------------------|--------|
+| Jira | `overseer-jira` | `ATLASSIAN_API_TOKEN` | `read:jira-work`, `read:sprint:jira-software`, `read:board-scope:jira-software` |
+| Bitbucket | `overseer-bitbucket` | `BITBUCKET_API_TOKEN` | `read:repository:bitbucket`, `read:pullrequest:bitbucket` |
 
 ## Sprint board and open PRs
 
@@ -338,35 +388,42 @@ trimming):
   (default 10). Without `sprint_start` the pace marker and the pace warning
   are hidden. The kanban is hidden when there are no sprint tickets.
 
-PRs from Bitbucket. The PR source runs `bb` once in each folder listed in
-`pr_repos`, so each folder must be a clone `bb` understands (for example
-`~/Repos/demo-api` and `~/Repos/demo-web`).
+PRs from Bitbucket. With a Bitbucket token saved (see "Pull requests from
+Bitbucket" above), the PR source calls `https://api.bitbucket.org/2.0/`
+itself: each `pr_repos` folder's `origin` remote names its repo, and
+`pr_workspace` lists the workspace's repos. `pr_command` and
+`pr_repos_command` are then not used. Without a token, the PR source runs
+`bb` once in each folder listed in `pr_repos`, so each folder must be a clone
+`bb` understands (for example `~/Repos/demo-api` and `~/Repos/demo-web`).
 
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `pr_repos` | `[]` | Repo folders to poll. Empty turns the PR source off. |
-| `pr_command` | `bb pullrequest list --state open --output json` | Command run in each repo folder. |
+| `pr_command` | `bb pullrequest list --state open --output json` | Command run in each repo folder when no Bitbucket token is saved. |
 | `pr_poll_secs` | `300` | Seconds between polls. |
 | `pr_author` | `""` | Empty shows every open PR in those repos; otherwise only that author's. |
 | `pr_workspace` | `""` | A Bitbucket workspace whose repos are found and polled. Empty turns this off. |
 | `pr_project` | `""` | Only repos in this Bitbucket project key. Empty means the whole workspace. |
 | `pr_active_days` | `30` | Only repos updated in this many days are polled. `0` polls every repo. |
-| `pr_repos_command` | `bb repo list --workspace {workspace} --output json` | Lists the workspace's repos; `{workspace}` is replaced by `pr_workspace`. |
+| `pr_repos_command` | `bb repo list --workspace {workspace} --output json` | Lists the workspace's repos when no Bitbucket token is saved; `{workspace}` is replaced by `pr_workspace`. |
 
 A PR links to a ticket when its title or branch name matches `ticket_pattern`
-(for example `DEMO-12` in `DEMO-12-fix-login`). If `bb` fails in one repo, the
+(for example `DEMO-12` in `DEMO-12-fix-login`). If one repo fails, the
 other repos' PRs still show and the PR source message names the failing repo.
 
 Whole workspace. Instead of listing folders, set `pr_workspace` (for example
-`demo-ws`) and the daemon finds the repos itself: it runs `pr_repos_command`,
+`demo-ws`) and the daemon finds the repos itself. It lists the workspace's
+repos (through the API, or by running `pr_repos_command` without a token),
 keeps the repos updated in the last `pr_active_days` days (a repo with no
-update time is kept), and runs `pr_command` with `--repository demo-ws/<repo>`
-added for each one, from `/`, so no clone is needed. Set `pr_project` to add
-`--project <key>` to the repo list. The repo list is read again once an hour;
-if a read fails, the last good list is kept and the PR source message shows
-`repos: <error>`. `pr_repos` and `pr_workspace` can both be set: repos from both
-are polled, and a folder whose name matches a workspace repo is polled once,
-from the folder. The PR source is off only when both are empty.
+update time is kept), and reads each one's open PRs: through the API, or by
+running `pr_command` with `--repository demo-ws/<repo>` added, from `/`, so no
+clone is needed. Set `pr_project` to list only that project's repos (without a
+token, `--project <key>` is added to the repo list). The repo list is read
+again once an hour; if a read fails, the last good list is kept and the PR
+source message shows `repos: <error>`. `pr_repos` and `pr_workspace` can both
+be set: repos from both are polled, and a folder whose name matches a
+workspace repo is polled once, from the folder. The PR source is off only when
+both are empty.
 
 This costs one Bitbucket call per active repo per poll, plus one repo list an
 hour, and Bitbucket limits API calls per hour. With many active repos, raise

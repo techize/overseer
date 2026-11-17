@@ -1275,7 +1275,8 @@ mod tests {
             targets_path: "/tmp/demo/targets.toml".into(),
             targets_note: "3 built-in patterns; /tmp/demo/targets.toml does not exist".into(),
             targets_error: Some("broken".into()),
-            jira_token_set: false,
+            jira_token: Default::default(),
+            bitbucket_token: Default::default(),
             daemon: DaemonInfo {
                 version: "0.1.0".into(),
                 build: "dev".into(),

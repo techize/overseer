@@ -488,7 +488,8 @@ pub fn read(
         targets_note: files.targets_note.clone(),
         targets_error: files.targets_error.clone(),
         daemon,
-        jira_token_set: false,
+        jira_token: Default::default(),
+        bitbucket_token: Default::default(),
     }
 }
 

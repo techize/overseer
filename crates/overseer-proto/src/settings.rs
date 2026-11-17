@@ -89,10 +89,39 @@ pub struct SettingsView {
     pub targets_note: String,
     pub targets_error: Option<String>,
     pub daemon: DaemonInfo,
-    /// A Jira token is stored (Keychain or the environment). The token
-    /// itself never leaves the daemon.
+    /// Where the Jira token was found. The token itself never leaves the
+    /// daemon.
     #[serde(default)]
-    pub jira_token_set: bool,
+    pub jira_token: TokenStatus,
+    /// Where the Bitbucket token was found.
+    #[serde(default)]
+    pub bitbucket_token: TokenStatus,
+}
+
+/// Where the daemon found an API token, for the Settings token rows.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenStatus {
+    #[default]
+    NotSet,
+    /// The Keychain item, the one Settings writes.
+    Keychain,
+    /// Only the environment variable holds one.
+    Environment,
+    /// The Keychain did not answer in time (locked, or a prompt is open).
+    Unknown,
+}
+
+impl TokenStatus {
+    /// What the token row shows.
+    pub fn text(self) -> &'static str {
+        match self {
+            TokenStatus::NotSet => "not set",
+            TokenStatus::Keychain => "set",
+            TokenStatus::Environment => "set (environment)",
+            TokenStatus::Unknown => "unknown (Keychain did not answer)",
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]

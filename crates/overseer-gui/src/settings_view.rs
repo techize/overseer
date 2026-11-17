@@ -13,10 +13,12 @@ use gpui::{
     div, prelude::*, px, rgb, rgba, Context, EventEmitter, FocusHandle, Focusable, FontWeight,
     KeyDownEvent, MouseButton, ScrollHandle, Window,
 };
-use overseer_proto::settings::{parse_text, Applies, SettingEdit, SettingValue, SettingsView};
+use overseer_proto::settings::{
+    parse_text, Applies, SettingEdit, SettingValue, SettingsView, TokenStatus,
+};
 use overseer_proto::{
     build_notice, current_build, local_hhmm, running_sessions_count, running_sessions_text, Client,
-    DaemonInfo, Request, Response, SlotInfo, SlotState,
+    DaemonInfo, Request, Response, SlotInfo, SlotState, TokenKind,
 };
 
 use crate::app::colors;
@@ -27,17 +29,55 @@ use crate::start_dialog::{edit_key, DialogKey, TextField};
 // Pure logic
 // ---------------------------------------------------------------------------
 
-/// The row in the Jira group that takes the API token. It has no entry in
-/// `config.toml`: the token goes to the Keychain through the daemon.
-const TOKEN_KEY: &str = "jira_token";
+/// The token rows follow the last row of this group: the Jira token, then
+/// a Bitbucket heading and its token. They have no entry in `config.toml`:
+/// a token goes to the Keychain through the daemon.
 const JIRA_GROUP: &str = "Jira";
+const BITBUCKET_GROUP: &str = "Bitbucket";
 
-/// `set` or `not set`, for the token row.
-fn token_status(set: bool) -> &'static str {
-    if set {
-        "set"
-    } else {
-        "not set"
+/// The token rows, in order.
+const TOKEN_KINDS: [TokenKind; 2] = [TokenKind::Jira, TokenKind::Bitbucket];
+
+/// The key a token row is activated by.
+fn token_key(kind: TokenKind) -> &'static str {
+    match kind {
+        TokenKind::Jira => "jira_token",
+        TokenKind::Bitbucket => "bitbucket_token",
+    }
+}
+
+/// The token row `key` belongs to, if it is one.
+fn token_kind(key: &str) -> Option<TokenKind> {
+    TOKEN_KINDS.into_iter().find(|k| token_key(*k) == key)
+}
+
+/// The line under a token row's field.
+fn token_note(kind: TokenKind) -> &'static str {
+    match kind {
+        TokenKind::Jira => {
+            "Stored in the macOS Keychain, never in config.toml. ATLASSIAN_API_TOKEN also works."
+        }
+        TokenKind::Bitbucket => {
+            "Scopes read:repository:bitbucket and read:pullrequest:bitbucket. \
+             Stored in the macOS Keychain; BITBUCKET_API_TOKEN also works. \
+             Without it, PRs come from pr_command."
+        }
+    }
+}
+
+/// The Save button's element id for the `kind` row.
+fn save_id(kind: TokenKind) -> &'static str {
+    match kind {
+        TokenKind::Jira => "save-jira-token",
+        TokenKind::Bitbucket => "save-bitbucket-token",
+    }
+}
+
+/// The token's state in `view`.
+fn view_token(view: &SettingsView, kind: TokenKind) -> TokenStatus {
+    match kind {
+        TokenKind::Jira => view.jira_token,
+        TokenKind::Bitbucket => view.bitbucket_token,
     }
 }
 
@@ -418,8 +458,8 @@ pub struct SettingsPanel {
     closed: bool,
     scroll: ScrollHandle,
     focus_handle: FocusHandle,
-    /// The token row's answer after a send, until the next view replaces it.
-    token_set: Option<bool>,
+    /// The tokens saved since the view was read: their rows say `set`.
+    tokens_saved: Vec<TokenKind>,
     token_busy: bool,
 }
 
@@ -457,7 +497,7 @@ impl SettingsPanel {
             closed: false,
             scroll: ScrollHandle::new(),
             focus_handle: cx.focus_handle(),
-            token_set: None,
+            tokens_saved: Vec::new(),
             token_busy: false,
         };
         if !old {
@@ -539,7 +579,7 @@ impl SettingsPanel {
 
     /// A fresh draft over `view`, keeping the row being edited.
     fn show(&mut self, view: SettingsView) {
-        self.token_set = None;
+        self.tokens_saved.clear();
         self.mode = Mode::Ready(Box::new(SettingsDraft::new(view)));
         self.esc.clear();
         let key = self.active.take();
@@ -582,9 +622,9 @@ impl SettingsPanel {
             if !matches!(r.value, RowValue::ReadOnly { .. }) {
                 keys.push(r.key);
             }
-            // The token field follows the last Jira row.
+            // The token fields follow the last Jira row.
             if Some(i) == last_jira {
-                keys.push(TOKEN_KEY.to_string());
+                keys.extend(TOKEN_KINDS.map(|k| token_key(k).to_string()));
             }
         }
         keys
@@ -647,18 +687,31 @@ impl SettingsPanel {
         self.error = None;
     }
 
-    /// Sends the typed token to the daemon, which stores it in the
+    /// The `kind` token as the row shows it.
+    fn token_state(&self, view: &SettingsView, kind: TokenKind) -> TokenStatus {
+        if self.tokens_saved.contains(&kind) {
+            TokenStatus::Keychain
+        } else {
+            view_token(view, kind)
+        }
+    }
+
+    /// Sends the typed `kind` token to the daemon, which stores it in the
     /// Keychain. The field is cleared at once and never filled back in.
-    fn send_token(&mut self, cx: &mut Context<Self>) {
+    fn send_token(&mut self, kind: TokenKind, cx: &mut Context<Self>) {
+        let label = kind.label();
+        if self.token_busy {
+            // The typed text stays in the field for another try.
+            self.note = Some("A token is still being saved; try again in a moment.".to_string());
+            cx.notify();
+            return;
+        }
         let token = std::mem::take(&mut self.field.text);
         self.field = TextField::default();
         let token = token.trim().to_string();
         if token.is_empty() {
-            self.note = Some("Type the Jira token first.".to_string());
+            self.note = Some(format!("Type the {label} token first."));
             cx.notify();
-            return;
-        }
-        if self.token_busy {
             return;
         }
         self.token_busy = true;
@@ -667,7 +720,8 @@ impl SettingsPanel {
         let client = self.client.clone();
         cx.spawn(async move |this, cx| {
             let reply = client
-                .request(Request::SetJiraToken {
+                .request(Request::SetToken {
+                    kind,
                     token: token.into(),
                 })
                 .await;
@@ -675,8 +729,10 @@ impl SettingsPanel {
                 this.token_busy = false;
                 match reply {
                     Ok(Response::Ok) => {
-                        this.token_set = Some(true);
-                        this.note = Some("Jira token saved to the Keychain.".to_string());
+                        if !this.tokens_saved.contains(&kind) {
+                            this.tokens_saved.push(kind);
+                        }
+                        this.note = Some(format!("{label} token saved to the Keychain."));
                     }
                     Ok(Response::Error { message }) => this.error = Some(message),
                     Ok(other) => this.error = Some(format!("Unexpected reply: {other:?}")),
@@ -849,8 +905,10 @@ impl SettingsPanel {
                     self.typed();
                 }
             }
-            DialogKey::Submit if self.active.as_deref() == Some(TOKEN_KEY) => self.send_token(cx),
-            DialogKey::Submit => self.save(cx),
+            DialogKey::Submit => match self.active.as_deref().and_then(token_kind) {
+                Some(kind) => self.send_token(kind, cx),
+                None => self.save(cx),
+            },
             DialogKey::NextField
             | DialogKey::PrevField
             | DialogKey::Cancel
@@ -1050,22 +1108,44 @@ impl SettingsPanel {
             .into_any_element()
     }
 
-    /// The "Jira token" row: `set` or `not set`, a masked field and Save.
-    /// What is typed here is sent to the daemon and never shown or kept.
+    /// The token rows that follow the Jira group: the Jira token, then a
+    /// Bitbucket heading and the Bitbucket token.
+    fn render_token_rows(
+        &self,
+        view: &SettingsView,
+        focused: bool,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        let mut out = Vec::new();
+        for kind in TOKEN_KINDS {
+            if kind == TokenKind::Bitbucket {
+                out.push(heading(BITBUCKET_GROUP).into_any_element());
+            }
+            let state = self.token_state(view, kind);
+            out.push(self.render_token_row(kind, state, focused, cx));
+        }
+        out
+    }
+
+    /// A token row ("Jira token" or "Bitbucket token"): where the token is,
+    /// a masked field and Save. What is typed here is sent to the daemon
+    /// and never shown or kept.
     fn render_token_row(
         &self,
-        set: bool,
+        kind: TokenKind,
+        state: TokenStatus,
         focused: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let active = self.active.as_deref() == Some(TOKEN_KEY);
+        let key = token_key(kind);
+        let active = self.active.as_deref() == Some(key);
         let text = if active {
             masked(&self.field).display(focused)
         } else {
             gpui::StyledText::new(String::new())
         };
         let field = div()
-            .id("token-field")
+            .id(key)
             .flex_1()
             .min_w(px(0.))
             .min_h(px(26.))
@@ -1081,16 +1161,21 @@ impl SettingsPanel {
             }))
             .cursor_text()
             .child(text)
-            .on_click(cx.listener(|this, _, _, cx| {
+            .on_click(cx.listener(move |this, _, _, cx| {
                 this.esc.clear();
-                this.activate(Some(TOKEN_KEY.to_string()));
+                this.activate(Some(key.to_string()));
                 cx.notify();
             }));
         div()
             .flex()
             .items_center()
             .gap_2()
-            .child(div().w(px(170.)).flex_none().child("Jira token"))
+            .child(
+                div()
+                    .w(px(170.))
+                    .flex_none()
+                    .child(format!("{} token", kind.label())),
+            )
             .child(
                 div()
                     .flex_1()
@@ -1098,16 +1183,16 @@ impl SettingsPanel {
                     .flex()
                     .flex_col()
                     .child(div().flex().items_center().gap_2().child(field).child(
-                        button("save-token", "Save", false, !self.token_busy).on_click(
-                            cx.listener(|this, _, _, cx| {
+                        button(save_id(kind), "Save", false, !self.token_busy).on_click(
+                            cx.listener(move |this, _, _, cx| {
                                 this.esc.clear();
-                                this.send_token(cx);
+                                this.send_token(kind, cx);
                             }),
                         ),
                     ))
-                    .child(muted("Stored in the macOS Keychain, never in config.toml").px_2()),
+                    .child(muted(token_note(kind)).px_2()),
             )
-            .child(muted(token_status(set)).w(px(84.)).flex_none())
+            .child(muted(state.text()).w(px(120.)).flex_none())
             .into_any_element()
     }
 
@@ -1198,16 +1283,19 @@ impl Render for SettingsPanel {
                         .into_any_element()
                 }));
                 let mut group = String::new();
-                let token_set = self.token_set.unwrap_or(view.jira_token_set);
                 for (i, row) in d.rows().into_iter().enumerate() {
                     if row.group != group {
                         if group == JIRA_GROUP {
-                            body.push(self.render_token_row(token_set, focused, cx));
+                            body.extend(self.render_token_rows(&view, focused, cx));
                         }
                         group = row.group.clone();
                         body.push(heading(&group).into_any_element());
                     }
                     body.push(self.render_row(i, row, focused, cx));
+                }
+                // Jira as the last group still gets its token rows.
+                if group == JIRA_GROUP {
+                    body.extend(self.render_token_rows(&view, focused, cx));
                 }
                 body.extend(self.render_files(&view, cx));
             }
@@ -1438,7 +1526,8 @@ mod tests {
             targets_path: "/tmp/demo/targets.toml".into(),
             targets_note: "3 built-in patterns; /tmp/demo/targets.toml does not exist".into(),
             targets_error: None,
-            jira_token_set: false,
+            jira_token: Default::default(),
+            bitbucket_token: Default::default(),
             daemon: DaemonInfo {
                 version: "0.1.0".into(),
                 build: "b1".into(),
@@ -1458,8 +1547,17 @@ mod tests {
 
     #[test]
     fn the_token_row_says_set_or_not_set() {
-        assert_eq!(token_status(true), "set");
-        assert_eq!(token_status(false), "not set");
+        assert_eq!(TokenStatus::NotSet.text(), "not set");
+        assert_eq!(TokenStatus::Keychain.text(), "set");
+        assert_eq!(TokenStatus::Environment.text(), "set (environment)");
+        assert_eq!(
+            TokenStatus::Unknown.text(),
+            "unknown (Keychain did not answer)"
+        );
+        for kind in TOKEN_KINDS {
+            assert_eq!(token_kind(token_key(kind)), Some(kind));
+        }
+        assert_eq!(token_kind("jira_site"), None);
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! Work items from beads and Jira, grouped into one list.
 
+pub mod bitbucket_api;
 pub mod group;
 pub mod jira_api;
 pub mod ownership;

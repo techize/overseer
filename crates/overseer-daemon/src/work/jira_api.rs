@@ -49,7 +49,7 @@ pub struct JiraApi {
 }
 
 /// `ureq::Agent` without a `Debug` of its own.
-struct Agent(ureq::Agent);
+pub(crate) struct Agent(pub(crate) ureq::Agent);
 
 impl std::fmt::Debug for Agent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -232,39 +232,51 @@ where
     T: Send + 'static,
     F: FnOnce() -> Result<T, String> + Send + 'static,
 {
+    run_blocking_for("Jira", f).await
+}
+
+/// [`run_blocking`] for a call to `service`, which the errors name.
+pub async fn run_blocking_for<T, F>(service: &str, f: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
     match tokio::time::timeout(API_TIMEOUT, tokio::task::spawn_blocking(f)).await {
         Err(_) => Err(format!(
-            "Jira did not answer within {} s",
+            "{service} did not answer within {} s",
             API_TIMEOUT.as_secs()
         )),
-        Ok(Err(e)) => Err(format!("Jira call failed: {e}")),
+        Ok(Err(e)) => Err(format!("{service} call failed: {e}")),
         Ok(Ok(r)) => r,
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
     use std::sync::mpsc;
 
     /// One request the fake server saw.
-    struct Seen {
-        method: String,
-        path: String,
-        auth: Option<String>,
-        body: String,
+    pub(crate) struct Seen {
+        pub(crate) method: String,
+        pub(crate) path: String,
+        pub(crate) auth: Option<String>,
+        pub(crate) body: String,
     }
 
     /// Answer each connection with the next canned `(status, body)`, one
-    /// request per connection, and hand back what was asked.
-    fn fake(replies: Vec<(u16, String)>) -> (String, mpsc::Receiver<Seen>) {
+    /// request per connection, and hand back what was asked. `{base}` in a
+    /// body becomes the server's own base URL.
+    pub(crate) fn fake(replies: Vec<(u16, String)>) -> (String, mpsc::Receiver<Seen>) {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", l.local_addr().unwrap());
         let (tx, rx) = mpsc::channel();
+        let own = base.clone();
         std::thread::spawn(move || {
             for (status, body) in replies {
+                let body = body.replace("{base}", &own);
                 let Ok((stream, _)) = l.accept() else { return };
                 let mut r = BufReader::new(stream.try_clone().unwrap());
                 let mut line = String::new();

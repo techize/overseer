@@ -8,8 +8,10 @@ use std::time::Duration;
 use anyhow::Context;
 use bytes::Bytes;
 use overseer_proto::{
-    read_frame, settings::SettingEdit, slot_name, write_frame, BoardView, DaemonInfo, Event, Frame,
-    Request, Response, SlotId, SlotState,
+    read_frame,
+    settings::{SettingEdit, TokenStatus},
+    slot_name, write_frame, BoardView, DaemonInfo, Event, Frame, Request, Response, SlotId,
+    SlotState, TokenKind,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
@@ -28,6 +30,7 @@ use crate::relay::courier::Courier;
 use crate::settings::SettingsFiles;
 use crate::slot::CatchUp;
 use crate::work::store::{unix_now, KickoffFacts};
+use crate::work::token::{save_token, token_status};
 use crate::work::WorkStore;
 
 /// Frames queued per connection before it is considered too slow.
@@ -63,6 +66,8 @@ struct SettingsCtx {
     home: PathBuf,
     save: Mutex<()>,
     env: BaseEnv,
+    /// The last token read, used for a save's reply.
+    tokens: Mutex<Option<Tokens>>,
 }
 
 impl SettingsCtx {
@@ -83,43 +88,74 @@ impl SettingsCtx {
         }
     }
 
-    /// Whether a Jira token is stored for the running `jira_email`. The
-    /// Keychain read is bounded, so a locked Keychain reads as not set.
-    async fn token_set(&self) -> bool {
+    /// Where each token is for the running `jira_email`, read now. Both
+    /// reads run at once, each waiting at most `STATUS_TIMEOUT` on the
+    /// Keychain, so a locked Keychain costs Settings a few seconds, not 30.
+    async fn read_tokens(&self) -> Tokens {
         let email = self.running.jira_email.trim();
         if email.is_empty() {
-            return false;
+            return Tokens::default();
         }
         let vars = self.env.get();
-        crate::work::token::jira_token(email, &vars, &self.files.security)
-            .await
-            .is_ok()
+        let security = &self.files.security;
+        let (jira, bitbucket) = tokio::join!(
+            token_status(TokenKind::Jira, email, &vars, security),
+            token_status(TokenKind::Bitbucket, email, &vars, security),
+        );
+        let read = Tokens { jira, bitbucket };
+        *self.tokens.lock().unwrap() = Some(read);
+        read
     }
 
-    /// `resp` with `jira_token_set` filled in when it is a Settings view.
-    async fn with_token_state(&self, resp: Response) -> Response {
+    /// `resp` with the token states filled in when it is a Settings view.
+    /// `fresh` reads them again; otherwise the last read is used (a settings
+    /// save cannot change a token), and only the first view reads them.
+    async fn with_token_state(&self, resp: Response, fresh: bool) -> Response {
         match resp {
             Response::Settings(mut v) => {
-                v.jira_token_set = self.token_set().await;
+                let known = *self.tokens.lock().unwrap();
+                let t = match known {
+                    Some(t) if !fresh => t,
+                    _ => self.read_tokens().await,
+                };
+                v.jira_token = t.jira;
+                v.bitbucket_token = t.bitbucket;
                 Response::Settings(v)
             }
             other => other,
         }
     }
 
-    /// Stores `token` in the Keychain. It is not logged or answered.
-    async fn set_token(&self, token: &str) -> Response {
+    /// Stores the `kind` token in the Keychain. It is not logged or
+    /// answered. The save reads the item back, so a success is recorded as
+    /// stored without asking the Keychain again.
+    async fn set_token(&self, kind: TokenKind, token: &str) -> Response {
         let email = self.running.jira_email.trim();
         if email.is_empty() {
             return Response::Error {
                 message: "set jira_email first".into(),
             };
         }
-        match crate::work::token::save_jira_token(email, token, &self.files.security).await {
-            Ok(()) => Response::Ok,
+        match save_token(kind, email, token, &self.files.security).await {
+            Ok(()) => {
+                if let Some(t) = self.tokens.lock().unwrap().as_mut() {
+                    match kind {
+                        TokenKind::Jira => t.jira = TokenStatus::Keychain,
+                        TokenKind::Bitbucket => t.bitbucket = TokenStatus::Keychain,
+                    }
+                }
+                Response::Ok
+            }
             Err(message) => Response::Error { message },
         }
     }
+}
+
+/// Where each API token was last found, for the Settings view.
+#[derive(Clone, Copy, Default)]
+struct Tokens {
+    jira: TokenStatus,
+    bitbucket: TokenStatus,
 }
 
 /// `run` found another daemon serving the socket. Not a failure: the daemon
@@ -180,6 +216,7 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
         home: crate::config::home_from_env(),
         save: Mutex::new(()),
         env: env.clone(),
+        tokens: Mutex::new(None),
     });
     let (events, _) = broadcast::channel::<Event>(EVENT_CHANNEL_CAP);
     let db = cfg.state_dir.join("overseer.db");
@@ -732,7 +769,7 @@ fn handle_frame(
             let (settings, info) = (ctx.settings.clone(), ctx.info.clone());
             let outbox = outbox.clone();
             store.spawn(async move {
-                let resp = settings.with_token_state(settings.view(&info)).await;
+                let resp = settings.with_token_state(settings.view(&info), true).await;
                 outbox.send(Frame::Response { seq, resp });
             });
         }
@@ -744,18 +781,18 @@ fn handle_frame(
             let outbox = outbox.clone();
             store.spawn(async move {
                 let saved = settings.save(&info, &base_hash, &edits);
-                let resp = settings.with_token_state(saved).await;
+                let resp = settings.with_token_state(saved, false).await;
                 outbox.send(Frame::Response { seq, resp });
             });
         }
         Frame::Request {
             seq,
-            req: Request::SetJiraToken { token },
+            req: Request::SetToken { kind, token },
         } => {
             let settings = ctx.settings.clone();
             let outbox = outbox.clone();
             store.spawn(async move {
-                let resp = settings.set_token(token.expose()).await;
+                let resp = settings.set_token(kind, token.expose()).await;
                 outbox.send(Frame::Response { seq, resp });
             });
         }
@@ -950,7 +987,7 @@ fn handle_request(
         // `handle_frame` from a task of their own (they can wait on the
         // Keychain); this arm only keeps the match whole.
         Request::ListWorkItems | Request::RefreshWorkItems => Response::Work(store.view()),
-        Request::GetSettings | Request::SaveSettings { .. } | Request::SetJiraToken { .. } => {
+        Request::GetSettings | Request::SaveSettings { .. } | Request::SetToken { .. } => {
             Response::Error {
                 message: "settings requests are answered by the connection".into(),
             }

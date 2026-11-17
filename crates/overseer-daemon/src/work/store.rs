@@ -25,14 +25,15 @@ use regex::Regex;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
 
-use super::jira_api::{run_blocking, ActiveSprint, JiraApi};
+use super::bitbucket_api::{remote_target, BitbucketApi};
+use super::jira_api::{run_blocking, run_blocking_for, ActiveSprint, JiraApi};
 use super::ownership::{decide, promotions, Decision};
 use super::sprint::{
     newest_sprint_folder, parse_ymd, sprint_day, sprint_folder_name, sprint_label,
     weekdays_between, Ymd,
 };
 use super::stages::Stages;
-use super::token::jira_token;
+use super::token::{jira_token, token, TokenKind};
 use super::{
     active_repos, compile_pattern, group, parse_beads, parse_jira, parse_prs, parse_repos,
     run_source, Bead, Ticket,
@@ -76,7 +77,7 @@ pub type LabelWriter = Box<
 /// `ticket_pattern` is empty: any project key.
 pub const ANY_PROJECT_KEY: &str = r"[A-Z][A-Z0-9]+-\d+";
 
-/// The `security` tool that reads the Jira token from the Keychain.
+/// The `security` tool that reads the API tokens from the Keychain.
 pub const SECURITY: &str = "/usr/bin/security";
 
 /// The Jira status after a sudden empty list.
@@ -194,11 +195,75 @@ struct RepoList {
 }
 
 /// Where one repo's PR command runs.
+#[derive(Clone)]
 enum PrTarget {
-    /// In this clone.
+    /// In this clone. Through the API, its `origin` names the repo.
     Folder(PathBuf),
     /// In `WORKSPACE_CWD`, with `--repository <workspace>/<slug>` added.
     Workspace(String),
+}
+
+/// How one PR poll reads: `pr_command`, or the Bitbucket API when a
+/// Bitbucket token was found. No `Debug`: it holds the token.
+#[derive(Clone)]
+enum PrReader {
+    Command(Vec<String>),
+    Api {
+        api: Arc<BitbucketApi>,
+        token: String,
+    },
+}
+
+/// The PR source message when a Bitbucket token is found but no email.
+pub const NO_BITBUCKET_EMAIL: &str =
+    "a Bitbucket token is set but jira_email is empty; set it in Settings";
+
+/// The per-repo error for a `pr_repos` folder the API cannot name.
+pub const NO_BITBUCKET_REMOTE: &str = "no Bitbucket remote";
+
+/// The open PRs of one target, as `parse_prs` reads them.
+async fn read_target(
+    reader: &PrReader,
+    repo: &str,
+    target: &PrTarget,
+    vars: &Vars,
+) -> Result<Vec<PullRequest>, String> {
+    let out = match (reader, target) {
+        (PrReader::Command(cmd), PrTarget::Folder(dir)) => {
+            run_source(cmd, dir, SOURCE_TIMEOUT, vars).await?
+        }
+        (PrReader::Command(cmd), PrTarget::Workspace(full)) => {
+            let mut cmd = cmd.clone();
+            cmd.extend(["--repository".to_owned(), full.clone()]);
+            run_source(&cmd, Path::new(WORKSPACE_CWD), SOURCE_TIMEOUT, vars).await?
+        }
+        (PrReader::Api { api, token }, target) => {
+            let (ws, slug) = match target {
+                PrTarget::Folder(dir) => folder_remote(dir, vars).await?,
+                PrTarget::Workspace(full) => match full.split_once('/') {
+                    Some((ws, slug)) => (ws.to_owned(), slug.to_owned()),
+                    None => return Err(format!("bad repo name {full}")),
+                },
+            };
+            let (api, token) = (api.clone(), token.clone());
+            run_blocking_for("Bitbucket", move || api.open_prs(&token, &ws, &slug)).await?
+        }
+    };
+    parse_prs(&out, repo)
+}
+
+/// The workspace and slug of `dir`'s `origin` remote. A missing folder
+/// says so; anything else without a Bitbucket remote is
+/// `NO_BITBUCKET_REMOTE`.
+async fn folder_remote(dir: &Path, vars: &Vars) -> Result<(String, String), String> {
+    let cmd = ["git", "remote", "get-url", "origin"].map(String::from);
+    match run_source(&cmd, dir, SOURCE_TIMEOUT, vars).await {
+        Err(e) if !dir.is_dir() => Err(e),
+        read => read
+            .ok()
+            .and_then(|url| remote_target(&url))
+            .ok_or_else(|| NO_BITBUCKET_REMOTE.to_owned()),
+    }
 }
 
 /// A label change to make on a bead with `bd update`.
@@ -237,6 +302,8 @@ pub struct WorkStore {
     has_board: bool,
     /// The `security` tool's path; tests point it at a stub.
     security: String,
+    /// Used for PRs when a Bitbucket token is found.
+    bitbucket: Arc<BitbucketApi>,
     /// The beads folder is one Overseer owns, which may have no beads.
     notes_owned: bool,
     jql: String,
@@ -314,10 +381,10 @@ fn repo_name(dir: &Path) -> String {
         .unwrap_or_else(|| dir.display().to_string())
 }
 
-/// Runs `pr_command` for each target, at most `PR_PARALLEL` at once, and
-/// gives each target's PRs (or error) in the same order.
+/// Reads each target, at most `PR_PARALLEL` at once, and gives each
+/// target's PRs (or error) in the same order.
 async fn poll_prs(
-    pr_command: &[String],
+    reader: &PrReader,
     targets: &[(String, PrTarget)],
     vars: Arc<Vars>,
 ) -> Vec<Result<Vec<PullRequest>, String>> {
@@ -331,21 +398,9 @@ async fn poll_prs(
             let Some((i, (repo, target))) = next.next() else {
                 break;
             };
-            let mut cmd = pr_command.to_vec();
-            let cwd = match target {
-                PrTarget::Folder(dir) => dir.clone(),
-                PrTarget::Workspace(full) => {
-                    cmd.extend(["--repository".to_owned(), full.clone()]);
-                    PathBuf::from(WORKSPACE_CWD)
-                }
-            };
-            let (repo, vars) = (repo.clone(), vars.clone());
-            running.spawn(async move {
-                let read = run_source(&cmd, &cwd, SOURCE_TIMEOUT, &vars)
-                    .await
-                    .and_then(|out| parse_prs(&out, &repo));
-                (i, read)
-            });
+            let (reader, repo, target, vars) =
+                (reader.clone(), repo.clone(), target.clone(), vars.clone());
+            running.spawn(async move { (i, read_target(&reader, &repo, &target, &vars).await) });
         }
         match running.join_next().await {
             Some(Ok((i, read))) => results[i] = Some(read),
@@ -482,6 +537,7 @@ impl WorkStore {
             jira_site: site.to_owned(),
             has_board: !cfg.jira_board.trim().is_empty(),
             security: SECURITY.to_owned(),
+            bitbucket: Arc::new(BitbucketApi::new(email)),
             notes_owned: cfg.notes_owned,
             jql: cfg.jql.clone(),
             pr_repos: cfg.pr_repos.clone(),
@@ -802,9 +858,22 @@ impl WorkStore {
                 if self.pr_repos.is_empty() && self.pr_workspace.is_empty() {
                     return;
                 }
-                let repos_error = self.read_repo_list(&vars).await;
+                let reader = match self.pr_reader(&vars).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        // The PRs stay as they were; the status says why.
+                        tracing::warn!("prs source: {e}");
+                        let mut cache = self.cache();
+                        cache.prs_status.ok = false;
+                        cache.prs_status.message = Some(e);
+                        drop(cache);
+                        self.announce();
+                        return;
+                    }
+                };
+                let repos_error = self.read_repo_list(&reader, &vars).await;
                 let targets = self.pr_targets(unix_now());
-                let got = poll_prs(&self.pr_command, &targets, vars).await;
+                let got = poll_prs(&reader, &targets, vars).await;
                 let now = unix_now();
                 let mut cache = self.cache();
                 let mut errors = Vec::new();
@@ -1008,7 +1077,7 @@ impl WorkStore {
     /// Reads the workspace's repo list when there is none yet or it is
     /// older than `REPO_LIST_MAX_AGE`. A failed read keeps the last good
     /// list, is tried again on the next poll and gives the error.
-    async fn read_repo_list(&self, vars: &Vars) -> Option<String> {
+    async fn read_repo_list(&self, reader: &PrReader, vars: &Vars) -> Option<String> {
         if self.pr_workspace.is_empty() {
             return None;
         }
@@ -1020,17 +1089,25 @@ impl WorkStore {
         if fresh {
             return None;
         }
-        let mut cmd: Vec<String> = self
-            .pr_repos_command
-            .iter()
-            .map(|a| a.replace("{workspace}", &self.pr_workspace))
-            .collect();
-        if !self.pr_project.is_empty() {
-            cmd.extend(["--project".to_owned(), self.pr_project.clone()]);
+        let read = match reader {
+            PrReader::Command(_) => {
+                let mut cmd: Vec<String> = self
+                    .pr_repos_command
+                    .iter()
+                    .map(|a| a.replace("{workspace}", &self.pr_workspace))
+                    .collect();
+                if !self.pr_project.is_empty() {
+                    cmd.extend(["--project".to_owned(), self.pr_project.clone()]);
+                }
+                run_source(&cmd, Path::new(WORKSPACE_CWD), SOURCE_TIMEOUT, vars).await
+            }
+            PrReader::Api { api, token } => {
+                let (api, token) = (api.clone(), token.clone());
+                let (ws, project) = (self.pr_workspace.clone(), self.pr_project.clone());
+                run_blocking_for("Bitbucket", move || api.repos(&token, &ws, &project)).await
+            }
         }
-        let read = run_source(&cmd, Path::new(WORKSPACE_CWD), SOURCE_TIMEOUT, vars)
-            .await
-            .and_then(|out| parse_repos(&out));
+        .and_then(|out| parse_repos(&out));
         match read {
             Ok(repos) => {
                 self.cache().repo_list = Some(RepoList {
@@ -1043,6 +1120,23 @@ impl WorkStore {
                 tracing::warn!("prs source: repo list: {e}");
                 Some(e)
             }
+        }
+    }
+
+    /// The Bitbucket API when a Bitbucket token is found, else
+    /// `pr_command`. A Keychain that does not answer is an error, not a
+    /// quiet fallback.
+    async fn pr_reader(&self, vars: &Vars) -> Result<PrReader, String> {
+        let found = token(TokenKind::Bitbucket, &self.jira_email, vars, &self.security)
+            .await
+            .map_err(|e| format!("Bitbucket token: {e}"))?;
+        match found {
+            None => Ok(PrReader::Command(self.pr_command.clone())),
+            Some(_) if self.jira_email.is_empty() => Err(NO_BITBUCKET_EMAIL.into()),
+            Some(token) => Ok(PrReader::Api {
+                api: self.bitbucket.clone(),
+                token,
+            }),
         }
     }
 
@@ -2252,6 +2346,163 @@ esac"#,
         assert_eq!(peaks.len(), 9, "{peaks:?}");
         assert!(peaks.iter().all(|&n| n <= 4), "{peaks:?}");
         assert!(prs_source(&s.view()).ok, "{:?}", prs_source(&s.view()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Points `s` at a stub `security` running `script` and a Bitbucket
+    /// API at `base`, with the developer's `PATH` (for `git`) and no token
+    /// variables.
+    fn use_bitbucket(s: &mut Arc<WorkStore>, dir: &Path, script: &str, base: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let security = dir.join("security");
+        std::fs::write(&security, format!("#!/bin/sh\n{script}\n")).unwrap();
+        std::fs::set_permissions(&security, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let st = Arc::get_mut(s).expect("only reference");
+        st.security = security.to_str().unwrap().to_owned();
+        st.bitbucket =
+            Arc::new(BitbucketApi::new("demo@example.test").with_base(format!("{base}/2.0/")));
+        st.env = BaseEnv::ready(vec![(
+            "PATH".into(),
+            std::env::var_os("PATH").unwrap_or_default(),
+        )]);
+    }
+
+    /// A git clone stand-in at `dir` whose `origin` is `url`.
+    fn git_folder(dir: &Path, url: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        for args in [&["init", "-q"][..], &["remote", "add", "origin", url]] {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn prs_use_the_api_when_a_bitbucket_token_is_set() {
+        use super::super::jira_api::tests::fake;
+        let dir = temp_dir("bb-api");
+        let recent = utc_iso(unix_now() - 86_400);
+        let repos = format!(
+            r#"{{"values":[{{"slug":"demo-api","updated_on":"{recent}"}}],"next":"{{base}}/2.0/repositories/demo-ws?page=2"}}"#
+        );
+        let repos2 = r#"{"values":[{"slug":"demo-old","updated_on":"2001-01-01T00:00:00Z"}]}"#;
+        let prs = r#"{"values":[{"id":7,"title":"DEMO-12 api work","author":{"display_name":"Dana Demo"}}]}"#;
+        let (base, rx) = fake(vec![(200, repos), (200, repos2.into()), (200, prs.into())]);
+        let mut s = ws_store(&dir, |c| {
+            c.jira_email = "demo@example.test".into();
+            c.pr_project = "DEMO".into();
+        });
+        // Only the Bitbucket item is in the stub Keychain.
+        use_bitbucket(
+            &mut s,
+            &dir,
+            "case \"$*\" in *'-s overseer-bitbucket -a demo@example.test '*) echo bb-tok ;; *) exit 44 ;; esac",
+            &base,
+        );
+        s.refresh(Source::Prs).await;
+        let v = s.view();
+        let got: Vec<_> = v
+            .prs
+            .iter()
+            .map(|p| (p.repo.as_str(), p.id, p.ticket.as_deref()))
+            .collect();
+        assert_eq!(got, [("demo-api", 7, Some("DEMO-12"))]);
+        assert!(prs_source(&v).ok, "{:?}", prs_source(&v));
+        assert_eq!(calls(&dir), "", "pr_command must not run");
+        let seen: Vec<_> = rx.try_iter().collect();
+        let paths: Vec<_> = seen.iter().map(|s| s.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "/2.0/repositories/demo-ws?pagelen=100&sort=-updated_on&q=project.key%3D%22DEMO%22",
+                "/2.0/repositories/demo-ws?page=2",
+                "/2.0/repositories/demo-ws/demo-api/pullrequests?state=OPEN&pagelen=50",
+            ]
+        );
+        // base64("demo@example.test:bb-tok")
+        assert!(seen
+            .iter()
+            .all(|s| s.auth.as_deref() == Some("Basic ZGVtb0BleGFtcGxlLnRlc3Q6YmItdG9r")));
+
+        // Folders: the remote names the repo; one without a Bitbucket
+        // remote is a per-repo error and costs no request.
+        let web = dir.join("demo-web");
+        git_folder(&web, "git@bitbucket.org:demo-ws/demo-web.git");
+        let gh = dir.join("demo-gh");
+        git_folder(&gh, "https://github.com/demo-ws/demo-gh.git");
+        let web_prs = r#"{"values":[{"id":21,"title":"Button colours"}]}"#;
+        let (base, rx) = fake(vec![(200, web_prs.into())]);
+        let mut s = store_with(|c| {
+            c.jira_email = "demo@example.test".into();
+            c.pr_repos = vec![web.clone(), gh.clone()];
+            c.pr_command = sh("echo ran >&2; exit 1");
+        });
+        use_bitbucket(
+            &mut s,
+            &dir,
+            "case \"$*\" in *overseer-bitbucket*) echo bb-tok ;; *) exit 44 ;; esac",
+            &base,
+        );
+        s.refresh(Source::Prs).await;
+        let v = s.view();
+        let ids: Vec<_> = v.prs.iter().map(|p| (p.repo.as_str(), p.id)).collect();
+        assert_eq!(ids, [("demo-web", 21)]);
+        assert_eq!(
+            prs_source(&v).message.as_deref(),
+            Some("demo-gh: no Bitbucket remote")
+        );
+        let seen: Vec<_> = rx.try_iter().collect();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0].path,
+            "/2.0/repositories/demo-ws/demo-web/pullrequests?state=OPEN&pagelen=50"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn prs_use_pr_command_when_no_bitbucket_token() {
+        let dir = temp_dir("bb-none");
+        write_repos(&dir, &[("demo-api", Some(1))]);
+        // Nothing listens here: any API call would fail the read.
+        let closed = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", l.local_addr().unwrap())
+        };
+        let mut s = ws_store(&dir, |c| c.jira_email = "demo@example.test".into());
+        use_bitbucket(&mut s, &dir, "exit 44", &closed);
+        s.refresh(Source::Prs).await;
+        let v = s.view();
+        let ids: Vec<_> = v.prs.iter().map(|p| (p.repo.as_str(), p.id)).collect();
+        assert_eq!(ids, [("demo-api", 7)]);
+        assert!(prs_source(&v).ok, "{:?}", prs_source(&v));
+        let log = calls(&dir);
+        assert!(log.contains("repo list --workspace demo-ws"), "{log}");
+        assert!(log.contains("--repository demo-ws/demo-api"), "{log}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_bitbucket_token_without_an_email_is_an_error() {
+        let dir = temp_dir("bb-noemail");
+        write_repos(&dir, &[("demo-api", Some(1))]);
+        let mut s = ws_store(&dir, |_| {});
+        use_bitbucket(&mut s, &dir, "exit 44", "http://127.0.0.1:9");
+        Arc::get_mut(&mut s).unwrap().env =
+            BaseEnv::ready(vec![("BITBUCKET_API_TOKEN".into(), "bb-env".into())]);
+        s.refresh(Source::Prs).await;
+        let v = s.view();
+        let prs = prs_source(&v);
+        assert!(!prs.ok);
+        let msg = prs.message.as_deref().unwrap_or("");
+        assert!(msg.contains("jira_email"), "{msg}");
+        assert!(!msg.contains("bb-env"), "{msg}");
+        assert_eq!(calls(&dir), "", "pr_command must not run");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
