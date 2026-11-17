@@ -846,6 +846,7 @@ impl WorkStore {
                             cmd.iter().map(|a| a.replace("{jql}", &self.jql)).collect();
                         let got = run_source(&cmd, Path::new("/"), SOURCE_TIMEOUT, &vars)
                             .await
+                            .map_err(|e| missing_program_hint(&cmd, e))
                             .and_then(|out| parse_jira(&out));
                         (got, None)
                     }
@@ -1500,6 +1501,15 @@ impl WorkStore {
                 }
             });
         }
+    }
+}
+
+/// `<prog> not found` for the Jira command gets the way out: with
+/// `jira_site` set, Overseer reads Jira itself and needs no command.
+fn missing_program_hint(cmd: &[String], e: String) -> String {
+    match cmd.first() {
+        Some(prog) if e == format!("{prog} not found") => format!("{e}: set jira_site"),
+        _ => e,
     }
 }
 
@@ -2664,6 +2674,27 @@ esac"#,
         s.refresh(Source::Jira).await;
         assert_eq!(s.tickets().len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_missing_jira_command_says_to_set_jira_site() {
+        let s = store_with(|c| {
+            c.jira_site = String::new();
+            c.jira_command = vec!["overseer-no-such-acli".into(), "{jql}".into()];
+        });
+        s.refresh(Source::Jira).await;
+        let v = s.view();
+        let j = jira_source(&v);
+        assert!(!j.ok, "{j:?}");
+        assert_eq!(
+            j.message.as_deref(),
+            Some("overseer-no-such-acli not found: set jira_site")
+        );
+        // Any other failure is passed through as it was.
+        assert_eq!(
+            missing_program_hint(&["acli".into()], "acli failed".into()),
+            "acli failed"
+        );
     }
 
     #[tokio::test]

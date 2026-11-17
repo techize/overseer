@@ -70,7 +70,7 @@ token, since the token is stored under the email the running daemon has.
 
 When `jira_site` is set Overseer uses the Jira API. With it empty it falls back
 to the `acli` command, and without `acli` installed the board says
-`acli not found`: set `jira_site`. `ticket_pattern`, when left empty, is built
+`acli not found: set jira_site`. Set `jira_site` (the API needs no `acli`). `ticket_pattern`, when left empty, is built
 from your Jira project keys. `user_name` defaults to the first word of your
 macOS full name.
 

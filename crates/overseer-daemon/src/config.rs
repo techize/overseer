@@ -194,6 +194,17 @@ fn default_user_name(full_name: Option<&str>, env_user: Option<&str>) -> String 
         .to_string()
 }
 
+/// `jira_site` as the bare host: a pasted `https://` or `http://` and any
+/// trailing `/` are dropped.
+pub fn site_host(site: &str) -> String {
+    let s = site.trim();
+    let s = s
+        .strip_prefix("https://")
+        .or_else(|| s.strip_prefix("http://"))
+        .unwrap_or(s);
+    s.trim_end_matches('/').to_string()
+}
+
 /// The name prompts and messages use: `configured` when it has any text, so
 /// an explicit empty `user_name` renders as the default, never as nothing.
 fn effective_user_name(
@@ -306,6 +317,7 @@ impl Config {
                 config.current_session = config.brain_dir.join("CURRENT_SESSION.md");
             }
         }
+        config.jira_site = site_host(&config.jira_site);
         config.user_name = effective_user_name(&config.user_name, full_name, env_user);
         config.beads_dir = expand(&config.beads_dir, home);
         config.current_session = expand(&config.current_session, home);
@@ -666,6 +678,23 @@ mod tests {
         assert_eq!(c.brain_dir, h.0.join("n"));
         assert!(!c.notes_owned);
         assert!(!c.brain_writer);
+    }
+
+    #[test]
+    fn jira_site_is_the_bare_host() {
+        for raw in [
+            "demo.atlassian.net",
+            "https://demo.atlassian.net",
+            "http://demo.atlassian.net/",
+            " https://demo.atlassian.net// ",
+        ] {
+            assert_eq!(site_host(raw), "demo.atlassian.net", "{raw}");
+        }
+        let h = fresh_home();
+        let (_d, p) = write("jira_site = \"https://demo.atlassian.net/\"\n");
+        let (c, err) = Config::load_with(&p, &h.0, None);
+        assert!(err.is_none());
+        assert_eq!(c.jira_site, "demo.atlassian.net");
     }
 
     #[test]

@@ -1930,7 +1930,10 @@ async fn missing_jira_program_reports_status_and_beads_still_load() {
     let v = c.refresh().await;
     let jira = source(&v, "jira");
     assert!(!jira.ok, "{jira:?}");
-    assert_eq!(jira.message.as_deref(), Some("no-such-jira-xyz not found"));
+    assert_eq!(
+        jira.message.as_deref(),
+        Some("no-such-jira-xyz not found: set jira_site")
+    );
     let beads = source(&v, "beads");
     assert!(beads.ok && beads.count == 4, "{beads:?}");
     // Beads still group under ticket nodes made from their own keys.

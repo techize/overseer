@@ -63,7 +63,7 @@ impl JiraApi {
     pub fn new(site: &str, email: &str, board: &str, cloud_id: &str) -> JiraApi {
         let cloud_id = cloud_id.trim();
         JiraApi {
-            site_base: format!("https://{}", site.trim()),
+            site_base: format!("https://{}", crate::config::site_host(site)),
             email: email.trim().to_owned(),
             board: board.trim().to_owned(),
             api_base: "https://api.atlassian.com".to_owned(),

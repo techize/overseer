@@ -197,6 +197,14 @@ async fn bind(path: &PathBuf) -> anyhow::Result<UnixListener> {
     Ok(listener)
 }
 
+/// The work source a saved token is for.
+fn source_for(kind: TokenKind) -> crate::work::store::Source {
+    match kind {
+        TokenKind::Jira => crate::work::store::Source::Jira,
+        TokenKind::Bitbucket => crate::work::store::Source::Prs,
+    }
+}
+
 /// The notes folder notice goes to S0, whose role works in that folder.
 const NOTES_NOTICE_SLOT: SlotId = 0;
 
@@ -814,9 +822,16 @@ fn handle_frame(
         } => {
             let settings = ctx.settings.clone();
             let outbox = outbox.clone();
+            let task_store = store.clone();
             store.spawn(async move {
                 let resp = settings.set_token(kind, token.expose()).await;
+                let saved = resp == Response::Ok;
                 outbox.send(Frame::Response { seq, resp });
+                // The source that uses the token reads again now, not at
+                // its next poll.
+                if saved {
+                    task_store.refresh(source_for(kind)).await;
+                }
             });
         }
         // Approving a plan creates worktrees and starts sessions, so it is
@@ -1412,6 +1427,13 @@ fn slot_worktree(plans: &PlanCtx, manager: &Mutex<SlotManager>, slot: SlotId) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_saved_token_refreshes_its_own_source() {
+        use crate::work::store::Source;
+        assert_eq!(source_for(TokenKind::Jira), Source::Jira);
+        assert_eq!(source_for(TokenKind::Bitbucket), Source::Prs);
+    }
 
     fn outbox() -> (Outbox, mpsc::Receiver<Frame>) {
         let (tx, rx) = mpsc::channel(16);
