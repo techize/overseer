@@ -1,9 +1,10 @@
 //! The work-item cache and its assignments, shared by every connection.
 //!
-//! Three sources fill the cache: `bd list --json` in the beads folder, the
-//! configured Jira command and the PR command, run in each of `pr_repos`
-//! and for each active repo of `pr_workspace`. Each runs off the request
-//! path with a 30 s timeout, so a slow source never stalls a slot request.
+//! Three sources fill the cache: `bd list --json` in the beads folder, Jira
+//! (the REST API when `jira_site` is set, else the configured command) and
+//! the PR command, run in each of `pr_repos` and for each active repo of
+//! `pr_workspace`. Each runs off the request path with a timeout, so a slow
+//! source never stalls a slot request.
 //! Ownership lives in the ledger; every decision and its writes happen in
 //! one ledger transaction, so two clients assigning the same item cannot
 //! both win.
@@ -13,7 +14,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use overseer_proto::{
@@ -24,9 +25,14 @@ use regex::Regex;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
 
+use super::jira_api::{run_blocking, ActiveSprint, JiraApi};
 use super::ownership::{decide, promotions, Decision};
-use super::sprint::{newest_sprint_folder, parse_ymd, sprint_day, sprint_label, Ymd};
+use super::sprint::{
+    newest_sprint_folder, parse_ymd, sprint_day, sprint_folder_name, sprint_label,
+    weekdays_between, Ymd,
+};
 use super::stages::Stages;
+use super::token::jira_token;
 use super::{
     active_repos, compile_pattern, group, parse_beads, parse_jira, parse_prs, parse_repos,
     run_source, Bead, Ticket,
@@ -65,6 +71,69 @@ pub type LabelWriter = Box<
         + Send
         + Sync,
 >;
+
+/// The ticket pattern before any Jira list, or after an empty one, when
+/// `ticket_pattern` is empty: any project key.
+pub const ANY_PROJECT_KEY: &str = r"[A-Z][A-Z0-9]+-\d+";
+
+/// The `security` tool that reads the Jira token from the Keychain.
+pub const SECURITY: &str = "/usr/bin/security";
+
+/// The Jira status after a sudden empty list.
+pub const EMPTY_KEPT: &str = "Jira returned no tickets; keeping the last list";
+
+/// The Jira status when a site is set without an email.
+pub const NO_JIRA_EMAIL: &str = "jira_email is empty; set it in Settings";
+
+/// The header text when the board has no running sprint.
+pub const NO_ACTIVE_SPRINT: &str = "No active sprint";
+
+/// The beads status in an owned folder that has no beads.
+pub const BEADS_NOT_SET_UP: &str = "beads not set up here";
+
+/// Where Jira tickets come from.
+pub(crate) enum JiraSource {
+    /// The REST API, when `jira_site` is set.
+    Api(Arc<JiraApi>),
+    /// The configured command (acli), when only `jira_command` is set.
+    Command(Vec<String>),
+    /// Neither: the status says why.
+    Off,
+}
+
+/// What to do with a Jira list that came back empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EmptyGuard {
+    Accept,
+    /// Keep the previous tickets this once.
+    Keep,
+}
+
+/// A list of zero after a list of some is kept the first time: one empty
+/// answer is more likely a Jira hiccup than a cleared sprint. `streak`
+/// counts the empty lists in a row before this one.
+pub(crate) fn empty_guard(prev_len: usize, new_len: usize, streak: u32) -> EmptyGuard {
+    if new_len == 0 && prev_len > 0 && streak == 0 {
+        EmptyGuard::Keep
+    } else {
+        EmptyGuard::Accept
+    }
+}
+
+/// The ticket pattern for an empty `ticket_pattern`: the project keys of
+/// `keys`, sorted, as `(K1|K2)-\d+`; any project key for an empty list.
+pub(crate) fn derive_pattern(keys: &[String]) -> String {
+    let projects: std::collections::BTreeSet<&str> = keys
+        .iter()
+        .filter_map(|k| k.rsplit_once('-').map(|(p, _)| p))
+        .filter(|p| !p.is_empty())
+        .collect();
+    if projects.is_empty() {
+        return ANY_PROJECT_KEY.to_owned();
+    }
+    let alts: Vec<String> = projects.iter().map(|p| regex::escape(p)).collect();
+    format!(r"({})-\d+", alts.join("|"))
+}
 
 /// How long shutdown waits for queued bead labels to reach `bd`.
 pub const LABEL_DRAIN: Duration = Duration::from_secs(3);
@@ -112,6 +181,10 @@ struct Cache {
     folders: Vec<(String, PathBuf)>,
     /// The newest `Sprints/sprint-*` folder at the last scan.
     sprint_folder: Option<String>,
+    /// Empty Jira lists in a row; any non-empty list or error resets it.
+    empty_streak: u32,
+    /// The board's running sprint at the last good read.
+    active_sprint: Option<ActiveSprint>,
 }
 
 struct RepoList {
@@ -155,8 +228,15 @@ pub struct WorkStore {
     sprint_name: String,
     sprint_start: Option<Ymd>,
     sprint_days: u32,
-    /// `None` when the configured command is empty: Jira is off.
-    jira_command: Option<Vec<String>>,
+    jira: JiraSource,
+    /// The Jira email, the Keychain item's account.
+    jira_email: String,
+    /// Set when `jira_board` is: the API also reads the active sprint.
+    has_board: bool,
+    /// The `security` tool's path; tests point it at a stub.
+    security: String,
+    /// The beads folder is one Overseer owns, which may have no beads.
+    notes_owned: bool,
     jql: String,
     /// The PR source is off when both this and `pr_workspace` are empty.
     pr_repos: Vec<PathBuf>,
@@ -175,8 +255,10 @@ pub struct WorkStore {
     jira_poll: Duration,
     pr_poll: Duration,
     /// The ticket pattern, or one that never matches when the configured
-    /// pattern is bad (beads then stay ungrouped).
-    pattern: Regex,
+    /// pattern is bad (beads then stay ungrouped). Read it with `pattern()`.
+    pattern: RwLock<Regex>,
+    /// `ticket_pattern` is empty: `pattern` is derived from each good Jira list.
+    derived: bool,
     pattern_error: Option<String>,
     ledger: Arc<Ledger>,
     events: broadcast::Sender<Event>,
@@ -325,9 +407,11 @@ impl WorkStore {
         events: broadcast::Sender<Event>,
         env: BaseEnv,
     ) -> Arc<WorkStore> {
-        // An empty pattern is the default: any project key.
-        let wanted = if cfg.ticket_pattern.trim().is_empty() {
-            r"[A-Z][A-Z0-9]+-\d+"
+        // An empty pattern is derived from the Jira list; any project key
+        // until there is one.
+        let derived = cfg.ticket_pattern.trim().is_empty();
+        let wanted = if derived {
+            ANY_PROJECT_KEY
         } else {
             cfg.ticket_pattern.as_str()
         };
@@ -339,13 +423,26 @@ impl WorkStore {
                 (Regex::new(r"\b\B").expect("static regex"), Some(e))
             }
         };
-        let jira_command = (!cfg.jira_command.is_empty()).then(|| cfg.jira_command.clone());
+        let site = cfg.jira_site.trim();
+        let email = cfg.jira_email.trim();
+        let (jira, off_message) = if !site.is_empty() {
+            if email.is_empty() {
+                (JiraSource::Off, NO_JIRA_EMAIL)
+            } else {
+                let api = JiraApi::new(site, email, &cfg.jira_board, &cfg.jira_cloud_id);
+                (JiraSource::Api(Arc::new(api)), "")
+            }
+        } else if !cfg.jira_command.is_empty() {
+            (JiraSource::Command(cfg.jira_command.clone()), "")
+        } else {
+            (JiraSource::Off, JIRA_OFF)
+        };
         let jira_status = status(
             "jira",
-            Some(if jira_command.is_some() {
-                "not read yet".into()
+            Some(if matches!(jira, JiraSource::Off) {
+                off_message.into()
             } else {
-                JIRA_OFF.into()
+                "not read yet".into()
             }),
         );
         let prs_status = status(
@@ -378,7 +475,11 @@ impl WorkStore {
             sprint_name: cfg.sprint_name.clone(),
             sprint_start,
             sprint_days: cfg.sprint_days,
-            jira_command,
+            jira,
+            jira_email: email.to_owned(),
+            has_board: !cfg.jira_board.trim().is_empty(),
+            security: SECURITY.to_owned(),
+            notes_owned: cfg.notes_owned,
             jql: cfg.jql.clone(),
             pr_repos: cfg.pr_repos.clone(),
             pr_command: cfg.pr_command.clone(),
@@ -391,7 +492,8 @@ impl WorkStore {
             beads_poll: Duration::from_secs(cfg.beads_poll_secs.max(1)),
             jira_poll: Duration::from_secs(cfg.jira_poll_secs.max(1)),
             pr_poll: Duration::from_secs(cfg.pr_poll_secs.max(1)),
-            pattern,
+            pattern: RwLock::new(pattern),
+            derived,
             pattern_error,
             ledger,
             events,
@@ -407,6 +509,8 @@ impl WorkStore {
                 prs_status,
                 folders: Vec::new(),
                 sprint_folder: newest_sprint_folder(&cfg.brain_dir),
+                empty_streak: 0,
+                active_sprint: None,
             }),
             beads_turn: tokio::sync::Mutex::new(()),
             jira_turn: tokio::sync::Mutex::new(()),
@@ -427,6 +531,24 @@ impl WorkStore {
 
     pub fn brain_dir(&self) -> &Path {
         &self.brain_dir
+    }
+
+    /// The ticket pattern now. A clone, so no lock is held while it is used.
+    fn pattern(&self) -> Regex {
+        self.pattern
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// The tickets Jira last listed.
+    pub fn tickets(&self) -> Vec<Ticket> {
+        self.cache().tickets.clone()
+    }
+
+    /// The board's running sprint at the last good read.
+    pub fn active_sprint(&self) -> Option<ActiveSprint> {
+        self.cache().active_sprint.clone()
     }
 
     /// Sends the label writes to `f` instead of running `bd` here. Set once
@@ -515,14 +637,50 @@ impl WorkStore {
             sprint: self.sprint_text(&cache),
             prs,
             sprint_day: self
-                .sprint_start
-                .and_then(|start| sprint_day(start, self.sprint_days, today())),
+                .sprint_dates(&cache)
+                .and_then(|(start, days)| sprint_day(start, days, today())),
         }
     }
 
-    /// The header's sprint text: the configured name, else the folder found
-    /// at the last scan, with the day counted from the real clock.
+    /// The configured sprint is used when `sprint_name` or `sprint_start`
+    /// is set; else the board's active sprint.
+    fn config_sprint(&self) -> bool {
+        !self.sprint_name.is_empty() || self.sprint_start.is_some()
+    }
+
+    /// The API reads the board's active sprint: a site and a board are set.
+    fn reads_sprint(&self) -> bool {
+        self.has_board && matches!(self.jira, JiraSource::Api(_))
+    }
+
+    /// The header follows the board's sprint: it is read and the config
+    /// names no sprint.
+    fn follows_board(&self) -> bool {
+        self.reads_sprint() && !self.config_sprint()
+    }
+
+    /// The sprint's first day and length in weekdays, when known.
+    fn sprint_dates(&self, cache: &Cache) -> Option<(Ymd, u32)> {
+        if self.follows_board() {
+            return cache
+                .active_sprint
+                .as_ref()
+                .map(|s| (s.start, weekdays_between(s.start, s.end)));
+        }
+        self.sprint_start.map(|start| (start, self.sprint_days))
+    }
+
+    /// The header's sprint text, with the day counted from the real clock:
+    /// the configured sprint, else the board's active sprint (or that it
+    /// has none), else the newest sprint folder at the last scan.
     fn sprint_text(&self, cache: &Cache) -> Option<String> {
+        if self.follows_board() {
+            let Some(s) = &cache.active_sprint else {
+                return Some(NO_ACTIVE_SPRINT.into());
+            };
+            let days = weekdays_between(s.start, s.end);
+            return sprint_label(&sprint_folder_name(&s.name), Some(s.start), days, today());
+        }
         let name = if self.sprint_name.is_empty() {
             cache.sprint_folder.as_deref().unwrap_or("")
         } else {
@@ -534,7 +692,7 @@ impl WorkStore {
     /// A key not in the cache is a ticket when the whole key matches the
     /// ticket pattern, else a bead.
     fn guess_kind(&self, key: &str) -> ItemKind {
-        match self.pattern.find(key) {
+        match self.pattern().find(key) {
             Some(m) if m.as_str() == key => ItemKind::Ticket,
             _ => ItemKind::Bead,
         }
@@ -597,6 +755,19 @@ impl WorkStore {
                         };
                         cache.beads = beads;
                     }
+                    Err(e) if self.beads_not_set_up(&e) => {
+                        cache.beads_status = SourceStatus {
+                            name: "beads".into(),
+                            ok: true,
+                            count: 0,
+                            at: Some(now),
+                            message: join_messages(
+                                Some(BEADS_NOT_SET_UP.into()),
+                                self.pattern_error.as_ref(),
+                            ),
+                        };
+                        cache.beads.clear();
+                    }
                     Err(e) => {
                         tracing::warn!("beads source: {e}");
                         let s = &mut cache.beads_status;
@@ -606,36 +777,22 @@ impl WorkStore {
                 }
             }
             Source::Jira => {
-                let Some(cmd) = &self.jira_command else {
-                    self.announce();
-                    return;
+                let (got, sprint) = match &self.jira {
+                    JiraSource::Off => {
+                        self.announce();
+                        return;
+                    }
+                    JiraSource::Command(cmd) => {
+                        let cmd: Vec<String> =
+                            cmd.iter().map(|a| a.replace("{jql}", &self.jql)).collect();
+                        let got = run_source(&cmd, Path::new("/"), SOURCE_TIMEOUT, &vars)
+                            .await
+                            .and_then(|out| parse_jira(&out));
+                        (got, None)
+                    }
+                    JiraSource::Api(api) => self.read_api(api, &vars).await,
                 };
-                let cmd: Vec<String> = cmd.iter().map(|a| a.replace("{jql}", &self.jql)).collect();
-                let got = run_source(&cmd, Path::new("/"), SOURCE_TIMEOUT, &vars)
-                    .await
-                    .and_then(|out| parse_jira(&out));
-                let now = unix_now();
-                if let Ok(tickets) = &got {
-                    self.record_stages(tickets, now);
-                }
-                let mut cache = self.cache();
-                match got {
-                    Ok(tickets) => {
-                        cache.jira_status = SourceStatus {
-                            name: "jira".into(),
-                            ok: true,
-                            count: tickets.len(),
-                            at: Some(now),
-                            message: None,
-                        };
-                        cache.tickets = tickets;
-                    }
-                    Err(e) => {
-                        tracing::warn!("jira source: {e}");
-                        cache.jira_status.ok = false;
-                        cache.jira_status.message = Some(e);
-                    }
-                }
+                self.take_jira(got, sprint, unix_now());
             }
             Source::Prs => {
                 // Off: nothing to read and nothing in the view changes.
@@ -684,6 +841,115 @@ impl WorkStore {
         }
         self.regroup(unix_now());
         self.announce();
+    }
+
+    /// The tickets and, with a board, the active sprint through the API.
+    /// No token fails both; a sprint error leaves the tickets alone.
+    async fn read_api(
+        &self,
+        api: &Arc<JiraApi>,
+        vars: &Vars,
+    ) -> (
+        Result<Vec<Ticket>, String>,
+        Option<Result<Option<ActiveSprint>, String>>,
+    ) {
+        let token = match jira_token(&self.jira_email, vars, &self.security).await {
+            Ok(t) => t,
+            Err(e) => return (Err(e), None),
+        };
+        let (a, t, jql) = (api.clone(), token.clone(), self.jql.clone());
+        let got = run_blocking(move || a.tickets(&t, &jql)).await;
+        let sprint = if self.has_board {
+            let a = api.clone();
+            Some(run_blocking(move || a.active_sprint(&token)).await)
+        } else {
+            None
+        };
+        (got, sprint)
+    }
+
+    /// Stores one Jira read: the tickets (a sudden empty list is kept
+    /// once), the derived pattern, the active sprint and the status. An
+    /// error keeps the last tickets and sprint.
+    fn take_jira(
+        &self,
+        got: Result<Vec<Ticket>, String>,
+        sprint: Option<Result<Option<ActiveSprint>, String>>,
+        now: i64,
+    ) {
+        let guard = match &got {
+            Ok(tickets) => {
+                let cache = self.cache();
+                empty_guard(cache.tickets.len(), tickets.len(), cache.empty_streak)
+            }
+            Err(_) => EmptyGuard::Accept,
+        };
+        if let (Ok(tickets), EmptyGuard::Accept) = (&got, guard) {
+            self.record_stages(tickets, now);
+            if self.derived {
+                let keys: Vec<String> = tickets.iter().map(|t| t.key.clone()).collect();
+                match compile_pattern(&derive_pattern(&keys)) {
+                    Ok(p) => *self.pattern.write().unwrap_or_else(|e| e.into_inner()) = p,
+                    Err(e) => tracing::warn!("derived ticket pattern: {e}"),
+                }
+            }
+        }
+        let mut cache = self.cache();
+        match got {
+            Ok(tickets) => {
+                cache.empty_streak = if tickets.is_empty() {
+                    cache.empty_streak.saturating_add(1)
+                } else {
+                    0
+                };
+                if guard == EmptyGuard::Keep {
+                    tracing::warn!("jira source: {EMPTY_KEPT}");
+                    let count = cache.tickets.len();
+                    let s = &mut cache.jira_status;
+                    s.ok = true;
+                    s.count = count;
+                    s.message = Some(EMPTY_KEPT.into());
+                } else {
+                    cache.jira_status = SourceStatus {
+                        name: "jira".into(),
+                        ok: true,
+                        count: tickets.len(),
+                        at: Some(now),
+                        message: None,
+                    };
+                    cache.tickets = tickets;
+                }
+            }
+            Err(e) => {
+                tracing::warn!("jira source: {e}");
+                cache.empty_streak = 0;
+                cache.jira_status.ok = false;
+                cache.jira_status.message = Some(e);
+            }
+        }
+        match sprint {
+            Some(Ok(s)) => cache.active_sprint = s,
+            Some(Err(e)) => {
+                tracing::warn!("jira source: active sprint: {e}");
+                let msg = cache.jira_status.message.take();
+                cache.jira_status.message =
+                    join_messages(msg, Some(&format!("active sprint: {e}")));
+            }
+            None => {}
+        }
+    }
+
+    /// A beads read that failed only because an owned folder has no beads:
+    /// `bd` is not installed or the folder has no `.beads`.
+    fn beads_not_set_up(&self, e: &str) -> bool {
+        if !self.notes_owned {
+            return false;
+        }
+        let bd_missing = self
+            .bd_command
+            .first()
+            .is_some_and(|prog| e == format!("{prog} not found"));
+        bd_missing || !self.beads_dir.join(".beads").exists()
     }
 
     /// Every source at once; returns when all are done.
@@ -784,10 +1050,10 @@ impl WorkStore {
 
     /// `pr` with the first ticket key in its title, else in its branch.
     fn link_ticket(&self, mut pr: PullRequest) -> PullRequest {
-        pr.ticket = self
-            .pattern
+        let pattern = self.pattern();
+        pr.ticket = pattern
             .find(&pr.title)
-            .or_else(|| self.pattern.find(&pr.branch))
+            .or_else(|| pattern.find(&pr.branch))
             .map(|m| m.as_str().to_owned());
         pr
     }
@@ -799,12 +1065,13 @@ impl WorkStore {
         let folders = list_folders(&self.brain_dir);
         let mut folders = Some(folders);
         let sprint_folder = newest_sprint_folder(&self.brain_dir);
+        let pattern = self.pattern();
         let mut told = false;
         let done = self.ledger.transaction(|conn| {
             let owners: HashMap<String, SlotId> =
                 ledger::assignments_on(conn)?.into_iter().collect();
             let mut cache = self.cache();
-            let after = group(&cache.tickets, &cache.beads, &self.pattern);
+            let after = group(&cache.tickets, &cache.beads, &pattern);
             for (bead, was, ticket_owner) in promotions(&cache.items, &after, &owners) {
                 let parent = after
                     .iter()
@@ -835,7 +1102,7 @@ impl WorkStore {
             // The list still updates; only the promotion notices are lost.
             tracing::warn!("recording promotions failed: {e:#}");
             let mut cache = self.cache();
-            cache.items = group(&cache.tickets, &cache.beads, &self.pattern);
+            cache.items = group(&cache.tickets, &cache.beads, &pattern);
             if let Some(f) = folders.take() {
                 cache.folders = f;
             }
@@ -1357,8 +1624,8 @@ mod tests {
     fn an_empty_pattern_means_any_project_key() {
         let s = store("");
         assert!(s.pattern_error.is_none());
-        assert!(s.pattern.is_match("fix ABC1-42 now"));
-        assert!(!s.pattern.is_match("abc-42"));
+        assert!(s.pattern().is_match("fix ABC1-42 now"));
+        assert!(!s.pattern().is_match("abc-42"));
     }
 
     #[test]
@@ -1416,7 +1683,7 @@ mod tests {
         let s = store("[DEMO");
         assert!(s.pattern_error.is_some());
         assert_eq!(s.guess_kind("DEMO-1"), ItemKind::Bead);
-        assert!(s.pattern.find("DEMO-1 x").is_none());
+        assert!(s.pattern().find("DEMO-1 x").is_none());
     }
 
     #[test]
@@ -2027,6 +2294,263 @@ esac"#,
         let v = s.view();
         assert_eq!(v.items.len(), 2);
         assert!(v.items.iter().all(|i| i.stage.is_none()), "{:?}", v.items);
+    }
+
+    #[test]
+    fn derive_pattern_from_project_keys() {
+        let keys: Vec<String> = ["DEMO-2", "OPS-1", "DEMO-9"].map(String::from).into();
+        let p = derive_pattern(&keys);
+        assert_eq!(p, r"(DEMO|OPS)-\d+");
+        assert_eq!(derive_pattern(&[]), r"[A-Z][A-Z0-9]+-\d+");
+        let re = compile_pattern(&p).unwrap();
+        assert!(re.is_match("OPS-1"));
+        assert!(!re.is_match("UTF-8"));
+    }
+
+    #[test]
+    fn empty_guard_keeps_only_the_first_sudden_empty() {
+        assert_eq!(empty_guard(3, 0, 0), EmptyGuard::Keep);
+        assert_eq!(empty_guard(3, 0, 1), EmptyGuard::Accept);
+        assert_eq!(empty_guard(0, 0, 0), EmptyGuard::Accept);
+        assert_eq!(empty_guard(3, 2, 0), EmptyGuard::Accept);
+    }
+
+    fn jira_source(v: &WorkView) -> &SourceStatus {
+        v.sources
+            .iter()
+            .find(|s| s.name == "jira")
+            .expect("jira source")
+    }
+
+    fn write_jira_keys(dir: &Path, keys: &[&str]) {
+        let issues: Vec<String> = keys
+            .iter()
+            .map(|k| {
+                format!(r#"{{"key":"{k}","fields":{{"summary":"t","status":{{"name":"To Do"}}}}}}"#)
+            })
+            .collect();
+        let json = format!(r#"{{"issues":[{}]}}"#, issues.join(","));
+        std::fs::write(dir.join("jira.json"), json).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_sudden_empty_list_is_kept_once() {
+        let dir = temp_dir("jira-empty");
+        write_jira_keys(&dir, &["DEMO-1", "DEMO-2"]);
+        let s = store_with(|c| c.jira_command = fake_jira(&dir));
+        s.refresh(Source::Jira).await;
+        assert_eq!(s.tickets().len(), 2);
+        write_jira_keys(&dir, &[]);
+        s.refresh(Source::Jira).await;
+        let v = s.view();
+        let j = jira_source(&v);
+        assert!(j.ok, "{j:?}");
+        assert_eq!(j.count, 2);
+        assert_eq!(
+            j.message.as_deref(),
+            Some("Jira returned no tickets; keeping the last list")
+        );
+        assert_eq!(s.tickets().len(), 2);
+        s.refresh(Source::Jira).await;
+        let v = s.view();
+        let j = jira_source(&v);
+        assert!(j.ok && j.count == 0 && j.message.is_none(), "{j:?}");
+        assert!(s.tickets().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_failing_jira_read_keeps_the_tickets() {
+        let dir = temp_dir("jira-fail");
+        write_jira_keys(&dir, &["DEMO-1"]);
+        let flag = dir.join("down");
+        let script = format!(
+            "[ -e '{}' ] && {{ echo 'Jira unreachable: connection refused' >&2; exit 1; }}; cat '{}'",
+            flag.display(),
+            dir.join("jira.json").display()
+        );
+        let s = store_with(|c| c.jira_command = sh(&script));
+        s.refresh(Source::Jira).await;
+        std::fs::write(&flag, "").unwrap();
+        s.refresh(Source::Jira).await;
+        let v = s.view();
+        let j = jira_source(&v);
+        assert!(!j.ok, "{j:?}");
+        assert_eq!(s.tickets().len(), 1);
+        assert!(v.items.iter().any(|i| i.key == "DEMO-1"));
+        // An error resets the streak: the next empty list is kept again.
+        std::fs::remove_file(&flag).unwrap();
+        write_jira_keys(&dir, &[]);
+        s.refresh(Source::Jira).await;
+        assert_eq!(s.tickets().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_empty_pattern_is_derived_from_the_jira_list() {
+        let dir = temp_dir("jira-derive");
+        write_jira_keys(&dir, &["DEMO-1", "OPS-4"]);
+        let s = store_with(|c| {
+            c.ticket_pattern = String::new();
+            c.jira_command = fake_jira(&dir);
+        });
+        assert_eq!(s.guess_kind("UTF-8"), ItemKind::Ticket);
+        s.refresh(Source::Jira).await;
+        assert_eq!(s.guess_kind("UTF-8"), ItemKind::Bead);
+        assert_eq!(s.guess_kind("OPS-12"), ItemKind::Ticket);
+        // A set pattern is never replaced.
+        let fixed = store_with(|c| c.jira_command = fake_jira(&dir));
+        fixed.refresh(Source::Jira).await;
+        assert_eq!(fixed.guess_kind("OPS-12"), ItemKind::Bead);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn beads_not_set_up_in_an_owned_folder_is_fine() {
+        let dir = temp_dir("owned-beads");
+        let s = store_with(|c| {
+            c.notes_owned = true;
+            c.beads_dir = dir.clone();
+            c.bd_command = vec!["overseer-no-such-bd".into()];
+        });
+        s.refresh(Source::Beads).await;
+        let v = s.view();
+        let b = &v.sources[0];
+        assert!(b.ok, "{b:?}");
+        assert_eq!(b.message.as_deref(), Some("beads not set up here"));
+        // Not owned: the same failure is an error.
+        let s = store_with(|c| {
+            c.beads_dir = dir.clone();
+            c.bd_command = vec!["overseer-no-such-bd".into()];
+        });
+        s.refresh(Source::Beads).await;
+        assert!(!s.view().sources[0].ok);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn jira_source_is_picked_from_the_config() {
+        let api = store_with(|c| {
+            c.jira_site = "demo.atlassian.net".into();
+            c.jira_email = "demo@example.test".into();
+            c.jira_command = sh("true");
+        });
+        assert!(matches!(api.jira, JiraSource::Api(_)));
+        let no_email = store_with(|c| {
+            c.jira_site = "demo.atlassian.net".into();
+            c.jira_command = sh("true");
+        });
+        assert!(matches!(no_email.jira, JiraSource::Off));
+        assert_eq!(
+            jira_source(&no_email.view()).message.as_deref(),
+            Some("jira_email is empty; set it in Settings")
+        );
+        let cmd = store_with(|c| c.jira_command = sh("true"));
+        assert!(matches!(cmd.jira, JiraSource::Command(_)));
+        let off = store_with(|_| {});
+        assert!(matches!(off.jira, JiraSource::Off));
+        assert_eq!(jira_source(&off.view()).message.as_deref(), Some(JIRA_OFF));
+    }
+
+    fn ymd(y: i32, m: u32, d: u32) -> Ymd {
+        Ymd { y, m, d }
+    }
+
+    #[test]
+    fn the_header_uses_the_active_sprint_unless_the_config_names_one() {
+        let dir = temp_dir("active-sprint");
+        std::fs::create_dir_all(dir.join("Sprints/sprint-26-01")).unwrap();
+        let board = |edit: fn(&mut Config)| {
+            store_with(|c| {
+                c.brain_dir = dir.clone();
+                c.jira_site = "demo.atlassian.net".into();
+                c.jira_email = "demo@example.test".into();
+                c.jira_board = "7".into();
+                edit(c);
+            })
+        };
+        let s = board(|_| {});
+        assert_eq!(s.view().sprint.as_deref(), Some("No active sprint"));
+        assert_eq!(s.view().sprint_day, None);
+        let long_ago = ActiveSprint {
+            name: "DEMO Sprint 26-01".into(),
+            start: ymd(2020, 1, 6),
+            end: ymd(2020, 1, 17),
+        };
+        s.cache().active_sprint = Some(long_ago.clone());
+        assert_eq!(s.active_sprint(), Some(long_ago.clone()));
+        let v = s.view();
+        assert_eq!(
+            v.sprint.as_deref(),
+            Some("sprint-demo-sprint-26-01, ended Fri 17 Jan")
+        );
+        assert_eq!(v.sprint_day, Some(SprintDay { day: 10, days: 10 }));
+        // The config wins.
+        let named = board(|c| c.sprint_name = "Demo sprint".into());
+        named.cache().active_sprint = Some(long_ago);
+        assert_eq!(named.view().sprint.as_deref(), Some("Demo sprint"));
+        assert_eq!(named.view().sprint_day, None);
+        // No board: the folder scan, as before.
+        let folder = store_with(|c| c.brain_dir = dir.clone());
+        assert_eq!(folder.view().sprint.as_deref(), Some("sprint-26-01"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The network drops mid-sprint: an API store whose Jira cannot be
+    /// reached keeps its tickets and its sprint header.
+    #[tokio::test]
+    async fn an_unreachable_jira_keeps_the_tickets_and_the_sprint() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("jira-down");
+        let security = dir.join("security");
+        std::fs::write(&security, "#!/bin/sh\necho demo-token\n").unwrap();
+        std::fs::set_permissions(&security, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A port nothing listens on.
+        let closed = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", l.local_addr().unwrap())
+        };
+        let mut s = store_with(|c| {
+            c.jira_site = "demo.atlassian.net".into();
+            c.jira_email = "demo@example.test".into();
+            c.jira_board = "7".into();
+        });
+        {
+            let st = Arc::get_mut(&mut s).expect("only reference");
+            st.security = security.to_str().unwrap().to_owned();
+            let api = JiraApi::new("demo.atlassian.net", "demo@example.test", "7", "demo-cloud")
+                .with_bases(closed.clone(), closed);
+            st.jira = JiraSource::Api(Arc::new(api));
+        }
+        let sprint = ActiveSprint {
+            name: "DEMO Sprint 26-01".into(),
+            start: ymd(2020, 1, 6),
+            end: ymd(2020, 1, 17),
+        };
+        {
+            let mut c = s.cache();
+            c.tickets = vec![Ticket {
+                key: "DEMO-1".into(),
+                title: "Widget wiring".into(),
+                status: "To Do".into(),
+                priority: None,
+            }];
+            c.active_sprint = Some(sprint.clone());
+        }
+        let header = s.view().sprint;
+        s.refresh(Source::Jira).await;
+        let v = s.view();
+        let j = jira_source(&v);
+        assert!(!j.ok, "{j:?}");
+        let msg = j.message.as_deref().unwrap_or("");
+        assert!(msg.contains("Jira unreachable"), "{msg}");
+        assert!(msg.contains("active sprint: "), "{msg}");
+        assert!(!msg.contains("demo-token"), "{msg}");
+        assert_eq!(s.tickets().len(), 1);
+        assert!(v.items.iter().any(|i| i.key == "DEMO-1"));
+        assert_eq!(s.active_sprint(), Some(sprint));
+        assert_eq!(v.sprint, header);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

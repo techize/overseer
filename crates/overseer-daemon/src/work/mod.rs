@@ -10,6 +10,7 @@ pub mod store;
 pub mod token;
 
 pub use group::{group, ticket_of};
+pub use jira_api::ActiveSprint;
 pub use sources::{
     active_repos, parse_beads, parse_iso_time, parse_jira, parse_prs, parse_repos, run_source,
     Bead, Ticket,
