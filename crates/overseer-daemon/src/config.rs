@@ -239,27 +239,45 @@ impl Config {
         full_name: Option<&str>,
         env_user: Option<&str>,
     ) -> (Config, Option<String>) {
-        let (mut config, table, err) = match std::fs::read_to_string(path) {
-            Ok(text) => match toml::from_str::<Config>(&text) {
+        match std::fs::read_to_string(path) {
+            Ok(text) => {
+                let (c, err) = Config::resolve(Some(&text), home, full_name, env_user);
+                (c, err.map(|e| format!("{}: {e}", path.display())))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Config::resolve(None, home, full_name, env_user)
+            }
+            Err(e) => {
+                let (c, _) = Config::resolve(None, home, full_name, env_user);
+                (c, Some(format!("{}: {e}", path.display())))
+            }
+        }
+    }
+
+    /// The config `text` gives on this machine, as `load` resolves it;
+    /// `None` is a missing file. Text that does not parse gives the
+    /// defaults and the error.
+    pub fn load_text(text: Option<&str>, home: &Path, full_name: Option<&str>) -> Config {
+        let env_user = std::env::var("USER").ok();
+        Config::resolve(text, home, full_name, env_user.as_deref()).0
+    }
+
+    fn resolve(
+        text: Option<&str>,
+        home: &Path,
+        full_name: Option<&str>,
+        env_user: Option<&str>,
+    ) -> (Config, Option<String>) {
+        let (mut config, table, err) = match text {
+            Some(text) => match toml::from_str::<Config>(text) {
                 Ok(mut c) => {
-                    c.fold_legacy_stage_keys(&text);
+                    c.fold_legacy_stage_keys(text);
                     let table = text.parse::<toml::Table>().unwrap_or_default();
                     (c, table, None)
                 }
-                Err(e) => (
-                    Config::default(),
-                    toml::Table::new(),
-                    Some(format!("{}: {e}", path.display())),
-                ),
+                Err(e) => (Config::default(), toml::Table::new(), Some(e.to_string())),
             },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                (Config::default(), toml::Table::new(), None)
-            }
-            Err(e) => (
-                Config::default(),
-                toml::Table::new(),
-                Some(format!("{}: {e}", path.display())),
-            ),
+            None => (Config::default(), toml::Table::new(), None),
         };
         let set = |key: &str| table.contains_key(key);
         let mut defaulted_overseer = false;

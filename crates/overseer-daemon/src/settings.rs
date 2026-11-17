@@ -439,8 +439,29 @@ fn read_text(p: &Path) -> Result<String, String> {
     }
 }
 
+/// A folder the daemon would refuse to own (see `notes::prepare`) leaves
+/// the writer and the sprint sync off.
+fn refuse_as_the_daemon_does(c: &mut Config) {
+    if c.notes_owned && crate::notes::foreign(&c.brain_dir) {
+        crate::notes::disown(c);
+    }
+}
+
+/// A path value under `home` is shown with `~`, as config files write it.
+fn shown(spec: &Spec, value: SettingValue, home: &Path) -> SettingValue {
+    match (&spec.kind, value) {
+        (SettingKind::Path, SettingValue::Text(s)) => match Path::new(&s).strip_prefix(home) {
+            Ok(rest) if rest.as_os_str().is_empty() => text("~"),
+            Ok(rest) => SettingValue::Text(format!("~/{}", rest.display())),
+            Err(_) => SettingValue::Text(s),
+        },
+        (_, v) => v,
+    }
+}
+
 /// The view of `files` for a daemon running `running`. A value is the
-/// file's as written (`~` not expanded), else the default; a key needs a
+/// file's as written (`~` not expanded), else the default as this machine
+/// resolves it (the notes folder, push and the writer depend on the vault); a key needs a
 /// restart when the file's value, loaded as the daemon would, differs from
 /// the running one.
 pub fn read(
@@ -454,12 +475,28 @@ pub fn read(
         Err(e) => (String::new(), Some(e)),
     };
     let doc = text.parse::<DocumentMut>().ok();
-    let (file_config, load_error) = Config::load(&files.config, home);
+    let (mut file_config, load_error) = Config::load(&files.config, home);
+    refuse_as_the_daemon_does(&mut file_config);
+    let full_name = crate::config::macos_full_name();
     let settings = CATALOGUE
         .iter()
         .map(|spec| {
-            let default = default_value(spec);
             let found = doc.as_ref().and_then(|d| lookup(d, spec.key));
+            let default = match (spec.get, &doc) {
+                // What the daemon resolves for this machine with the key
+                // left out, not the built-in value: the notes folder,
+                // push and the writer depend on what is on disk.
+                (Some(get), Some(doc)) if found.is_some() => {
+                    let mut without = doc.clone();
+                    remove(&mut without, file_key(doc, spec.key));
+                    let mut c =
+                        Config::load_text(Some(&without.to_string()), home, full_name.as_deref());
+                    refuse_as_the_daemon_does(&mut c);
+                    shown(spec, get(&c), home)
+                }
+                (Some(get), _) => shown(spec, get(&file_config), home),
+                (None, _) => default_value(spec),
+            };
             let restart_needed = spec.applies != Applies::App
                 && spec
                     .get
@@ -839,6 +876,65 @@ mod tests {
             .iter()
             .all(|s| !s.in_file && s.value == s.default));
         assert!(v.settings.iter().all(|s| !s.restart_needed));
+    }
+
+    #[test]
+    fn absent_keys_show_what_this_machine_resolves() {
+        // No config file and no vault: the daemon owns ~/OverseerNotes.
+        let home = tempfile::tempdir().unwrap();
+        let rig = Rig::new(None);
+        let running = Config::load(&rig.files.config, home.path()).0;
+        let v = read(&rig.files, &running, home.path(), info());
+        let notes = row(&v, "notes_dir");
+        assert!(!notes.in_file);
+        assert_eq!(notes.value, SettingValue::Text("~/OverseerNotes".into()));
+        assert_eq!(notes.default, notes.value);
+        assert_eq!(
+            row(&v, "current_session").value,
+            SettingValue::Text("~/OverseerNotes/CURRENT_SESSION.md".into())
+        );
+        assert_eq!(row(&v, "push").value, SettingValue::Bool(false));
+        assert_eq!(row(&v, "brain_writer").value, SettingValue::Bool(true));
+        assert!(v.settings.iter().all(|s| !s.restart_needed));
+
+        // With the vault, the same keys show today's setup.
+        std::fs::create_dir_all(home.path().join("Repos/2ndBrain")).unwrap();
+        let running = Config::load(&rig.files.config, home.path()).0;
+        let v = read(&rig.files, &running, home.path(), info());
+        assert_eq!(
+            row(&v, "notes_dir").value,
+            SettingValue::Text("~/Repos/2ndBrain".into())
+        );
+        assert_eq!(row(&v, "push").value, SettingValue::Bool(true));
+        assert_eq!(row(&v, "brain_writer").value, SettingValue::Bool(false));
+    }
+
+    #[test]
+    fn a_set_key_resets_to_what_this_machine_resolves() {
+        let home = tempfile::tempdir().unwrap();
+        let rig = Rig::new(Some("notes_dir = \"~/elsewhere\"\npush = true\n"));
+        let running = Config::load(&rig.files.config, home.path()).0;
+        let v = read(&rig.files, &running, home.path(), info());
+        let notes = row(&v, "notes_dir");
+        assert!(notes.in_file);
+        assert_eq!(notes.value, SettingValue::Text("~/elsewhere".into()));
+        assert_eq!(notes.default, SettingValue::Text("~/OverseerNotes".into()));
+        // ~/elsewhere has no marker, so push left out would resolve to true.
+        assert_eq!(row(&v, "push").default, SettingValue::Bool(true));
+    }
+
+    #[test]
+    fn a_refused_default_folder_shows_the_writer_off() {
+        let home = tempfile::tempdir().unwrap();
+        let notes = home.path().join("OverseerNotes");
+        std::fs::create_dir_all(&notes).unwrap();
+        std::fs::write(notes.join("a.md"), "x").unwrap();
+        let rig = Rig::new(None);
+        let mut running = Config::load(&rig.files.config, home.path()).0;
+        crate::notes::disown(&mut running);
+        let v = read(&rig.files, &running, home.path(), info());
+        assert_eq!(row(&v, "brain_writer").value, SettingValue::Bool(false));
+        assert!(!row(&v, "brain_writer").restart_needed);
     }
 
     #[test]
