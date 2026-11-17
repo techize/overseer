@@ -105,7 +105,14 @@ impl JiraApi {
             return Ok(id.clone());
         }
         let url = format!("{}/_edge/tenant_info", self.site_base);
-        let body = read(self.agent.0.get(&url).call())?;
+        let body = match self.agent.0.get(&url).call() {
+            // Atlassian answers 404 for a site name it does not host.
+            Err(ureq::Error::Status(404, _)) => {
+                let host = self.site_base.trim_start_matches("https://");
+                return Err(format!("Jira site not found: check jira_site ({host})"));
+            }
+            r => read(r)?,
+        };
         let v: Value = serde_json::from_str(&body).map_err(|e| format!("Jira tenant info: {e}"))?;
         let id = v
             .get("cloudId")
@@ -188,15 +195,21 @@ pub fn classify(status: u16, body: &str) -> String {
     if status == 401 || status == 403 {
         return format!("Jira token rejected ({status}): check the token and its scopes");
     }
-    let first: String = body
-        .lines()
-        .next()
-        .unwrap_or("")
-        .trim()
-        .chars()
-        .take(200)
-        .collect();
-    format!("Jira answered {status}: {first}")
+    match body_summary(body) {
+        Some(first) => format!("Jira answered {status}: {first}"),
+        None => format!("Jira answered {status}"),
+    }
+}
+
+/// The first non-empty line of an error body, cut to 200 characters, or
+/// `None` when there is none or the body is markup (an HTML error page
+/// says nothing a person can act on).
+pub(crate) fn body_summary(body: &str) -> Option<String> {
+    let first = body.lines().map(str::trim).find(|l| !l.is_empty())?;
+    if first.starts_with('<') {
+        return None;
+    }
+    Some(first.chars().take(200).collect())
 }
 
 /// The date part of an ISO time such as `2026-11-17T09:00:00.000Z`.
@@ -456,6 +469,34 @@ pub(crate) mod tests {
         let seen = rx.recv().unwrap();
         assert_eq!(seen.path, "/_edge/tenant_info");
         assert_eq!(seen.auth, None);
+    }
+
+    #[test]
+    fn unknown_site_says_to_check_jira_site() {
+        let (base, _rx) = fake(vec![(
+            404,
+            "<!DOCTYPE html>\n<html>Not found</html>".into(),
+        )]);
+        let a = JiraApi::new("demo.atlassian.net", "demo@example.test", "7", "")
+            .with_bases(base.clone(), base.clone());
+        let host = base.trim_start_matches("https://").to_owned();
+        assert_eq!(
+            a.cloud_id().unwrap_err(),
+            format!("Jira site not found: check jira_site ({host})")
+        );
+    }
+
+    #[test]
+    fn classify_drops_html_bodies() {
+        assert_eq!(
+            classify(404, "<!DOCTYPE html>\n<html><body>Oops</body></html>"),
+            "Jira answered 404"
+        );
+        assert_eq!(classify(500, ""), "Jira answered 500");
+        assert_eq!(
+            classify(500, "\n  \nreal reason"),
+            "Jira answered 500: real reason"
+        );
     }
 
     #[test]

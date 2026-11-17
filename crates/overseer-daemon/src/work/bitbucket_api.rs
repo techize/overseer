@@ -159,15 +159,10 @@ pub fn classify(status: u16, body: &str) -> String {
     if status == 401 || status == 403 {
         return format!("Bitbucket token rejected ({status}): check the token and its scopes");
     }
-    let first: String = body
-        .lines()
-        .next()
-        .unwrap_or("")
-        .trim()
-        .chars()
-        .take(200)
-        .collect();
-    format!("Bitbucket {status}: {first}")
+    match super::jira_api::body_summary(body) {
+        Some(first) => format!("Bitbucket {status}: {first}"),
+        None => format!("Bitbucket {status}"),
+    }
 }
 
 /// The workspace and repo slug of a Bitbucket Cloud remote URL:
