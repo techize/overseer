@@ -250,6 +250,57 @@ pub fn card_click(info: &SlotInfo) -> CardClick {
     }
 }
 
+/// What clicking a ticket card does: open its owner's session (Running or
+/// Resumable), start work in a slot, or report that no slot is free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TicketClick {
+    Open(SlotId),
+    Start(SlotId),
+    NoSlot,
+}
+
+/// The slot starting work on a ticket uses. With an owner: that owner when
+/// it is Empty or Exited and not S0, else None (a Running or Resumable owner
+/// is opened, never started over). With no owner: the lowest Empty or
+/// Exited slot in S1 to S6 that owns no work, so a click never piles a
+/// ticket onto another ticket's slot. S0 and Running slots are never picked.
+pub fn start_slot(owner: Option<SlotId>, slots: &[SlotInfo], work: &WorkView) -> Option<SlotId> {
+    let free = |i: &&SlotInfo| matches!(i.state, SlotState::Empty | SlotState::Exited { .. });
+    match owner {
+        Some(o) => slots
+            .get(o as usize)
+            .filter(|i| i.id != 0)
+            .filter(free)
+            .map(|i| i.id),
+        None => slots
+            .iter()
+            .filter(|i| (1..=6).contains(&i.id))
+            .filter(free)
+            .find(|i| crate::board::owned_by(work, i.id).is_empty())
+            .map(|i| i.id),
+    }
+}
+
+/// A Running or Resumable owner opens: its pop-over offers Resume, and a
+/// fresh start would throw that session away. An S0 owner opens too, since
+/// the coordinator is never started from a ticket.
+pub fn ticket_click(owner: Option<SlotId>, slots: &[SlotInfo], work: &WorkView) -> TicketClick {
+    let open = owner.and_then(|o| slots.get(o as usize)).filter(|i| {
+        i.id == 0
+            || matches!(
+                i.state,
+                SlotState::Running { .. } | SlotState::Resumable { .. }
+            )
+    });
+    if let Some(info) = open {
+        return TicketClick::Open(info.id);
+    }
+    match start_slot(owner, slots, work) {
+        Some(slot) => TicketClick::Start(slot),
+        None => TicketClick::NoSlot,
+    }
+}
+
 /// Whether assigning to this slot goes on to start it with the kickoff
 /// ("Assign and start"): it has no session running.
 pub fn assign_starts(info: &SlotInfo) -> bool {
@@ -359,7 +410,7 @@ fn app_settings(path: &std::path::Path) -> Result<(Theme, String), String> {
     Ok((theme, crate::terminal_view::editor_from_toml(&text)))
 }
 
-fn empty_slots() -> Vec<SlotInfo> {
+pub(crate) fn empty_slots() -> Vec<SlotInfo> {
     (0..7)
         .map(|id| SlotInfo {
             id,
@@ -1089,7 +1140,7 @@ impl OverseerApp {
 
     /// The start dialog, the picker, the plan view or Settings is up;
     /// navigation waits for it.
-    fn modal_open(&self) -> bool {
+    pub(crate) fn modal_open(&self) -> bool {
         self.dialog.is_some()
             || self.picker.is_some()
             || self.plan_view.is_some()
@@ -1306,6 +1357,99 @@ impl OverseerApp {
             });
         })
         .detach();
+    }
+
+    /// A click on a ticket card that is not Running anywhere: assign the
+    /// ticket to `start_slot` (unless that slot owns it already), then fetch
+    /// the kickoff and open the start dialog, as the picker does.
+    pub(crate) fn start_ticket(
+        &mut self,
+        key: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.modal_open() {
+            return;
+        }
+        let owner = self
+            .work
+            .items
+            .iter()
+            .find(|i| i.key == key)
+            .and_then(|i| i.owner);
+        let Some(slot) = start_slot(owner, &self.slots, &self.work) else {
+            self.status = Some(format!(
+                "No free slot for {key}: stop or clear a session first."
+            ));
+            cx.notify();
+            return;
+        };
+        self.status = None;
+        if owner == Some(slot) {
+            self.assign_and_start(slot, key, window, cx);
+            return;
+        }
+        let client = self.client.clone();
+        let req = Request::Assign {
+            key: key.clone(),
+            slot,
+            // A daemon warning (beads under the ticket owned by other slots)
+            // goes to the status line instead of being confirmed silently.
+            confirm: false,
+            move_owner: false,
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            let reply = client.request(req).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                match reply {
+                    // The slot may have started while the Assign was out.
+                    Ok(Response::Ok)
+                        if this.slots.get(slot as usize).is_some_and(assign_starts) =>
+                    {
+                        this.assign_and_start(slot, key, window, cx)
+                    }
+                    Ok(Response::Ok) => {
+                        this.status = Some(format!(
+                            "{key} assigned to {}, which started meanwhile.",
+                            overseer_proto::slot_name(slot)
+                        ))
+                    }
+                    Ok(Response::NeedsConfirm { message }) | Ok(Response::Error { message }) => {
+                        this.status = Some(message)
+                    }
+                    Ok(other) => {
+                        this.status = Some(format!("unexpected reply to assign: {other:?}"))
+                    }
+                    Err(e) => {
+                        this.status = Some(format!("{} ({e:#})", crate::terminal_view::LOST_DAEMON))
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// A click on a ticket card that is not Done.
+    pub(crate) fn click_ticket(
+        &mut self,
+        key: String,
+        owner: Option<SlotId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Before the first slot list every slot looks Empty.
+        if !self.slots_known {
+            return;
+        }
+        match ticket_click(owner, &self.slots, &self.work) {
+            TicketClick::Open(id) => {
+                if !self.modal_open() {
+                    self.open_card(id, window, cx);
+                }
+            }
+            TicketClick::Start(_) | TicketClick::NoSlot => self.start_ticket(key, window, cx),
+        }
     }
 
     /// Stop, wait for Exited, then start with the same label, cwd and
@@ -1904,6 +2048,89 @@ mod tests {
         ex.state = SlotState::Exited { code: None, at: 0 };
         assert_eq!(card_click(&ex), CardClick::Open(2));
     }
+
+    #[test]
+    fn ticket_clicks() {
+        let w = empty_work();
+        let exited = SlotState::Exited { code: None, at: 0 };
+        // A Running owner opens its pop-over.
+        let s = slots_with(&[4]);
+        assert_eq!(ticket_click(Some(4), &s, &w), TicketClick::Open(4));
+        assert_eq!(start_slot(Some(4), &s, &w), None, "never a Running owner");
+        // An Exited owner is the target, even when a lower slot is free.
+        let mut s = empty_slots();
+        s[4].state = exited.clone();
+        assert_eq!(ticket_click(Some(4), &s, &w), TicketClick::Start(4));
+        // A Resumable owner opens its pop-over, where Resume is offered.
+        s[4].state = SlotState::Resumable {
+            session_id: "demo-session".into(),
+            at: 0,
+        };
+        assert_eq!(ticket_click(Some(4), &s, &w), TicketClick::Open(4));
+        assert_eq!(start_slot(Some(4), &s, &w), None, "never a Resumable owner");
+        // An Empty owner still starts in place.
+        s[4].state = SlotState::Empty;
+        assert_eq!(ticket_click(Some(4), &s, &w), TicketClick::Start(4));
+        // No owner: the lowest free slot, skipping Running ones.
+        let s = slots_with(&[1]);
+        assert_eq!(ticket_click(None, &s, &w), TicketClick::Start(2));
+        // S0 is never picked.
+        let s = slots_with(&[1, 2, 3, 4, 5, 6]);
+        assert_eq!(s[0].state, SlotState::Empty);
+        assert_eq!(ticket_click(None, &s, &w), TicketClick::NoSlot);
+        assert_eq!(start_slot(None, &s, &w), None);
+        // An Exited slot counts as free.
+        let mut s = slots_with(&[1, 2]);
+        s[3].state = exited;
+        assert_eq!(ticket_click(None, &s, &w), TicketClick::Start(3));
+        assert_eq!(start_slot(None, &s, &w), Some(3));
+    }
+
+    #[test]
+    fn s0_owner_opens_the_coordinator() {
+        let w = empty_work();
+        let mut s = empty_slots();
+        assert_eq!(ticket_click(Some(0), &s, &w), TicketClick::Open(0));
+        s[0].state = SlotState::Exited { code: None, at: 0 };
+        assert_eq!(ticket_click(Some(0), &s, &w), TicketClick::Open(0));
+        assert_eq!(start_slot(Some(0), &s, &w), None);
+    }
+
+    #[test]
+    fn start_slot_skips_free_slots_that_own_work() {
+        use overseer_proto::{ItemKind, WorkItem};
+        let mut w = empty_work();
+        w.items = vec![WorkItem {
+            key: "DEMO-5".into(),
+            kind: ItemKind::Ticket,
+            title: String::new(),
+            status: "open".into(),
+            priority: None,
+            parent: None,
+            owner: Some(1),
+            in_list: true,
+            folder: None,
+            stage: None,
+            stage_since: None,
+        }];
+        // S1 Exited owning DEMO-5, S2 Empty: S2.
+        let mut s = empty_slots();
+        s[1].state = SlotState::Exited { code: None, at: 0 };
+        assert_eq!(start_slot(None, &s, &w), Some(2));
+        assert_eq!(ticket_click(None, &s, &w), TicketClick::Start(2));
+        // Only S1 free, and it owns DEMO-5: none.
+        let mut s = slots_with(&[2, 3, 4, 5, 6]);
+        s[1].state = SlotState::Exited { code: None, at: 0 };
+        assert_eq!(start_slot(None, &s, &w), None);
+        assert_eq!(ticket_click(None, &s, &w), TicketClick::NoSlot);
+        // An Empty S1 that was given DEMO-5 (a cancelled start) is skipped
+        // the same way.
+        s[1].state = SlotState::Empty;
+        assert_eq!(start_slot(None, &s, &w), None);
+        // DEMO-5's own click still restarts it in S1.
+        assert_eq!(ticket_click(Some(1), &s, &w), TicketClick::Start(1));
+    }
+
     /// Contexts that take the keyboard for themselves; window-wide
     /// navigation waits while one is open. A new modal is one line here.
     const MODALS: &[&[&str]] = &[DIALOG, PICKER, PLAN, SETTINGS];
