@@ -75,14 +75,13 @@ Overseer keeps journals, session notes and sprint files in a notes folder
   else `~/Overseer`.
 - A folder without the `.overseer-notes` marker, such as an existing vault, is
   only read: Overseer does not create sprint or ticket folders there.
-- To have Overseer create and fill its own folder, leave `notes_dir` unset (so
-  `~/Overseer` is used, when `~/Repos/2ndBrain` does not exist) or point it at a
-  folder that does not exist yet. At start Overseer creates the folder with the
-  `.overseer-notes` marker, a `Sprints/` folder and its own local git history
-  (one starting commit, and it does not push). It then keeps the notes writer
-  on there, which writes the journal and session notes, and, with `jira_board`
-  set, the sprint and ticket folders. A folder that already has files and no
-  marker is left alone.
+- The only way to get a folder Overseer owns and fills is to leave `notes_dir`
+  unset, which gives `~/Overseer` (when `~/Repos/2ndBrain` does not exist). Any
+  other `notes_dir` is only read. At start Overseer creates `~/Overseer` with
+  the `.overseer-notes` marker, a `Sprints/` folder and its own local git
+  history (one starting commit, and it does not push). It then keeps the notes
+  writer on there, which writes the journal and session notes, and, with
+  `jira_board` set, the sprint and ticket folders.
 - With `jira_board` set, Overseer keeps
   `Sprints/sprint-<slug>/<KEY>-<slug>/ticket.md` in the notes folder, one per
   ticket, in step with Jira. `ticket.md` is the only file it writes there, so
@@ -291,7 +290,7 @@ group for the notes keys). They apply after a daemon restart.
 | `jql` | open sprints, assigned to you | The ticket query. |
 | `ticket_pattern` | `""` | Empty: built from your Jira project keys, as `(DEMO|OPS)-\d+`. |
 | `user_name` | first word of your macOS full name | The name used in prompts and messages. |
-| `notes_dir` (alias `brain_dir`) | `~/Repos/2ndBrain` if it exists, else `~/Overseer` | The notes folder. Overseer only syncs into one holding a `.overseer-notes` marker. |
+| `notes_dir` (alias `brain_dir`) | `~/Repos/2ndBrain` if it exists, else `~/Overseer` | The notes folder. Only the default `~/Overseer` is created and owned; any other folder is only read. |
 
 The Jira token is not a config key. Set it in Settings (Keychain) or with
 `ATLASSIAN_API_TOKEN`.
