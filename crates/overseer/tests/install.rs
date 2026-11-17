@@ -60,6 +60,21 @@ struct Rig {
 
 impl Drop for Rig {
     fn drop(&mut self) {
+        // install.sh starts a daemon in the rig's home (the stub launchctl
+        // starts nothing). Stop it before its folder goes, or it outlives
+        // the test. Only when its socket exists: `ctl` would start one.
+        let socket = self.state().join("overseer.sock");
+        if socket.exists() {
+            let _ = Command::new(assert_cmd::cargo::cargo_bin("overseer"))
+                .env("OVERSEER_HOME", self.state())
+                .env("OVERSEER_LAUNCHCTL", self.launchctl())
+                .args(["ctl", "shutdown"])
+                .output();
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while socket.exists() && std::time::Instant::now() < until {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
         if !std::thread::panicking() {
             let bare = std::fs::read_to_string(self.path("bare-launchctl.log")).unwrap_or_default();
             assert!(bare.is_empty(), "a bare launchctl ran:\n{bare}");
