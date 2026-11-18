@@ -156,6 +156,28 @@ Overseer keeps journals, session notes and sprint files in a notes folder
   fetch error. When the folder has commits on both sides the strip turns orange
   and reads `Notes: 65 ahead, 4 behind its remote`. `overseer ctl brain` prints
   the same counts and the last push.
+- When the remote rejects a push, the writer fetches and merges the remote
+  into the folder, then pushes again. Sessions can ask for the same with the
+  `sync_2ndbrain` tool (or you with `overseer ctl notes-sync`). The merge:
+  - sets aside files git is told to skip (`git update-index --skip-worktree`,
+    for example Obsidian Git's `data.json`) and puts this machine's copy back
+    afterwards;
+  - stashes uncommitted edits and puts them back;
+  - settles a conflict in a file `notes_merge_ours` names (default
+    `06-Daily/`, `Sessions/` and `CURRENT_SESSION.md`) with this folder's
+    copy, and in one `notes_merge_theirs` names (default none) with the
+    remote's. An entry ending in `/` covers a folder; any other matches the
+    path or the file name;
+  - stops on any other conflict and changes nothing, and the strip says which
+    files conflict.
+- If the merge makes a file more than 30% and more than 20 lines shorter, it
+  stays committed in the folder but nothing is pushed, and the strip reads
+  `Notes push held: notes.md went from 40 to 3 lines in the merge`, naming the
+  commit from before the merge. Check the file. If it lost text, the
+  `restore_2ndbrain_file` tool (or `overseer ctl notes-restore <path> <rev>`)
+  puts back the copy from that commit and commits it. Then
+  `sync_2ndbrain` with `confirm` (or `overseer ctl notes-sync --confirm`)
+  pushes. The hold outlasts a daemon restart.
 
 ### What each optional tool adds
 
@@ -200,9 +222,17 @@ Overseer keeps journals, session notes and sprint files in a notes folder
   have commits the other lacks, so a push is rejected until they are merged.
   This usually means another writer (Obsidian Git, a sync script, another
   machine) pushed while this machine was not pushing (`push = false`) or its
-  pushes failed. Run `git -C <notes folder> merge-tree --write-tree --name-only
-  HEAD @{u}` to see whether the merge would conflict, then pull and push by
-  hand.
+  pushes failed. Run `overseer ctl notes-sync` to merge and push. To see
+  first whether the merge would conflict, run `git -C <notes folder>
+  merge-tree --write-tree --name-only HEAD @{u}`.
+- `Notes push needs you: merge would conflict in <files>; nothing was
+  changed`. Those files changed on both sides and no `notes_merge_ours` or
+  `notes_merge_theirs` entry covers them. Merge by hand in the notes folder
+  (`git merge @{u}`, fix the files, commit), or name the files in one of those
+  keys, then run `overseer ctl notes-sync`.
+- `Notes push held: ...`. See the notes folder section above: check the file
+  the message names, restore it if it lost text, then
+  `overseer ctl notes-sync --confirm`.
 - Token status in Settings. Each token row says `set` (in the Keychain),
   `set (environment)` (only the environment variable holds one), `not set`, or
   `unknown (Keychain did not answer)` when the Keychain is locked or waiting on

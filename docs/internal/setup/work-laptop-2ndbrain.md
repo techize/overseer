@@ -50,7 +50,7 @@ In Obsidian, Settings, Community plugins, Git:
 - Auto commit-and-sync interval: `0` (setting `autoSaveInterval: 0` in
   `.obsidian/plugins/obsidian-git/data.json`).
 - Auto push interval: `0` (`autoPushInterval: 0`).
-- Auto pull interval: `0`. The daemon pulls (`git pull --rebase --autostash`)
+- Auto pull interval: `0`. The daemon fetches and merges the remote
   whenever a push is rejected, under its own lock, so a second puller only
   races it.
 - Leave "commit on close" and any "pull on startup" off as well.
@@ -187,6 +187,8 @@ defaults:
   decides in step 0; a link into the vault is fine)
 - `backup_mins = 5` (0 turns the timed backup off)
 - `push = true`
+- `notes_merge_ours = ["06-Daily/", "Sessions/", "CURRENT_SESSION.md"]`,
+  `notes_merge_theirs = []` (which side a merge conflict in those files takes)
 - `sync_command`, `bd_command` (defaults `["05-Meta/Sync-System/sync-run.sh", "--auto"]`
   and `["bd"]`)
 
@@ -223,8 +225,8 @@ in S1, then `grep -E 'role template|brain_rules' ~/Library/Logs/Overseer/daemon.
    then grep the log).
 5. The board's bottom strip should read `Notes: nothing yet`, then
    `Notes: committed HH:MM` after the first commit. If it reads
-   `Notes: N ahead, M behind its remote`, merge the folder by hand before
-   going on. See the acceptance list
+   `Notes: N ahead, M behind its remote`, run `overseer ctl notes-sync`
+   before going on. See the acceptance list
    (`docs/internal/acceptance/phase-5.md`) for the checks to run on the home Mac before
    doing this on the work laptop.
 
@@ -238,23 +240,33 @@ the global hooks then need switching back by hand.
   `sed -i`, `perl -i`, `cp`, `mv`, `rm`, `touch` and `truncate` aimed at the
   vault. A script that a session writes and runs can still write anywhere.
   This is guard rails, not a sandbox.
-- Inside the vault the hook allows only `git status`, `log`, `diff`, `show`,
-  `blame`, `rev-parse`, `ls-files`, `describe`, `remote -v` and `branch` with
-  only listing flags (`-a`, `-r`, `-v`, `-vv`, `--list`, `--show-current`).
-  Other read-only commands (`git grep`, `git reflog`, `git stash list`, ...)
-  are denied there with `use the commit_2ndbrain tool; Overseer commits and
-  pushes 2ndBrain`. Run them in your own terminal, which the hook never sees.
+- Inside the vault the hook allows only git commands that read: `status`,
+  `log`, `diff`, `show`, `blame`, `rev-parse`, `rev-list`, `merge-base`,
+  `merge-tree`, `ls-files`, `ls-tree`, `cat-file`, `for-each-ref`,
+  `show-ref`, `describe`, `name-rev`, `shortlog`, `grep`, `reflog` (not
+  `expire` or `delete`), `remote -v`, `branch` with only listing flags (`-a`,
+  `-r`, `-v`, `-vv`, `--list`, `--show-current`) and `fetch` (not with a
+  refspec such as `main:main`, or `-u`). Anything else (`git stash list`
+  included) is denied there with `use the commit_2ndbrain tool; Overseer
+  commits and pushes the notes folder`. Run it in your own terminal, which
+  the hook never sees.
 - A `bd` write on a line with `$(...)`, backticks, `${`, a file redirect or an
   env prefix is denied; run it as a plain line. Long text goes in with
   `--body-file -` and a quoted heredoc (`<<'EOF'`). `ctl bd` reads stdin only
   when an argument is `-` or ends in `=-`.
-- A push the remote rejects runs `git pull --rebase --autostash`. While it
-  runs, your uncommitted edits in the vault (an open Obsidian note included)
-  are stashed and then put back. If they do not go back cleanly, the file is
-  left with conflict markers, the notice names the stash by its hash, and
-  Overseer holds its queued commits, leaves the conflicted files out of the
-  backup and holds the sync until you resolve them (`git status`) and drop
-  that stash. Your text is in the file and in the stash; nothing is lost.
+- A push the remote rejects fetches and runs `git merge --autostash @{u}`
+  (the README's notes folder section has the whole of it). While it runs,
+  your uncommitted edits in the vault (an open Obsidian note included) are
+  stashed and then put back, and skip-worktree files such as Obsidian Git's
+  `data.json` keep this machine's copy. A conflict outside
+  `notes_merge_ours` and `notes_merge_theirs` stops the merge with nothing
+  changed. A merge that cuts a file short is committed but not pushed until
+  `overseer ctl notes-sync --confirm`. If your edits do not go back cleanly,
+  the file is left with conflict markers, the notice names the stash by its
+  hash, and Overseer holds its queued commits, leaves the conflicted files out
+  of the backup and holds the sync until you resolve them (`git status`) and
+  drop that stash. Your text is in the file and in the stash; nothing is
+  lost.
 - A `bd` write is rewritten only when bd, run from the session's cwd, would
   use `beads_dir`: the cwd is under it, or no other `.beads` exists from the
   cwd up to your home folder, and `BEADS_DIR` or `--db` does not name another

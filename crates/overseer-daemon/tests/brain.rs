@@ -1048,6 +1048,89 @@ async fn push_conflict_keeps_the_commit_and_tells_jonathan() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_shrinking_merge_holds_pushes_until_sync_confirms() {
+    let v = Vault::new("held");
+    let long: String = (0..40).map(|i| format!("line {i}\n")).collect();
+    write(&v.vault.join("notes.md"), &long);
+    sh(&v.vault, &["add", "-A"]);
+    sh(&v.vault, &["commit", "-qm", "long notes"]);
+    sh(&v.vault, &["push", "-q"]);
+    sh(
+        &v.base,
+        &["clone", "-q", v.remote.to_str().unwrap(), "other"],
+    );
+    let other = v.base.join("other");
+    sh(&other, &["config", "user.name", "Other"]);
+    sh(&other, &["config", "user.email", "other@example.com"]);
+    write(&other.join("notes.md"), "line 0\nline 1\nline 2\n");
+    sh(&other, &["commit", "-qam", "cut short"]);
+    sh(&other, &["push", "-q"]);
+
+    let ledger = Arc::new(Ledger::in_memory());
+    let svc = v.service(ledger.clone(), v.options());
+    write(&v.vault.join(S1_NOTE), "# S1\n");
+    let r = svc
+        .commit(
+            Sender::Slot { slot: 1 },
+            vec![S1_NOTE.into()],
+            "S1: note".into(),
+            &owners(),
+        )
+        .await;
+    assert!(text(&r).contains("committed"), "{r:?}");
+    until("the push result", || svc.view().entries[0].pushed.is_some()).await;
+    let problem = svc.view().push_problem.expect("held");
+    assert!(
+        problem.starts_with("Notes push held: notes.md went from 40 to 3 lines in the merge."),
+        "{problem}"
+    );
+    assert_eq!(svc.view().entries[0].pushed, Some(false));
+    let rev = problem
+        .split("with rev ")
+        .nth(1)
+        .and_then(|r| r.split(' ').next())
+        .expect("names the commit before the merge")
+        .to_string();
+    assert_eq!(rev.len(), 12, "{problem}");
+    drop(svc);
+
+    // The hold outlives a restart, and a sync without confirm leaves it.
+    let svc = v.service(ledger.clone(), v.options());
+    assert_eq!(svc.view().push_problem.as_deref(), Some(problem.as_str()));
+    let r = svc.sync_notes(false).await;
+    assert!(error(&r).starts_with("Notes push held:"), "{r:?}");
+    let remote_log = sh(&v.remote, &["log", "--format=%s", "main"]);
+    assert!(!remote_log.contains("S1: note"), "{remote_log}");
+
+    let r = svc
+        .restore_file(Sender::Slot { slot: 1 }, "notes.md", &rev, &owners())
+        .await;
+    assert!(text(&r).contains("committed"), "{r:?}");
+    assert_eq!(
+        std::fs::read_to_string(v.vault.join("notes.md")).unwrap(),
+        long
+    );
+    let r = svc.sync_notes(true).await;
+    assert!(text(&r).ends_with("Pushed."), "{r:?}");
+    assert_eq!(svc.view().push_problem, None);
+    assert_eq!(sh(&v.remote, &["show", "main:notes.md"]), long);
+    drop(svc);
+
+    // Confirmed for good: after a restart pushes run again.
+    let svc = v.service(ledger, v.options());
+    assert_eq!(svc.view().push_problem, None);
+    write(&v.vault.join(S1_NOTE), "# S1 again\n");
+    svc.commit(
+        Sender::Slot { slot: 1 },
+        vec![S1_NOTE.into()],
+        "S1: again".into(),
+        &owners(),
+    )
+    .await;
+    until("the push", || svc.view().entries[0].pushed == Some(true)).await;
+}
+
 /// Every commit reachable from `rev` whose patch adds a conflict marker.
 fn commits_with_markers(dir: &Path, rev: &str) -> Vec<String> {
     let log = sh(dir, &["log", "-p", "--format=commit %s", rev]);

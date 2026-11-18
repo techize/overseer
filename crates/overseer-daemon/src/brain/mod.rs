@@ -27,7 +27,9 @@ use tokio::time::Instant;
 use crate::config::Config;
 use crate::env::BaseEnv;
 use crate::ledger::Ledger;
-use git::{GitError, VaultGit, VaultGuard};
+use git::{
+    list_shrinks, short, GitError, MergeOutcome, MergePolicy, SyncReport, VaultGit, VaultGuard,
+};
 use paths::{
     classify, fill_template, locate, shared_match, vault_rel, Owners, PathClass, PathContext,
 };
@@ -54,6 +56,10 @@ const REMOTE_CHECK: Duration = Duration::from_secs(10 * 60);
 const REPLY_WAIT: Duration = Duration::from_secs(600);
 const BD_TIMEOUT: Duration = Duration::from_secs(120);
 const SYNC_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// The `brain_runs` row that says a merge shrank a file and the push waits
+/// for `sync_2ndbrain` with `confirm`: `ok` is true while it waits.
+const PUSH_HELD: &str = "push_held";
 
 const GIT_DENY: &str = "use the commit_2ndbrain tool; Overseer commits and pushes the notes folder";
 const BD_COMPOUND_DENY: &str = "Overseer: run bd writes on their own, without $(...), backticks, redirects or env prefixes, so the daemon can run them under the notes folder lock";
@@ -218,6 +224,8 @@ struct Runtime {
     need_push: bool,
     next_remote_check: Option<Instant>,
     remote: Option<NotesRemote>,
+    /// A merge shrank a file: no push until `sync_2ndbrain` with `confirm`.
+    push_held: Option<String>,
 }
 
 pub struct BrainService {
@@ -263,7 +271,16 @@ impl BrainService {
         if !cfg.brain_writer {
             return None;
         }
-        let git = VaultGit::new(cfg.brain_dir.clone(), cfg.push).with_lock_wait(opts.lock_wait);
+        let git = VaultGit::new(cfg.brain_dir.clone(), cfg.push)
+            .with_lock_wait(opts.lock_wait)
+            .with_policy(MergePolicy {
+                ours: cfg.notes_merge_ours.clone(),
+                theirs: cfg.notes_merge_theirs.clone(),
+            });
+        let push_held = match ledger.brain_run(PUSH_HELD) {
+            Ok(Some((_, true, detail))) => Some(detail),
+            _ => None,
+        };
         let push_problem = match ledger.brain_run("push") {
             Ok(Some((_, false, detail))) => Some(detail),
             _ => None,
@@ -273,6 +290,7 @@ impl BrainService {
         let bd_sync_pending = matches!(ledger.brain_run(BD_PENDING), Ok(Some((_, true, _))));
         let rt = Runtime {
             push_problem,
+            push_held,
             next_backup: opts.backup.map(|d| Instant::now() + d),
             // The first check runs at the first tick.
             next_remote_check: opts.remote_check.map(|_| Instant::now()),
@@ -1465,6 +1483,21 @@ impl BrainService {
             }
             _ => {}
         }
+        let held = self.rt().push_held.clone();
+        if let Some(text) = held {
+            if let Some(id) = id {
+                let head = self.git.run(g, &["rev-parse", "HEAD"]).await.ok();
+                self.note_push(
+                    id,
+                    head.as_deref().map(str::trim),
+                    false,
+                    Some("held: a merge shrank a file; run sync_2ndbrain with confirm"),
+                );
+            }
+            self.rt().push_problem = Some(text);
+            self.announce();
+            return;
+        }
         let result = self.git.push(g).await;
         let head = self
             .git
@@ -1478,48 +1511,184 @@ impl BrainService {
                 if let Some(id) = id {
                     self.note_push(id, head.as_deref(), true, None);
                 }
-                for e in self.ledger.queue_unpushed().unwrap_or_default() {
-                    self.note_push(e.id, e.commit.as_deref(), true, None);
-                }
-                {
-                    let mut rt = self.rt();
-                    rt.conflict_problem = false;
-                    rt.push_problem = None;
-                }
-                // The remote answered, so any fetch error has passed. The
-                // counts go first, so whoever sees the push sees them too.
-                if self.git.has_upstream(g).await {
-                    self.count_remote(g, None).await;
-                }
-                // Every good push is recorded: the board shows when the
-                // folder last reached its remote.
-                let _ = self.ledger.set_brain_run("push", now, true, "");
+                self.pushed(g, now).await;
             }
             Err(err) => {
                 let line = match &err {
                     GitError::Conflict(m) | GitError::Failed(m) => m.clone(),
-                    GitError::IndexLocked => err.to_string(),
+                    GitError::IndexLocked | GitError::Held { .. } => err.to_string(),
                 };
-                let text = match &err {
-                    GitError::Conflict(m) if m.contains("stash") => format!(
-                        "Notes push needs you: {m}. Resolve the conflicted files in the notes folder (git status), then drop that stash (git stash list --format='%gd %H' shows its stash@{{n}}); Overseer holds its commits, backup and sync until then."
-                    ),
-                    GitError::Conflict(m) => format!("Notes push needs you: {m}"),
-                    _ => format!(
-                        "Notes push failed: {line}; it is tried again after the next commit or backup"
-                    ),
-                };
-                tracing::warn!("{text}");
                 if let Some(id) = id {
                     self.note_push(id, head.as_deref(), false, Some(&line));
                 }
-                let _ = self.ledger.set_brain_run("push", now, false, &text);
-                let mut rt = self.rt();
-                rt.push_problem = Some(text);
-                rt.conflict_problem = false;
+                self.push_failed(&err, now);
             }
         }
         self.announce();
+    }
+
+    /// After a good push: every waiting entry is pushed and the problem
+    /// line goes.
+    async fn pushed(&self, g: &VaultGuard<'_>, now: i64) {
+        for e in self.ledger.queue_unpushed().unwrap_or_default() {
+            self.note_push(e.id, e.commit.as_deref(), true, None);
+        }
+        {
+            let mut rt = self.rt();
+            rt.conflict_problem = false;
+            rt.push_problem = None;
+        }
+        // The remote answered, so any fetch error has passed. The
+        // counts go first, so whoever sees the push sees them too.
+        if self.git.has_upstream(g).await {
+            self.count_remote(g, None).await;
+        }
+        // Every good push is recorded: the board shows when the
+        // folder last reached its remote.
+        let _ = self.ledger.set_brain_run("push", now, true, "");
+    }
+
+    /// Records a push or sync that failed or was held, for the board.
+    fn push_failed(&self, err: &GitError, now: i64) -> String {
+        let text = match err {
+            GitError::Conflict(m) if m.contains("stash") => format!(
+                "Notes push needs you: {m}. Resolve the conflicted files in the notes folder (git status), then drop that stash (git stash list --format='%gd %H' shows its stash@{{n}}); Overseer holds its commits, backup and sync until then."
+            ),
+            GitError::Conflict(m) => format!(
+                "Notes push needs you: {m}. Merge it by hand in the notes folder (git merge @{{u}}), or name the file in notes_merge_ours or notes_merge_theirs; the push is tried again after the next commit or backup."
+            ),
+            GitError::Held { .. } => self.hold_push(err),
+            GitError::Failed(m) => format!(
+                "Notes push failed: {m}; it is tried again after the next commit or backup"
+            ),
+            GitError::IndexLocked => format!(
+                "Notes push failed: {err}; it is tried again after the next commit or backup"
+            ),
+        };
+        tracing::warn!("{text}");
+        let _ = self.ledger.set_brain_run("push", now, false, &text);
+        let mut rt = self.rt();
+        rt.push_problem = Some(text.clone());
+        rt.conflict_problem = false;
+        text
+    }
+
+    /// Holds every push until `sync_2ndbrain` runs with `confirm`; returns
+    /// the board's text for it.
+    fn hold_push(&self, err: &GitError) -> String {
+        let GitError::Held { before, shrunk } = err else {
+            return err.to_string();
+        };
+        let text = format!(
+            "Notes push held: {} in the merge. Check it; restore_2ndbrain_file with rev {} brings back the copy from before the merge. Then run sync_2ndbrain with confirm to push.",
+            list_shrinks(shrunk),
+            short(before)
+        );
+        let _ = self
+            .ledger
+            .set_brain_run(PUSH_HELD, unix_now(), true, &text);
+        self.rt().push_held = Some(text.clone());
+        text
+    }
+
+    /// `sync_2ndbrain`: fetch, merge the upstream and push. While a push is
+    /// held for a shrunk file, only `confirm` pushes.
+    pub async fn sync_notes(&self, confirm: bool) -> Response {
+        let held = self.rt().push_held.clone();
+        if let (Some(text), false) = (&held, confirm) {
+            return Response::Error {
+                message: format!("{text} (nothing was fetched or pushed)"),
+            };
+        }
+        let g = self.git.lock().await;
+        let r = self.git.sync(&g, confirm).await;
+        let now = unix_now();
+        let resp = match r {
+            Ok(report) if !report.held.is_empty() => {
+                let before = report
+                    .merges
+                    .first()
+                    .map(|m| m.before.clone())
+                    .unwrap_or_default();
+                let err = GitError::Held {
+                    before,
+                    shrunk: report.held.clone(),
+                };
+                let text = self.push_failed(&err, now);
+                Response::Text {
+                    text: format!("{}\n{text}", sync_text(&report)),
+                }
+            }
+            Ok(report) => {
+                if held.is_some() {
+                    self.rt().push_held = None;
+                    let _ = self
+                        .ledger
+                        .set_brain_run(PUSH_HELD, now, false, "confirmed");
+                }
+                if report.pushed {
+                    self.pushed(&g, now).await;
+                } else {
+                    if report.ahead == 0 {
+                        // Nothing here waits to go, so an old push problem
+                        // no longer applies.
+                        let mut rt = self.rt();
+                        rt.push_problem = None;
+                        rt.conflict_problem = false;
+                    }
+                    self.count_remote(&g, None).await;
+                }
+                Response::Text {
+                    text: sync_text(&report),
+                }
+            }
+            Err(err) => {
+                let text = self.push_failed(&err, now);
+                if self.git.has_upstream(&g).await {
+                    self.count_remote(&g, None).await;
+                }
+                Response::Error { message: text }
+            }
+        };
+        drop(g);
+        self.announce();
+        resp
+    }
+
+    /// `restore_2ndbrain_file`: writes `path` as it was at `rev` and commits
+    /// it. A slot may restore a shared file (the usual one a merge cuts
+    /// short), not one another slot owns or `CURRENT_SESSION.md`.
+    pub async fn restore_file(
+        &self,
+        from: Sender,
+        path: &str,
+        rev: &str,
+        owners: &Owners,
+    ) -> Response {
+        let err = |message: String| Response::Error { message };
+        let rel = match vault_rel(&self.cfg.brain, None, Path::new(path), &self.opts.home) {
+            Ok(r) => r,
+            Err(e) => return err(e),
+        };
+        if let Sender::Slot { slot } = from {
+            let pctx = self.path_ctx(owners, None);
+            let shared = matches!(classify(Path::new(&rel), &pctx), PathClass::Shared);
+            if !shared {
+                if let Some(d) = self.deny_for(Path::new(&rel), slot, owners, None) {
+                    return err(d);
+                }
+            }
+        }
+        let sha = {
+            let _f = self.files.lock(&canon(&self.cfg.brain.join(&rel))).await;
+            let g = self.git.lock().await;
+            match self.git.restore_file(&g, &rel, rev.trim()).await {
+                Ok(sha) => sha,
+                Err(e) => return err(e.to_string()),
+            }
+        };
+        let message = format!("restore {rel} from {}", short(&sha));
+        self.enqueue(from, vec![rel], message).await
     }
 
     /// Runs the queued `bd sync`, then `sync_command` unless a running
@@ -1624,6 +1793,47 @@ impl BrainService {
         rt.sync_pending = false;
         rt.sync_held = false;
     }
+}
+
+/// What a sync did, a line per step.
+fn sync_text(r: &SyncReport) -> String {
+    let mut out = vec![format!(
+        "The notes folder was {} ahead and {} behind its remote.",
+        r.ahead, r.behind
+    )];
+    for m in &r.merges {
+        out.push(merge_text(m));
+    }
+    if r.pushed {
+        out.push("Pushed.".into());
+    } else if r.held.is_empty() && r.ahead == 0 && r.behind == 0 {
+        out.push("Nothing to do.".into());
+    } else if r.held.is_empty() && r.merges.is_empty() {
+        out.push("Nothing was pushed (push is off).".into());
+    }
+    out.join("\n")
+}
+
+fn merge_text(m: &MergeOutcome) -> String {
+    let mut line = format!(
+        "Merged the remote's changes to {} file{}",
+        m.merged.len(),
+        if m.merged.len() == 1 { "" } else { "s" }
+    );
+    if !m.ours.is_empty() {
+        line.push_str(&format!(
+            "; kept this folder's copy of {}",
+            list_paths(&m.ours)
+        ));
+    }
+    if !m.theirs.is_empty() {
+        line.push_str(&format!(
+            "; took the remote's copy of {}",
+            list_paths(&m.theirs)
+        ));
+    }
+    line.push_str(&format!(" (before the merge: {}).", short(&m.before)));
+    line
 }
 
 /// The timed backup's own entries are the only ones Overseer sends.

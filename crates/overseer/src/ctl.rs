@@ -113,6 +113,14 @@ pub enum CtlCmd {
         #[arg(allow_hyphen_values = true)]
         text: String,
     },
+    /// Fetch the notes folder, merge its remote and push. `--confirm`
+    /// pushes a merge held for making a file much shorter.
+    NotesSync {
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Put a notes file back as it was at commit <rev> and commit it.
+    NotesRestore { path: String, rev: String },
     /// Run a bd write under the notes folder lock: `ctl bd -- update ov-3 ...`.
     /// Prints bd's output and exits with its code. Stdin, when it is not a
     /// terminal, is passed to bd.
@@ -1071,6 +1079,23 @@ pub async fn run(cmd: CtlCmd) -> anyhow::Result<()> {
                     .await?,
             )
         }
+        CtlCmd::NotesSync { confirm } => print_brain_text(
+            client
+                .request(Request::SyncNotes {
+                    from: env_slot(),
+                    confirm,
+                })
+                .await?,
+        ),
+        CtlCmd::NotesRestore { path, rev } => print_brain_text(
+            client
+                .request(Request::RestoreNotesFile {
+                    from: env_slot(),
+                    path,
+                    rev,
+                })
+                .await?,
+        ),
         CtlCmd::Bd { args } => {
             let stdin = piped_stdin(&args);
             match client

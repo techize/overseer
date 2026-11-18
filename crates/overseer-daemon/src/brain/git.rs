@@ -1,5 +1,5 @@
-//! The vault's git runner: one async mutex, pathspec commits, push with
-//! rebase on rejection, and `index.lock` handling (Rulings 5, 6 and 7).
+//! The vault's git runner: one async mutex, pathspec commits, push with a
+//! guarded merge on rejection, and `index.lock` handling (Rulings 5, 6 and 7).
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -23,8 +23,15 @@ const LOCK_POLL: Duration = Duration::from_millis(100);
 pub enum GitError {
     /// `.git/index.lock` is held and is not yet stale.
     IndexLocked,
-    /// A rebase stopped on a conflict (aborted; local commit kept). Holds the first error line.
+    /// A merge would conflict (aborted; nothing changed) or its autostash
+    /// did not re-apply. Holds what to tell the user.
     Conflict(String),
+    /// A merge made these files much shorter; it is committed here but not
+    /// pushed until someone checks it. `before` is HEAD before the merge.
+    Held {
+        before: String,
+        shrunk: Vec<Shrink>,
+    },
     Failed(String),
 }
 
@@ -32,10 +39,114 @@ impl fmt::Display for GitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             GitError::IndexLocked => write!(f, "index.lock held, will retry"),
-            GitError::Conflict(m) => write!(f, "rebase conflict: {m}"),
+            GitError::Conflict(m) => write!(f, "merge conflict: {m}"),
+            GitError::Held { before, shrunk } => write!(
+                f,
+                "push held: {} in the merge; the copy from before it is in {}",
+                list_shrinks(shrunk),
+                short(before)
+            ),
             GitError::Failed(m) => write!(f, "{m}"),
         }
     }
+}
+
+/// A file a merge made much shorter: more than 20 lines and more than 30%
+/// gone. A deleted file counts as 0 lines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Shrink {
+    pub path: String,
+    pub before: u32,
+    pub after: u32,
+}
+
+impl fmt::Display for Shrink {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} went from {} to {} lines",
+            self.path, self.before, self.after
+        )
+    }
+}
+
+/// A commit hash cut to the 12 characters people read.
+pub fn short(sha: &str) -> &str {
+    sha.get(..12).unwrap_or(sha)
+}
+
+pub fn list_shrinks(s: &[Shrink]) -> String {
+    s.iter()
+        .map(Shrink::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn shrank(before: u32, after: u32) -> bool {
+    before.saturating_sub(after) > 20 && u64::from(after) * 10 < u64::from(before) * 7
+}
+
+/// Which side a conflicted path takes in a merge. An entry ending in `/`
+/// matches every path under it; any other entry matches the whole path or
+/// the file name.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MergePolicy {
+    pub ours: Vec<String>,
+    pub theirs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Ours,
+    Theirs,
+}
+
+fn policy_matches(entry: &str, path: &str) -> bool {
+    if entry.is_empty() {
+        return false;
+    }
+    if entry.ends_with('/') {
+        return path.starts_with(entry);
+    }
+    path == entry || path.rsplit('/').next() == Some(entry)
+}
+
+impl MergePolicy {
+    fn side(&self, path: &str) -> Option<Side> {
+        if self.ours.iter().any(|e| policy_matches(e, path)) {
+            Some(Side::Ours)
+        } else if self.theirs.iter().any(|e| policy_matches(e, path)) {
+            Some(Side::Theirs)
+        } else {
+            None
+        }
+    }
+}
+
+/// What a merge of the upstream did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MergeOutcome {
+    /// HEAD before the merge: where the old copies are.
+    pub before: String,
+    /// Every file that differs from before the merge.
+    pub merged: Vec<String>,
+    /// Conflicted files that took this folder's copy, then the remote's.
+    pub ours: Vec<String>,
+    pub theirs: Vec<String>,
+    pub shrunk: Vec<Shrink>,
+}
+
+/// What `sync` found and did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SyncReport {
+    /// Commits ahead of and behind the upstream after the fetch.
+    pub ahead: u32,
+    pub behind: u32,
+    /// The merges made, the sync's own first and any a rejected push needed.
+    pub merges: Vec<MergeOutcome>,
+    pub pushed: bool,
+    /// Files the merge shrank; the push waits for `confirm`.
+    pub held: Vec<Shrink>,
 }
 
 impl std::error::Error for GitError {}
@@ -53,6 +164,7 @@ pub struct VaultGit {
     timeout: Option<Duration>,
     git_bin: PathBuf,
     removed_stale_lock: AtomicBool,
+    policy: MergePolicy,
 }
 
 struct Out {
@@ -79,7 +191,14 @@ impl VaultGit {
             timeout: None,
             git_bin: PathBuf::from("git"),
             removed_stale_lock: AtomicBool::new(false),
+            policy: MergePolicy::default(),
         }
+    }
+
+    /// Which conflicted files a merge may settle by taking one side.
+    pub fn with_policy(mut self, policy: MergePolicy) -> Self {
+        self.policy = policy;
+        self
     }
 
     /// Shorten the `index.lock` wait (tests).
@@ -289,57 +408,265 @@ impl VaultGit {
         git.join("rebase-merge").exists() || git.join("rebase-apply").exists()
     }
 
-    /// `git push`; when rejected, `git pull --rebase --autostash` and push once
-    /// more. A rebase conflict is aborted and reported as `Conflict`; the local
-    /// commit is kept. A no-op when `push` is off.
+    fn merge_in_progress(&self) -> bool {
+        self.root.join(".git").join("MERGE_HEAD").exists()
+    }
+
+    /// `git push`; when rejected, fetch, merge the upstream (`merge_upstream`)
+    /// and push again, twice at most. A merge that would conflict is aborted
+    /// and reported as `Conflict`; one that shrank a file is `Held`. A no-op
+    /// when `push` is off.
     pub async fn push(&self, _g: &VaultGuard<'_>) -> Result<(), GitError> {
         if !self.push {
             return Ok(());
         }
-        let first = self.exec(&["push"]).await?;
-        if first.ok {
+        self.push_merging().await.map(|_| ())
+    }
+
+    async fn push_merging(&self) -> Result<Vec<MergeOutcome>, GitError> {
+        let mut merges = Vec::new();
+        for attempt in 0..3 {
+            let o = self.exec(&["push"]).await?;
+            if o.ok {
+                return Ok(merges);
+            }
+            let rejected = o.stderr.contains("rejected")
+                || o.stderr.contains("non-fast-forward")
+                || o.stderr.contains("fetch first");
+            if !rejected || attempt == 2 {
+                return Err(GitError::Failed(first_line(&o.stderr)));
+            }
+            self.run_inner(&["fetch", "--quiet"]).await?;
+            let m = self.merge_upstream().await?;
+            if !m.shrunk.is_empty() {
+                return Err(GitError::Held {
+                    before: m.before,
+                    shrunk: m.shrunk,
+                });
+            }
+            merges.push(m);
+        }
+        unreachable!("the last attempt returns")
+    }
+
+    /// Fetch, merge the upstream when behind and push when ahead. Refuses
+    /// while a merge or rebase is under way or files are unmerged. A merge
+    /// that shrank a file is kept here and not pushed unless `confirm`.
+    pub async fn sync(&self, _g: &VaultGuard<'_>, confirm: bool) -> Result<SyncReport, GitError> {
+        if self.merge_in_progress() || self.rebase_in_progress() {
+            return Err(GitError::Failed(
+                "a merge or rebase is under way in the notes folder; finish or abort it first"
+                    .into(),
+            ));
+        }
+        let unmerged = self.unmerged_inner().await?;
+        if !unmerged.is_empty() {
+            return Err(GitError::Failed(format!(
+                "unresolved conflicts in {}; resolve them first (git status)",
+                unmerged.join(", ")
+            )));
+        }
+        if self
+            .run_inner(&["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+            .await
+            .is_err()
+        {
+            return Err(GitError::Failed(
+                "the notes folder's branch has no upstream to sync with".into(),
+            ));
+        }
+        self.run_inner(&["fetch", "--quiet"]).await?;
+        let counts = self
+            .run_inner(&["rev-list", "--left-right", "--count", "HEAD...@{u}"])
+            .await?;
+        let (ahead, behind) = parse_counts(&counts).ok_or_else(|| {
+            GitError::Failed(format!("unexpected rev-list output: {}", counts.trim()))
+        })?;
+        let mut report = SyncReport {
+            ahead,
+            behind,
+            ..SyncReport::default()
+        };
+        if behind > 0 {
+            let m = self.merge_upstream().await?;
+            let shrunk = m.shrunk.clone();
+            report.merges.push(m);
+            if !shrunk.is_empty() && !confirm {
+                report.held = shrunk;
+                return Ok(report);
+            }
+        }
+        if !self.push {
+            return Ok(report);
+        }
+        let now = self
+            .run_inner(&["rev-list", "--count", "@{u}..HEAD"])
+            .await?;
+        if now.trim() != "0" {
+            report.merges.extend(self.push_merging().await?);
+            report.pushed = true;
+        }
+        Ok(report)
+    }
+
+    /// Merges `@{u}` (already fetched) into HEAD. Skip-worktree files are
+    /// set aside first and put back after, whatever happened. A conflict in
+    /// a file the policy names takes that side; any other conflict aborts
+    /// the merge, leaving HEAD and the files as they were.
+    async fn merge_upstream(&self) -> Result<MergeOutcome, GitError> {
+        let pre = self.run_inner(&["rev-parse", "HEAD"]).await?;
+        let pre = pre.trim().to_string();
+        let skipped = self.unskip().await?;
+        let merged = self.merge_inner().await;
+        let back = self.reskip(&skipped).await;
+        let (ours, theirs) = merged?;
+        back?;
+        let names = self
+            .run_inner(&["diff", "--name-only", "-z", "--no-renames", &pre, "HEAD"])
+            .await?;
+        let shrunk = self.shrunk_since(&pre).await?;
+        Ok(MergeOutcome {
+            before: pre,
+            merged: names
+                .split('\0')
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
+            ours,
+            theirs,
+            shrunk,
+        })
+    }
+
+    /// Skip-worktree paths with their contents (`None` when the file is
+    /// absent), after clearing the flag and checking each out: a merge
+    /// refuses to touch them otherwise.
+    async fn unskip(&self) -> Result<Vec<(String, Option<Vec<u8>>)>, GitError> {
+        let out = self.run_inner(&["ls-files", "-v", "-z"]).await?;
+        let paths: Vec<String> = out
+            .split('\0')
+            .filter_map(|e| e.strip_prefix("S "))
+            .map(str::to_string)
+            .collect();
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let saved: Vec<(String, Option<Vec<u8>>)> = paths
+            .iter()
+            .map(|p| (p.clone(), std::fs::read(self.root.join(p)).ok()))
+            .collect();
+        let mut args = vec!["update-index", "--no-skip-worktree", "--"];
+        args.extend(paths.iter().map(String::as_str));
+        if let Err(e) = self.run_inner(&args).await {
+            // Leave nothing half done: set the flag on every path again.
+            let _ = self.reskip(&saved).await;
+            return Err(e);
+        }
+        let mut args = vec!["checkout", "--"];
+        args.extend(paths.iter().map(String::as_str));
+        if let Err(e) = self.run_inner(&args).await {
+            let _ = self.reskip(&saved).await;
+            return Err(e);
+        }
+        Ok(saved)
+    }
+
+    /// Puts back what `unskip` set aside and sets the flag on each path
+    /// still tracked.
+    async fn reskip(&self, saved: &[(String, Option<Vec<u8>>)]) -> Result<(), GitError> {
+        if saved.is_empty() {
             return Ok(());
         }
-        let rejected = first.stderr.contains("rejected")
-            || first.stderr.contains("non-fast-forward")
-            || first.stderr.contains("fetch first");
-        if !rejected {
-            return Err(GitError::Failed(first_line(&first.stderr)));
-        }
-        let pull = self.exec(&["pull", "--rebase", "--autostash"]).await?;
-        if !pull.ok {
-            let msg = if pull.stderr.trim().is_empty() {
-                first_line(&pull.stdout)
-            } else {
-                first_line(&pull.stderr)
+        let mut failed = None;
+        for (p, body) in saved {
+            let file = self.root.join(p);
+            let r = match body {
+                Some(b) => file
+                    .parent()
+                    .map_or(Ok(()), std::fs::create_dir_all)
+                    .and_then(|()| std::fs::write(&file, b)),
+                None => match std::fs::remove_file(&file) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+                    _ => Ok(()),
+                },
             };
-            if self.rebase_in_progress() {
-                let abort = self.exec(&["rebase", "--abort"]).await;
-                let aborted = matches!(&abort, Ok(o) if o.ok) && !self.rebase_in_progress();
-                if !aborted {
-                    let why = match abort {
-                        Ok(o) => first_line(&o.stderr),
-                        Err(e) => e.to_string(),
-                    };
-                    return Err(GitError::Failed(format!("rebase --abort failed: {why}")));
-                }
-                // Prefer the conflict line git printed on stdout when stderr is generic.
-                let line = pull
-                    .stdout
-                    .lines()
-                    .chain(pull.stderr.lines())
-                    .map(str::trim)
-                    .find(|l| l.starts_with("CONFLICT") || l.starts_with("error:"))
-                    .map(str::to_string)
-                    .unwrap_or(msg);
-                return Err(GitError::Conflict(line));
+            if let Err(e) = r {
+                failed.get_or_insert(format!("cannot put back {p}: {e}"));
             }
-            return Err(GitError::Failed(msg));
+        }
+        let mut args = vec!["ls-files", "-z", "--"];
+        args.extend(saved.iter().map(|(p, _)| p.as_str()));
+        let tracked = self.run_inner(&args).await?;
+        let tracked: Vec<&str> = tracked.split('\0').filter(|s| !s.is_empty()).collect();
+        if !tracked.is_empty() {
+            let mut args = vec!["update-index", "--skip-worktree", "--"];
+            args.extend(tracked);
+            self.run_inner(&args).await?;
+        }
+        match failed {
+            Some(m) => Err(GitError::Failed(m)),
+            None => Ok(()),
+        }
+    }
+
+    /// `merge --no-edit --autostash @{u}`, settling conflicts by policy.
+    /// Returns the paths that took ours, then theirs.
+    async fn merge_inner(&self) -> Result<(Vec<String>, Vec<String>), GitError> {
+        let m = self
+            .exec(&["merge", "--no-edit", "--autostash", "@{u}"])
+            .await?;
+        let mut said = format!("{}{}", m.stdout, m.stderr);
+        let mut ours = Vec::new();
+        let mut theirs = Vec::new();
+        if !m.ok {
+            if !self.merge_in_progress() {
+                let msg = if m.stderr.trim().is_empty() {
+                    first_line(&m.stdout)
+                } else {
+                    first_line(&m.stderr)
+                };
+                return Err(GitError::Failed(msg));
+            }
+            let unmerged = self.unmerged_inner().await?;
+            let mut unlisted = Vec::new();
+            for p in unmerged {
+                match self.policy.side(&p) {
+                    Some(Side::Ours) => ours.push(p),
+                    Some(Side::Theirs) => theirs.push(p),
+                    None => unlisted.push(p),
+                }
+            }
+            if !unlisted.is_empty() || (ours.is_empty() && theirs.is_empty()) {
+                self.abort_merge().await?;
+                let what = if unlisted.is_empty() {
+                    first_line(&m.stderr)
+                } else {
+                    unlisted.join(", ")
+                };
+                return Err(GitError::Conflict(format!(
+                    "merge would conflict in {what}; nothing was changed"
+                )));
+            }
+            for (side, paths) in [("--ours", &ours), ("--theirs", &theirs)] {
+                for p in paths.iter() {
+                    if let Err(e) = self.take_side(side, p).await {
+                        self.abort_merge().await?;
+                        return Err(e);
+                    }
+                }
+            }
+            let c = self.exec(&["commit", "--no-edit"]).await?;
+            said.push_str(&c.stdout);
+            said.push_str(&c.stderr);
+            if !c.ok {
+                let why = first_line(&c.stderr);
+                self.abort_merge().await?;
+                return Err(GitError::Failed(format!("the merge commit failed: {why}")));
+            }
         }
         // The autostash can fail to re-apply while git still exits 0. The
         // stash stack is shared, so the stash is named by its hash.
         let unmerged = self.unmerged_inner().await?;
-        let said = format!("{}{}", pull.stdout, pull.stderr);
         if !unmerged.is_empty() || said.contains("Applying autostash resulted in conflicts") {
             let stash = match self.autostash_sha(&said).await {
                 Some(sha) => format!("stash {sha}"),
@@ -349,15 +676,98 @@ impl VaultGit {
                 "autostash did not re-apply; your changes are safe in {stash}"
             )));
         }
-        let second = self.exec(&["push"]).await?;
-        if second.ok {
-            Ok(())
+        Ok((ours, theirs))
+    }
+
+    /// Resolves one conflicted path to `side`; when that side deleted it,
+    /// removes it.
+    async fn take_side(&self, side: &str, p: &str) -> Result<(), GitError> {
+        if self.run_inner(&["checkout", side, "--", p]).await.is_ok() {
+            self.run_inner(&["add", "--", p]).await.map(|_| ())
         } else {
-            Err(GitError::Failed(first_line(&second.stderr)))
+            self.run_inner(&["rm", "-q", "--", p]).await.map(|_| ())
         }
     }
 
-    /// The full hash of the stash `pull --autostash` left behind: from its
+    async fn abort_merge(&self) -> Result<(), GitError> {
+        let abort = self.exec(&["merge", "--abort"]).await;
+        if matches!(&abort, Ok(o) if o.ok) && !self.merge_in_progress() {
+            return Ok(());
+        }
+        let why = match abort {
+            Ok(o) => first_line(&o.stderr),
+            Err(e) => e.to_string(),
+        };
+        Err(GitError::Failed(format!("merge --abort failed: {why}")))
+    }
+
+    /// Files HEAD has much shorter than `pre` had them.
+    async fn shrunk_since(&self, pre: &str) -> Result<Vec<Shrink>, GitError> {
+        let out = self
+            .run_inner(&["diff", "--numstat", "-z", "--no-renames", pre, "HEAD"])
+            .await?;
+        let mut found = Vec::new();
+        for entry in out.split('\0').filter(|s| !s.is_empty()) {
+            // `<added>\t<deleted>\t<path>`; binary files show `-`.
+            let mut it = entry.splitn(3, '\t');
+            let (Some(Ok(added)), Some(Ok(deleted)), Some(path)) = (
+                it.next().map(str::parse::<u32>),
+                it.next().map(str::parse::<u32>),
+                it.next(),
+            ) else {
+                continue;
+            };
+            if deleted <= added.saturating_add(20) {
+                continue;
+            }
+            let before = self.line_count(pre, path).await;
+            let after = self.line_count("HEAD", path).await;
+            if shrank(before, after) {
+                found.push(Shrink {
+                    path: path.to_string(),
+                    before,
+                    after,
+                });
+            }
+        }
+        Ok(found)
+    }
+
+    async fn line_count(&self, rev: &str, path: &str) -> u32 {
+        let spec = format!("{rev}:{path}");
+        match self.run_inner(&["show", &spec]).await {
+            Ok(body) => u32::try_from(body.lines().count()).unwrap_or(u32::MAX),
+            Err(_) => 0,
+        }
+    }
+
+    /// Writes `path` as it was at `rev` (a commit), in the folder and the
+    /// index. The caller commits it.
+    pub async fn restore_file(
+        &self,
+        _g: &VaultGuard<'_>,
+        path: &str,
+        rev: &str,
+    ) -> Result<String, GitError> {
+        if rev.is_empty() || rev.starts_with('-') {
+            return Err(GitError::Failed(format!("not a revision: {rev}")));
+        }
+        let spec = format!("{rev}^{{commit}}");
+        let sha = self
+            .run_inner(&["rev-parse", "-q", "--verify", &spec])
+            .await
+            .map_err(|_| GitError::Failed(format!("no commit {rev} in the notes folder")))?;
+        let sha = sha.trim().to_string();
+        let blob = format!("{sha}:{path}");
+        if self.run_inner(&["cat-file", "-e", &blob]).await.is_err() {
+            return Err(GitError::Failed(format!("{path} is not in {rev}")));
+        }
+        self.clear_index_lock().await?;
+        self.run_inner(&["checkout", &sha, "--", path]).await?;
+        Ok(sha)
+    }
+
+    /// The full hash of the stash `merge --autostash` left behind: from its
     /// `Created autostash: <sha>` line, else the newest stash entry git
     /// stored as `autostash`.
     async fn autostash_sha(&self, said: &str) -> Option<String> {
@@ -620,7 +1030,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejected_push_rebases_and_pushes() {
+    async fn rejected_push_merges_and_pushes() {
         let v = TestVault::new("reject");
         let other = v.clone_other();
         std::fs::write(other.join("other.md"), "o\n").unwrap();
@@ -662,9 +1072,15 @@ mod tests {
         std::fs::write(v.vault.join("a.md"), "dirty\n").unwrap();
 
         let err = v.git.push(&g).await.unwrap_err();
-        assert!(matches!(err, GitError::Conflict(_)), "{err:?}");
-        assert!(!v.vault.join(".git/rebase-merge").exists());
-        assert!(!v.vault.join(".git/rebase-apply").exists());
+        match &err {
+            GitError::Conflict(m) => assert_eq!(
+                m, "merge would conflict in jonathan.md; nothing was changed",
+                "{err:?}"
+            ),
+            e => panic!("{e:?}"),
+        }
+        assert!(!v.vault.join(".git/MERGE_HEAD").exists());
+        assert!(v.git.unmerged(&g).await.unwrap().is_empty());
         assert_eq!(sh(&v.vault, &["rev-parse", "HEAD"]), head);
         assert_eq!(
             std::fs::read_to_string(v.vault.join("a.md")).unwrap(),
@@ -835,7 +1251,7 @@ mod tests {
         let wrapper = v.base.join("git-wrap.sh");
         std::fs::write(
             &wrapper,
-            "#!/bin/sh\nif [ \"$1\" = rebase ] && [ \"$2\" = --abort ]; then echo 'abort refused' >&2; exit 1; fi\nexec git \"$@\"\n",
+            "#!/bin/sh\nif [ \"$1\" = merge ] && [ \"$2\" = --abort ]; then echo 'abort refused' >&2; exit 1; fi\nexec git \"$@\"\n",
         )
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
@@ -845,9 +1261,233 @@ mod tests {
         let g = git.lock().await;
         let r = git.push(&g).await;
         match r {
-            Err(GitError::Failed(m)) => assert!(m.contains("rebase --abort failed"), "{m}"),
+            Err(GitError::Failed(m)) => assert!(m.contains("merge --abort failed"), "{m}"),
             e => panic!("{e:?}"),
         }
+    }
+
+    /// Commits `files` in a fresh clone and pushes them.
+    fn push_from_other(v: &TestVault, files: &[(&str, &str)]) -> PathBuf {
+        let other = v.base.join("other");
+        if !other.exists() {
+            v.clone_other();
+        } else {
+            sh(&other, &["pull", "--no-rebase", "-q"]);
+        }
+        for (f, body) in files {
+            let path = other.join(f);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        sh(&other, &["add", "-A"]);
+        sh(&other, &["commit", "-qm", "theirs"]);
+        sh(&other, &["push", "-q"]);
+        other
+    }
+
+    fn lines(n: usize) -> String {
+        (0..n).map(|i| format!("line {i}\n")).collect()
+    }
+
+    #[test]
+    fn policy_entries_match_folders_paths_and_names() {
+        let p = MergePolicy {
+            ours: vec!["06-Daily/".into(), "CURRENT_SESSION.md".into()],
+            theirs: vec!["Sprints/board.md".into()],
+        };
+        assert_eq!(p.side("06-Daily/2026/a.md"), Some(Side::Ours));
+        assert_eq!(p.side("06-Daily"), None);
+        assert_eq!(p.side("CURRENT_SESSION.md"), Some(Side::Ours));
+        assert_eq!(p.side("x/CURRENT_SESSION.md"), Some(Side::Ours));
+        assert_eq!(p.side("Sprints/board.md"), Some(Side::Theirs));
+        assert_eq!(p.side("board.md"), None);
+        assert_eq!(p.side("notes.md"), None);
+        assert!(shrank(40, 3));
+        assert!(!shrank(40, 30), "under 30% gone");
+        assert!(shrank(25, 0), "a deleted file counts as 0 lines");
+        assert!(!shrank(20, 0), "20 lines or fewer gone");
+    }
+
+    #[tokio::test]
+    async fn conflicts_the_policy_names_take_their_side() {
+        let v = TestVault::new("policy");
+        push_from_other(
+            &v,
+            &[("06-Daily/today.md", "theirs\n"), ("board.md", "theirs\n")],
+        );
+        std::fs::create_dir_all(v.vault.join("06-Daily")).unwrap();
+        std::fs::write(v.vault.join("06-Daily/today.md"), "ours\n").unwrap();
+        std::fs::write(v.vault.join("board.md"), "ours\n").unwrap();
+        let git = VaultGit::new(v.vault.clone(), true).with_policy(MergePolicy {
+            ours: vec!["06-Daily/".into()],
+            theirs: vec!["board.md".into()],
+        });
+        let g = git.lock().await;
+        git.commit_paths(
+            &g,
+            &["06-Daily/today.md".into(), "board.md".into()],
+            "S1: ours",
+        )
+        .await
+        .unwrap();
+        let report = git.sync(&g, false).await.unwrap();
+        assert_eq!((report.ahead, report.behind), (1, 1));
+        assert!(report.pushed);
+        assert_eq!(report.merges.len(), 1);
+        assert_eq!(report.merges[0].ours, vec!["06-Daily/today.md".to_string()]);
+        assert_eq!(report.merges[0].theirs, vec!["board.md".to_string()]);
+        let day = sh(&v.remote, &["show", "main:06-Daily/today.md"]);
+        assert_eq!(day, "ours\n");
+        assert_eq!(sh(&v.remote, &["show", "main:board.md"]), "theirs\n");
+        assert!(!v.vault.join(".git/MERGE_HEAD").exists());
+    }
+
+    #[tokio::test]
+    async fn skip_worktree_files_keep_their_local_copy() {
+        let v = TestVault::new("skip");
+        let rel = ".obsidian/data.json";
+        std::fs::create_dir_all(v.vault.join(".obsidian")).unwrap();
+        std::fs::write(v.vault.join(rel), "{}\n").unwrap();
+        sh(&v.vault, &["add", "-A"]);
+        sh(&v.vault, &["commit", "-qm", "plugin"]);
+        sh(&v.vault, &["push", "-q"]);
+        sh(&v.vault, &["update-index", "--skip-worktree", rel]);
+        std::fs::write(v.vault.join(rel), "{\"local\":1}\n").unwrap();
+        push_from_other(&v, &[(rel, "{\"remote\":1}\n"), ("other.md", "o\n")]);
+        std::fs::write(v.vault.join("mine.md"), "m\n").unwrap();
+        let g = v.git.lock().await;
+        v.git
+            .commit_paths(&g, &["mine.md".into()], "S1: mine")
+            .await
+            .unwrap();
+        v.git.push(&g).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(v.vault.join(rel)).unwrap(),
+            "{\"local\":1}\n"
+        );
+        let flags = sh(&v.vault, &["ls-files", "-v", rel]);
+        assert!(flags.starts_with("S "), "{flags}");
+        assert_eq!(
+            sh(&v.vault, &["show", &format!("HEAD:{rel}")]),
+            "{\"remote\":1}\n"
+        );
+        let log = sh(&v.remote, &["log", "--format=%s", "main"]);
+        assert!(log.contains("S1: mine"), "{log}");
+    }
+
+    #[tokio::test]
+    async fn a_merge_that_shrinks_a_file_is_held_until_confirmed() {
+        let v = TestVault::new("shrink");
+        std::fs::write(v.vault.join("notes.md"), lines(40)).unwrap();
+        sh(&v.vault, &["add", "-A"]);
+        sh(&v.vault, &["commit", "-qm", "long notes"]);
+        sh(&v.vault, &["push", "-q"]);
+        push_from_other(&v, &[("notes.md", &lines(3))]);
+        std::fs::write(v.vault.join("mine.md"), "m\n").unwrap();
+        let g = v.git.lock().await;
+        v.git
+            .commit_paths(&g, &["mine.md".into()], "S1: mine")
+            .await
+            .unwrap();
+        let before = sh(&v.vault, &["rev-parse", "HEAD"]);
+        let err = v.git.push(&g).await.unwrap_err();
+        let want = vec![Shrink {
+            path: "notes.md".into(),
+            before: 40,
+            after: 3,
+        }];
+        let before = before.trim().to_string();
+        assert_eq!(
+            err,
+            GitError::Held {
+                before: before.clone(),
+                shrunk: want
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "push held: notes.md went from 40 to 3 lines in the merge; the copy from before it is in {}",
+                &before[..12]
+            )
+        );
+        assert!(!sh(&v.remote, &["log", "--format=%s", "main"]).contains("S1: mine"));
+        // The merge stays here; the old copy is one commit back.
+        assert_ne!(sh(&v.vault, &["rev-parse", "HEAD"]).trim(), before);
+
+        let report = v.git.sync(&g, false).await.unwrap();
+        assert_eq!(report.behind, 0);
+        assert!(report.pushed, "the merge is already made: {report:?}");
+        assert!(sh(&v.remote, &["log", "--format=%s", "main"]).contains("S1: mine"));
+    }
+
+    #[tokio::test]
+    async fn sync_holds_a_shrinking_merge_unless_confirmed() {
+        let v = TestVault::new("synchold");
+        std::fs::write(v.vault.join("notes.md"), lines(40)).unwrap();
+        sh(&v.vault, &["add", "-A"]);
+        sh(&v.vault, &["commit", "-qm", "long notes"]);
+        sh(&v.vault, &["push", "-q"]);
+        push_from_other(&v, &[("notes.md", &lines(3))]);
+        std::fs::write(v.vault.join("mine.md"), "m\n").unwrap();
+        let g = v.git.lock().await;
+        v.git
+            .commit_paths(&g, &["mine.md".into()], "S1: mine")
+            .await
+            .unwrap();
+        let report = v.git.sync(&g, false).await.unwrap();
+        assert_eq!((report.ahead, report.behind), (1, 1));
+        assert!(!report.pushed);
+        assert_eq!(report.held.len(), 1);
+        assert_eq!(report.merges[0].merged, vec!["notes.md".to_string()]);
+        assert!(!sh(&v.remote, &["log", "--format=%s", "main"]).contains("S1: mine"));
+
+        // The old copy comes back from the commit before the merge.
+        let sha = v.git.restore_file(&g, "notes.md", "HEAD^1").await.unwrap();
+        assert_eq!(sha.len(), 40);
+        assert_eq!(
+            std::fs::read_to_string(v.vault.join("notes.md")).unwrap(),
+            lines(40)
+        );
+        v.git
+            .commit_paths(&g, &["notes.md".into()], "restore notes.md")
+            .await
+            .unwrap();
+        let report = v.git.sync(&g, true).await.unwrap();
+        assert!(report.pushed);
+        assert_eq!(sh(&v.remote, &["show", "main:notes.md"]), lines(40));
+    }
+
+    #[tokio::test]
+    async fn sync_refuses_without_an_upstream_or_with_conflicts() {
+        let v = TestVault::new("syncno");
+        let g = v.git.lock().await;
+        let ok = v.git.sync(&g, false).await.unwrap();
+        assert_eq!(ok, SyncReport::default());
+        std::fs::write(v.vault.join(".git/MERGE_HEAD"), "x\n").unwrap();
+        let r = v.git.sync(&g, false).await;
+        assert!(
+            matches!(&r, Err(GitError::Failed(m)) if m.contains("under way")),
+            "{r:?}"
+        );
+        std::fs::remove_file(v.vault.join(".git/MERGE_HEAD")).unwrap();
+        sh(&v.vault, &["branch", "--unset-upstream"]);
+        let r = v.git.sync(&g, false).await;
+        assert!(
+            matches!(&r, Err(GitError::Failed(m)) if m.contains("no upstream")),
+            "{r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_refuses_options_and_missing_files() {
+        let v = TestVault::new("restore");
+        let g = v.git.lock().await;
+        for rev in ["", "--orphan", "nosuchrev"] {
+            assert!(v.git.restore_file(&g, "a.md", rev).await.is_err(), "{rev}");
+        }
+        let r = v.git.restore_file(&g, "missing.md", "HEAD").await;
+        assert_eq!(r, Err(GitError::Failed("missing.md is not in HEAD".into())));
     }
 
     #[tokio::test]
