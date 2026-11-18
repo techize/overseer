@@ -366,6 +366,10 @@ struct Fetched {
     body: Option<String>,
     notes: Option<String>,
     depends_on: Vec<String>,
+    /// What the source calls the item, for when the view only has the key.
+    title: Option<String>,
+    status: Option<String>,
+    priority: Option<String>,
 }
 
 struct Tasks {
@@ -1021,6 +1025,21 @@ impl WorkStore {
         };
         match fetched {
             Ok((f, when)) => {
+                // An item that has left the list shows its key as its title
+                // and no status; what the source said fills those in.
+                if let Some(t) = f.title.filter(|t| !t.trim().is_empty()) {
+                    if detail.title.trim().is_empty() || detail.title == detail.key {
+                        detail.title = t;
+                    }
+                }
+                if let Some(st) = f.status.filter(|s| !s.trim().is_empty()) {
+                    if detail.status == overseer_proto::UNKNOWN_STATUS {
+                        detail.status = st;
+                    }
+                }
+                if detail.priority.is_none() {
+                    detail.priority = f.priority;
+                }
                 detail.body = f.body;
                 detail.notes = f.notes;
                 detail.depends_on = f.depends_on;
@@ -1056,6 +1075,9 @@ impl WorkStore {
                 body: d.body,
                 notes: d.notes,
                 depends_on: d.depends_on,
+                title: None,
+                status: None,
+                priority: None,
             });
         }
         let out = match &self.jira {
@@ -1082,6 +1104,9 @@ impl WorkStore {
             body: d.body,
             notes: None,
             depends_on: Vec::new(),
+            title: Some(d.title),
+            status: Some(d.status),
+            priority: d.priority,
         })
     }
 
@@ -3234,6 +3259,11 @@ esac"#,
             ["jira workitem view DEMO-1 --fields summary,description,status,priority --json"]
         );
         assert!(d.body.is_some_and(|b| !b.trim().is_empty()));
+        // DEMO-1 is owned but not listed, so the view only knows its key;
+        // the fetch supplies the title, status and priority.
+        assert_eq!(d.title, "Wire the detail view");
+        assert_eq!(d.status, "In Progress");
+        assert_eq!(d.priority.as_deref(), Some("High"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
