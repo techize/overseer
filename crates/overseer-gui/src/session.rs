@@ -221,12 +221,21 @@ pub fn owns_rows(view: &WorkView, slot: SlotId) -> Vec<OwnsRow> {
         .into_iter()
         .map(|i| OwnsRow {
             key: i.key.clone(),
-            title: i.title.clone(),
+            title: title_or_key(&i.title, &i.key),
             status: i.status.clone(),
             gone: !i.in_list,
             not_read_yet: view.not_read_yet(i),
         })
         .collect()
+}
+
+/// `title`, or `key` when the title is empty or blank.
+fn title_or_key(title: &str, key: &str) -> String {
+    if title.trim().is_empty() {
+        key.to_string()
+    } else {
+        title.to_string()
+    }
 }
 
 /// One line of the detail view's body, read from the daemon's plain text.
@@ -270,6 +279,32 @@ pub struct OpenDetail {
     pub req: u64,
     /// The whole body shows, not only the first `BODY_PREVIEW_LINES`.
     pub show_all: bool,
+    /// A refresh is on its way while the last loaded detail stays shown.
+    pub refreshing: bool,
+}
+
+/// The detail to show for request `req` of `key` in `slot`, given the one
+/// open before. The same item keeps `show_all`; a refresh of a loaded detail
+/// keeps its text and marks it `refreshing`, anything else starts `Loading`.
+pub fn reopen(
+    prev: Option<&OpenDetail>,
+    slot: SlotId,
+    key: &str,
+    req: u64,
+    refresh: bool,
+) -> OpenDetail {
+    let same = prev.filter(|p| p.slot == slot && p.key == key);
+    let kept = same
+        .filter(|p| refresh && matches!(p.state, DetailState::Loaded(_)))
+        .map(|p| p.state.clone());
+    OpenDetail {
+        slot,
+        key: key.to_string(),
+        refreshing: kept.is_some(),
+        state: kept.unwrap_or(DetailState::Loading),
+        req,
+        show_all: same.is_some_and(|p| p.show_all),
+    }
 }
 
 /// What the detail view shows.
@@ -283,6 +318,9 @@ pub struct DetailModel {
     pub body: Vec<BodyLine>,
     /// Body lines were dropped for the preview.
     pub truncated: bool,
+    /// The full body is longer than `BODY_PREVIEW_LINES`, so Show all /
+    /// Show less applies.
+    pub expandable: bool,
     /// What failed, shown in orange above the body.
     pub notice: Option<String>,
     /// `ov-3 Title (open)`, one per child bead.
@@ -319,11 +357,15 @@ pub fn body_lines(text: &str) -> Vec<BodyLine> {
         let hashes = rest.bytes().take_while(|b| *b == b'#').count();
         if depth == 0 && hashes > 0 && rest[hashes..].starts_with(' ') {
             out.push(BodyLine::Heading(rest[hashes..].trim().to_string()));
+        } else if rest.trim_end() == "-" {
+            // An empty bullet: nothing to show.
         } else if let Some(item) = rest.strip_prefix("- ") {
-            out.push(BodyLine::Bullet {
-                depth,
-                text: item.trim_end().to_string(),
-            });
+            if !item.trim().is_empty() {
+                out.push(BodyLine::Bullet {
+                    depth,
+                    text: item.trim_end().to_string(),
+                });
+            }
         } else if is_numbered(rest) {
             out.push(BodyLine::Bullet {
                 depth,
@@ -334,6 +376,11 @@ pub fn body_lines(text: &str) -> Vec<BodyLine> {
         }
     }
     out
+}
+
+/// Left padding of a body bullet at `depth`, in pixels.
+pub fn bullet_indent(depth: usize) -> f32 {
+    8. + 12. * depth as f32
 }
 
 /// `IN PROGRESS · 3h`, or the label alone when the move was not seen.
@@ -352,8 +399,31 @@ fn pr_text(pr: &overseer_proto::PullRequest) -> String {
     format!("{} #{} {}", pr.repo, pr.id, pr.title.trim())
 }
 
+/// The PRs of `key` from the poll, newest first, undated last.
+fn view_prs<'a>(view: &'a WorkView, key: &str) -> Vec<&'a overseer_proto::PullRequest> {
+    let mut prs: Vec<_> = view
+        .prs
+        .iter()
+        .filter(|p| p.ticket.as_deref() == Some(key))
+        .collect();
+    // `None` sorts below any date, so reversed it goes last.
+    prs.sort_by_key(|p| std::cmp::Reverse(p.created));
+    prs
+}
+
+/// The beads under `key` from the poll, as the Child beads box lists them.
+fn view_children(view: &WorkView, key: &str) -> Vec<String> {
+    view.items
+        .iter()
+        .filter(|i| i.kind == ItemKind::Bead && i.parent.as_deref() == Some(key))
+        .map(|i| format!("{} {} ({})", i.key, i.title.trim(), i.status))
+        .collect()
+}
+
 /// The detail view for `open`. Until the reply is in (or when the request
 /// failed) the rows come from the item in `view`, so the view is never empty.
+/// Once loaded, an item still listed takes its status, priority, stage and
+/// PRs from the poll, which is newer than the reply.
 pub fn detail_model(
     open: &OpenDetail,
     view: &WorkView,
@@ -363,20 +433,42 @@ pub fn detail_model(
     let item = view.items.iter().find(|i| i.key == open.key);
     let row = |k: &str, v: String| (k.to_string(), v);
     let priority = |p: Option<&String>| p.cloned().unwrap_or_else(|| "Not set".into());
+    let pr_rows = |rows: &mut Vec<(String, String)>| {
+        rows.extend(
+            view_prs(view, &open.key)
+                .into_iter()
+                .map(|p| row("PR", pr_text(p))),
+        );
+    };
     let mut rows = Vec::new();
     let mut body = Vec::new();
     let mut notice = None;
-    let mut children = Vec::new();
+    let children;
     let title;
     match &open.state {
         DetailState::Loaded(d) => {
-            title = d.title.clone();
-            rows.push(row("Status", d.status.clone()));
-            rows.push(row("Priority", priority(d.priority.as_ref())));
-            if let Some(stage) = d.stage {
-                rows.push(row("Stage", stage_text(stage, d.stage_since, now)));
+            title = title_or_key(&d.title, &open.key);
+            match item.filter(|i| i.in_list) {
+                Some(i) => {
+                    rows.push(row("Status", i.status.clone()));
+                    rows.push(row(
+                        "Priority",
+                        priority(i.priority.as_ref().or(d.priority.as_ref())),
+                    ));
+                    if let Some(stage) = i.stage {
+                        rows.push(row("Stage", stage_text(stage, i.stage_since, now)));
+                    }
+                    pr_rows(&mut rows);
+                }
+                None => {
+                    rows.push(row("Status", d.status.clone()));
+                    rows.push(row("Priority", priority(d.priority.as_ref())));
+                    if let Some(stage) = d.stage {
+                        rows.push(row("Stage", stage_text(stage, d.stage_since, now)));
+                    }
+                    rows.extend(d.prs.iter().map(|p| row("PR", pr_text(p))));
+                }
             }
-            rows.extend(d.prs.iter().map(|p| row("PR", pr_text(p))));
             if d.kind == ItemKind::Bead {
                 if let Some(n) = &d.notes {
                     rows.push(row("Notes", n.clone()));
@@ -388,7 +480,9 @@ pub fn detail_model(
             if let Some(f) = &d.folder {
                 rows.push(row("Folder", tilde(f, home)));
             }
-            if let Some(t) = d.fetched_at {
+            if open.refreshing {
+                rows.push(row("Fetched", "Refreshing...".into()));
+            } else if let Some(t) = d.fetched_at {
                 rows.push(row(
                     "Fetched",
                     format!("{} ago", crate::sprint_view::age_text(now - t)),
@@ -415,7 +509,7 @@ pub fn detail_model(
                 notice = Some(e.clone());
             }
             title = item
-                .map(|i| i.title.clone())
+                .map(|i| title_or_key(&i.title, &open.key))
                 .unwrap_or_else(|| open.key.clone());
             if let Some(i) = item {
                 rows.push(row("Status", i.status.clone()));
@@ -423,19 +517,16 @@ pub fn detail_model(
                 if let Some(stage) = i.stage {
                     rows.push(row("Stage", stage_text(stage, i.stage_since, now)));
                 }
-                rows.extend(
-                    view.prs
-                        .iter()
-                        .filter(|p| p.ticket.as_deref() == Some(open.key.as_str()))
-                        .map(|p| row("PR", pr_text(p))),
-                );
+                pr_rows(&mut rows);
                 if let Some(f) = &i.folder {
                     rows.push(row("Folder", tilde(f, home)));
                 }
             }
+            children = view_children(view, &open.key);
         }
     }
-    let truncated = !open.show_all && body.len() > BODY_PREVIEW_LINES;
+    let expandable = body.len() > BODY_PREVIEW_LINES;
+    let truncated = !open.show_all && expandable;
     if truncated {
         body.truncate(BODY_PREVIEW_LINES);
     }
@@ -445,6 +536,7 @@ pub fn detail_model(
         rows,
         body,
         truncated,
+        expandable,
         notice,
         children,
         loading: open.state == DetailState::Loading,
@@ -458,19 +550,35 @@ pub fn detail_still_owned(open: &OpenDetail, view: &WorkView) -> bool {
         .any(|i| i.key == open.key && i.owner == Some(open.slot))
 }
 
-/// Why a detail request must not be sent to the daemon, if it must not: an
-/// older build cannot decode `GetItemDetail` and hangs up on it, which drops
-/// the app's whole connection.
-pub fn detail_unavailable(daemon: &DaemonKnown, app_build: &str) -> Option<String> {
-    let old = match daemon {
-        DaemonKnown::Old => true,
-        DaemonKnown::Info(info) => overseer_proto::build_notice(app_build, &info.build).is_some(),
-        DaemonKnown::Unknown => false,
-    };
-    old.then(|| {
-        "The daemon runs an older build and cannot fetch details. Restart the daemon to finish the upgrade (overseer ctl restart, or Settings)."
-            .to_string()
-    })
+/// Whether a detail request may go to the daemon now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DetailGate {
+    Send,
+    /// The daemon's build is being asked for; hold the request until then.
+    Wait,
+    /// Not sent, with why.
+    Refuse(String),
+}
+
+/// Whether a detail request may be sent: an older build cannot decode
+/// `GetItemDetail` and hangs up on it, which drops the app's whole
+/// connection, so any build mismatch refuses. While the build probe runs the
+/// request waits for it; a daemon that gave no answer is sent it.
+pub fn detail_gate(daemon: &DaemonKnown, probing: bool, app_build: &str) -> DetailGate {
+    match daemon {
+        DaemonKnown::Unknown if probing => DetailGate::Wait,
+        DaemonKnown::Unknown => DetailGate::Send,
+        DaemonKnown::Old => DetailGate::Refuse(
+            "The daemon runs an older build and cannot fetch details. Restart the daemon to finish the upgrade (overseer ctl restart, or Settings)."
+                .to_string(),
+        ),
+        DaemonKnown::Info(info) => {
+            match overseer_proto::build_notice(app_build, &info.build) {
+                None => DetailGate::Send,
+                Some(why) => DetailGate::Refuse(format!("Cannot fetch details: {why}")),
+            }
+        }
+    }
 }
 
 /// Puts a reply for request `req` of `key` into the open detail. A reply for
@@ -483,9 +591,15 @@ pub fn take_reply(
     resp: Result<ItemDetail, String>,
 ) {
     if let Some(o) = open.as_mut().filter(|o| o.key == key && o.req == req) {
-        o.state = match resp {
-            Ok(d) => DetailState::Loaded(d),
-            Err(e) => DetailState::Failed(e),
+        o.refreshing = false;
+        o.state = match (resp, std::mem::replace(&mut o.state, DetailState::Loading)) {
+            (Ok(d), _) => DetailState::Loaded(d),
+            // A failed refresh keeps the text it would have replaced.
+            (Err(e), DetailState::Loaded(mut prev)) => {
+                prev.error = Some(e);
+                DetailState::Loaded(prev)
+            }
+            (Err(e), _) => DetailState::Failed(e),
         };
     }
 }
@@ -1170,7 +1284,7 @@ impl OverseerApp {
                 BodyLine::Bullet { depth, text } => {
                     let mark = if is_numbered(&text) { "" } else { "\u{2022} " };
                     div()
-                        .pl(px(12. * (depth as f32 + 1.)))
+                        .pl(px(bullet_indent(depth)))
                         .child(format!("{mark}{text}"))
                 }
                 BodyLine::Code(t) => div()
@@ -1183,7 +1297,7 @@ impl OverseerApp {
                 BodyLine::Blank => div().h(px(6.)),
             })
             .collect();
-        let toggle = (m.truncated || show_all).then(|| {
+        let toggle = m.expandable.then(|| {
             button(
                 "detail-all",
                 if show_all { "Show less" } else { "Show all" },
@@ -2647,6 +2761,7 @@ mod tests {
             state,
             req: 1,
             show_all: false,
+            refreshing: false,
         }
     }
 
@@ -2710,7 +2825,10 @@ mod tests {
     #[test]
     fn detail_model_rows_from_a_loaded_detail() {
         use overseer_proto::{ChildBead, PullRequest, Stage};
-        let view = demo_view(vec![demo_item("DEMO-1", Some(2))]);
+        // Not listed, so every row comes from the reply.
+        let mut item = demo_item("DEMO-1", Some(2));
+        item.in_list = false;
+        let view = demo_view(vec![item]);
         let mut d = demo_detail("DEMO-1");
         d.stage = Some(Stage::InProgress);
         d.stage_since = Some(100 - 3 * 3600);
@@ -2882,22 +3000,239 @@ mod tests {
         assert!(detail_model(&o, &view, 0, None).body.is_empty());
     }
 
+    fn info_build(build: &str) -> DaemonKnown {
+        DaemonKnown::Info(overseer_proto::DaemonInfo {
+            version: "0".into(),
+            build: build.into(),
+            pid: 1,
+            started_at: 0,
+            exe: "/demo/overseer".into(),
+        })
+    }
+
+    fn refused(gate: DetailGate) -> String {
+        match gate {
+            DetailGate::Refuse(why) => why,
+            other => panic!("expected Refuse, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn an_older_daemon_is_not_sent_the_detail_request() {
-        assert_eq!(detail_unavailable(&DaemonKnown::Unknown, "b2"), None);
-        let why = detail_unavailable(&DaemonKnown::Old, "b2").unwrap();
+    fn detail_waits_for_the_build_probe() {
+        assert_eq!(
+            detail_gate(&DaemonKnown::Unknown, true, "b2"),
+            DetailGate::Wait
+        );
+        assert_eq!(
+            detail_gate(&DaemonKnown::Unknown, false, "b2"),
+            DetailGate::Send
+        );
+        let why = refused(detail_gate(&DaemonKnown::Old, false, "b2"));
         assert!(why.contains("older build"), "{why}");
         assert!(why.contains("Restart the daemon"), "{why}");
-        let info = |build: &str| {
-            DaemonKnown::Info(overseer_proto::DaemonInfo {
-                version: "0".into(),
-                build: build.into(),
-                pid: 1,
-                started_at: 0,
-                exe: "/demo/overseer".into(),
-            })
+        let why = refused(detail_gate(
+            &info_build("abc1234-202611140930"),
+            false,
+            "def5678-202611141000",
+        ));
+        assert!(why.contains("Restart the daemon"), "{why}");
+        let why = refused(detail_gate(
+            &info_build("def5678-202611141000"),
+            false,
+            "abc1234-202611140930",
+        ));
+        assert!(why.contains("Restart Overseer"), "{why}");
+        let why = refused(detail_gate(&info_build("b1"), false, "b2"));
+        assert!(why.contains("restart both"), "{why}");
+        assert_eq!(
+            detail_gate(&info_build("dev"), false, "b2"),
+            DetailGate::Send
+        );
+        assert_eq!(
+            detail_gate(&info_build("b2"), false, "b2"),
+            DetailGate::Send
+        );
+    }
+
+    fn row_pairs(m: &DetailModel) -> Vec<(&str, &str)> {
+        m.rows
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect()
+    }
+
+    fn demo_pr(id: u64, created: Option<i64>) -> overseer_proto::PullRequest {
+        overseer_proto::PullRequest {
+            repo: "demo-repo".into(),
+            id,
+            title: format!("Change {id}"),
+            branch: format!("DEMO-1-{id}"),
+            url: None,
+            author: None,
+            created,
+            ticket: Some("DEMO-1".into()),
+            approvals: None,
+        }
+    }
+
+    #[test]
+    fn refresh_keeps_the_loaded_text() {
+        let view = demo_view(vec![demo_item("DEMO-1", Some(2))]);
+        let mut d = demo_detail("DEMO-1");
+        d.body = Some("Kept body".into());
+        let prev = open("DEMO-1", DetailState::Loaded(d));
+        let o = reopen(Some(&prev), 2, "DEMO-1", 2, true);
+        assert!(matches!(o.state, DetailState::Loaded(_)));
+        assert!(o.refreshing);
+        assert_eq!(o.req, 2);
+        let m = detail_model(&o, &view, 100, None);
+        assert_eq!(m.body, [BodyLine::Text("Kept body".into())]);
+        assert!(row_pairs(&m).contains(&("Fetched", "Refreshing...")));
+        assert!(!m.loading);
+        let o = reopen(Some(&prev), 2, "DEMO-1", 3, false);
+        assert_eq!(o.state, DetailState::Loading);
+        assert!(!o.refreshing);
+    }
+
+    #[test]
+    fn a_failed_refresh_keeps_the_text() {
+        let view = demo_view(vec![demo_item("DEMO-1", Some(2))]);
+        let mut d = demo_detail("DEMO-1");
+        d.body = Some("Kept body".into());
+        let prev = open("DEMO-1", DetailState::Loaded(d));
+        let mut o = Some(reopen(Some(&prev), 2, "DEMO-1", 2, true));
+        take_reply(&mut o, "DEMO-1", 2, Err("lost".into()));
+        let o = o.unwrap();
+        assert!(matches!(o.state, DetailState::Loaded(_)));
+        assert!(!o.refreshing);
+        let m = detail_model(&o, &view, 100, None);
+        assert_eq!(m.body, [BodyLine::Text("Kept body".into())]);
+        assert_eq!(m.notice.as_deref(), Some("lost"));
+    }
+
+    #[test]
+    fn loading_and_failed_show_child_beads_and_prs_newest_first() {
+        let mut bead = demo_item("ov-1", None);
+        bead.kind = ItemKind::Bead;
+        bead.parent = Some("DEMO-1".into());
+        bead.title = "First step".into();
+        bead.status = "open".into();
+        let mut view = demo_view(vec![demo_item("DEMO-1", Some(2)), bead]);
+        view.prs = vec![
+            demo_pr(1, None),
+            demo_pr(2, Some(100)),
+            demo_pr(4, Some(200)),
+        ];
+        for state in [DetailState::Loading, DetailState::Failed("x".into())] {
+            let m = detail_model(&open("DEMO-1", state), &view, 300, None);
+            assert_eq!(m.children, ["ov-1 First step (open)"]);
+            let prs: Vec<&str> = row_pairs(&m)
+                .into_iter()
+                .filter(|(k, _)| *k == "PR")
+                .map(|(_, v)| v)
+                .collect();
+            assert_eq!(
+                prs,
+                [
+                    "demo-repo #4 Change 4",
+                    "demo-repo #2 Change 2",
+                    "demo-repo #1 Change 1"
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn live_fields_follow_polls_while_listed() {
+        use overseer_proto::Stage;
+        let mut item = demo_item("DEMO-1", Some(2));
+        item.status = "In Review".into();
+        item.priority = Some("High".into());
+        item.stage = Some(Stage::InProgress);
+        item.stage_since = Some(40);
+        let mut view = demo_view(vec![item]);
+        view.prs = vec![demo_pr(5, Some(10))];
+        let mut d = demo_detail("DEMO-1");
+        d.status = "To Do".into();
+        d.priority = None;
+        d.body = Some("B".into());
+        let o = open("DEMO-1", DetailState::Loaded(d));
+        let m = detail_model(&o, &view, 100, None);
+        let rows = row_pairs(&m);
+        assert!(rows.contains(&("Status", "In Review")), "{rows:?}");
+        assert!(rows.contains(&("Priority", "High")), "{rows:?}");
+        assert!(rows.iter().any(|(k, _)| *k == "Stage"), "{rows:?}");
+        assert!(rows.contains(&("PR", "demo-repo #5 Change 5")), "{rows:?}");
+        assert_eq!(m.body, [BodyLine::Text("B".into())]);
+        view.items[0].in_list = false;
+        let m = detail_model(&o, &view, 100, None);
+        let rows = row_pairs(&m);
+        assert!(rows.contains(&("Status", "To Do")), "{rows:?}");
+        assert!(!rows.iter().any(|(k, _)| *k == "PR"), "{rows:?}");
+    }
+
+    #[test]
+    fn live_priority_falls_back_to_the_reply() {
+        let mut item = demo_item("DEMO-1", Some(2));
+        item.priority = None;
+        let view = demo_view(vec![item]);
+        let mut d = demo_detail("DEMO-1");
+        d.priority = Some("Low".into());
+        let m = detail_model(&open("DEMO-1", DetailState::Loaded(d)), &view, 100, None);
+        assert!(row_pairs(&m).contains(&("Priority", "Low")));
+    }
+
+    #[test]
+    fn show_all_only_past_forty_lines() {
+        let view = demo_view(vec![demo_item("DEMO-1", Some(2))]);
+        let lines = |n: usize| {
+            let mut d = demo_detail("DEMO-1");
+            d.body = Some(
+                (1..=n)
+                    .map(|i| format!("line {i}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+            open("DEMO-1", DetailState::Loaded(d))
         };
-        assert_eq!(detail_unavailable(&info("b2"), "b2"), None);
-        assert!(detail_unavailable(&info("b1"), "b2").is_some());
+        let m = detail_model(&lines(40), &view, 100, None);
+        assert!(!m.expandable && !m.truncated);
+        let mut o = lines(41);
+        let m = detail_model(&o, &view, 100, None);
+        assert!(m.expandable && m.truncated);
+        o.show_all = true;
+        let m = detail_model(&o, &view, 100, None);
+        assert!(m.expandable && !m.truncated);
+    }
+
+    #[test]
+    fn an_empty_title_shows_the_key() {
+        let mut item = demo_item("DEMO-1", Some(2));
+        item.title = String::new();
+        let view = demo_view(vec![item]);
+        let mut d = demo_detail("DEMO-1");
+        d.title = "  ".into();
+        let m = detail_model(&open("DEMO-1", DetailState::Loaded(d)), &view, 100, None);
+        assert_eq!(m.title, "DEMO-1");
+        let m = detail_model(&open("DEMO-1", DetailState::Loading), &view, 100, None);
+        assert_eq!(m.title, "DEMO-1");
+        assert_eq!(owns_rows(&view, 2)[0].title, "DEMO-1");
+    }
+
+    #[test]
+    fn empty_bullets_are_dropped() {
+        assert_eq!(
+            body_lines("- \n-\n- Real\n  - "),
+            [BodyLine::Bullet {
+                depth: 0,
+                text: "Real".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn bullet_indent_grows_twelve_per_level() {
+        assert_eq!(bullet_indent(0), 8.);
+        assert_eq!(bullet_indent(2), 32.);
     }
 }
