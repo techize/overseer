@@ -163,6 +163,25 @@ impl JiraApi {
         Ok(out)
     }
 
+    /// The raw JSON of one ticket with the fields the detail view shows.
+    /// Blocking.
+    pub fn issue(&self, token: &str, key: &str) -> Result<String, String> {
+        let url = self.jira_url(&format!(
+            "rest/api/3/issue/{key}?fields=summary,status,priority,description"
+        ))?;
+        match self
+            .agent
+            .0
+            .get(&url)
+            .set("Authorization", &self.auth(token))
+            .set("Accept", "application/json")
+            .call()
+        {
+            Err(ureq::Error::Status(404, _)) => Err(format!("{key} was not found in Jira")),
+            r => read(r),
+        }
+    }
+
     /// The board's active sprint with the keys of its issues, or `None`
     /// when it has none. Blocking.
     pub fn active_sprint(&self, token: &str) -> Result<Option<ActiveSprint>, String> {
@@ -393,6 +412,28 @@ pub(crate) mod tests {
         format!(
             r#"{{"key":"{key}","fields":{{"summary":"t {key}","status":{{"name":"To Do"}},"priority":{{"name":"High"}}}}}}"#
         )
+    }
+
+    #[test]
+    fn issue_reads_one_ticket_and_maps_404() {
+        let body = r#"{"key":"DEMO-1","fields":{"summary":"Widget wiring"}}"#.to_owned();
+        let (base, rx) = fake(vec![(200, body.clone()), (404, "{}".into())]);
+        let got = api(&base).issue("tok", "DEMO-1").unwrap();
+        assert_eq!(got, body);
+        let seen = rx.try_recv().unwrap();
+        assert_eq!(seen.method, "GET");
+        assert_eq!(
+            seen.path,
+            "/ex/jira/demo-cloud/rest/api/3/issue/DEMO-1?fields=summary,status,priority,description"
+        );
+        assert_eq!(
+            seen.auth.as_deref(),
+            Some("Basic ZGVtb0BleGFtcGxlLnRlc3Q6dG9r")
+        );
+        assert_eq!(
+            api(&base).issue("tok", "DEMO-1").unwrap_err(),
+            "DEMO-1 was not found in Jira"
+        );
     }
 
     #[test]
