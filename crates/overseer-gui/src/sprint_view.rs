@@ -1089,7 +1089,7 @@ impl OverseerApp {
             .collect();
         // A column with more than fits scrolls in place. The kanban fills
         // the space left below the session cards, or keeps the height its
-        // top edge was dragged to; either way it shrinks to fit the window
+        // bottom edge was dragged to; either way it shrinks to fit the window
         // before the cards or the footer would move off screen.
         let measured = self.kanban_measured.clone();
         let panel = div()
@@ -1149,8 +1149,8 @@ impl OverseerApp {
                 .min_h(px(crate::kanban_size::MIN))
                 .flex()
                 .flex_col()
-                .child(handle)
-                .child(panel),
+                .child(panel)
+                .child(handle),
         )
     }
 }
