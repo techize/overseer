@@ -240,6 +240,30 @@ fn s0_proposes_and_gets_the_board() {
 }
 
 #[test]
+fn get_item_detail_is_listed_and_sends_the_request() {
+    let d = TempDaemon::start("detail");
+    let mut s0 = Mcp::start(&d.home, "S0");
+    let reply = s0.rpc("tools/list", json!({}));
+    let tool = reply["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "get_item_detail")
+        .expect("listed")
+        .clone();
+    assert_eq!(tool["inputSchema"]["properties"]["key"]["type"], "string");
+    assert_eq!(
+        tool["inputSchema"]["properties"]["refresh"]["type"],
+        "boolean"
+    );
+    assert_eq!(tool["inputSchema"]["required"], json!(["key"]));
+    // The daemon has no such item: its answer comes back as a tool error.
+    let (text, err) = s0.tool("get_item_detail", json!({"key": "DEMO-404"}));
+    assert!(err, "{text}");
+    assert!(!text.starts_with("Unexpected reply"), "{text}");
+}
+
+#[test]
 fn worker_cannot_propose() {
     let d = TempDaemon::start("worker");
     let mut s3 = Mcp::start(&d.home, "S3");

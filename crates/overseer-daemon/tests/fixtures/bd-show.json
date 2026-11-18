@@ -1,0 +1,18 @@
+[
+  {
+    "id": "demo-1",
+    "title": "Wire the detail view",
+    "description": "Show the item body.\n\nSecond paragraph.",
+    "notes": "note line 1\nnote line 2\nnote line 3\nnote line 4\nnote line 5\nnote line 6\nnote line 7\nnote line 8\nnote line 9\nnote line 10\nnote line 11\nnote line 12",
+    "status": "in_progress",
+    "priority": 1,
+    "issue_type": "task",
+    "dependencies": [
+      {
+        "issue_id": "demo-1",
+        "depends_on_id": "demo-2",
+        "type": "blocks"
+      }
+    ]
+  }
+]

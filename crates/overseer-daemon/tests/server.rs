@@ -1657,6 +1657,24 @@ async fn work_items_load_from_stub_sources() {
 }
 
 #[tokio::test]
+async fn get_item_detail_is_answered() {
+    let s = stub_sources("detail", false);
+    let d = s.daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    c.refresh().await;
+    match c
+        .request(Request::GetItemDetail {
+            key: "DEMO-999".into(),
+            refresh: false,
+        })
+        .await
+    {
+        Response::Error { message } => assert!(message.contains("DEMO-999"), "{message}"),
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn assign_then_second_slot_is_refused() {
     let s = stub_sources("refuse", false);
     let d = s.daemon().await;

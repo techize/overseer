@@ -462,6 +462,16 @@ trimming):
   new key is absent, and the review names are added to In progress.
 - Click a session card, or press Cmd+0 to Cmd+6, to open that session over the
   board. Cmd+Esc, the x button, or a click outside the panel closes it.
+- A worker session's panel has an Owns box listing the items it owns. Each row
+  shows the key and status, then the title on up to two lines. Click the row
+  (not Release) to open the item's detail in place of the panel boxes, with
+  Back, the key and Refresh at the top. The detail is fetched when you open it
+  and cached in the daemon for 5 minutes per key; Refresh skips the cache. A
+  long body shows its first 40 lines, with Show all for the rest. If the
+  source fails, the error shows in orange along with the cached fields and the
+  first paragraph of the item folder's `00-PROJECT-OVERVIEW.md`. Sessions,
+  including S0, get the same lookup from the `get_item_detail` MCP tool (`key`,
+  and `refresh` to skip the cache).
 - Click a ticket card to open its session, or to start one in a free slot.
   Cmd+click opens its ticket folder, and hovering shows its details. A click
   on a Done card still opens its folder. A PR row with a session chip opens

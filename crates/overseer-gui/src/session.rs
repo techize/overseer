@@ -8,14 +8,16 @@
 //! The Owns box lists the work the slot owns with a Release button each,
 //! the slot's notices, Assign (the work-item picker) and Send kickoff,
 //! which types the daemon's kickoff prompt into an idle session.
+//! Clicking an owned row (not its Release button) shows the item's detail
+//! in place of the panel's boxes, fetched from the daemon on request.
 
 use std::path::{Path, PathBuf};
 
 use gpui::Keystroke;
 use gpui::{div, prelude::*, px, relative, rgb, rgba, Context, FontWeight, SharedString, Window};
 use overseer_proto::{
-    slot_name, ActivityKind, ClaimKind, CoordView, ItemKind, LockView, Notice, RelayState,
-    ReportKind, Request, Response, Sender, SlotId, SlotInfo, SlotState, WorkView,
+    slot_name, ActivityKind, ClaimKind, CoordView, ItemDetail, ItemKind, LockView, Notice,
+    RelayState, ReportKind, Request, Response, Sender, SlotId, SlotInfo, SlotState, WorkView,
 };
 
 use crate::app::{colors, OpenMessage, OpenNote, OpenRelease, OverseerApp};
@@ -23,6 +25,7 @@ use crate::board::{
     activity_detail, activity_state, format_elapsed, local_hhmm, one_line, owned_by, slot_title,
     tilde, Tone,
 };
+use crate::daemon_info::DaemonKnown;
 use crate::start_dialog::{edit_key, DialogKey, TextField};
 
 // ---------------------------------------------------------------------------
@@ -224,6 +227,267 @@ pub fn owns_rows(view: &WorkView, slot: SlotId) -> Vec<OwnsRow> {
             not_read_yet: view.not_read_yet(i),
         })
         .collect()
+}
+
+/// One line of the detail view's body, read from the daemon's plain text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BodyLine {
+    /// `## Goal`, without the `#`s.
+    Heading(String),
+    /// `- item` (text without the dash) or `1. item` (text keeps the
+    /// number), `depth` from two spaces of indent per level.
+    Bullet {
+        depth: usize,
+        text: String,
+    },
+    /// A line inside a fenced code block.
+    Code(String),
+    Text(String),
+    Blank,
+}
+
+/// Body lines the detail view shows before "Show all".
+pub const BODY_PREVIEW_LINES: usize = 40;
+
+/// Where the open detail's fetch stands.
+// Only one is held at a time, so the size gap costs nothing.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum DetailState {
+    Loading,
+    Loaded(ItemDetail),
+    Failed(String),
+}
+
+/// The item whose detail replaces the panel's boxes for `slot`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenDetail {
+    pub slot: SlotId,
+    pub key: String,
+    pub state: DetailState,
+    /// Which request this view waits for; a reply carrying another number
+    /// is stale and dropped.
+    pub req: u64,
+    /// The whole body shows, not only the first `BODY_PREVIEW_LINES`.
+    pub show_all: bool,
+}
+
+/// What the detail view shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetailModel {
+    pub key: String,
+    pub title: String,
+    /// (name, value): Status, Priority, Stage, PR..., Notes, Depends on,
+    /// Folder, Fetched, each only when known.
+    pub rows: Vec<(String, String)>,
+    pub body: Vec<BodyLine>,
+    /// Body lines were dropped for the preview.
+    pub truncated: bool,
+    /// What failed, shown in orange above the body.
+    pub notice: Option<String>,
+    /// `ov-3 Title (open)`, one per child bead.
+    pub children: Vec<String>,
+    pub loading: bool,
+}
+
+/// `1. ` (any number) at the start of `s`.
+fn is_numbered(s: &str) -> bool {
+    let digits = s.bytes().take_while(u8::is_ascii_digit).count();
+    digits > 0 && s[digits..].starts_with(". ")
+}
+
+/// Reads the daemon's plain text (see `adf_to_text`): `#` headings, `- ` and
+/// `1. ` items indented two spaces per level, fenced code, blank lines.
+pub fn body_lines(text: &str) -> Vec<BodyLine> {
+    let mut out = Vec::new();
+    let mut in_code = false;
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            in_code = !in_code;
+            continue;
+        }
+        if in_code {
+            out.push(BodyLine::Code(line.to_string()));
+            continue;
+        }
+        if line.trim().is_empty() {
+            out.push(BodyLine::Blank);
+            continue;
+        }
+        let rest = line.trim_start_matches(' ');
+        let depth = (line.len() - rest.len()) / 2;
+        let hashes = rest.bytes().take_while(|b| *b == b'#').count();
+        if depth == 0 && hashes > 0 && rest[hashes..].starts_with(' ') {
+            out.push(BodyLine::Heading(rest[hashes..].trim().to_string()));
+        } else if let Some(item) = rest.strip_prefix("- ") {
+            out.push(BodyLine::Bullet {
+                depth,
+                text: item.trim_end().to_string(),
+            });
+        } else if is_numbered(rest) {
+            out.push(BodyLine::Bullet {
+                depth,
+                text: rest.trim_end().to_string(),
+            });
+        } else {
+            out.push(BodyLine::Text(rest.trim_end().to_string()));
+        }
+    }
+    out
+}
+
+/// `IN PROGRESS · 3h`, or the label alone when the move was not seen.
+fn stage_text(stage: overseer_proto::Stage, since: Option<i64>, now: i64) -> String {
+    match since {
+        Some(t) => format!(
+            "{} \u{b7} {}",
+            stage.label(),
+            crate::sprint_view::age_text(now - t)
+        ),
+        None => stage.label().to_string(),
+    }
+}
+
+fn pr_text(pr: &overseer_proto::PullRequest) -> String {
+    format!("{} #{} {}", pr.repo, pr.id, pr.title.trim())
+}
+
+/// The detail view for `open`. Until the reply is in (or when the request
+/// failed) the rows come from the item in `view`, so the view is never empty.
+pub fn detail_model(
+    open: &OpenDetail,
+    view: &WorkView,
+    now: i64,
+    home: Option<&Path>,
+) -> DetailModel {
+    let item = view.items.iter().find(|i| i.key == open.key);
+    let row = |k: &str, v: String| (k.to_string(), v);
+    let priority = |p: Option<&String>| p.cloned().unwrap_or_else(|| "Not set".into());
+    let mut rows = Vec::new();
+    let mut body = Vec::new();
+    let mut notice = None;
+    let mut children = Vec::new();
+    let title;
+    match &open.state {
+        DetailState::Loaded(d) => {
+            title = d.title.clone();
+            rows.push(row("Status", d.status.clone()));
+            rows.push(row("Priority", priority(d.priority.as_ref())));
+            if let Some(stage) = d.stage {
+                rows.push(row("Stage", stage_text(stage, d.stage_since, now)));
+            }
+            rows.extend(d.prs.iter().map(|p| row("PR", pr_text(p))));
+            if d.kind == ItemKind::Bead {
+                if let Some(n) = &d.notes {
+                    rows.push(row("Notes", n.clone()));
+                }
+                if !d.depends_on.is_empty() {
+                    rows.push(row("Depends on", d.depends_on.join(", ")));
+                }
+            }
+            if let Some(f) = &d.folder {
+                rows.push(row("Folder", tilde(f, home)));
+            }
+            if let Some(t) = d.fetched_at {
+                rows.push(row(
+                    "Fetched",
+                    format!("{} ago", crate::sprint_view::age_text(now - t)),
+                ));
+            }
+            let text = [d.body.as_deref(), d.overview.as_deref()]
+                .into_iter()
+                .flatten()
+                .find(|t| !t.trim().is_empty());
+            match text {
+                Some(text) => body = body_lines(text),
+                None if d.error.is_none() => body = vec![BodyLine::Text("No description".into())],
+                None => {}
+            }
+            notice = d.error.clone();
+            children = d
+                .children
+                .iter()
+                .map(|c| format!("{} {} ({})", c.key, c.title.trim(), c.status))
+                .collect();
+        }
+        DetailState::Loading | DetailState::Failed(_) => {
+            if let DetailState::Failed(e) = &open.state {
+                notice = Some(e.clone());
+            }
+            title = item
+                .map(|i| i.title.clone())
+                .unwrap_or_else(|| open.key.clone());
+            if let Some(i) = item {
+                rows.push(row("Status", i.status.clone()));
+                rows.push(row("Priority", priority(i.priority.as_ref())));
+                if let Some(stage) = i.stage {
+                    rows.push(row("Stage", stage_text(stage, i.stage_since, now)));
+                }
+                rows.extend(
+                    view.prs
+                        .iter()
+                        .filter(|p| p.ticket.as_deref() == Some(open.key.as_str()))
+                        .map(|p| row("PR", pr_text(p))),
+                );
+                if let Some(f) = &i.folder {
+                    rows.push(row("Folder", tilde(f, home)));
+                }
+            }
+        }
+    }
+    let truncated = !open.show_all && body.len() > BODY_PREVIEW_LINES;
+    if truncated {
+        body.truncate(BODY_PREVIEW_LINES);
+    }
+    DetailModel {
+        key: open.key.clone(),
+        title,
+        rows,
+        body,
+        truncated,
+        notice,
+        children,
+        loading: open.state == DetailState::Loading,
+    }
+}
+
+/// Whether `open.slot` still owns the item; the detail closes otherwise.
+pub fn detail_still_owned(open: &OpenDetail, view: &WorkView) -> bool {
+    view.items
+        .iter()
+        .any(|i| i.key == open.key && i.owner == Some(open.slot))
+}
+
+/// Why a detail request must not be sent to the daemon, if it must not: an
+/// older build cannot decode `GetItemDetail` and hangs up on it, which drops
+/// the app's whole connection.
+pub fn detail_unavailable(daemon: &DaemonKnown, app_build: &str) -> Option<String> {
+    let old = match daemon {
+        DaemonKnown::Old => true,
+        DaemonKnown::Info(info) => overseer_proto::build_notice(app_build, &info.build).is_some(),
+        DaemonKnown::Unknown => false,
+    };
+    old.then(|| {
+        "The daemon runs an older build and cannot fetch details. Restart the daemon to finish the upgrade (overseer ctl restart, or Settings)."
+            .to_string()
+    })
+}
+
+/// Puts a reply for request `req` of `key` into the open detail. A reply for
+/// another key, or an older request for the same key (one that was closed,
+/// reopened or refreshed while it ran), is dropped.
+pub fn take_reply(
+    open: &mut Option<OpenDetail>,
+    key: &str,
+    req: u64,
+    resp: Result<ItemDetail, String>,
+) {
+    if let Some(o) = open.as_mut().filter(|o| o.key == key && o.req == req) {
+        o.state = match resp {
+            Ok(d) => DetailState::Loaded(d),
+            Err(e) => DetailState::Failed(e),
+        };
+    }
 }
 
 /// One line of the Holds box.
@@ -803,39 +1067,46 @@ impl OverseerApp {
             .on_mouse_down(gpui::MouseButton::Left, move |_, window, _| {
                 window.focus(&focus)
             })
-            .child(
-                panel_box("Session")
-                    .child(div().font_weight(FontWeight::SEMIBOLD).child(m.title))
-                    .children(rows)
-                    .children(
-                        note_line(info, self.brain.brain_dir.as_deref()).map(|text| {
-                            let missing = info.session_note.is_none();
-                            div()
-                                .flex()
-                                .gap_2()
-                                .text_sm()
-                                .child(
+            .map(|panel| match self.render_detail(id, now, cx) {
+                // The detail takes the place of every box.
+                Some(detail) => panel.child(detail),
+                None => panel
+                    .child(
+                        panel_box("Session")
+                            .child(div().font_weight(FontWeight::SEMIBOLD).child(m.title))
+                            .children(rows)
+                            .children(note_line(info, self.brain.brain_dir.as_deref()).map(
+                                |text| {
+                                    let missing = info.session_note.is_none();
                                     div()
-                                        .w(px(64.))
-                                        .text_color(rgb(colors::MUTED))
-                                        .child("Note"),
-                                )
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w(px(0.))
-                                        .truncate()
-                                        .when(missing, |d| d.text_color(rgb(colors::TEXT_DIM)))
-                                        .child(text),
-                                )
-                        }),
+                                        .flex()
+                                        .gap_2()
+                                        .text_sm()
+                                        .child(
+                                            div()
+                                                .w(px(64.))
+                                                .text_color(rgb(colors::MUTED))
+                                                .child("Note"),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w(px(0.))
+                                                .truncate()
+                                                .when(missing, |d| {
+                                                    d.text_color(rgb(colors::TEXT_DIM))
+                                                })
+                                                .child(text),
+                                        )
+                                },
+                            ))
+                            .child(buttons),
                     )
-                    .child(buttons),
-            )
-            .child(self.render_owns(id, cx))
-            .child(self.render_holds(id, now, cx))
-            .child(self.render_relays(id, cx))
-            .child(self.render_progress(id))
+                    .child(self.render_owns(id, cx))
+                    .child(self.render_holds(id, now, cx))
+                    .child(self.render_relays(id, cx))
+                    .child(self.render_progress(id)),
+            })
             .children(
                 self.status
                     .clone()
@@ -843,40 +1114,177 @@ impl OverseerApp {
             )
     }
 
+    /// The open detail of an item `id` owns, in place of the panel's boxes.
+    fn render_detail(&self, id: SlotId, now: i64, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        let open = self.detail.as_ref().filter(|d| d.slot == id)?;
+        let m = detail_model(open, &self.work, now, self.home.as_deref());
+        let refresh_key = m.key.clone();
+        let show_all = open.show_all;
+        let bar = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                button("detail-back", "Back", true)
+                    .on_click(cx.listener(|this, _, _, cx| this.close_detail(cx))),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .truncate()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(m.key.clone()),
+            )
+            .child(
+                button("detail-refresh", "Refresh", true).on_click(cx.listener(
+                    move |this, _, window, cx| {
+                        this.open_detail(id, refresh_key.clone(), true, window, cx)
+                    },
+                )),
+            );
+        let rows: Vec<_> = m
+            .rows
+            .into_iter()
+            .map(|(k, v)| {
+                div()
+                    .flex()
+                    .gap_2()
+                    .text_sm()
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(72.))
+                            .text_color(rgb(colors::MUTED))
+                            .child(k),
+                    )
+                    .child(div().flex_1().min_w(px(0.)).child(v))
+            })
+            .collect();
+        let font = self.theme.font_family.clone();
+        let body: Vec<_> = m
+            .body
+            .into_iter()
+            .map(|line| match line {
+                BodyLine::Heading(t) => div().pt_1().font_weight(FontWeight::SEMIBOLD).child(t),
+                BodyLine::Bullet { depth, text } => {
+                    let mark = if is_numbered(&text) { "" } else { "\u{2022} " };
+                    div()
+                        .pl(px(12. * (depth as f32 + 1.)))
+                        .child(format!("{mark}{text}"))
+                }
+                BodyLine::Code(t) => div()
+                    .px_1()
+                    .bg(rgb(colors::FIELD))
+                    .font_family(font.clone())
+                    .text_xs()
+                    .child(if t.is_empty() { " ".to_string() } else { t }),
+                BodyLine::Text(t) => div().child(t),
+                BodyLine::Blank => div().h(px(6.)),
+            })
+            .collect();
+        let toggle = (m.truncated || show_all).then(|| {
+            button(
+                "detail-all",
+                if show_all { "Show less" } else { "Show all" },
+                true,
+            )
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_detail_all(cx)))
+        });
+        let children = (!m.children.is_empty()).then(|| {
+            panel_box("Child beads")
+                .children(m.children.into_iter().map(|c| div().text_sm().child(c)))
+        });
+        Some(
+            div()
+                .flex_none()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .p_2()
+                        .rounded(px(6.))
+                        .bg(rgb(colors::CARD))
+                        .border_1()
+                        .border_color(rgb(colors::BORDER))
+                        .child(bar)
+                        .child(div().font_weight(FontWeight::SEMIBOLD).child(m.title))
+                        .children(rows)
+                        .children(
+                            m.notice
+                                .map(|n| div().text_sm().text_color(rgb(colors::ORANGE)).child(n)),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .pt_1()
+                                .text_sm()
+                                .children(m.loading.then(|| {
+                                    div()
+                                        .text_color(rgb(colors::MUTED))
+                                        .child("Loading description...")
+                                }))
+                                .children(body),
+                        )
+                        .children(toggle.map(|t| div().flex().child(t))),
+                )
+                .children(children),
+        )
+    }
+
     fn render_owns(&self, id: SlotId, cx: &mut Context<Self>) -> impl IntoElement {
         let rows: Vec<_> = owns_rows(&self.work, id)
             .into_iter()
             .enumerate()
             .map(|(n, row)| {
-                let key = row.key.clone();
+                let release_key = row.key.clone();
+                let open_key = row.key.clone();
                 div()
+                    .id(("own", n))
                     .flex()
                     .items_center()
                     .gap_2()
+                    .p_1()
+                    .rounded(px(4.))
                     .text_sm()
-                    .child(
-                        div()
-                            .flex_shrink()
-                            .min_w(px(0.))
-                            .truncate()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(row.key),
-                    )
-                    .child(
-                        div()
-                            .flex_shrink()
-                            .min_w(px(0.))
-                            .truncate()
-                            .text_color(rgb(colors::MUTED))
-                            .child(row.status),
-                    )
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(colors::CARD_HOVER)))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_detail(id, open_key.clone(), false, window, cx)
+                    }))
                     .child(
                         div()
                             .flex_1()
                             .min_w(px(0.))
                             .flex()
                             .flex_col()
-                            .child(div().truncate().child(row.title))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_baseline()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child(row.key),
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w(px(0.))
+                                            .truncate()
+                                            .text_xs()
+                                            .text_color(rgb(colors::MUTED))
+                                            .child(row.status),
+                                    ),
+                            )
+                            .child(div().line_clamp(2).child(row.title))
                             .children(row.gone.then(|| {
                                 if row.not_read_yet {
                                     div()
@@ -895,7 +1303,10 @@ impl OverseerApp {
                         button(("release", n), "Release", true)
                             .flex_none()
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.release_item(key.clone(), cx)
+                                // The row behind opens the detail; this click
+                                // must not reach it.
+                                cx.stop_propagation();
+                                this.release_item(release_key.clone(), cx)
                             })),
                     )
             })
@@ -2178,5 +2589,315 @@ mod tests {
         );
         assert_eq!(progress_rows(&view, 1, clock, 1).len(), 1);
         assert!(progress_rows(&view, 4, clock, 10).is_empty());
+    }
+
+    fn demo_item(key: &str, owner: Option<SlotId>) -> overseer_proto::WorkItem {
+        overseer_proto::WorkItem {
+            key: key.into(),
+            kind: ItemKind::Ticket,
+            title: format!("Title of {key}"),
+            status: "In Progress".into(),
+            priority: Some("High".into()),
+            parent: None,
+            owner,
+            in_list: true,
+            folder: None,
+            stage: None,
+            stage_since: None,
+        }
+    }
+
+    fn demo_view(items: Vec<overseer_proto::WorkItem>) -> WorkView {
+        WorkView {
+            notes_off: None,
+            items,
+            sources: vec![],
+            notices: vec![],
+            sprint: None,
+            prs: Vec::new(),
+            sprint_day: None,
+        }
+    }
+
+    fn demo_detail(key: &str) -> overseer_proto::ItemDetail {
+        overseer_proto::ItemDetail {
+            key: key.into(),
+            kind: ItemKind::Ticket,
+            title: format!("Full title of {key}"),
+            status: "In Review".into(),
+            priority: None,
+            stage: None,
+            stage_since: None,
+            folder: None,
+            body: None,
+            notes: None,
+            depends_on: vec![],
+            children: vec![],
+            prs: vec![],
+            overview: None,
+            fetched_at: None,
+            error: None,
+        }
+    }
+
+    fn open(key: &str, state: DetailState) -> OpenDetail {
+        OpenDetail {
+            slot: 2,
+            key: key.into(),
+            state,
+            req: 1,
+            show_all: false,
+        }
+    }
+
+    #[test]
+    fn body_lines_reads_headings_bullets_and_code() {
+        let text =
+            "## Goal\nShow the detail view.\n\n- First\n  - Nested\n- Second\n```\ncargo test\n```";
+        assert_eq!(
+            body_lines(text),
+            vec![
+                BodyLine::Heading("Goal".into()),
+                BodyLine::Text("Show the detail view.".into()),
+                BodyLine::Blank,
+                BodyLine::Bullet {
+                    depth: 0,
+                    text: "First".into()
+                },
+                BodyLine::Bullet {
+                    depth: 1,
+                    text: "Nested".into()
+                },
+                BodyLine::Bullet {
+                    depth: 0,
+                    text: "Second".into()
+                },
+                BodyLine::Code("cargo test".into()),
+            ]
+        );
+        // Numbered items keep their number; code keeps its blank lines and `#`.
+        assert_eq!(
+            body_lines("1. One\n  2. Two\n```\n# not a heading\n\n```"),
+            vec![
+                BodyLine::Bullet {
+                    depth: 0,
+                    text: "1. One".into()
+                },
+                BodyLine::Bullet {
+                    depth: 1,
+                    text: "2. Two".into()
+                },
+                BodyLine::Code("# not a heading".into()),
+                BodyLine::Code(String::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn detail_model_while_loading_uses_the_cache() {
+        let view = demo_view(vec![demo_item("DEMO-1", Some(2))]);
+        let m = detail_model(&open("DEMO-1", DetailState::Loading), &view, 100, None);
+        assert!(m.loading);
+        assert_eq!(m.key, "DEMO-1");
+        assert_eq!(m.title, "Title of DEMO-1");
+        assert_eq!(m.rows[0], ("Status".to_string(), "In Progress".to_string()));
+        assert_eq!(m.rows[1], ("Priority".to_string(), "High".to_string()));
+        assert!(m.body.is_empty());
+        assert!(!m.truncated);
+        assert_eq!(m.notice, None);
+    }
+
+    #[test]
+    fn detail_model_rows_from_a_loaded_detail() {
+        use overseer_proto::{ChildBead, PullRequest, Stage};
+        let view = demo_view(vec![demo_item("DEMO-1", Some(2))]);
+        let mut d = demo_detail("DEMO-1");
+        d.stage = Some(Stage::InProgress);
+        d.stage_since = Some(100 - 3 * 3600);
+        d.folder = Some("/Users/demo/notes/DEMO-1".into());
+        d.fetched_at = Some(100 - 120);
+        d.prs = vec![PullRequest {
+            repo: "demo-repo".into(),
+            id: 7,
+            title: "Add the view".into(),
+            branch: "DEMO-1-view".into(),
+            url: None,
+            author: None,
+            created: None,
+            ticket: Some("DEMO-1".into()),
+            approvals: None,
+        }];
+        d.children = vec![ChildBead {
+            key: "ov-3".into(),
+            title: "Write tests".into(),
+            status: "open".into(),
+        }];
+        let m = detail_model(
+            &open("DEMO-1", DetailState::Loaded(d)),
+            &view,
+            100,
+            Some(Path::new("/Users/demo")),
+        );
+        assert!(!m.loading);
+        assert_eq!(m.title, "Full title of DEMO-1");
+        let rows: Vec<(&str, &str)> = m
+            .rows
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("Status", "In Review"),
+                ("Priority", "Not set"),
+                ("Stage", "IN PROGRESS \u{b7} 3h"),
+                ("PR", "demo-repo #7 Add the view"),
+                ("Folder", "~/notes/DEMO-1"),
+                ("Fetched", "2m ago"),
+            ]
+        );
+        assert_eq!(m.children, ["ov-3 Write tests (open)"]);
+    }
+
+    #[test]
+    fn detail_model_shows_bead_notes_and_dependencies() {
+        let mut item = demo_item("ov-3", Some(2));
+        item.kind = ItemKind::Bead;
+        let view = demo_view(vec![item]);
+        let mut d = demo_detail("ov-3");
+        d.kind = ItemKind::Bead;
+        d.notes = Some("tried it\nworks".into());
+        d.depends_on = vec!["ov-1".into(), "ov-2 (blocks)".into()];
+        let m = detail_model(&open("ov-3", DetailState::Loaded(d)), &view, 100, None);
+        assert!(m.rows.contains(&("Notes".into(), "tried it\nworks".into())));
+        assert!(m
+            .rows
+            .contains(&("Depends on".into(), "ov-1, ov-2 (blocks)".into())));
+    }
+
+    #[test]
+    fn detail_model_caps_long_bodies() {
+        let view = demo_view(vec![demo_item("DEMO-1", Some(2))]);
+        let mut d = demo_detail("DEMO-1");
+        d.body = Some(
+            (1..=100)
+                .map(|n| format!("line {n}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        let mut o = open("DEMO-1", DetailState::Loaded(d));
+        let m = detail_model(&o, &view, 100, None);
+        assert_eq!(m.body.len(), BODY_PREVIEW_LINES);
+        assert!(m.truncated);
+        o.show_all = true;
+        let m = detail_model(&o, &view, 100, None);
+        assert_eq!(m.body.len(), 100);
+        assert!(!m.truncated);
+    }
+
+    #[test]
+    fn detail_model_shows_the_failure_and_overview() {
+        let view = demo_view(vec![demo_item("DEMO-1", Some(2))]);
+        let mut d = demo_detail("DEMO-1");
+        d.error = Some("jira: cannot reach demo.atlassian.net".into());
+        d.overview = Some("The project overview.".into());
+        let m = detail_model(&open("DEMO-1", DetailState::Loaded(d)), &view, 100, None);
+        assert_eq!(
+            m.notice.as_deref(),
+            Some("jira: cannot reach demo.atlassian.net")
+        );
+        assert_eq!(m.body, [BodyLine::Text("The project overview.".into())]);
+        // A failed request keeps the cached rows and says why.
+        let m = detail_model(
+            &open("DEMO-1", DetailState::Failed("daemon gone".into())),
+            &view,
+            100,
+            None,
+        );
+        assert_eq!(m.notice.as_deref(), Some("daemon gone"));
+        assert_eq!(m.title, "Title of DEMO-1");
+        assert!(!m.loading);
+    }
+
+    #[test]
+    fn detail_closes_when_the_item_leaves_the_slot() {
+        let o = open("DEMO-1", DetailState::Loading);
+        assert!(detail_still_owned(
+            &o,
+            &demo_view(vec![demo_item("DEMO-1", Some(2))])
+        ));
+        assert!(!detail_still_owned(
+            &o,
+            &demo_view(vec![demo_item("DEMO-1", Some(3))])
+        ));
+        assert!(!detail_still_owned(
+            &o,
+            &demo_view(vec![demo_item("DEMO-1", None)])
+        ));
+        assert!(!detail_still_owned(&o, &demo_view(vec![])));
+    }
+
+    #[test]
+    fn a_late_reply_for_another_key_is_ignored() {
+        let mut o = Some(open("DEMO-2", DetailState::Loading));
+        take_reply(&mut o, "DEMO-1", 1, Ok(demo_detail("DEMO-1")));
+        assert_eq!(o.as_ref().unwrap().state, DetailState::Loading);
+        take_reply(&mut o, "DEMO-2", 1, Err("no".into()));
+        assert_eq!(o.as_ref().unwrap().state, DetailState::Failed("no".into()));
+        take_reply(&mut o, "DEMO-2", 1, Ok(demo_detail("DEMO-2")));
+        assert!(matches!(o.unwrap().state, DetailState::Loaded(_)));
+        // Closed meanwhile: nothing reopens.
+        let mut none = None;
+        take_reply(&mut none, "DEMO-2", 1, Ok(demo_detail("DEMO-2")));
+        assert!(none.is_none());
+    }
+
+    #[test]
+    fn an_older_request_for_the_same_key_cannot_overwrite_a_newer_one() {
+        // Refresh pressed while the first fetch still hangs: request 2 is
+        // the one the view waits for.
+        let mut o = Some(open("DEMO-1", DetailState::Loading));
+        o.as_mut().unwrap().req = 2;
+        take_reply(&mut o, "DEMO-1", 2, Ok(demo_detail("DEMO-1")));
+        assert!(matches!(o.as_ref().unwrap().state, DetailState::Loaded(_)));
+        // The first request times out late.
+        take_reply(&mut o, "DEMO-1", 1, Err("timed out".into()));
+        assert!(matches!(o.unwrap().state, DetailState::Loaded(_)));
+    }
+
+    #[test]
+    fn an_empty_description_says_so() {
+        let view = demo_view(vec![demo_item("DEMO-1", Some(2))]);
+        for body in [None, Some(String::new()), Some("  \n ".to_string())] {
+            let mut d = demo_detail("DEMO-1");
+            d.body = body;
+            let o = open("DEMO-1", DetailState::Loaded(d));
+            let m = detail_model(&o, &view, 0, None);
+            assert_eq!(m.body, [BodyLine::Text("No description".into())]);
+        }
+        // A failed fetch says why instead.
+        let mut d = demo_detail("DEMO-1");
+        d.error = Some("Jira is off".into());
+        let o = open("DEMO-1", DetailState::Loaded(d));
+        assert!(detail_model(&o, &view, 0, None).body.is_empty());
+    }
+
+    #[test]
+    fn an_older_daemon_is_not_sent_the_detail_request() {
+        assert_eq!(detail_unavailable(&DaemonKnown::Unknown, "b2"), None);
+        let why = detail_unavailable(&DaemonKnown::Old, "b2").unwrap();
+        assert!(why.contains("older build"), "{why}");
+        assert!(why.contains("Restart the daemon"), "{why}");
+        let info = |build: &str| {
+            DaemonKnown::Info(overseer_proto::DaemonInfo {
+                version: "0".into(),
+                build: build.into(),
+                pid: 1,
+                started_at: 0,
+                exe: "/demo/overseer".into(),
+            })
+        };
+        assert_eq!(detail_unavailable(&info("b2"), "b2"), None);
+        assert!(detail_unavailable(&info("b1"), "b2").is_some());
     }
 }

@@ -790,6 +790,22 @@ fn handle_frame(
                 });
             });
         }
+        // An item's detail can wait on the Keychain, a Jira call or `bd`, so
+        // it is answered from a task like a refresh.
+        Frame::Request {
+            seq,
+            req: Request::GetItemDetail { key, refresh },
+        } => {
+            let task_store = store.clone();
+            let outbox = outbox.clone();
+            store.spawn(async move {
+                let resp = match task_store.item_detail(&key, refresh).await {
+                    Ok(d) => Response::ItemDetail(d),
+                    Err(message) => Response::Error { message },
+                };
+                outbox.send(Frame::Response { seq, resp });
+            });
+        }
         // The Settings view says whether a token is stored, which reads the
         // Keychain (bounded, but not instant), so the settings requests are
         // answered from a task. Saves stay one at a time inside `save`.
@@ -1030,10 +1046,13 @@ fn handle_request(
         }
         Request::ListSlots => Response::Slots(manager.lock().unwrap().list()),
         Request::DaemonInfo => Response::DaemonInfo(ctx.info.clone()),
-        // RefreshWorkItems and the settings requests are answered in
+        // RefreshWorkItems, GetItemDetail and the settings requests are answered in
         // `handle_frame` from a task of their own (they can wait on the
         // Keychain); this arm only keeps the match whole.
         Request::ListWorkItems | Request::RefreshWorkItems => Response::Work(store.view()),
+        Request::GetItemDetail { .. } => Response::Error {
+            message: "item details are answered by the connection".into(),
+        },
         Request::GetSettings | Request::SaveSettings { .. } | Request::SetToken { .. } => {
             Response::Error {
                 message: "settings requests are answered by the connection".into(),

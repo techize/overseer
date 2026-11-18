@@ -203,6 +203,51 @@ impl Stage {
     }
 }
 
+/// A bead under an item, shown in its detail.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChildBead {
+    pub key: String,
+    pub title: String,
+    pub status: String,
+}
+
+/// Everything the detail view shows of one item.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ItemDetail {
+    pub key: String,
+    pub kind: ItemKind,
+    pub title: String,
+    pub status: String,
+    #[serde(default)]
+    pub priority: Option<String>,
+    #[serde(default)]
+    pub stage: Option<Stage>,
+    /// Unix seconds the item entered its stage.
+    #[serde(default)]
+    pub stage_since: Option<i64>,
+    #[serde(default)]
+    pub folder: Option<PathBuf>,
+    #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    #[serde(default)]
+    pub children: Vec<ChildBead>,
+    #[serde(default)]
+    pub prs: Vec<PullRequest>,
+    /// The project overview paragraph, filled only when `body` is `None`.
+    #[serde(default)]
+    pub overview: Option<String>,
+    /// Unix seconds the detail was fetched.
+    #[serde(default)]
+    pub fetched_at: Option<i64>,
+    /// Why the fetch failed, when it did.
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
 /// An open pull request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PullRequest {
@@ -520,6 +565,12 @@ pub enum Request {
     ListWorkItems,
     /// Re-reads the sources now instead of waiting for the next poll.
     RefreshWorkItems,
+    /// The detail of one owned item. `refresh` bypasses the cache.
+    GetItemDetail {
+        key: String,
+        #[serde(default)]
+        refresh: bool,
+    },
     /// Gives a work item to a slot. `confirm` accepts a busy-slot warning,
     /// `move_owner` takes the item from its current owner.
     Assign {
@@ -1037,6 +1088,7 @@ pub enum Response {
         message: String,
     },
     Work(WorkView),
+    ItemDetail(ItemDetail),
     /// The request needs the caller to confirm and resend with `confirm` set.
     NeedsConfirm {
         message: String,
@@ -1530,6 +1582,10 @@ mod tests {
         for req in [
             Request::ListWorkItems,
             Request::RefreshWorkItems,
+            Request::GetItemDetail {
+                key: "DEMO-1".into(),
+                refresh: true,
+            },
             Request::Assign {
                 key: "DEMO-1".into(),
                 slot: 2,
@@ -1545,6 +1601,19 @@ mod tests {
             let json = serde_json::to_string(&req).unwrap();
             assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), req);
         }
+    }
+
+    #[test]
+    fn get_item_detail_reads_without_refresh() {
+        let req: Request =
+            serde_json::from_str(r#"{"type":"GetItemDetail","key":"DEMO-1"}"#).unwrap();
+        assert_eq!(
+            req,
+            Request::GetItemDetail {
+                key: "DEMO-1".into(),
+                refresh: false,
+            }
+        );
     }
 
     #[test]
@@ -1584,6 +1653,24 @@ mod tests {
     fn work_responses_round_trip() {
         for resp in [
             Response::Work(view()),
+            Response::ItemDetail(ItemDetail {
+                key: "DEMO-1".into(),
+                kind: ItemKind::Ticket,
+                title: "T".into(),
+                status: "To Do".into(),
+                priority: None,
+                stage: None,
+                stage_since: None,
+                folder: None,
+                body: None,
+                notes: None,
+                depends_on: vec![],
+                children: vec![],
+                prs: vec![],
+                overview: None,
+                fetched_at: None,
+                error: None,
+            }),
             Response::NeedsConfirm {
                 message: "S2 is busy".into(),
             },

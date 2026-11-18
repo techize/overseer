@@ -18,14 +18,15 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use overseer_proto::{
-    owned_by_message, slot_name, Event, ItemKind, PullRequest, Response, Sender, SlotId,
-    SourceStatus, Stage, WorkItem, WorkView, JIRA_OFF, PRS_OFF,
+    owned_by_message, slot_name, ChildBead, Event, ItemDetail, ItemKind, PullRequest, Response,
+    Sender, SlotId, SourceStatus, Stage, WorkItem, WorkView, JIRA_OFF, PRS_OFF,
 };
 use regex::Regex;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
 
 use super::bitbucket_api::{pick_remote, BitbucketApi};
+use super::detail::{overview_paragraph, parse_bead_detail, parse_issue_detail, DETAIL_TTL};
 use super::jira_api::{run_blocking, run_blocking_for, ActiveSprint, JiraApi};
 use super::ownership::{decide, promotions, Decision};
 use super::sprint::{
@@ -340,6 +341,8 @@ pub struct WorkStore {
     events: broadcast::Sender<Event>,
     env: BaseEnv,
     cache: Mutex<Cache>,
+    /// Fetched item bodies by key: when, what and the unix time.
+    detail_cache: Mutex<HashMap<String, (Instant, Fetched, i64)>>,
     /// Held for the length of one source's refresh, so refreshes of the same
     /// source run one after another.
     beads_turn: tokio::sync::Mutex<()>,
@@ -355,6 +358,18 @@ pub struct WorkStore {
     /// Every task the store runs (polls, requested refreshes, the label
     /// worker), so `shutdown` can stop them and the source children they own.
     tasks: Mutex<Tasks>,
+}
+
+/// What a detail fetch brings: the parts the view does not already have.
+#[derive(Clone)]
+struct Fetched {
+    body: Option<String>,
+    notes: Option<String>,
+    depends_on: Vec<String>,
+    /// What the source calls the item, for when the view only has the key.
+    title: Option<String>,
+    status: Option<String>,
+    priority: Option<String>,
 }
 
 struct Tasks {
@@ -574,6 +589,7 @@ impl WorkStore {
             ledger,
             events,
             env,
+            detail_cache: Mutex::new(HashMap::new()),
             cache: Mutex::new(Cache {
                 beads: Vec::new(),
                 tickets: Vec::new(),
@@ -939,6 +955,159 @@ impl WorkStore {
         if matches!(which, Source::Jira) {
             self.sync_notes().await;
         }
+    }
+
+    /// Everything the detail view shows of `key`: the listed fields, its
+    /// child beads and PRs, and the body fetched from Jira or `bd`, kept for
+    /// [`DETAIL_TTL`] unless `refresh`. A failed fetch is reported in
+    /// `error` (and not kept) with the project overview as a fallback.
+    /// `Err` only for a key the store does not know.
+    pub async fn item_detail(&self, key: &str, refresh: bool) -> Result<ItemDetail, String> {
+        let view = self.view();
+        let item = view
+            .items
+            .iter()
+            .find(|i| i.key == key)
+            .ok_or_else(|| format!("{key} is not a known item"))?;
+        let children = view
+            .items
+            .iter()
+            .filter(|i| i.kind == ItemKind::Bead && i.parent.as_deref() == Some(key))
+            .map(|i| ChildBead {
+                key: i.key.clone(),
+                title: i.title.clone(),
+                status: i.status.clone(),
+            })
+            .collect();
+        let mut prs: Vec<PullRequest> = view
+            .prs
+            .iter()
+            .filter(|p| p.ticket.as_deref() == Some(key))
+            .cloned()
+            .collect();
+        // Newest first; `None` sorts below every date, so undated come last.
+        prs.sort_by_key(|p| std::cmp::Reverse(p.created));
+        let mut detail = ItemDetail {
+            key: item.key.clone(),
+            kind: item.kind.clone(),
+            title: item.title.clone(),
+            status: item.status.clone(),
+            priority: item.priority.clone(),
+            stage: item.stage,
+            stage_since: item.stage_since,
+            folder: item.folder.clone(),
+            body: None,
+            notes: None,
+            depends_on: Vec::new(),
+            children,
+            prs,
+            overview: None,
+            fetched_at: None,
+            error: None,
+        };
+        let cached = self
+            .detail_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .filter(|(at, _, _)| !refresh && at.elapsed() < DETAIL_TTL)
+            .map(|(_, f, when)| (f.clone(), *when));
+        let fetched = match cached {
+            Some((f, when)) => Ok((f, when)),
+            None => self.fetch_detail(key, &item.kind).await.map(|f| {
+                let when = unix_now();
+                self.detail_cache
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(key.to_owned(), (Instant::now(), f.clone(), when));
+                (f, when)
+            }),
+        };
+        match fetched {
+            Ok((f, when)) => {
+                // An item that has left the list shows its key as its title
+                // and no status; what the source said fills those in.
+                if let Some(t) = f.title.filter(|t| !t.trim().is_empty()) {
+                    if detail.title.trim().is_empty() || detail.title == detail.key {
+                        detail.title = t;
+                    }
+                }
+                if let Some(st) = f.status.filter(|s| !s.trim().is_empty()) {
+                    if detail.status == overseer_proto::UNKNOWN_STATUS {
+                        detail.status = st;
+                    }
+                }
+                if detail.priority.is_none() {
+                    detail.priority = f.priority;
+                }
+                detail.body = f.body;
+                detail.notes = f.notes;
+                detail.depends_on = f.depends_on;
+                detail.fetched_at = Some(when);
+            }
+            Err(e) => {
+                detail.error = Some(e);
+                if let Some(folder) = detail.folder.clone() {
+                    detail.overview = tokio::task::spawn_blocking(move || {
+                        std::fs::read_to_string(folder.join("00-PROJECT-OVERVIEW.md")).ok()
+                    })
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|md| overview_paragraph(&md));
+                }
+            }
+        }
+        Ok(detail)
+    }
+
+    /// Reads one item's body from its source.
+    async fn fetch_detail(&self, key: &str, kind: &ItemKind) -> Result<Fetched, String> {
+        // The login shell's PATH is what finds `bd` and `acli`.
+        let mut env = self.env.clone();
+        env.wait().await;
+        let vars = env.get();
+        if *kind == ItemKind::Bead {
+            let cmd = self.bd(&["show".into(), key.into(), "--json".into()]);
+            let out = run_source(&cmd, &self.beads_dir, SOURCE_TIMEOUT, &vars).await?;
+            let d = parse_bead_detail(&out)?;
+            return Ok(Fetched {
+                body: d.body,
+                notes: d.notes,
+                depends_on: d.depends_on,
+                title: None,
+                status: None,
+                priority: None,
+            });
+        }
+        let out = match &self.jira {
+            JiraSource::Off => return Err("Jira is off: no jira_site or jira_command".into()),
+            JiraSource::Api(api) => {
+                let token = jira_token(&self.jira_email, &vars, &self.security).await?;
+                let (api, key) = (api.clone(), key.to_owned());
+                run_blocking(move || api.issue(&token, &key)).await?
+            }
+            JiraSource::Command(cmd) => {
+                let prog = cmd.first().ok_or("jira_command is empty")?;
+                let cmd: Vec<String> = [prog.as_str(), "jira", "workitem", "view", key]
+                    .into_iter()
+                    .chain(["--fields", "summary,description,status,priority", "--json"])
+                    .map(str::to_owned)
+                    .collect();
+                run_source(&cmd, Path::new(WORKSPACE_CWD), SOURCE_TIMEOUT, &vars)
+                    .await
+                    .map_err(|e| format!("{}: {}", cmd.join(" "), missing_program_hint(&cmd, e)))?
+            }
+        };
+        let d = parse_issue_detail(&out)?;
+        Ok(Fetched {
+            body: d.body,
+            notes: None,
+            depends_on: Vec::new(),
+            title: Some(d.title),
+            status: Some(d.status),
+            priority: d.priority,
+        })
     }
 
     /// Writes the active sprint's tickets into the owned notes folder, off
@@ -3003,6 +3172,193 @@ esac"#,
         // Long over: capped at the last day.
         assert_eq!(s.view().sprint_day, Some(SprintDay { day: 10, days: 10 }));
         assert_eq!(store_with(|_| {}).view().sprint_day, None);
+    }
+
+    // Item details.
+
+    fn fixture(name: &str) -> String {
+        format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"))
+    }
+
+    fn bead(id: &str, title: &str) -> Bead {
+        Bead {
+            id: id.into(),
+            title: title.into(),
+            status: "open".into(),
+            priority: None,
+            external_ref: None,
+            labels: vec![],
+        }
+    }
+
+    fn lines(path: &Path) -> Vec<String> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn detail_for_a_bead_runs_bd_show_and_caches() {
+        let dir = temp_dir("detail-bead");
+        let log = dir.join("calls.log");
+        let script = format!(
+            "echo \"$@\" >> '{}'; cat '{}'",
+            log.display(),
+            fixture("bd-show.json")
+        );
+        let s = store_with(|c| {
+            c.beads_dir = dir.clone();
+            c.bd_command = fake_cmd(&script, &[]);
+        });
+        s.cache().beads = vec![bead("demo-1", "Wire the detail view")];
+        s.regroup(1);
+        for _ in 0..2 {
+            let d = s.item_detail("demo-1", false).await.unwrap();
+            assert_eq!(d.error, None);
+            assert_eq!(
+                d.body.as_deref(),
+                Some("Show the item body.\n\nSecond paragraph.")
+            );
+            let notes = d.notes.unwrap();
+            assert!(notes.ends_with("note line 12"), "{notes}");
+            assert!(!notes.contains("note line 2\n"), "{notes}");
+            assert_eq!(d.depends_on, ["demo-2 (blocks)"]);
+            assert!(d.fetched_at.is_some());
+        }
+        assert_eq!(lines(&log), ["show demo-1 --json"]);
+        s.item_detail("demo-1", true).await.unwrap();
+        assert_eq!(lines(&log).len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn detail_for_a_command_ticket_uses_acli_view() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("detail-acli");
+        let log = dir.join("calls.log");
+        // Only the program is used, so the fake is an executable of its own.
+        let acli = dir.join("acli");
+        std::fs::write(
+            &acli,
+            format!(
+                "#!/bin/sh\necho \"$@\" >> '{}'\ncat '{}'\n",
+                log.display(),
+                fixture("jira-issue.json")
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&acli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let s = store_with(|c| c.jira_command = vec![acli.to_str().unwrap().to_owned()]);
+        s.ledger.assign("DEMO-1", 2, 1).unwrap();
+        let d = s.item_detail("DEMO-1", false).await.unwrap();
+        assert_eq!(d.error, None);
+        assert_eq!(
+            lines(&log),
+            ["jira workitem view DEMO-1 --fields summary,description,status,priority --json"]
+        );
+        assert!(d.body.is_some_and(|b| !b.trim().is_empty()));
+        // DEMO-1 is owned but not listed, so the view only knows its key;
+        // the fetch supplies the title, status and priority.
+        assert_eq!(d.title, "Wire the detail view");
+        assert_eq!(d.status, "In Progress");
+        assert_eq!(d.priority.as_deref(), Some("High"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn detail_says_why_when_jira_is_off() {
+        let dir = temp_dir("detail-off");
+        let folder = dir.join("Sprints/sprint-26-01/DEMO-1");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(
+            folder.join("00-PROJECT-OVERVIEW.md"),
+            "# DEMO-1 Widget\n\nWidgets glow when wired.\n\nSecond.\n",
+        )
+        .unwrap();
+        let s = store_with(|c| c.brain_dir = dir.clone());
+        s.ledger.assign("DEMO-1", 2, 1).unwrap();
+        s.regroup(1);
+        for _ in 0..2 {
+            let d = s.item_detail("DEMO-1", false).await.unwrap();
+            assert_eq!(d.body, None);
+            assert_eq!(
+                d.error.as_deref(),
+                Some("Jira is off: no jira_site or jira_command")
+            );
+            assert_eq!(d.overview.as_deref(), Some("Widgets glow when wired."));
+            assert_eq!(d.fetched_at, None);
+        }
+        assert!(s.detail_cache.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_failed_fetch_is_not_cached() {
+        let dir = temp_dir("detail-fail");
+        let count = dir.join("count");
+        let script = format!(
+            "echo x >> '{c}'; if [ \"$(wc -l < '{c}')\" -lt 2 ]; then echo boom >&2; exit 1; fi; cat '{f}'",
+            c = count.display(),
+            f = fixture("bd-show.json")
+        );
+        let s = store_with(|c| {
+            c.beads_dir = dir.clone();
+            c.bd_command = fake_cmd(&script, &[]);
+        });
+        s.cache().beads = vec![bead("demo-1", "Wire the detail view")];
+        s.regroup(1);
+        let first = s.item_detail("demo-1", false).await.unwrap();
+        assert!(first.error.is_some_and(|e| e.contains("boom")));
+        assert_eq!(first.body, None);
+        let second = s.item_detail("demo-1", false).await.unwrap();
+        assert_eq!(second.error, None);
+        assert!(second.body.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn unknown_key_is_an_error() {
+        let s = store_with(|_| {});
+        assert!(s.item_detail("DEMO-999", false).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn detail_lists_child_beads_and_prs_newest_first() {
+        let s = store_with(|_| {});
+        s.cache().beads = vec![
+            bead("ov-1", "DEMO-1 first step"),
+            bead("ov-2", "DEMO-1 second step"),
+            bead("ov-3", "unrelated"),
+        ];
+        let pr = |id: u64, ticket: Option<&str>, created: Option<i64>| PullRequest {
+            repo: "demo-api".into(),
+            id,
+            title: format!("pr {id}"),
+            branch: "b".into(),
+            url: None,
+            author: None,
+            created,
+            ticket: ticket.map(str::to_owned),
+            approvals: None,
+        };
+        s.cache().prs.insert(
+            "demo-api".into(),
+            vec![
+                pr(1, Some("DEMO-1"), None),
+                pr(2, Some("DEMO-1"), Some(100)),
+                pr(3, Some("DEMO-2"), Some(900)),
+                pr(4, Some("DEMO-1"), Some(200)),
+            ],
+        );
+        s.regroup(1);
+        s.ledger.assign("DEMO-1", 2, 1).unwrap();
+        let d = s.item_detail("DEMO-1", false).await.unwrap();
+        let kids: Vec<_> = d.children.iter().map(|c| c.key.as_str()).collect();
+        assert_eq!(kids, ["ov-1", "ov-2"]);
+        let prs: Vec<_> = d.prs.iter().map(|p| p.id).collect();
+        assert_eq!(prs, [4, 2, 1]);
     }
 }
 
