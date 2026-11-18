@@ -309,6 +309,8 @@ pub struct WorkStore {
     bitbucket: Arc<BitbucketApi>,
     /// The beads folder is one Overseer owns, which may have no beads.
     notes_owned: bool,
+    /// Why Overseer would not take the notes folder, for the board banner.
+    notes_off: Option<String>,
     jql: String,
     /// The PR source is off when both this and `pr_workspace` are empty.
     pr_repos: Vec<PathBuf>,
@@ -552,6 +554,7 @@ impl WorkStore {
             keychain_timeout: SOURCE_TIMEOUT,
             bitbucket: Arc::new(BitbucketApi::new(email)),
             notes_owned: cfg.notes_owned,
+            notes_off: cfg.notes_refused.clone(),
             jql: cfg.jql.clone(),
             pr_repos: cfg.pr_repos.clone(),
             pr_command: cfg.pr_command.clone(),
@@ -712,6 +715,7 @@ impl WorkStore {
             sprint_day: self
                 .sprint_dates(&cache)
                 .and_then(|(start, days)| sprint_day(start, days, today())),
+            notes_off: self.notes_off.clone(),
         }
     }
 
@@ -1065,7 +1069,8 @@ impl WorkStore {
     /// A beads read that failed only because an owned folder has no beads:
     /// `bd` is not installed or the folder has no `.beads`.
     fn beads_not_set_up(&self, e: &str) -> bool {
-        if !self.notes_owned {
+        // A refused folder is still where the default beads folder points.
+        if !self.notes_owned && self.notes_off.is_none() {
             return false;
         }
         let bd_missing = self
@@ -2802,6 +2807,23 @@ esac"#,
         });
         s.refresh(Source::Beads).await;
         assert!(!s.view().sources[0].ok);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_refused_notes_folder_shows_on_the_board_and_its_beads_are_not_an_error() {
+        let dir = temp_dir("refused-beads");
+        let s = store_with(|c| {
+            c.beads_dir = dir.clone();
+            c.bd_command = vec!["overseer-no-such-bd".into()];
+            c.notes_refused = Some("Notes are off: demo".into());
+        });
+        s.refresh(Source::Beads).await;
+        let v = s.view();
+        assert_eq!(v.notes_off.as_deref(), Some("Notes are off: demo"));
+        let b = &v.sources[0];
+        assert!(b.ok, "{b:?}");
+        assert_eq!(b.message.as_deref(), Some("beads not set up here"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

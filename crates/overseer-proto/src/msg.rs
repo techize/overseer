@@ -298,6 +298,10 @@ pub struct WorkView {
     /// The sprint day for the pace marker, when the sprint start is known.
     #[serde(default)]
     pub sprint_day: Option<SprintDay>,
+    /// Why notes are off, when Overseer would not take the notes folder;
+    /// the board shows it as a banner.
+    #[serde(default)]
+    pub notes_off: Option<String>,
 }
 
 /// The Jira source's message while `jira_command` is empty. Jira is then
@@ -1308,6 +1312,7 @@ mod tests {
         let board = Response::Board(BoardView {
             slots: vec![],
             work: WorkView {
+                notes_off: None,
                 items: vec![],
                 sources: vec![],
                 notices: vec![],
@@ -1380,6 +1385,7 @@ mod tests {
 
     fn view() -> WorkView {
         WorkView {
+            notes_off: None,
             items: vec![
                 WorkItem {
                     key: "DEMO-1".into(),

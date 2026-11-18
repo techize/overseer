@@ -123,9 +123,12 @@ Overseer keeps journals, session notes and sprint files in a notes folder
   writes the journal and session notes and, with `jira_board` set, the sprint
   and ticket folders.
 - If `~/OverseerNotes` already holds other files and no marker, Overseer leaves
-  it alone, turns the notes writer off and leaves a notice on the board (in
-  S0's panel) that names the folder and says how to fix it: set `notes_dir` to
-  another folder, or move that one aside, then restart the daemon.
+  it alone, turns the notes writer off and shows a banner at the top of the
+  board (and a notice in S0's panel) that names the folder and says how to fix
+  it: set `notes_dir` to another folder, or move that one aside, then restart
+  the daemon. Until then the beads source says `beads not set up here` rather
+  than failing, and sessions are not asked to keep a `CURRENT_SESSION.md`
+  inside that folder.
 - When git has no `user.name` or `user.email` set, Overseer writes them into
   the owned folder's own git config (your `user_name` and `overseer@localhost`),
   so its commits work on a machine with no git identity.
@@ -159,9 +162,13 @@ Overseer keeps journals, session notes and sprint files in a notes folder
   tickets assigned to you, run the JQL in Jira's search, and check `jira_board`
   is a board of that sprint. If Jira returns none after a poll that had some,
   Overseer keeps the last list once and says so.
-- Keychain prompt. Overseer saves the token with `security`, so its own reads
-  normally get no prompt. If macOS does ask to allow `security` to use the
-  item, choose Always Allow. If it is left unanswered the source says
+- Keychain prompt. Overseer saves the token with `security`, which puts
+  `security` on the item's access list, so its own reads get no prompt. A
+  token added another way (for example in Keychain Access) is not on that
+  list yet, and macOS asks whether `security` may use it. Enter your login
+  password and choose Always Allow: that adds `security` to the item's list,
+  as if Overseer had saved it. Allow works only once, so every poll would ask
+  again. If the prompt is left unanswered the source says
   `Keychain did not answer`. Unlock your login keychain and wait for the next
   poll, or use `ATLASSIAN_API_TOKEN` instead. The PR source still reads PRs
   with `pr_command` (`bb`) meanwhile and says so.

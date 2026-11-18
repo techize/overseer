@@ -731,6 +731,7 @@ mod tests {
     #[test]
     fn owned_items_leave_out_beads_under_an_owned_ticket() {
         let view = WorkView {
+            notes_off: None,
             items: vec![
                 item("DEMO-12", ItemKind::Ticket, None, Some(1)),
                 item("ov-2", ItemKind::Bead, Some("DEMO-12"), Some(1)),
