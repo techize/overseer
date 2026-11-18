@@ -568,6 +568,7 @@ pub enum Request {
     /// The detail of one owned item. `refresh` bypasses the cache.
     GetItemDetail {
         key: String,
+        #[serde(default)]
         refresh: bool,
     },
     /// Gives a work item to a slot. `confirm` accepts a busy-slot warning,
@@ -1600,6 +1601,19 @@ mod tests {
             let json = serde_json::to_string(&req).unwrap();
             assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), req);
         }
+    }
+
+    #[test]
+    fn get_item_detail_reads_without_refresh() {
+        let req: Request =
+            serde_json::from_str(r#"{"type":"GetItemDetail","key":"DEMO-1"}"#).unwrap();
+        assert_eq!(
+            req,
+            Request::GetItemDetail {
+                key: "DEMO-1".into(),
+                refresh: false,
+            }
+        );
     }
 
     #[test]
