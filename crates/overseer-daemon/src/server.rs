@@ -1034,6 +1034,9 @@ fn handle_request(
         // `handle_frame` from a task of their own (they can wait on the
         // Keychain); this arm only keeps the match whole.
         Request::ListWorkItems | Request::RefreshWorkItems => Response::Work(store.view()),
+        Request::GetItemDetail { .. } => Response::Error {
+            message: "answered by the connection".into(),
+        },
         Request::GetSettings | Request::SaveSettings { .. } | Request::SetToken { .. } => {
             Response::Error {
                 message: "settings requests are answered by the connection".into(),
