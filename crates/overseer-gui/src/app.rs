@@ -355,6 +355,8 @@ pub fn empty_locks() -> LockView {
 /// The 2ndBrain view before the daemon's first answer.
 pub fn empty_brain() -> BrainView {
     BrainView {
+        remote: None,
+        last_push: None,
         on: false,
         entries: Vec::new(),
         last_backup: None,

@@ -217,11 +217,14 @@ in S1, then `grep -E 'role template|brain_rules' ~/Library/Logs/Overseer/daemon.
 2. Restart the daemon: `overseer ctl shutdown`, then open the app (or
    `launchctl kickstart -k gui/$(id -u)/uk.co.techize.overseer` if the
    LaunchAgent is installed).
-3. `overseer ctl brain` should say `2ndBrain writer is on`.
+3. `overseer ctl brain` should say `Notes writer is on`, then a `remote` line
+   with the folder's ahead and behind counts once the first check has run.
 4. Do the role check from step 5 now (start a session in S0 and one in S1,
    then grep the log).
-5. The board's bottom strip should read `2ndBrain: nothing yet`, then
-   `2ndBrain: committed HH:MM` after the first commit. See the acceptance list
+5. The board's bottom strip should read `Notes: nothing yet`, then
+   `Notes: committed HH:MM` after the first commit. If it reads
+   `Notes: N ahead, M behind its remote`, merge the folder by hand before
+   going on. See the acceptance list
    (`docs/internal/acceptance/phase-5.md`) for the checks to run on the home Mac before
    doing this on the work laptop.
 

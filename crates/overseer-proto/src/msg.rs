@@ -969,6 +969,28 @@ pub struct BrainView {
     /// where a new session starts.
     #[serde(default)]
     pub notes_dir: Option<std::path::PathBuf>,
+    /// How the notes folder stands against its upstream, from the last
+    /// check. `None` before the first check or with no upstream.
+    #[serde(default)]
+    pub remote: Option<NotesRemote>,
+    /// The last push Overseer tried.
+    #[serde(default)]
+    pub last_push: Option<BrainRun>,
+}
+
+/// The notes folder against its upstream branch.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NotesRemote {
+    /// Local commits the upstream does not have.
+    pub ahead: u32,
+    /// Upstream commits not merged here, as of the last fetch.
+    pub behind: u32,
+    /// Unix seconds of the check.
+    pub checked_at: i64,
+    /// Why the fetch failed, when it did; the counts are then from the
+    /// last good fetch.
+    #[serde(default)]
+    pub fetch_error: Option<String>,
 }
 
 /// A file write the `PreToolUse` hook asks the daemon to check.
@@ -1888,6 +1910,8 @@ mod tests {
 
     fn brain_view() -> BrainView {
         BrainView {
+            remote: None,
+            last_push: None,
             on: true,
             entries: vec![
                 queue_entry(),

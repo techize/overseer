@@ -140,6 +140,22 @@ Overseer keeps journals, session notes and sprint files in a notes folder
   `Sprints/sprint-<slug>/<KEY>-<slug>/ticket.md` in the notes folder, one per
   ticket, in step with Jira. `ticket.md` is the only file it writes there, so
   your own notes in a ticket folder are left alone.
+- With the notes writer on, Overseer is the only committer in the notes folder.
+  Sessions commit with the `commit_2ndbrain` tool, and the session hook denies
+  `git add`, `commit`, `push`, `pull`, `merge`, `checkout` and the other
+  commands that change the folder. Commands that only read are allowed, so a
+  session can check how the folder stands: `status`, `log`, `diff`, `show`
+  (including `show <rev>:<path>`), `blame`, `rev-parse`, `rev-list`,
+  `merge-base`, `merge-tree`, `ls-files`, `ls-tree`, `cat-file`,
+  `for-each-ref`, `show-ref`, `describe`, `name-rev`, `shortlog`, `grep`,
+  `reflog` (not `expire` or `delete`), `branch` and `remote -v` with their
+  listing flags, and `fetch` (not with a refspec such as `main:main`, or `-u`).
+- Every 10 minutes the writer fetches the folder and counts it against its
+  upstream. The notes list at the bottom of the board (hover or click the
+  strip) shows `Remote: 3 ahead, 0 behind at 09:41; last push 09:12`, with any
+  fetch error. When the folder has commits on both sides the strip turns orange
+  and reads `Notes: 65 ahead, 4 behind its remote`. `overseer ctl brain` prints
+  the same counts and the last push.
 
 ### What each optional tool adds
 
@@ -180,6 +196,13 @@ Overseer keeps journals, session notes and sprint files in a notes folder
 - `no Bitbucket remote`. A `pr_repos` folder with no remote on
   `bitbucket.org` cannot be read through the API. Add a Bitbucket remote, or
   poll it through `pr_workspace` instead.
+- `Notes: N ahead, M behind its remote`. The notes folder and its remote both
+  have commits the other lacks, so a push is rejected until they are merged.
+  This usually means another writer (Obsidian Git, a sync script, another
+  machine) pushed while this machine was not pushing (`push = false`) or its
+  pushes failed. Run `git -C <notes folder> merge-tree --write-tree --name-only
+  HEAD @{u}` to see whether the merge would conflict, then pull and push by
+  hand.
 - Token status in Settings. Each token row says `set` (in the Keychain),
   `set (environment)` (only the environment variable holds one), `not set`, or
   `unknown (Keychain did not answer)` when the Keychain is locked or waiting on

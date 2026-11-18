@@ -118,7 +118,7 @@ impl VaultGit {
 
     async fn exec(&self, args: &[&str]) -> Result<Out, GitError> {
         let limit = self.timeout.unwrap_or(match args.first() {
-            Some(&"push") | Some(&"pull") => NET_TIMEOUT,
+            Some(&"push") | Some(&"pull") | Some(&"fetch") => NET_TIMEOUT,
             _ => LOCAL_TIMEOUT,
         });
         let mut cmd = Command::new(&self.git_bin);
@@ -155,6 +155,28 @@ impl VaultGit {
     /// Run git with the vault as cwd and `OVERSEER_COMMIT=1`; returns stdout.
     pub async fn run(&self, _g: &VaultGuard<'_>, args: &[&str]) -> Result<String, GitError> {
         self.run_inner(args).await
+    }
+
+    /// Whether the checked-out branch has an upstream.
+    pub async fn has_upstream(&self, _g: &VaultGuard<'_>) -> bool {
+        self.run_inner(&["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+            .await
+            .is_ok()
+    }
+
+    /// `git fetch --quiet` of the upstream's remote.
+    pub async fn fetch(&self, _g: &VaultGuard<'_>) -> Result<(), GitError> {
+        self.run_inner(&["fetch", "--quiet"]).await.map(|_| ())
+    }
+
+    /// Commits ahead of and behind the upstream, from the refs as they are
+    /// (no fetch).
+    pub async fn ahead_behind(&self, _g: &VaultGuard<'_>) -> Result<(u32, u32), GitError> {
+        let out = self
+            .run_inner(&["rev-list", "--left-right", "--count", "HEAD...@{u}"])
+            .await?;
+        parse_counts(&out)
+            .ok_or_else(|| GitError::Failed(format!("unexpected rev-list output: {}", out.trim())))
     }
 
     async fn run_inner(&self, args: &[&str]) -> Result<String, GitError> {
@@ -410,6 +432,15 @@ impl VaultGit {
     }
 }
 
+/// `rev-list --left-right --count` output: `<ahead>\t<behind>`.
+fn parse_counts(out: &str) -> Option<(u32, u32)> {
+    let mut it = out.split_whitespace().map(str::parse::<u32>);
+    match (it.next(), it.next(), it.next()) {
+        (Some(Ok(a)), Some(Ok(b)), None) => Some((a, b)),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -557,6 +588,35 @@ mod tests {
             .commit_paths(&g, &["a.md".into()], "S1: nothing")
             .await;
         assert_eq!(r, Ok(None));
+    }
+
+    #[tokio::test]
+    async fn ahead_and_behind_are_counted_after_a_fetch() {
+        let v = TestVault::new("counts");
+        let g = v.git.lock().await;
+        assert!(v.git.has_upstream(&g).await);
+        assert_eq!(v.git.ahead_behind(&g).await.unwrap(), (0, 0));
+        let other = v.clone_other();
+        std::fs::write(other.join("other.md"), "o\n").unwrap();
+        sh(&other, &["add", "-A"]);
+        sh(&other, &["commit", "-m", "other"]);
+        sh(&other, &["push"]);
+        std::fs::write(v.vault.join("mine.md"), "m\n").unwrap();
+        v.git
+            .commit_paths(&g, &["mine.md".into()], "S1: mine")
+            .await
+            .unwrap();
+        // Before a fetch the remote's commit is not known here.
+        assert_eq!(v.git.ahead_behind(&g).await.unwrap(), (1, 0));
+        v.git.fetch(&g).await.unwrap();
+        assert_eq!(v.git.ahead_behind(&g).await.unwrap(), (1, 1));
+    }
+
+    #[test]
+    fn rev_list_counts_parse() {
+        assert_eq!(parse_counts("65\t4\n"), Some((65, 4)));
+        assert_eq!(parse_counts("1"), None);
+        assert_eq!(parse_counts("a\tb"), None);
     }
 
     #[tokio::test]

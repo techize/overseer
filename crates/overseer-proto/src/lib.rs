@@ -15,8 +15,8 @@ pub use frame::{read_frame, write_frame, Frame, MAX_FRAME};
 pub use msg::{
     owned_by_message, owner_in_refusal, running_sessions_count, running_sessions_text, slot_name,
     Activity, ActivityKind, Approvals, BashCheck, BoardView, BrainRun, BrainView, Claim, ClaimKind,
-    CoordView, DaemonInfo, Event, HookEvent, HookKind, ItemKind, LockView, Notice, Plan,
-    PlanDecision, PlanRecord, PlanSlot, PlanState, PlanTarget, PlanWorktree, PullRequest,
+    CoordView, DaemonInfo, Event, HookEvent, HookKind, ItemKind, LockView, NotesRemote, Notice,
+    Plan, PlanDecision, PlanRecord, PlanSlot, PlanState, PlanTarget, PlanWorktree, PullRequest,
     QueueEntry, QueueState, Relay, RelayState, Report, ReportKind, Request, Response, Sender,
     SlotId, SlotInfo, SlotState, SourceStatus, SprintDay, Stage, Summary, TokenKind, Wait,
     WorkItem, WorkView, WriteCheck, CHECK_ENV, JIRA_OFF, PRS_OFF, UNKNOWN_STATUS,
