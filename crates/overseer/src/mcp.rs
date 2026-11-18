@@ -8,11 +8,16 @@
 use std::io::{BufRead, Write};
 use std::time::Duration;
 
-use overseer_proto::{paths, slot_name, Client, Plan, PlanSlot, Request, Response, SlotId};
+use overseer_proto::{
+    paths, slot_name, Client, ItemDetail, Plan, PlanSlot, Request, Response, SlotId,
+};
 use serde_json::{json, Value};
 
 /// Budget for connect plus the round trip of one tool call.
 const CALL_WITHIN: Duration = Duration::from_secs(5);
+
+/// Budget for an item detail that has to be fetched from Jira or bd.
+const DETAIL_CALL_WITHIN: Duration = Duration::from_secs(30);
 /// A 2ndBrain write waits its turn in the queue, and a commit blocked by an
 /// `index.lock` is answered after up to 600 s (as `Queued`).
 const BRAIN_CALL_WITHIN: Duration = Duration::from_secs(660);
@@ -28,6 +33,8 @@ fn call_within(req: &Request) -> Duration {
         // Approving a plan creates worktrees and starts sessions.
         | Request::ProposePlan { .. }
         | Request::DecidePlan { .. } => BRAIN_CALL_WITHIN,
+        // A cache miss runs acli or a REST call.
+        Request::GetItemDetail { .. } => DETAIL_CALL_WITHIN,
         _ => CALL_WITHIN,
     }
 }
@@ -167,6 +174,18 @@ fn tools() -> Value {
             "inputSchema": {"type": "object", "properties": {}}
         },
         {
+            "name": "get_item_detail",
+            "description": "Read one ticket's or bead's details: description, notes, PRs, child beads. Cached for 5 minutes; refresh: true fetches again.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string", "description": "The item key, for example DEMO-12 or ov-3."},
+                    "refresh": {"type": "boolean", "description": "Fetch again instead of using the cached copy."}
+                },
+                "required": ["key"]
+            }
+        },
+        {
             "name": "propose_plan",
             "description": "Coordinator only. Propose a plan for the user to approve: which slot takes which items, which targets it claims, where it works and what it is told. Nothing runs until the user approves. A new plan replaces a pending one.",
             "inputSchema": {
@@ -257,6 +276,53 @@ fn rpc_error(id: &Value, code: i64, message: &str) -> Value {
 
 fn rpc_result(id: &Value, result: Value) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "result": result})
+}
+
+/// One item's detail as the text a session reads.
+fn detail_text(d: &ItemDetail) -> String {
+    let mut out = format!(
+        "{} {}\nStatus: {} \u{b7} Priority: {}",
+        d.key,
+        d.title,
+        d.status,
+        d.priority.as_deref().unwrap_or("not set")
+    );
+    if let Some(stage) = d.stage {
+        out.push_str(&format!(" \u{b7} Stage: {}", stage.label()));
+    }
+    out.push_str("\n\n");
+    match (&d.error, &d.body) {
+        (Some(error), _) => {
+            out.push_str(&format!("Could not fetch the description: {error}"));
+            if let Some(overview) = &d.overview {
+                out.push_str(&format!("\n\nFrom the folder overview: {overview}"));
+            }
+        }
+        (None, Some(body)) => out.push_str(body),
+        (None, None) => out.push_str("No description"),
+    }
+    if let Some(notes) = &d.notes {
+        out.push_str(&format!("\n\nNotes:\n{notes}"));
+    }
+    if !d.depends_on.is_empty() {
+        out.push_str(&format!("\n\nDepends on: {}", d.depends_on.join(", ")));
+    }
+    if !d.prs.is_empty() {
+        out.push_str("\n\nPull requests:");
+        for pr in &d.prs {
+            out.push_str(&format!("\n- {} #{} {}", pr.repo, pr.id, pr.title));
+        }
+    }
+    if !d.children.is_empty() {
+        out.push_str("\n\nChild beads:");
+        for c in &d.children {
+            out.push_str(&format!("\n- {} {} {}", c.key, c.status, c.title));
+        }
+    }
+    if let Some(folder) = &d.folder {
+        out.push_str(&format!("\n\nFolder: {}", folder.display()));
+    }
+    out
 }
 
 fn tool_result(text: impl Into<String>, is_error: bool) -> Value {
@@ -401,6 +467,10 @@ fn tool_request(name: &str, args: &Value, slot: Option<SlotId>) -> Result<ToolPl
         }),
         "get_board" => ToolPlan::Send(Request::GetBoard),
         "get_work_items" => ToolPlan::Send(Request::ListWorkItems),
+        "get_item_detail" => ToolPlan::Send(Request::GetItemDetail {
+            key: str_arg(args, "key")?.to_owned(),
+            refresh: opt_bool_arg(args, "refresh")?.unwrap_or(false),
+        }),
         "propose_plan" => {
             str_arg(args, "summary")?;
             ToolPlan::Send(Request::ProposePlan {
@@ -503,6 +573,7 @@ fn call_tool(params: &Value, slot: Option<SlotId>, call: &mut Call) -> Result<Va
             };
             tool_result(text, false)
         }
+        Ok(Response::ItemDetail(d)) => tool_result(detail_text(&d), false),
         Ok(Response::Ok) => tool_result("Done.", false),
         Ok(other) => tool_result(format!("Unexpected reply from Overseer: {other:?}"), true),
     })
@@ -861,7 +932,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_has_sixteen_tools() {
+    fn tools_list_has_seventeen_tools() {
         let (out, _) = call_with(&rpc("tools/list", json!({})), Some(1), Ok(Response::Ok));
         let out = out.unwrap();
         let names: Vec<&str> = out["result"]["tools"]
@@ -885,13 +956,88 @@ mod tests {
                 "restore_2ndbrain_file",
                 "get_board",
                 "get_work_items",
+                "get_item_detail",
                 "propose_plan",
                 "request_status",
                 "report_progress",
                 "set_board_summary"
             ]
         );
-        assert_eq!(names.len(), 16);
+        assert_eq!(names.len(), 17);
+    }
+
+    fn demo_detail() -> ItemDetail {
+        ItemDetail {
+            key: "DEMO-12".into(),
+            kind: overseer_proto::ItemKind::Ticket,
+            title: "Fix the login".into(),
+            status: "In Progress".into(),
+            priority: None,
+            stage: None,
+            stage_since: None,
+            folder: None,
+            body: None,
+            notes: None,
+            depends_on: vec![],
+            children: vec![],
+            prs: vec![],
+            overview: None,
+            fetched_at: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn detail_text_lists_body_prs_and_children() {
+        let d = ItemDetail {
+            priority: Some("High".into()),
+            stage: Some(overseer_proto::Stage::InProgress),
+            body: Some("Login fails on retry.".into()),
+            notes: Some("tried a reset".into()),
+            depends_on: vec!["DEMO-3".into(), "DEMO-4".into()],
+            prs: vec![overseer_proto::PullRequest {
+                repo: "demo-api".into(),
+                id: 7,
+                title: "Retry the login".into(),
+                branch: "demo-12".into(),
+                url: None,
+                author: None,
+                created: None,
+                ticket: None,
+                approvals: None,
+            }],
+            children: vec![overseer_proto::ChildBead {
+                key: "ov-3".into(),
+                title: "Add the retry".into(),
+                status: "open".into(),
+            }],
+            folder: Some("/demo/DEMO-12".into()),
+            ..demo_detail()
+        };
+        let label = overseer_proto::Stage::InProgress.label();
+        assert_eq!(
+            detail_text(&d),
+            format!(
+                "DEMO-12 Fix the login\nStatus: In Progress \u{b7} Priority: High \u{b7} Stage: {label}\n\nLogin fails on retry.\n\nNotes:\ntried a reset\n\nDepends on: DEMO-3, DEMO-4\n\nPull requests:\n- demo-api #7 Retry the login\n\nChild beads:\n- ov-3 open Add the retry\n\nFolder: /demo/DEMO-12"
+            )
+        );
+    }
+
+    #[test]
+    fn detail_text_shows_the_error_and_overview() {
+        let d = ItemDetail {
+            error: Some("acli failed".into()),
+            overview: Some("A demo project.".into()),
+            ..demo_detail()
+        };
+        assert_eq!(
+            detail_text(&d),
+            "DEMO-12 Fix the login\nStatus: In Progress \u{b7} Priority: not set\n\nCould not fetch the description: acli failed\n\nFrom the folder overview: A demo project."
+        );
+        assert_eq!(
+            detail_text(&demo_detail()),
+            "DEMO-12 Fix the login\nStatus: In Progress \u{b7} Priority: not set\n\nNo description"
+        );
     }
 
     #[test]
