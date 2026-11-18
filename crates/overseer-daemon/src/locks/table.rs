@@ -299,7 +299,7 @@ pub(crate) fn claim_on(conn: &Connection, c: &NewClaim, now: i64) -> Result<Clai
             if c.via == Via::Tool && held.kind == ClaimKind::Grant {
                 conn.execute(
                     "UPDATE claims SET kind = 'claim', reason = COALESCE(reason, ?3),
-                            item = COALESCE(item, ?4)
+                            item = COALESCE(item, ?4), relay_id = NULL
                      WHERE target = ?1 AND slot = ?2",
                     params![c.target, c.slot, c.reason, c.item],
                 )?;
@@ -447,10 +447,15 @@ pub(crate) fn release_on(
     }
 }
 
-/// Records that `slot` used `target` now, if it holds it.
+/// Records that `slot` used `target` now, if it holds it. A claim (not a
+/// grant, which `release_on_stop_on` still ties to its notice) forgets the
+/// notice that announced it, so dropping that notice later leaves the
+/// claim alone even when it was used in its first second.
 pub(crate) fn touch_on(conn: &Connection, target: &str, slot: SlotId, now: i64) -> Result<()> {
     conn.execute(
-        "UPDATE claims SET last_used = ?3 WHERE target = ?1 AND slot = ?2",
+        "UPDATE claims SET last_used = ?3,
+                relay_id = CASE WHEN kind = 'grant' THEN relay_id END
+         WHERE target = ?1 AND slot = ?2",
         params![target, slot, now],
     )?;
     Ok(())
@@ -630,14 +635,18 @@ pub(crate) fn drop_relays_from_to_on(
 }
 
 /// After lock notice `relay` was dropped by hand: the slot it was for was
-/// never told it holds the target, so if it still holds it through the
-/// claim that notice announced, the target goes to the next waiter as on a
-/// release.
+/// never told it holds the target. If it still holds it through the claim
+/// that notice announced and has not used it since (still an unpinned
+/// grant or claim, never touched, see `touch_on`), the target goes to the
+/// next waiter as on a release. A slot that has used or pinned it keeps
+/// it, so a hand drop never takes a target from a slot acting on it.
 fn give_up_notice_hold_on(conn: &Connection, relay: i64, now: i64) -> Result<Option<Handoff>> {
     let held = conn
         .query_row(
             "SELECT c.target, c.slot FROM claims c JOIN relays r ON r.id = c.relay_id
-             WHERE c.relay_id = ?1 AND c.slot = r.to_slot",
+             WHERE c.relay_id = ?1 AND c.slot = r.to_slot
+               AND c.kind IN ('grant', 'claim') AND c.pin_revision IS NULL
+               AND c.last_used = c.since",
             params![relay],
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, SlotId>(1)?)),
         )
@@ -1882,6 +1891,88 @@ mod tests {
             assert_eq!(all.len(), 6);
             assert!(all.iter().all(|r| r.kind == RelayKind::Note), "{all:?}");
             assert_eq!(relay_on(c, good)?.unwrap().kind, RelayKind::Note);
+            Ok(())
+        })
+    }
+
+    /// S1 hands `T` to S2 (queued by `via`) with S3 queued behind it, and
+    /// returns S2's notice.
+    fn hand_t_to_2(c: &Connection, via: Via) -> i64 {
+        take(c, T, 1, ClaimKind::Claim, 10);
+        queue(c, T, 2, via, 11);
+        queue(c, T, 3, Via::Hook, 12);
+        release_on(c, T, Releaser::Slot(1), None, 20).unwrap();
+        pending_relays_on(c, 2).unwrap()[0].id
+    }
+
+    /// After a hand drop of `notice`, S2 still holds `T` as `kind` and S3
+    /// still waits, with nothing new for it.
+    fn kept_by_2(c: &Connection, notice: i64, kind: ClaimKind) {
+        assert_eq!(
+            state_and_reason(c, notice),
+            (RelayState::Dropped, Some(t("dropped by you")))
+        );
+        assert_eq!(holders(c), vec![(T.into(), 2, kind)]);
+        let waits: Vec<_> = waits_on(c).unwrap().iter().map(|w| w.slot).collect();
+        assert_eq!(waits, vec![3]);
+        assert!(texts(c, 3).is_empty());
+    }
+
+    #[test]
+    fn hand_dropping_the_notice_of_a_grant_in_use_keeps_the_hold() {
+        with(|c| {
+            let notice = hand_t_to_2(c, Via::Hook);
+            assert!(bind_grant_on(c, T, 2, "tu-2", None)?);
+            touch_on(c, T, 2, 20)?;
+            assert_eq!(
+                drop_relay_on(c, notice, None, "dropped by you", 30)?,
+                Ok(())
+            );
+            kept_by_2(c, notice, ClaimKind::Command);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn hand_dropping_the_notice_of_a_pinned_grant_keeps_the_pin() {
+        with(|c| {
+            let notice = hand_t_to_2(c, Via::Hook);
+            assert!(pin_on(c, T, 2, "abc123")?);
+            assert_eq!(drop_relays_from_to_on(c, None, 2, "dropped by you", 30)?, 1);
+            kept_by_2(c, notice, ClaimKind::Pin);
+            assert_eq!(claims_on(c)?[0].pin_revision.as_deref(), Some("abc123"));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn hand_dropping_the_notice_of_a_claim_used_in_its_first_second_keeps_it() {
+        with(|c| {
+            let notice = hand_t_to_2(c, Via::Tool);
+            // Used in the very second it was handed over.
+            touch_on(c, T, 2, 20)?;
+            assert_eq!(
+                drop_relay_on(c, notice, None, "dropped by you", 30)?,
+                Ok(())
+            );
+            kept_by_2(c, notice, ClaimKind::Claim);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn hand_dropping_the_notice_of_a_grant_claimed_again_keeps_it() {
+        with(|c| {
+            let notice = hand_t_to_2(c, Via::Hook);
+            assert_eq!(
+                claim_on(c, &claim(T, 2, ClaimKind::Claim, Via::Tool), 20)?,
+                ClaimOutcome::AlreadyHeld
+            );
+            assert_eq!(
+                drop_relay_on(c, notice, None, "dropped by you", 30)?,
+                Ok(())
+            );
+            kept_by_2(c, notice, ClaimKind::Claim);
             Ok(())
         })
     }

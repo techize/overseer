@@ -3636,6 +3636,34 @@ async fn dropping_a_lock_notice_by_hand_hands_the_target_on() {
     assert!(c.locks().await.claims.is_empty());
 }
 
+/// S2 runs its deploy on the grant before the notice reaches it; dropping
+/// the notice then must not take the target from it.
+#[tokio::test]
+async fn dropping_the_notice_of_a_grant_in_use_keeps_the_hold() {
+    let d = lock_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    let api = "deploy:demo/api";
+    assert_eq!(c.check(1, "tu-1", "demo-deploy api").await, None);
+    assert!(c.check(2, "tu-2", "demo-deploy api").await.is_some());
+    assert!(c.check(3, "tu-3", "demo-deploy api").await.is_some());
+    c.hook(post_tool_use(1, "tu-1")).await;
+    assert_eq!(holds(&c.locks().await), [(t(api), 2, ClaimKind::Grant)]);
+    assert_eq!(c.check(2, "tu-4", "demo-deploy api").await, None);
+    let v = c.locks().await;
+    assert_eq!(holds(&v), [(t(api), 2, ClaimKind::Command)]);
+    let notice = v.relays.iter().find(|r| r.to == 2).unwrap().id;
+    assert_eq!(
+        c.drop_relays(None, None, Some(2)).await,
+        text("Dropped 1 relay to S2.")
+    );
+    let v = c.locks().await;
+    assert_eq!(holds(&v), [(t(api), 2, ClaimKind::Command)]);
+    assert_eq!(queued(&v), [(t(api), 3)]);
+    let dropped = v.relays.iter().find(|r| r.id == notice).unwrap();
+    assert_eq!(dropped.state, RelayState::Dropped);
+    assert!(v.relays.iter().all(|r| r.to != 3), "{v:?}");
+}
+
 #[tokio::test]
 async fn drop_every_relay_to_a_slot_says_how_many() {
     let d = lock_daemon().await;
