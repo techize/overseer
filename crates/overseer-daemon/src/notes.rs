@@ -201,8 +201,9 @@ fn without_updated(text: &str) -> String {
 /// Keeps a `ticket.md` for each ticket under `Sprints/<sprint>/`, in the
 /// folder the key already has anywhere under `Sprints/`, else a new one.
 /// A file is written only when its content, apart from the `Updated:` line,
-/// changes. Returns how many files were written. Folders of tickets that
-/// left the sprint stay as they are.
+/// changes. The sprint folder is made even with no tickets to write.
+/// Returns how many files were written. Folders of tickets that left the
+/// sprint stay as they are.
 pub fn sync_sprint(
     dir: &Path,
     sprint: &str,
@@ -216,6 +217,7 @@ pub fn sync_sprint(
     }
     let folders = list_folders(dir);
     let sprint_dir = dir.join("Sprints").join(sprint);
+    std::fs::create_dir_all(&sprint_dir)?;
     let stamp = local_stamp(now);
     let mut written = 0;
     for t in tickets.iter().filter(|t| safe_key(&t.key)) {
@@ -430,6 +432,16 @@ mod tests {
     }
 
     #[test]
+    fn the_sprint_folder_is_made_with_no_tickets() {
+        let t = owned();
+        assert_eq!(
+            sync_sprint(t.path(), "sprint-empty", &[], SITE, T0).unwrap(),
+            0
+        );
+        assert!(t.path().join("Sprints/sprint-empty").is_dir());
+    }
+
+    #[test]
     fn no_site_leaves_out_the_jira_line() {
         let t = owned();
         let mut tk = ticket("DEMO-1", "A", "To Do");
@@ -500,7 +512,10 @@ mod tests {
         )
         .unwrap();
         assert!(old.join("ticket.md").is_file());
-        assert!(!t.path().join("Sprints/sprint-demo-1").exists());
+        // The sprint folder is made, but the ticket stays where it was.
+        let sprint = t.path().join("Sprints/sprint-demo-1");
+        assert!(sprint.is_dir());
+        assert_eq!(std::fs::read_dir(&sprint).unwrap().count(), 0);
     }
 
     #[test]
