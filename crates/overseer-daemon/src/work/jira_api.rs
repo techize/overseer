@@ -167,7 +167,8 @@ impl JiraApi {
     /// Blocking.
     pub fn issue(&self, token: &str, key: &str) -> Result<String, String> {
         let url = self.jira_url(&format!(
-            "rest/api/3/issue/{key}?fields=summary,status,priority,description"
+            "rest/api/3/issue/{}?fields=summary,status,priority,description",
+            path_segment(key)
         ))?;
         match self
             .agent
@@ -227,6 +228,20 @@ impl JiraApi {
                 .call(),
         )
     }
+}
+
+/// `s` as one URL path segment: every byte outside `A-Za-z0-9-._~` becomes
+/// `%XX`.
+fn path_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 /// The body of a successful response, or the error to show.
@@ -412,6 +427,13 @@ pub(crate) mod tests {
         format!(
             r#"{{"key":"{key}","fields":{{"summary":"t {key}","status":{{"name":"To Do"}},"priority":{{"name":"High"}}}}}}"#
         )
+    }
+
+    #[test]
+    fn issue_path_encodes_the_key() {
+        assert_eq!(path_segment("DEMO-1.a_b~"), "DEMO-1.a_b~");
+        assert_eq!(path_segment("DEMO 1/x?y"), "DEMO%201%2Fx%3Fy");
+        assert_eq!(path_segment("\u{e9}"), "%C3%A9");
     }
 
     #[test]

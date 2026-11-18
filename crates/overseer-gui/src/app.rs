@@ -40,7 +40,9 @@ use crate::daemon_info::DaemonKnown;
 use crate::locks_view::LocksState;
 use crate::picker::{Picker, PickerEvent};
 use crate::plan_view::{PlanEvent, PlanView};
-use crate::session::{detail_still_owned, detail_unavailable, take_reply, DetailState, OpenDetail};
+use crate::session::{
+    detail_gate, detail_still_owned, fail_detail, reopen, take_reply, DetailGate, OpenDetail,
+};
 use crate::session::{incarnation, keep_view, restart_begin, restart_on_change, Incarnation};
 use crate::session::{reply_note, EntryAction, EntryKind, PanelEntry, RestartPlan};
 use crate::settings_view::{SettingsEvent, SettingsPanel};
@@ -497,6 +499,12 @@ pub struct OverseerApp {
     settings_leaving: Vec<(Entity<SettingsPanel>, Subscription)>,
     /// What the connected daemon said about itself; see `probe_daemon`.
     pub(crate) daemon: DaemonKnown,
+    /// A build probe is on its way, so `daemon` may still change from
+    /// `Unknown`.
+    daemon_probing: bool,
+    /// A detail click held until the probe answers: its `refresh`. See
+    /// `open_detail`.
+    detail_waiting: Option<bool>,
     /// A `ctl restart --yes` from Settings is running.
     restarting_daemon: bool,
     /// The slots came from a list reply on this connection. Until then,
@@ -548,10 +556,9 @@ impl OverseerApp {
             }
         });
         Self::ask_for_lists(client.clone(), cx);
-        Self::probe_daemon(cx);
         let board_focus = cx.focus_handle();
         window.focus(&board_focus);
-        OverseerApp {
+        let mut app = OverseerApp {
             client,
             theme,
             slots: empty_slots(),
@@ -581,6 +588,8 @@ impl OverseerApp {
             settings: None,
             settings_leaving: Vec::new(),
             daemon: DaemonKnown::Unknown,
+            daemon_probing: false,
+            detail_waiting: None,
             restarting_daemon: false,
             slots_known: false,
             pending_click: None,
@@ -600,7 +609,9 @@ impl OverseerApp {
             _events: events,
             _clicks: clicked,
             reconnecting: false,
-        }
+        };
+        app.probe_daemon(cx);
+        app
     }
 
     /// Reads the current frame hub's events into `on_frame`. When they end
@@ -654,22 +665,27 @@ impl OverseerApp {
     /// Asks the daemon which build it runs, on a connection of its own (see
     /// `settings_view::probe_daemon`), and says when it differs from the
     /// app's.
-    fn probe_daemon(cx: &mut Context<Self>) {
+    fn probe_daemon(&mut self, cx: &mut Context<Self>) {
+        self.daemon_probing = true;
         let runtime = cx.global::<FrameHub>().runtime().clone();
         let socket = overseer_proto::paths::socket_path();
         cx.spawn(async move |this, cx| {
-            let Ok(known) = runtime
+            // A probe that did not finish (the runtime is shutting down)
+            // still ends the wait, as no answer.
+            let known = runtime
                 .spawn(crate::daemon_info::probe_daemon(socket))
                 .await
-            else {
-                return;
-            };
+                .unwrap_or(DaemonKnown::Unknown);
             let _ = this.update(cx, |this, cx| this.daemon_known(known, cx));
         })
         .detach();
     }
 
+    /// Takes the probe's answer (`Unknown` when it timed out) and sends or
+    /// refuses a detail click held for it, so the detail never stays on
+    /// Loading.
     fn daemon_known(&mut self, known: DaemonKnown, cx: &mut Context<Self>) {
+        self.daemon_probing = false;
         let notice = match &known {
             DaemonKnown::Info(info) => {
                 overseer_proto::build_notice(overseer_proto::current_build(), &info.build)
@@ -684,6 +700,11 @@ impl OverseerApp {
             s.update(cx, |s, cx| s.daemon_known(&known, cx));
         }
         self.daemon = known;
+        if let Some(refresh) = self.detail_waiting.take() {
+            if self.detail.is_some() {
+                self.gate_detail(refresh, cx);
+            }
+        }
         cx.notify();
     }
 
@@ -738,7 +759,7 @@ impl OverseerApp {
         }
         // A new daemon may be another build; ask again.
         self.daemon = DaemonKnown::Unknown;
-        Self::probe_daemon(cx);
+        self.probe_daemon(cx);
         // Requests in flight on the old connection have failed.
         self.restarts.clear();
         self.kickoffs.clear();
@@ -981,7 +1002,8 @@ impl OverseerApp {
     }
 
     /// Shows `key`'s detail in `slot`'s panel and asks the daemon for it;
-    /// `refresh` skips the daemon's cache. The cached fields show at once.
+    /// `refresh` skips the daemon's cache and keeps a loaded detail shown
+    /// until the reply. The cached fields show at once.
     pub(crate) fn open_detail(
         &mut self,
         slot: SlotId,
@@ -990,31 +1012,49 @@ impl OverseerApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let show_all = self
-            .detail
-            .as_ref()
-            .is_some_and(|d| d.slot == slot && d.key == key && d.show_all);
         self.detail_req += 1;
-        let req_no = self.detail_req;
         // The hidden Claim/Message entry must not keep the keyboard focus.
         self.entry = None;
         window.focus(&self.session_focus);
-        let unavailable = detail_unavailable(&self.daemon, overseer_proto::current_build());
-        self.detail = Some(OpenDetail {
+        self.detail = Some(reopen(
+            self.detail.as_ref(),
             slot,
-            key: key.clone(),
-            state: match &unavailable {
-                Some(why) => DetailState::Failed(why.clone()),
-                None => DetailState::Loading,
-            },
-            req: req_no,
-            show_all,
-        });
+            &key,
+            self.detail_req,
+            refresh,
+        ));
+        self.detail_waiting = None;
+        self.gate_detail(refresh, cx);
         cx.notify();
-        if unavailable.is_some() {
-            // An older daemon hangs up on a request it cannot decode.
-            return;
+    }
+
+    /// Sends the open detail's request, holds it for the build probe, or
+    /// says why it cannot be sent (an older daemon hangs up on a request it
+    /// cannot decode).
+    fn gate_detail(&mut self, refresh: bool, cx: &mut Context<Self>) {
+        match detail_gate(
+            &self.daemon,
+            self.daemon_probing,
+            overseer_proto::current_build(),
+        ) {
+            DetailGate::Send => self.send_detail(refresh, cx),
+            DetailGate::Wait => self.detail_waiting = Some(refresh),
+            DetailGate::Refuse(why) => {
+                if let Some(d) = self.detail.as_mut() {
+                    fail_detail(d, why);
+                }
+            }
         }
+    }
+
+    /// Asks the daemon for the open detail; the reply goes through
+    /// `take_reply`, so one for a detail since closed or reopened is dropped.
+    fn send_detail(&mut self, refresh: bool, cx: &mut Context<Self>) {
+        let Some(open) = self.detail.as_ref() else {
+            return;
+        };
+        let key = open.key.clone();
+        let req_no = open.req;
         let client = self.client.clone();
         cx.spawn(async move |this, cx| {
             let req = Request::GetItemDetail {
@@ -1037,6 +1077,7 @@ impl OverseerApp {
 
     pub(crate) fn close_detail(&mut self, cx: &mut Context<Self>) {
         self.detail = None;
+        self.detail_waiting = None;
         cx.notify();
     }
 

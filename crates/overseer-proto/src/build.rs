@@ -39,14 +39,52 @@ pub fn current_build() -> &'static str {
     })
 }
 
-/// The line to show when the app and the daemon run different known builds.
-pub fn build_notice(app: &str, daemon: &str) -> Option<String> {
+/// How the daemon's build sits against the app's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildOrder {
+    Match,
+    DaemonOlder,
+    DaemonNewer,
+    Different,
+}
+
+/// The `yyyymmddHHMM` stamp after the last `-`, when it is 12 ASCII digits.
+fn stamp(build: &str) -> Option<u64> {
+    let (_, stamp) = build.rsplit_once('-')?;
+    (stamp.len() == 12 && stamp.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| stamp.parse().ok())
+        .flatten()
+}
+
+/// Compares two build ids by their timestamp suffix. Equal ids, or `dev` on
+/// either side, match; ids without a readable stamp, or with equal stamps on
+/// different commits, are `Different`.
+pub fn compare_builds(app: &str, daemon: &str) -> BuildOrder {
     if app == daemon || app == DEV_BUILD || daemon == DEV_BUILD {
-        return None;
+        return BuildOrder::Match;
     }
-    Some(format!(
-        "The daemon runs build {daemon}, this app build {app}. Restart the daemon to finish the upgrade (overseer ctl restart, or Settings)."
-    ))
+    match (stamp(app), stamp(daemon)) {
+        (Some(a), Some(d)) if d < a => BuildOrder::DaemonOlder,
+        (Some(a), Some(d)) if d > a => BuildOrder::DaemonNewer,
+        _ => BuildOrder::Different,
+    }
+}
+
+/// The line to show when the app and the daemon run different known builds,
+/// naming the side to restart.
+pub fn build_notice(app: &str, daemon: &str) -> Option<String> {
+    match compare_builds(app, daemon) {
+        BuildOrder::Match => None,
+        BuildOrder::DaemonOlder => Some(format!(
+            "The daemon runs build {daemon}, older than this app's build {app}. Restart the daemon to finish the upgrade (overseer ctl restart, or Settings)."
+        )),
+        BuildOrder::DaemonNewer => Some(format!(
+            "The daemon runs build {daemon}, newer than this app's build {app}. Restart Overseer (quit and reopen the app) to finish the upgrade."
+        )),
+        BuildOrder::Different => Some(format!(
+            "The app and the daemon are different builds ({app} and {daemon}); restart both."
+        )),
+    }
 }
 
 /// Local `HH:MM` for unix seconds, `?` when the time cannot be converted.
@@ -102,14 +140,48 @@ mod tests {
     }
 
     #[test]
-    fn notice_only_when_both_known_and_different() {
+    fn compare_builds_reads_the_timestamp_suffix() {
+        let new = "abc1234-202611141000";
+        let old = "abc1234-202611140930";
+        assert_eq!(compare_builds(new, old), BuildOrder::DaemonOlder);
+        assert_eq!(compare_builds(old, new), BuildOrder::DaemonNewer);
+        assert_eq!(compare_builds(new, new), BuildOrder::Match);
+        assert_eq!(compare_builds("dev", old), BuildOrder::Match);
+        assert_eq!(compare_builds(old, "dev"), BuildOrder::Match);
+        assert_eq!(compare_builds("b2", "b1"), BuildOrder::Different);
+        assert_eq!(
+            compare_builds("feat-x-abc1234-202611141000", "feat-x-abc1234-202611140930"),
+            BuildOrder::DaemonOlder
+        );
+        assert_eq!(
+            compare_builds("a-20261114093", "b-202611140930"),
+            BuildOrder::Different
+        );
+        assert_eq!(
+            compare_builds("a-202611140930", "b-202611140930"),
+            BuildOrder::Different
+        );
+    }
+
+    #[test]
+    fn notice_names_who_to_restart() {
+        let new = "abc1234-202611141000";
+        let old = "abc1234-202611140930";
+        assert_eq!(
+            build_notice(new, old).as_deref(),
+            Some("The daemon runs build abc1234-202611140930, older than this app's build abc1234-202611141000. Restart the daemon to finish the upgrade (overseer ctl restart, or Settings).")
+        );
+        assert_eq!(
+            build_notice(old, new).as_deref(),
+            Some("The daemon runs build abc1234-202611141000, newer than this app's build abc1234-202611140930. Restart Overseer (quit and reopen the app) to finish the upgrade.")
+        );
+        assert_eq!(
+            build_notice("b2", "b1").as_deref(),
+            Some("The app and the daemon are different builds (b2 and b1); restart both.")
+        );
         assert_eq!(build_notice("a", "a"), None);
         assert_eq!(build_notice("dev", "b"), None);
         assert_eq!(build_notice("a", "dev"), None);
-        assert_eq!(
-            build_notice("b2", "b1").as_deref(),
-            Some("The daemon runs build b1, this app build b2. Restart the daemon to finish the upgrade (overseer ctl restart, or Settings).")
-        );
     }
 
     #[test]

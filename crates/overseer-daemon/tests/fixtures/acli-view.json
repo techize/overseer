@@ -1,0 +1,195 @@
+{
+  "expand": "operations,versionedRepresentations,editmeta,changelog,customfield_10010.requestTypePractice,transitions,renderedFields",
+  "id": "10007",
+  "key": "DEMO-7",
+  "self": "https://demo.atlassian.net/rest/api/3/issue/10007",
+  "fields": {
+    "summary": "Rotate the demo widget keys",
+    "status": {
+      "description": "Work is underway",
+      "iconUrl": "https://demo.atlassian.net/images/icons/statuses/inprogress.png",
+      "id": "3",
+      "name": "In Progress",
+      "self": "https://demo.atlassian.net/rest/api/3/status/3",
+      "statusCategory": {
+        "colorName": "yellow",
+        "id": 4,
+        "key": "indeterminate",
+        "name": "In Progress",
+        "self": "https://demo.atlassian.net/rest/api/3/statuscategory/4"
+      }
+    },
+    "priority": {
+      "iconUrl": "https://demo.atlassian.net/images/icons/priorities/medium.svg",
+      "id": "3",
+      "name": "Medium",
+      "self": "https://demo.atlassian.net/rest/api/3/priority/3"
+    },
+    "description": {
+      "type": "doc",
+      "version": 1,
+      "content": [
+        {
+          "type": "paragraph",
+          "content": [
+            {
+              "type": "text",
+              "text": "Rotate the keys for "
+            },
+            {
+              "type": "text",
+              "text": "demo-ws",
+              "marks": [
+                {
+                  "type": "code"
+                }
+              ]
+            },
+            {
+              "type": "text",
+              "text": " before "
+            },
+            {
+              "type": "text",
+              "text": "Friday",
+              "marks": [
+                {
+                  "type": "strong"
+                }
+              ]
+            },
+            {
+              "type": "text",
+              "text": ". See "
+            },
+            {
+              "type": "inlineCard",
+              "attrs": {
+                "url": "https://demo.atlassian.net/browse/DEMO-8"
+              }
+            }
+          ]
+        },
+        {
+          "type": "heading",
+          "attrs": {
+            "level": 3
+          },
+          "content": [
+            {
+              "type": "text",
+              "text": "Acceptance criteria"
+            }
+          ]
+        },
+        {
+          "type": "bulletList",
+          "content": [
+            {
+              "type": "listItem",
+              "content": [
+                {
+                  "type": "paragraph",
+                  "content": [
+                    {
+                      "type": "text",
+                      "text": "Old keys stop working"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "listItem",
+              "content": [
+                {
+                  "type": "paragraph",
+                  "content": [
+                    {
+                      "type": "text",
+                      "text": "New keys are in the "
+                    },
+                    {
+                      "type": "text",
+                      "text": "vault",
+                      "marks": [
+                        {
+                          "type": "link",
+                          "attrs": {
+                            "href": "https://demo.atlassian.net/wiki"
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "orderedList",
+          "attrs": {
+            "order": 1
+          },
+          "content": [
+            {
+              "type": "listItem",
+              "content": [
+                {
+                  "type": "paragraph",
+                  "content": [
+                    {
+                      "type": "text",
+                      "text": "Make the keys"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "listItem",
+              "content": [
+                {
+                  "type": "paragraph",
+                  "content": [
+                    {
+                      "type": "text",
+                      "text": "Ship them"
+                    },
+                    {
+                      "type": "hardBreak"
+                    },
+                    {
+                      "type": "text",
+                      "text": "then check"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "codeBlock",
+          "content": [
+            {
+              "type": "text",
+              "text": "demo rotate --all"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "changelog": null,
+  "editmeta": null,
+  "fieldsToInclude": null,
+  "names": null,
+  "operations": null,
+  "properties": null,
+  "renderedFields": null,
+  "schema": null,
+  "transitions": null,
+  "versionedRepresentations": null
+}

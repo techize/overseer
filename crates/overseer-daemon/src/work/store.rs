@@ -10,10 +10,12 @@
 //! both win.
 //!
 //! Lock order: `change_turn`, then the ledger's lock, then the cache's.
-//! None is held across an await.
+//! None is held across an await. `detail_cache` and `detail_inflight` are
+//! never held together, nor with any of the above.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -22,11 +24,14 @@ use overseer_proto::{
     Sender, SlotId, SourceStatus, Stage, WorkItem, WorkView, JIRA_OFF, PRS_OFF,
 };
 use regex::Regex;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
 use super::bitbucket_api::{pick_remote, BitbucketApi};
-use super::detail::{overview_paragraph, parse_bead_detail, parse_issue_detail, DETAIL_TTL};
+use super::detail::{
+    acli_not_found, overview_paragraph, parse_bead_detail, parse_issue_detail, valid_item_key,
+    DETAIL_TTL,
+};
 use super::jira_api::{run_blocking, run_blocking_for, ActiveSprint, JiraApi};
 use super::ownership::{decide, promotions, Decision};
 use super::sprint::{
@@ -343,6 +348,10 @@ pub struct WorkStore {
     cache: Mutex<Cache>,
     /// Fetched item bodies by key: when, what and the unix time.
     detail_cache: Mutex<HashMap<String, (Instant, Fetched, i64)>>,
+    /// The detail fetch running for each key, for others to join.
+    detail_inflight: Mutex<HashMap<String, InFlight>>,
+    /// Numbers each detail fetch for its `InFlight` entry.
+    detail_ids: AtomicU64,
     /// Held for the length of one source's refresh, so refreshes of the same
     /// source run one after another.
     beads_turn: tokio::sync::Mutex<()>,
@@ -361,7 +370,7 @@ pub struct WorkStore {
 }
 
 /// What a detail fetch brings: the parts the view does not already have.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct Fetched {
     body: Option<String>,
     notes: Option<String>,
@@ -370,6 +379,35 @@ struct Fetched {
     title: Option<String>,
     status: Option<String>,
     priority: Option<String>,
+}
+
+/// What one detail fetch ends with: the fetched parts and the unix time.
+type DetailResult = Result<(Fetched, i64), String>;
+
+/// A detail fetch in progress. `rx` gets the result once it is in.
+struct InFlight {
+    /// The fetch is a refresh, so a refresh may join it.
+    refresh: bool,
+    /// Which fetch this is, so only its own leader removes it.
+    id: u64,
+    rx: watch::Receiver<Option<DetailResult>>,
+}
+
+/// Removes a leader's `InFlight` entry when the leader ends, finished or
+/// dropped; an entry a later fetch put in its place is left alone.
+struct Unregister<'a> {
+    map: &'a Mutex<HashMap<String, InFlight>>,
+    key: &'a str,
+    id: u64,
+}
+
+impl Drop for Unregister<'_> {
+    fn drop(&mut self) {
+        let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        if map.get(self.key).is_some_and(|f| f.id == self.id) {
+            map.remove(self.key);
+        }
+    }
 }
 
 struct Tasks {
@@ -590,6 +628,8 @@ impl WorkStore {
             events,
             env,
             detail_cache: Mutex::new(HashMap::new()),
+            detail_inflight: Mutex::new(HashMap::new()),
+            detail_ids: AtomicU64::new(0),
             cache: Mutex::new(Cache {
                 beads: Vec::new(),
                 tickets: Vec::new(),
@@ -960,9 +1000,13 @@ impl WorkStore {
     /// Everything the detail view shows of `key`: the listed fields, its
     /// child beads and PRs, and the body fetched from Jira or `bd`, kept for
     /// [`DETAIL_TTL`] unless `refresh`. A failed fetch is reported in
-    /// `error` (and not kept) with the project overview as a fallback.
-    /// `Err` only for a key the store does not know.
+    /// `error` (and not kept); the last good copy, if any, is shown with it.
+    /// With no body the project overview fills in. `Err` only for a key that
+    /// is malformed or that the store does not know.
     pub async fn item_detail(&self, key: &str, refresh: bool) -> Result<ItemDetail, String> {
+        if !valid_item_key(key) {
+            return Err(format!("{key} is not a valid item key"));
+        }
         let view = self.view();
         let item = view
             .items
@@ -1005,60 +1049,109 @@ impl WorkStore {
             fetched_at: None,
             error: None,
         };
-        let cached = self
+        let entry = self
             .detail_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(key)
-            .filter(|(at, _, _)| !refresh && at.elapsed() < DETAIL_TTL)
-            .map(|(_, f, when)| (f.clone(), *when));
-        let fetched = match cached {
-            Some((f, when)) => Ok((f, when)),
-            None => self.fetch_detail(key, &item.kind).await.map(|f| {
-                let when = unix_now();
-                self.detail_cache
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(key.to_owned(), (Instant::now(), f.clone(), when));
-                (f, when)
-            }),
+            .map(|(at, f, when)| (*at, f.clone(), *when));
+        let fetched = match entry {
+            Some((at, f, when)) if !refresh && at.elapsed() < DETAIL_TTL => Some((f, when)),
+            entry => match self.fetch_shared(key, &item.kind, refresh).await {
+                Ok(got) => Some(got),
+                // The last good copy, however old, beats an empty view.
+                Err(e) => {
+                    detail.error = Some(e);
+                    entry.map(|(_, f, when)| (f, when))
+                }
+            },
         };
-        match fetched {
-            Ok((f, when)) => {
-                // An item that has left the list shows its key as its title
-                // and no status; what the source said fills those in.
-                if let Some(t) = f.title.filter(|t| !t.trim().is_empty()) {
-                    if detail.title.trim().is_empty() || detail.title == detail.key {
-                        detail.title = t;
-                    }
+        if let Some((f, when)) = fetched {
+            // An item that has left the list shows its key as its title
+            // and no status; what the source said fills those in.
+            if let Some(t) = f.title.filter(|t| !t.trim().is_empty()) {
+                if detail.title.trim().is_empty() || detail.title == detail.key {
+                    detail.title = t;
                 }
-                if let Some(st) = f.status.filter(|s| !s.trim().is_empty()) {
-                    if detail.status == overseer_proto::UNKNOWN_STATUS {
-                        detail.status = st;
-                    }
-                }
-                if detail.priority.is_none() {
-                    detail.priority = f.priority;
-                }
-                detail.body = f.body;
-                detail.notes = f.notes;
-                detail.depends_on = f.depends_on;
-                detail.fetched_at = Some(when);
             }
-            Err(e) => {
-                detail.error = Some(e);
-                if let Some(folder) = detail.folder.clone() {
-                    detail.overview = tokio::task::spawn_blocking(move || {
-                        std::fs::read_to_string(folder.join("00-PROJECT-OVERVIEW.md")).ok()
-                    })
-                    .await
-                    .ok()
-                    .flatten()
-                    .and_then(|md| overview_paragraph(&md));
+            if let Some(st) = f.status.filter(|s| !s.trim().is_empty()) {
+                if detail.status == overseer_proto::UNKNOWN_STATUS {
+                    detail.status = st;
                 }
+            }
+            if detail.priority.is_none() {
+                detail.priority = f.priority;
+            }
+            detail.body = f.body;
+            detail.notes = f.notes;
+            detail.depends_on = f.depends_on;
+            detail.fetched_at = Some(when);
+        }
+        let no_body = detail.body.as_deref().is_none_or(|b| b.trim().is_empty());
+        if no_body {
+            if let Some(folder) = detail.folder.clone() {
+                detail.overview = tokio::task::spawn_blocking(move || {
+                    std::fs::read_to_string(folder.join("00-PROJECT-OVERVIEW.md")).ok()
+                })
+                .await
+                .ok()
+                .flatten()
+                .and_then(|md| overview_paragraph(&md));
             }
         }
         Ok(detail)
+    }
+
+    /// Fetches `key`'s detail, sharing one fetch between callers: a request
+    /// joins the fetch already running for `key`, except that a refresh only
+    /// joins a refresh. A good result is cached (after dropping expired
+    /// entries). If the fetch being joined is dropped before it answers, the
+    /// follower starts over.
+    async fn fetch_shared(&self, key: &str, kind: &ItemKind, refresh: bool) -> DetailResult {
+        loop {
+            let joined = {
+                let mut map = self
+                    .detail_inflight
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                match map.get(key) {
+                    Some(f) if !refresh || f.refresh => Ok(f.rx.clone()),
+                    _ => {
+                        let (tx, rx) = watch::channel(None);
+                        let id = self.detail_ids.fetch_add(1, Ordering::Relaxed);
+                        map.insert(key.to_owned(), InFlight { refresh, id, rx });
+                        Err((tx, id))
+                    }
+                }
+            };
+            let (tx, id) = match joined {
+                Ok(mut rx) => {
+                    let got = rx.wait_for(Option::is_some).await.map(|v| v.clone());
+                    match got {
+                        Ok(Some(result)) => return result,
+                        // The leader was dropped without answering.
+                        _ => continue,
+                    }
+                }
+                Err(lead) => lead,
+            };
+            // Declared after `tx`, so it drops first: the entry is gone
+            // before a follower sees the sender close.
+            let _unregister = Unregister {
+                map: &self.detail_inflight,
+                key,
+                id,
+            };
+            let result = self.fetch_detail(key, kind).await.map(|f| {
+                let when = unix_now();
+                let mut cache = self.detail_cache.lock().unwrap_or_else(|e| e.into_inner());
+                cache.retain(|_, (at, _, _)| at.elapsed() < DETAIL_TTL);
+                cache.insert(key.to_owned(), (Instant::now(), f.clone(), when));
+                (f, when)
+            });
+            tx.send_replace(Some(result.clone()));
+            return result;
+        }
     }
 
     /// Reads one item's body from its source.
@@ -1096,7 +1189,10 @@ impl WorkStore {
                     .collect();
                 run_source(&cmd, Path::new(WORKSPACE_CWD), SOURCE_TIMEOUT, &vars)
                     .await
-                    .map_err(|e| format!("{}: {}", cmd.join(" "), missing_program_hint(&cmd, e)))?
+                    .map_err(|e| match acli_not_found(key, &e) {
+                        Some(gone) => gone,
+                        None => format!("{}: {}", cmd.join(" "), missing_program_hint(&cmd, e)),
+                    })?
             }
         };
         let d = parse_issue_detail(&out)?;
@@ -3245,7 +3341,7 @@ esac"#,
             format!(
                 "#!/bin/sh\necho \"$@\" >> '{}'\ncat '{}'\n",
                 log.display(),
-                fixture("jira-issue.json")
+                fixture("acli-view.json")
             ),
         )
         .unwrap();
@@ -3261,9 +3357,9 @@ esac"#,
         assert!(d.body.is_some_and(|b| !b.trim().is_empty()));
         // DEMO-1 is owned but not listed, so the view only knows its key;
         // the fetch supplies the title, status and priority.
-        assert_eq!(d.title, "Wire the detail view");
+        assert_eq!(d.title, "Rotate the demo widget keys");
         assert_eq!(d.status, "In Progress");
-        assert_eq!(d.priority.as_deref(), Some("High"));
+        assert_eq!(d.priority.as_deref(), Some("Medium"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3322,6 +3418,191 @@ esac"#,
     async fn unknown_key_is_an_error() {
         let s = store_with(|_| {});
         assert!(s.item_detail("DEMO-999", false).await.is_err());
+    }
+
+    /// Writes an executable `sh` script at `path`.
+    fn write_exe(path: &Path, script: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, format!("#!/bin/sh\n{script}\n")).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// A store whose `bd` is `script`, run in `dir`, listing bead demo-1.
+    fn bead_store(dir: &Path, script: &str) -> Arc<WorkStore> {
+        let s = store_with(|c| {
+            c.beads_dir = dir.to_path_buf();
+            c.bd_command = fake_cmd(script, &[]);
+        });
+        s.cache().beads = vec![bead("demo-1", "Wire the detail view")];
+        s.regroup(1);
+        s
+    }
+
+    /// A `bd` that waits, logs its arguments and prints the fixture.
+    fn slow_bd(log: &Path) -> String {
+        format!(
+            "sleep 0.3; echo \"$@\" >> '{}'; cat '{}'",
+            log.display(),
+            fixture("bd-show.json")
+        )
+    }
+
+    #[tokio::test]
+    async fn a_bad_key_is_refused_before_any_fetch() {
+        let dir = temp_dir("detail-badkey");
+        let log = dir.join("calls.log");
+        let script = format!(
+            "echo \"$@\" >> '{}'; cat '{}'",
+            log.display(),
+            fixture("bd-show.json")
+        );
+        let s = bead_store(&dir, &script);
+        assert_eq!(
+            s.item_detail("demo-1;rm", false).await.unwrap_err(),
+            "demo-1;rm is not a valid item key"
+        );
+        assert!(!log.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_failed_refresh_keeps_the_cached_copy() {
+        let dir = temp_dir("detail-keep");
+        let count = dir.join("count");
+        let script = format!(
+            "echo x >> '{c}'; if [ \"$(wc -l < '{c}')\" -ge 2 ]; then echo boom >&2; exit 1; fi; cat '{f}'",
+            c = count.display(),
+            f = fixture("bd-show.json")
+        );
+        let s = bead_store(&dir, &script);
+        let first = s.item_detail("demo-1", false).await.unwrap();
+        assert_eq!(first.error, None);
+        assert!(first.body.is_some());
+        let t = first.fetched_at;
+        assert!(t.is_some());
+        let second = s.item_detail("demo-1", true).await.unwrap();
+        assert_eq!(second.body, first.body);
+        assert_eq!(second.notes, first.notes);
+        assert_eq!(second.depends_on, first.depends_on);
+        assert_eq!(second.fetched_at, t);
+        assert!(
+            second.error.as_deref().is_some_and(|e| e.contains("boom")),
+            "{:?}",
+            second.error
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_empty_body_brings_the_overview() {
+        let dir = temp_dir("detail-empty");
+        let folder = dir.join("Sprints/sprint-26-01/DEMO-1");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(
+            folder.join("00-PROJECT-OVERVIEW.md"),
+            "# DEMO-1 Widget\n\nWidgets glow when wired.\n",
+        )
+        .unwrap();
+        let acli = dir.join("acli");
+        write_exe(
+            &acli,
+            r#"echo '{"key":"DEMO-1","fields":{"summary":"S","description":null}}'"#,
+        );
+        let s = store_with(|c| {
+            c.brain_dir = dir.clone();
+            c.jira_command = vec![acli.to_str().unwrap().to_owned()];
+        });
+        s.ledger.assign("DEMO-1", 2, 1).unwrap();
+        s.regroup(1);
+        let d = s.item_detail("DEMO-1", false).await.unwrap();
+        assert_eq!(d.error, None);
+        assert_eq!(d.body, None);
+        assert_eq!(d.overview.as_deref(), Some("Widgets glow when wired."));
+        assert!(d.fetched_at.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn acli_not_found_reads_like_rest() {
+        let dir = temp_dir("detail-acli-404");
+        let acli = dir.join("acli");
+        write_exe(
+            &acli,
+            "echo '\u{2717} Error: Issue does not exist or you do not have permission to see it.' >&2; exit 1",
+        );
+        let s = store_with(|c| c.jira_command = vec![acli.to_str().unwrap().to_owned()]);
+        s.ledger.assign("DEMO-1", 2, 1).unwrap();
+        let d = s.item_detail("DEMO-1", false).await.unwrap();
+        assert_eq!(d.error.as_deref(), Some("DEMO-1 was not found in Jira"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn expired_entries_are_pruned_on_insert() {
+        let dir = temp_dir("detail-prune");
+        let s = bead_store(&dir, &format!("cat '{}'", fixture("bd-show.json")));
+        let old = Instant::now()
+            .checked_sub(DETAIL_TTL + Duration::from_secs(1))
+            .unwrap();
+        s.detail_cache
+            .lock()
+            .unwrap()
+            .insert("demo-9".into(), (old, Fetched::default(), 1));
+        s.item_detail("demo-1", false).await.unwrap();
+        let keys: Vec<String> = s.detail_cache.lock().unwrap().keys().cloned().collect();
+        assert_eq!(keys, ["demo-1"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn two_opens_share_one_fetch() {
+        let dir = temp_dir("detail-share");
+        let log = dir.join("calls.log");
+        let s = bead_store(&dir, &slow_bd(&log));
+        let (a, b) = tokio::join!(
+            s.item_detail("demo-1", false),
+            s.item_detail("demo-1", false)
+        );
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert!(a.body.is_some());
+        assert_eq!(a.body, b.body);
+        assert_eq!(lines(&log).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_refresh_does_not_join_a_plain_fetch() {
+        let dir = temp_dir("detail-refresh-join");
+        let log = dir.join("calls.log");
+        let s = bead_store(&dir, &slow_bd(&log));
+        let (a, b) = tokio::join!(s.item_detail("demo-1", false), async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            s.item_detail("demo-1", true).await
+        });
+        assert!(a.unwrap().body.is_some());
+        assert!(b.unwrap().body.is_some());
+        assert_eq!(lines(&log).len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_dropped_leader_does_not_strand_the_follower() {
+        let dir = temp_dir("detail-dropped");
+        let log = dir.join("calls.log");
+        let s = bead_store(&dir, &slow_bd(&log));
+        let (a, b) = tokio::join!(
+            tokio::time::timeout(Duration::from_millis(50), s.item_detail("demo-1", false)),
+            async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                s.item_detail("demo-1", false).await
+            }
+        );
+        assert!(a.is_err());
+        let b = b.unwrap();
+        assert_eq!(b.error, None);
+        assert!(b.body.is_some());
+        assert!(s.detail_inflight.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

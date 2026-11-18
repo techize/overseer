@@ -56,27 +56,19 @@ fn block(node: &Value, depth: usize, out: &mut String) {
         }
         Some(kind @ ("bulletList" | "orderedList")) => {
             for (i, item) in children(node).iter().enumerate() {
-                out.push_str(&"  ".repeat(depth));
-                if kind == "bulletList" {
-                    out.push_str("- ");
-                } else {
-                    out.push_str(&format!("{}. ", i + 1));
-                }
-                let mut first = true;
-                for child in children(item) {
-                    if first && child.get("type").and_then(Value::as_str) == Some("paragraph") {
+                for (j, child) in children(item).iter().enumerate() {
+                    if j == 0 && child.get("type").and_then(Value::as_str) == Some("paragraph") {
+                        out.push_str(&"  ".repeat(depth));
+                        if kind == "bulletList" {
+                            out.push_str("- ");
+                        } else {
+                            out.push_str(&format!("{}. ", i + 1));
+                        }
                         out.push_str(&inline(child));
                         out.push('\n');
                     } else {
-                        if first {
-                            out.push('\n');
-                        }
                         block(child, depth + 1, out);
                     }
-                    first = false;
-                }
-                if first {
-                    out.push('\n');
                 }
             }
         }
@@ -109,6 +101,19 @@ pub struct IssueDetail {
     pub status: String,
     pub priority: Option<String>,
     pub body: Option<String>,
+}
+
+/// Whether `key` is safe to pass to `acli`, `bd` or a URL path.
+pub fn valid_item_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// The REST-style message for an acli failure that means the issue is gone.
+pub fn acli_not_found(key: &str, err: &str) -> Option<String> {
+    err.contains("Issue does not exist")
+        .then(|| format!("{key} was not found in Jira"))
 }
 
 /// The first JSON value in `out`, starting at the first of `starts`.
@@ -190,10 +195,12 @@ pub fn parse_bead_detail(out: &str) -> Result<BeadDetail, String> {
                         return Some(id.to_owned());
                     }
                     let id = non_empty(d.get("depends_on_id")).or(non_empty(d.get("id")))?;
-                    Some(match non_empty(d.get("type")) {
-                        Some(t) => format!("{id} ({t})"),
-                        None => id.to_owned(),
-                    })
+                    Some(
+                        match non_empty(d.get("dependency_type")).or(non_empty(d.get("type"))) {
+                            Some(t) => format!("{id} ({t})"),
+                            None => id.to_owned(),
+                        },
+                    )
                 })
                 .collect()
         })
@@ -243,6 +250,7 @@ mod tests {
 
     const JIRA: &str = include_str!("../../tests/fixtures/jira-issue.json");
     const BD: &str = include_str!("../../tests/fixtures/bd-show.json");
+    const ACLI_VIEW: &str = include_str!("../../tests/fixtures/acli-view.json");
 
     #[test]
     fn adf_renders_headings_lists_and_code() {
@@ -307,6 +315,117 @@ mod tests {
             parse_bead_detail(&wrapped).unwrap(),
             parse_bead_detail(&obj[0].to_string()).unwrap()
         );
+    }
+
+    fn doc(content: Value) -> Value {
+        json!({"type":"doc","version":1,"content":content})
+    }
+    fn para(t: &str) -> Value {
+        json!({"type":"paragraph","content":[{"type":"text","text":t}]})
+    }
+    fn item(content: Value) -> Value {
+        json!({"type":"listItem","content":content})
+    }
+
+    #[test]
+    fn acli_view_fixture_reads_like_jira() {
+        let d = parse_issue_detail(ACLI_VIEW).unwrap();
+        assert_eq!(d.title, "Rotate the demo widget keys");
+        assert_eq!(d.status, "In Progress");
+        assert_eq!(d.priority.as_deref(), Some("Medium"));
+        assert_eq!(
+            d.body.as_deref(),
+            Some("Rotate the keys for demo-ws before Friday. See https://demo.atlassian.net/browse/DEMO-8\n\n### Acceptance criteria\n- Old keys stop working\n- New keys are in the vault\n1. Make the keys\n2. Ship them\nthen check\n```\ndemo rotate --all\n```")
+        );
+    }
+
+    #[test]
+    fn ordered_lists_number_and_nest() {
+        let d = doc(json!([{"type":"orderedList","content":[
+            item(json!([para("a")])), item(json!([para("b")])), item(json!([para("c")]))]}]));
+        assert_eq!(adf_to_text(&d), "1. a\n2. b\n3. c");
+        let d = doc(json!([{"type":"bulletList","content":[item(json!([
+            para("x"),
+            {"type":"orderedList","content":[item(json!([para("y")]))]}]))]}]));
+        assert_eq!(adf_to_text(&d), "- x\n  1. y");
+    }
+
+    #[test]
+    fn deep_headings_keep_their_level() {
+        let h = |l: Value, t: &str| {
+            let attrs = if l.is_null() {
+                json!({})
+            } else {
+                json!({"level": l})
+            };
+            json!({"type":"heading","attrs":attrs,"content":[{"type":"text","text":t}]})
+        };
+        let d = doc(json!([
+            h(json!(4), "Four"),
+            h(json!(5), "Five"),
+            h(json!(6), "Six"),
+            h(json!(9), "Nine"),
+            h(Value::Null, "None")
+        ]));
+        assert_eq!(
+            adf_to_text(&d),
+            "#### Four\n##### Five\n###### Six\n###### Nine\n# None"
+        );
+    }
+
+    #[test]
+    fn a_list_item_without_a_paragraph_has_no_lone_marker() {
+        let d = doc(json!([{"type":"bulletList","content":[item(json!([
+            {"type":"bulletList","content":[item(json!([para("inner")]))]}]))]}]));
+        assert_eq!(adf_to_text(&d), "  - inner");
+        let d = doc(json!([{"type":"bulletList","content":[
+            item(json!([])), item(json!([para("kept")]))]}]));
+        assert_eq!(adf_to_text(&d), "- kept");
+    }
+
+    #[test]
+    fn bead_dependencies_in_every_shape() {
+        assert_eq!(
+            parse_bead_detail(BD).unwrap().depends_on,
+            vec!["demo-2 (blocks)".to_string()]
+        );
+        let out = r#"{"dependencies": ["demo-3", {"id": "demo-4"}, {"depends_on_id": "demo-5", "type": "related"}]}"#;
+        assert_eq!(
+            parse_bead_detail(out).unwrap().depends_on,
+            vec!["demo-3", "demo-4", "demo-5 (related)"]
+        );
+    }
+
+    #[test]
+    fn acli_not_found_maps_to_the_rest_wording() {
+        let err = "acli exited with 1: \u{2717} Error: Issue does not exist or you do not have permission to see it.";
+        assert_eq!(
+            acli_not_found("DEMO-1", err).as_deref(),
+            Some("DEMO-1 was not found in Jira")
+        );
+        assert_eq!(
+            acli_not_found("DEMO-1", "acli exited with 1: timeout"),
+            None
+        );
+    }
+
+    #[test]
+    fn item_keys_are_checked() {
+        for ok in ["DEMO-1", "demo-12", "ov-3.1", "a_b"] {
+            assert!(valid_item_key(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "-DEMO",
+            ".x",
+            "DEMO 1",
+            "DEMO-1;rm",
+            "DEMO/1",
+            "\u{c9}DEMO",
+            "DEMO-1\n",
+        ] {
+            assert!(!valid_item_key(bad), "{bad:?}");
+        }
     }
 
     #[test]

@@ -502,6 +502,10 @@ async fn watch_exits(
     }
 }
 
+/// The answer to a request frame this daemon cannot decode.
+pub const UNKNOWN_REQUEST: &str =
+    "the daemon does not understand this request; restart the daemon to finish an upgrade";
+
 /// Bounded outbound queue for one connection. Sending never waits: if the
 /// queue is full the client is too slow and the connection is dropped.
 #[derive(Clone)]
@@ -649,7 +653,11 @@ async fn handle_conn(
     // N1: read_frame is not cancel-safe, so it lives in its own task and is
     // never polled inside a select!. The handler only selects on channels.
     let (in_tx, mut in_rx) = mpsc::channel::<Frame>(INBOUND_QUEUE);
-    let reader = tokio::spawn(async move {
+    let reader_outbox = outbox.clone();
+    // Aborts on drop: the reader holds an outbox clone, and the writer only
+    // ends once every clone is gone, so a handler that is itself dropped (at
+    // shutdown) must not leave the reader behind.
+    let reader = AbortOnDrop(tokio::spawn(async move {
         loop {
             match read_frame(&mut rd).await {
                 Ok(Some(frame)) => {
@@ -659,12 +667,22 @@ async fn handle_conn(
                 }
                 Ok(None) => break,
                 Err(e) => {
+                    if let Some(seq) = overseer_proto::undecodable_request(&e) {
+                        tracing::debug!("undecodable request {seq}: {e}");
+                        reader_outbox.send(Frame::Response {
+                            seq,
+                            resp: Response::Error {
+                                message: UNKNOWN_REQUEST.into(),
+                            },
+                        });
+                        continue;
+                    }
                     tracing::debug!("read error: {e}");
                     break;
                 }
             }
         }
-    });
+    }));
 
     let writer_dead = dead_tx.clone();
     let writer = tokio::spawn(async move {
@@ -747,8 +765,17 @@ async fn handle_conn(
     }
 
     streams.abort_all();
-    reader.abort();
+    drop(reader);
     writer.abort();
+}
+
+/// A task that is aborted when this handle is dropped.
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// What a request handler works with.

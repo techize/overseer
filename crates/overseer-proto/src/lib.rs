@@ -8,10 +8,13 @@ pub mod paths;
 pub mod settings;
 
 pub use build::{
-    build_from_plist, build_notice, build_of_exe, current_build, local_hhmm, DEV_BUILD,
+    build_from_plist, build_notice, build_of_exe, compare_builds, current_build, local_hhmm,
+    BuildOrder, DEV_BUILD,
 };
 pub use client::Client;
-pub use frame::{read_frame, write_frame, Frame, MAX_FRAME};
+pub use frame::{
+    read_frame, undecodable_request, write_frame, Frame, UndecodableRequest, MAX_FRAME,
+};
 pub use msg::{
     owned_by_message, owner_in_refusal, running_sessions_count, running_sessions_text, slot_name,
     Activity, ActivityKind, Approvals, BashCheck, BoardView, BrainRun, BrainView, ChildBead, Claim,
