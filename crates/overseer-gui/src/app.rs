@@ -40,6 +40,7 @@ use crate::daemon_info::DaemonKnown;
 use crate::locks_view::LocksState;
 use crate::picker::{Picker, PickerEvent};
 use crate::plan_view::{PlanEvent, PlanView};
+use crate::session::{detail_still_owned, take_reply, DetailState, OpenDetail};
 use crate::session::{incarnation, keep_view, restart_begin, restart_on_change, Incarnation};
 use crate::session::{reply_note, EntryAction, EntryKind, PanelEntry, RestartPlan};
 use crate::settings_view::{SettingsEvent, SettingsPanel};
@@ -445,7 +446,7 @@ struct TermEntry {
 
 pub struct OverseerApp {
     client: Arc<Client>,
-    theme: Theme,
+    pub(crate) theme: Theme,
     pub(crate) slots: Vec<SlotInfo>,
     /// Work items, owners, source health and notices from the daemon.
     pub(crate) work: WorkView,
@@ -477,6 +478,9 @@ pub struct OverseerApp {
     /// The daemon's last answer to an entry: (slot, is for Holds, text).
     pub(crate) entry_note: Option<(SlotId, bool, String)>,
     pub(crate) entry_focus: FocusHandle,
+    /// The owned item whose detail the session panel shows instead of its
+    /// boxes; see `open_detail`.
+    pub(crate) detail: Option<OpenDetail>,
     terminals: HashMap<SlotId, TermEntry>,
     dialog: Option<(Entity<StartDialog>, Subscription)>,
     picker: Option<(Entity<Picker>, Subscription)>,
@@ -580,6 +584,7 @@ impl OverseerApp {
             leaving: Vec::new(),
             restarts: HashMap::new(),
             kickoffs: HashSet::new(),
+            detail: None,
             focus_when_ready: None,
             root_focus: cx.focus_handle(),
             board_focus,
@@ -820,6 +825,13 @@ impl OverseerApp {
                     p.update(cx, |p, cx| p.set_view(view.clone(), cx));
                 }
                 self.work = view;
+                if self
+                    .detail
+                    .as_ref()
+                    .is_some_and(|d| !detail_still_owned(d, &self.work))
+                {
+                    self.detail = None;
+                }
                 cx.notify();
             }
             _ => {}
@@ -963,6 +975,59 @@ impl OverseerApp {
     pub(crate) fn release_item(&mut self, key: String, cx: &mut Context<Self>) {
         self.status = None;
         self.send(Request::Release { key }, cx);
+    }
+
+    /// Shows `key`'s detail in `slot`'s panel and asks the daemon for it;
+    /// `refresh` skips the daemon's cache. The cached fields show at once.
+    pub(crate) fn open_detail(
+        &mut self,
+        slot: SlotId,
+        key: String,
+        refresh: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let show_all = self
+            .detail
+            .as_ref()
+            .is_some_and(|d| d.slot == slot && d.key == key && d.show_all);
+        self.detail = Some(OpenDetail {
+            slot,
+            key: key.clone(),
+            state: DetailState::Loading,
+            show_all,
+        });
+        cx.notify();
+        let client = self.client.clone();
+        cx.spawn(async move |this, cx| {
+            let req = Request::GetItemDetail {
+                key: key.clone(),
+                refresh,
+            };
+            let resp = match client.request(req).await {
+                Ok(Response::ItemDetail(d)) => Ok(d),
+                Ok(Response::Error { message }) => Err(message),
+                Ok(other) => Err(format!("unexpected reply to the detail request: {other:?}")),
+                Err(e) => Err(format!("{} ({e:#})", crate::terminal_view::LOST_DAEMON)),
+            };
+            let _ = this.update(cx, |this, cx| {
+                take_reply(&mut this.detail, &key, resp);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(crate) fn close_detail(&mut self, cx: &mut Context<Self>) {
+        self.detail = None;
+        cx.notify();
+    }
+
+    /// Shows the whole body, or back to the first lines.
+    pub(crate) fn toggle_detail_all(&mut self, cx: &mut Context<Self>) {
+        if let Some(d) = self.detail.as_mut() {
+            d.show_all = !d.show_all;
+            cx.notify();
+        }
     }
 
     pub(crate) fn clear_notices(&mut self, slot: SlotId, cx: &mut Context<Self>) {
@@ -1495,6 +1560,13 @@ impl OverseerApp {
     fn set_screen(&mut self, screen: Screen, cx: &mut Context<Self>) {
         if self.screen == Screen::Locks && screen != Screen::Locks {
             self.locks_state = LocksState::default();
+        }
+        if self
+            .detail
+            .as_ref()
+            .is_some_and(|d| screen != Screen::Session(d.slot))
+        {
+            self.detail = None;
         }
         self.screen = screen;
         crate::notify::set_viewing(match screen {
