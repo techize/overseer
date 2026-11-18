@@ -25,7 +25,7 @@ use regex::Regex;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
 
-use super::bitbucket_api::{remote_target, BitbucketApi};
+use super::bitbucket_api::{pick_remote, BitbucketApi};
 use super::jira_api::{run_blocking, run_blocking_for, ActiveSprint, JiraApi};
 use super::ownership::{decide, promotions, Decision};
 use super::sprint::{
@@ -33,7 +33,7 @@ use super::sprint::{
     weekdays_between, Ymd,
 };
 use super::stages::Stages;
-use super::token::{jira_token, token, TokenKind};
+use super::token::{find_within, jira_token, TokenKind};
 use super::{
     active_repos, compile_pattern, group, parse_beads, parse_jira, parse_prs, parse_repos,
     run_source, Bead, Ticket,
@@ -253,16 +253,16 @@ async fn read_target(
     parse_prs(&out, repo, ai_reviewers)
 }
 
-/// The workspace and slug of `dir`'s `origin` remote. A missing folder
-/// says so; anything else without a Bitbucket remote is
-/// `NO_BITBUCKET_REMOTE`.
+/// The workspace and slug of `dir`'s Bitbucket remote: `origin`, else the
+/// first remote on Bitbucket. A missing folder says so; anything else
+/// without a Bitbucket remote is `NO_BITBUCKET_REMOTE`.
 async fn folder_remote(dir: &Path, vars: &Vars) -> Result<(String, String), String> {
-    let cmd = ["git", "remote", "get-url", "origin"].map(String::from);
+    let cmd = ["git", "config", "--get-regexp", r"^remote\..*\.url$"].map(String::from);
     match run_source(&cmd, dir, SOURCE_TIMEOUT, vars).await {
         Err(e) if !dir.is_dir() => Err(e),
         read => read
             .ok()
-            .and_then(|url| remote_target(&url))
+            .and_then(|listing| pick_remote(&listing))
             .ok_or_else(|| NO_BITBUCKET_REMOTE.to_owned()),
     }
 }
@@ -303,6 +303,8 @@ pub struct WorkStore {
     has_board: bool,
     /// The `security` tool's path; tests point it at a stub.
     security: String,
+    /// How long a PR poll waits on the Keychain; tests shorten it.
+    keychain_timeout: Duration,
     /// Used for PRs when a Bitbucket token is found.
     bitbucket: Arc<BitbucketApi>,
     /// The beads folder is one Overseer owns, which may have no beads.
@@ -547,6 +549,7 @@ impl WorkStore {
             jira_site: site.to_owned(),
             has_board: !cfg.jira_board.trim().is_empty(),
             security: SECURITY.to_owned(),
+            keychain_timeout: SOURCE_TIMEOUT,
             bitbucket: Arc::new(BitbucketApi::new(email)),
             notes_owned: cfg.notes_owned,
             jql: cfg.jql.clone(),
@@ -870,7 +873,7 @@ impl WorkStore {
                 if self.pr_repos.is_empty() && self.pr_workspace.is_empty() {
                     return;
                 }
-                let reader = match self.pr_reader(&vars).await {
+                let (reader, note) = match self.pr_reader(&vars).await {
                     Ok(r) => r,
                     Err(e) => {
                         // The PRs stay as they were; the status says why.
@@ -889,6 +892,10 @@ impl WorkStore {
                 let now = unix_now();
                 let mut cache = self.cache();
                 let mut errors = Vec::new();
+                if let Some(note) = note {
+                    tracing::warn!("prs source: {note}");
+                    errors.push(note);
+                }
                 if let Some(e) = &repos_error {
                     errors.push(format!("repos: {e}"));
                 }
@@ -1136,19 +1143,36 @@ impl WorkStore {
     }
 
     /// The Bitbucket API when a Bitbucket token is found, else
-    /// `pr_command`. A Keychain that does not answer is an error, not a
-    /// quiet fallback.
-    async fn pr_reader(&self, vars: &Vars) -> Result<PrReader, String> {
-        let found = token(TokenKind::Bitbucket, &self.jira_email, vars, &self.security)
-            .await
-            .map_err(|e| format!("Bitbucket token: {e}"))?;
+    /// `pr_command`. A Keychain that does not answer is not a quiet
+    /// fallback: `pr_command` still reads the PRs, and the note it gives
+    /// keeps the source marked as failed.
+    async fn pr_reader(&self, vars: &Vars) -> Result<(PrReader, Option<String>), String> {
+        let found = find_within(
+            TokenKind::Bitbucket,
+            &self.jira_email,
+            vars,
+            &self.security,
+            self.keychain_timeout,
+        )
+        .await
+        .map(|found| found.map(|(token, _)| token));
+        let found = match found {
+            Ok(found) => found,
+            Err(e) => {
+                let note = format!("Bitbucket token: {e}; read with pr_command instead");
+                return Ok((PrReader::Command(self.pr_command.clone()), Some(note)));
+            }
+        };
         match found {
-            None => Ok(PrReader::Command(self.pr_command.clone())),
+            None => Ok((PrReader::Command(self.pr_command.clone()), None)),
             Some(_) if self.jira_email.is_empty() => Err(NO_BITBUCKET_EMAIL.into()),
-            Some(token) => Ok(PrReader::Api {
-                api: self.bitbucket.clone(),
-                token,
-            }),
+            Some(token) => Ok((
+                PrReader::Api {
+                    api: self.bitbucket.clone(),
+                    token,
+                },
+                None,
+            )),
         }
     }
 
@@ -2386,6 +2410,31 @@ esac"#,
             "PATH".into(),
             std::env::var_os("PATH").unwrap_or_default(),
         )]);
+    }
+
+    #[tokio::test]
+    async fn a_keychain_stall_still_reads_prs_with_pr_command() {
+        let dir = temp_dir("bb-stall");
+        let recent = utc_iso(unix_now() - 86_400);
+        std::fs::write(
+            dir.join("repos.json"),
+            format!(r#"[{{"slug":"demo-api","updated_on":"{recent}"}}]"#),
+        )
+        .unwrap();
+        let mut s = ws_store(&dir, |c| c.jira_email = "demo@example.test".into());
+        use_bitbucket(&mut s, &dir, "sleep 5", "http://127.0.0.1:9");
+        Arc::get_mut(&mut s).unwrap().keychain_timeout = Duration::from_millis(200);
+        s.refresh(Source::Prs).await;
+        let v = s.view();
+        assert_eq!(v.prs.iter().map(|p| p.id).collect::<Vec<_>>(), [7]);
+        let status = prs_source(&v);
+        assert!(!status.ok, "the stall is still reported");
+        let message = status.message.clone().unwrap_or_default();
+        assert!(
+            message.contains("Keychain did not answer") && message.contains("pr_command"),
+            "{message}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A git clone stand-in at `dir` whose `origin` is `url`.

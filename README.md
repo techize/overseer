@@ -93,9 +93,11 @@ optional.
 pr_workspace = "demo-ws"
 ```
 
-or list clones with `pr_repos = ["~/Repos/demo-api"]`; each folder's `origin`
-remote (`https://bitbucket.org/demo-ws/demo-api.git` or
-`git@bitbucket.org:demo-ws/demo-api.git`) names the repo. Restart the daemon.
+or list clones with `pr_repos = ["~/Repos/demo-api"]`; each folder's Bitbucket
+remote (`https://bitbucket.org/demo-ws/demo-api.git`,
+`git@bitbucket.org:demo-ws/demo-api.git` or
+`ssh://git@bitbucket.org/demo-ws/demo-api.git`) names the repo: `origin`, or
+the first remote on Bitbucket when `origin` is not. Restart the daemon.
 
 With no Bitbucket token saved, the PR source runs `pr_command` (`bb`) as
 before.
@@ -161,15 +163,16 @@ Overseer keeps journals, session notes and sprint files in a notes folder
   normally get no prompt. If macOS does ask to allow `security` to use the
   item, choose Always Allow. If it is left unanswered the source says
   `Keychain did not answer`. Unlock your login keychain and wait for the next
-  poll, or use `ATLASSIAN_API_TOKEN` instead.
+  poll, or use `ATLASSIAN_API_TOKEN` instead. The PR source still reads PRs
+  with `pr_command` (`bb`) meanwhile and says so.
 - Bitbucket token rejected. The PR source says `Bitbucket token rejected (401):
   check the token and its scopes` (or 403). Make sure the token was made for
   the Bitbucket app with `read:repository:bitbucket` and
   `read:pullrequest:bitbucket`, and that `jira_email` is the account that
   created it.
-- `no Bitbucket remote`. A `pr_repos` folder whose `origin` is not on
-  `bitbucket.org` cannot be read through the API. Point `origin` at Bitbucket,
-  or poll it through `pr_workspace` instead.
+- `no Bitbucket remote`. A `pr_repos` folder with no remote on
+  `bitbucket.org` cannot be read through the API. Add a Bitbucket remote, or
+  poll it through `pr_workspace` instead.
 - Token status in Settings. Each token row says `set` (in the Keychain),
   `set (environment)` (only the environment variable holds one), `not set`, or
   `unknown (Keychain did not answer)` when the Keychain is locked or waiting on
@@ -411,7 +414,7 @@ trimming):
 
 PRs from Bitbucket. With a Bitbucket token saved (see "Pull requests from
 Bitbucket" above), the PR source calls `https://api.bitbucket.org/2.0/`
-itself: each `pr_repos` folder's `origin` remote names its repo, and
+itself: each `pr_repos` folder's Bitbucket remote names its repo, and
 `pr_workspace` lists the workspace's repos. `pr_command` and
 `pr_repos_command` are then not used. Without a token, the PR source runs
 `bb` once in each folder listed in `pr_repos`, so each folder must be a clone
