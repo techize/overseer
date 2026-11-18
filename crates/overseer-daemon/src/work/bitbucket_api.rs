@@ -167,13 +167,18 @@ pub fn classify(status: u16, body: &str) -> String {
 }
 
 /// The workspace and repo slug of a Bitbucket Cloud remote URL:
-/// `https://[user@]bitbucket.org/ws/slug(.git)` or
+/// `https://[user@]bitbucket.org/ws/slug(.git)`,
+/// `ssh://[user@]bitbucket.org[:port]/ws/slug(.git)` or
 /// `git@bitbucket.org:ws/slug(.git)`. `None` for anything else.
 pub fn remote_target(remote_url: &str) -> Option<(String, String)> {
     let url = remote_url.trim();
-    let path = if let Some(rest) = url.strip_prefix("https://") {
+    let path = if let Some(rest) = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("ssh://"))
+    {
         let (host, path) = rest.split_once('/')?;
         let host = host.rsplit_once('@').map_or(host, |(_, h)| h);
+        let host = host.split_once(':').map_or(host, |(h, _)| h);
         if !host.eq_ignore_ascii_case("bitbucket.org") {
             return None;
         }
@@ -188,6 +193,23 @@ pub fn remote_target(remote_url: &str) -> Option<(String, String)> {
         return None;
     }
     Some((ws.to_owned(), slug.to_owned()))
+}
+
+/// The Bitbucket repo a folder's remotes name, from
+/// `git config --get-regexp remote\..*\.url` output: `origin` when it is a
+/// Bitbucket remote, else the first remote that is.
+pub fn pick_remote(listing: &str) -> Option<(String, String)> {
+    let remotes: Vec<(&str, (String, String))> = listing
+        .lines()
+        .filter_map(|line| {
+            let (key, url) = line.trim().split_once(char::is_whitespace)?;
+            let name = key.strip_prefix("remote.")?.strip_suffix(".url")?;
+            Some((name, remote_target(url)?))
+        })
+        .collect();
+    let origin = remotes.iter().position(|(name, _)| *name == "origin");
+    let at = origin.unwrap_or(0);
+    remotes.into_iter().nth(at).map(|(_, target)| target)
 }
 
 #[cfg(test)]
@@ -340,6 +362,9 @@ mod tests {
             "git@bitbucket.org:demo-ws/demo-api.git",
             "git@bitbucket.org:demo-ws/demo-api",
             "  git@bitbucket.org:demo-ws/demo-api.git\n",
+            "ssh://git@bitbucket.org/demo-ws/demo-api.git",
+            "ssh://git@bitbucket.org:22/demo-ws/demo-api",
+            "ssh://bitbucket.org/demo-ws/demo-api.git",
         ] {
             assert_eq!(remote_target(url), want, "{url}");
         }
@@ -354,9 +379,27 @@ mod tests {
             "https://bitbucket.org/demo-ws",
             "https://bitbucket.org/demo-ws/demo-api/extra",
             "git@bitbucket.org:/demo-api.git",
+            "ssh://git@github.com/demo-ws/demo-api.git",
+            "ssh://git@bitbucket.org.example.test:22/demo-ws/demo-api",
             "",
         ] {
             assert_eq!(remote_target(url), None, "{url}");
         }
+    }
+
+    #[test]
+    fn pick_remote_prefers_origin_then_any_bitbucket_remote() {
+        let target = |s: &str| Some(("demo-ws".to_owned(), s.to_owned()));
+        let listing = "remote.upstream.url git@bitbucket.org:demo-ws/demo-up.git\n\
+                       remote.origin.url https://bitbucket.org/demo-ws/demo-api.git\n";
+        assert_eq!(pick_remote(listing), target("demo-api"));
+        let listing = "remote.origin.url git@github.com:demo/demo-api.git\n\
+                       remote.bb.url ssh://git@bitbucket.org/demo-ws/demo-web.git\n";
+        assert_eq!(pick_remote(listing), target("demo-web"));
+        assert_eq!(
+            pick_remote("remote.origin.url git@github.com:demo/x.git\n"),
+            None
+        );
+        assert_eq!(pick_remote(""), None);
     }
 }
