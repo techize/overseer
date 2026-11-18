@@ -8,7 +8,8 @@ and quitting or closing the app never stops a session.
 
 ### What Overseer is
 
-S0 is the coordinator session: it reads your sprint, proposes a plan and relays
+S0 is the coordinator session: it reads your sprint, reads each candidate
+ticket in full through `get_item_detail` before it proposes a plan, and relays
 requests. S1 to S6 are worker sessions, one per ticket, each in its own git
 worktree. The board shows the sessions, your sprint tickets by Jira status, and
 open pull requests. Sessions keep running when you close the app.
@@ -466,10 +467,12 @@ trimming):
   shows the key and status, then the title on up to two lines. Click the row
   (not Release) to open the item's detail in place of the panel boxes, with
   Back, the key and Refresh at the top. The detail is fetched when you open it
-  and cached in the daemon for 5 minutes per key; Refresh skips the cache. A
-  long body shows its first 40 lines, with Show all for the rest. If the
-  source fails, the error shows in orange along with the cached fields and the
-  first paragraph of the item folder's `00-PROJECT-OVERVIEW.md`. Sessions,
+  and cached in the daemon for 5 minutes per key; Refresh skips the cache,
+  keeps the text on screen and shows `Refreshing...`. A body longer than 40
+  lines shows its first 40, and Show all appears only then. If a fetch fails,
+  the last good copy stays and the error shows in orange above it; with no
+  good copy, the error shows along with the cached fields and the first
+  paragraph of the item folder's `00-PROJECT-OVERVIEW.md`. Sessions,
   including S0, get the same lookup from the `get_item_detail` MCP tool (`key`,
   and `refresh` to skip the cache).
 - Click a ticket card to open its session, or to start one in a free slot.

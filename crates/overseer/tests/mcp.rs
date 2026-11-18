@@ -21,11 +21,24 @@ struct TempDaemon {
 
 impl TempDaemon {
     fn start(tag: &str) -> TempDaemon {
+        TempDaemon::start_with(tag, |_| {})
+    }
+
+    fn start_with(tag: &str, edit: impl FnOnce(&mut overseer_daemon::Config)) -> TempDaemon {
         let home = std::path::PathBuf::from(format!("/tmp/ovmcp-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&home).unwrap();
         let socket = home.join("overseer.sock");
         // `overseer mcp` names the user from this file.
         std::fs::write(home.join("config.toml"), "user_name = \"Demo\"\n").unwrap();
+        let mut settings = overseer_daemon::Config {
+            beads_dir: "/nonexistent/overseer-test-beads".into(),
+            brain_dir: "/nonexistent/overseer-test-brain".into(),
+            jira_command: vec![],
+            user_name: "Demo".into(),
+            ..overseer_daemon::Config::default()
+        };
+        // No real beads or Jira unless the test supplies stubs.
+        edit(&mut settings);
         let rt = tokio::runtime::Runtime::new().unwrap();
         let task = rt.spawn(run(DaemonConfig {
             socket: socket.clone(),
@@ -35,14 +48,7 @@ impl TempDaemon {
             files: overseer_daemon::SettingsFiles::in_dir(&home),
             hook_program: std::path::PathBuf::from("/bin/true"),
             patterns: overseer_daemon::locks::targets::default_patterns(),
-            // No real beads or Jira.
-            settings: overseer_daemon::Config {
-                beads_dir: "/nonexistent/overseer-test-beads".into(),
-                brain_dir: "/nonexistent/overseer-test-brain".into(),
-                jira_command: vec![],
-                user_name: "Demo".into(),
-                ..overseer_daemon::Config::default()
-            },
+            settings,
         }));
         rt.block_on(async {
             let c = Client::connect_or_start(&socket, || Ok(())).await.unwrap();
@@ -276,4 +282,45 @@ fn worker_cannot_propose() {
     // A worker may still read the board.
     let (text, err) = s3.tool("get_board", json!({}));
     assert!(!err, "{text}");
+}
+
+#[test]
+fn get_item_detail_returns_a_bead() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = TempDaemon::start_with("bead", |c| {
+        let home = std::path::PathBuf::from(format!("/tmp/ovmcp-bead-{}", std::process::id()));
+        std::fs::create_dir_all(home.join("beads/.beads")).unwrap();
+        let show = home.join("bd-show.json");
+        std::fs::write(
+            &show,
+            include_str!("../../overseer-daemon/tests/fixtures/bd-show.json"),
+        )
+        .unwrap();
+        let bd = home.join("bd");
+        std::fs::write(
+            &bd,
+            format!(
+                "#!/bin/sh\ncase \"$1\" in show) cat {};; *) echo '[{{\"id\":\"demo-1\",\"title\":\"Wire the detail view\",\"status\":\"open\",\"priority\":1}}]';; esac\n",
+                show.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bd, std::fs::Permissions::from_mode(0o755)).unwrap();
+        c.beads_dir = home.join("beads");
+        c.bd_command = vec![bd.display().to_string()];
+    });
+    let mut s0 = Mcp::start(&d.home, "S0");
+    let mut last = (String::new(), true);
+    for _ in 0..100 {
+        last = s0.tool("get_item_detail", json!({"key": "demo-1"}));
+        if !last.0.contains("demo-1 is not a known item") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let (text, err) = last;
+    assert!(!err, "{text}");
+    assert!(text.contains("demo-1 Wire the detail view"), "{text}");
+    assert!(text.contains("Show the item body."), "{text}");
+    assert!(text.contains("Depends on: demo-2 (blocks)"), "{text}");
 }

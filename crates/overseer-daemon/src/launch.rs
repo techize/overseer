@@ -32,6 +32,7 @@ const PREVIOUS_COORDINATOR: &[u64] = &[
     0x551d58f77936ffa0, // phase 4
     0xbbd3513e7aa77734, // phase 5
     0x44b728f090b64d9f, // before the user's name was a placeholder
+    0x7757a9a9bae5e1c2, // before S0 read tickets in full
 ];
 const PREVIOUS_WORKER: &[u64] = &[
     0x215de771dfd84eb4,
@@ -1176,11 +1177,44 @@ mod tests {
         }
     }
 
+    const BEFORE_DETAIL_COORDINATOR: &str =
+        include_str!("../tests/fixtures/roles-before-detail/coordinator.md");
+
+    #[test]
+    fn roles_from_before_the_detail_reads_upgrade() {
+        assert_eq!(text_hash(BEFORE_DETAIL_COORDINATOR), 0x7757a9a9bae5e1c2);
+        assert!(PREVIOUS_COORDINATOR.contains(&text_hash(BEFORE_DETAIL_COORDINATOR)));
+        let dir = temp("beforedetail");
+        let roles = dir.join("roles");
+        std::fs::create_dir_all(&roles).unwrap();
+        std::fs::write(roles.join("coordinator.md"), BEFORE_DETAIL_COORDINATOR).unwrap();
+        let path = ensure_template(
+            &roles,
+            "coordinator.md",
+            COORDINATOR_ROLE,
+            PREVIOUS_COORDINATOR,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap().trim_end(),
+            COORDINATOR_ROLE.trim_end()
+        );
+        assert!(!roles.join("coordinator.md.new").exists());
+    }
+
+    #[test]
+    fn coordinator_role_reads_tickets_through_overseer() {
+        assert!(COORDINATOR_ROLE.contains("get_item_detail"));
+        assert!(COORDINATOR_ROLE.contains("acceptance criteria"));
+        assert!(!COORDINATOR_ROLE.contains("Do not read Jira yourself"));
+    }
+
     #[test]
     fn coordinator_role_names_the_board_tools() {
         for tool in [
             "get_board",
             "get_work_items",
+            "get_item_detail",
             "propose_plan",
             "request_status",
             "set_board_summary",
