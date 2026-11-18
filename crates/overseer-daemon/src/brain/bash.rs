@@ -424,8 +424,9 @@ pub fn glob(pattern: &str, cwd: &Path, home: &Path) -> Vec<PathBuf> {
     found
 }
 
-/// Subcommands of `git` that only read (Ruling 12).
-const GIT_READS: [&str; 8] = [
+/// Subcommands of `git` that only read (Ruling 12). `merge-tree` adds
+/// objects to the store but moves no ref and leaves the work tree alone.
+const GIT_READS: [&str; 18] = [
     "status",
     "log",
     "diff",
@@ -434,7 +435,34 @@ const GIT_READS: [&str; 8] = [
     "rev-parse",
     "ls-files",
     "describe",
+    "rev-list",
+    "merge-base",
+    "merge-tree",
+    "cat-file",
+    "for-each-ref",
+    "ls-tree",
+    "show-ref",
+    "name-rev",
+    "shortlog",
+    "grep",
 ];
+
+/// `git fetch` only moves remote-tracking refs, unless a refspec names a
+/// local destination (`main:main`) or `--update-head-ok` lets it move the
+/// checked-out branch.
+fn fetch_reads(args: &[String]) -> bool {
+    args.iter()
+        .all(|a| !a.contains(':') && a != "--update-head-ok" && a != "-u")
+}
+
+/// `git reflog` and `reflog show`/`exists` read; `expire` and `delete`
+/// rewrite the logs.
+fn reflog_reads(args: &[String]) -> bool {
+    !args
+        .iter()
+        .find(|a| !is_option(a))
+        .is_some_and(|a| a == "expire" || a == "delete")
+}
 
 /// `git` global options that take a value.
 const GIT_VALUE_OPTS: [&str; 6] = [
@@ -535,6 +563,8 @@ pub(crate) fn vault_git_in(command: &str, cwd: &Path, brain: &Path, home: &Path)
             continue;
         }
         let read = GIT_READS.contains(&name)
+            || (name == "fetch" && fetch_reads(args))
+            || (name == "reflog" && reflog_reads(args))
             || (name == "branch"
                 && args.iter().all(|a| {
                     matches!(
@@ -754,6 +784,34 @@ mod tests {
         assert_eq!(v("git branch -d x", brain).as_deref(), Some("branch"));
         assert_eq!(v("git remote -v", brain), None);
         assert_eq!(v("git remote add x y", brain).as_deref(), Some("remote"));
+        // Diagnosing a diverged folder (#39) reads only.
+        for c in [
+            "git rev-list --left-right --count main...origin/main",
+            "git merge-tree --write-tree --name-only main origin/main",
+            "git merge-base main origin/main",
+            "git show origin/main:06-Daily/demo.md",
+            "git cat-file -p HEAD",
+            "git for-each-ref refs/remotes",
+            "git ls-tree -r HEAD",
+            "git reflog",
+            "git reflog show main",
+            "git fetch",
+            "git fetch origin main",
+            "git fetch --prune origin",
+        ] {
+            assert_eq!(v(c, brain), None, "{c}");
+        }
+        for (c, sub) in [
+            ("git fetch origin main:main", "fetch"),
+            ("git fetch -u origin main", "fetch"),
+            ("git fetch origin +refs/heads/*:refs/heads/*", "fetch"),
+            ("git reflog expire --all", "reflog"),
+            ("git reflog delete main@{1}", "reflog"),
+            ("git merge origin/main", "merge"),
+            ("git checkout HEAD~1 -- notes.md", "checkout"),
+        ] {
+            assert_eq!(v(c, brain).as_deref(), Some(sub), "{c}");
+        }
         // A repo outside the vault is not ours.
         assert_eq!(v("git push", other), None);
         assert_eq!(v("git -C /h/Repos/other commit -m x", brain), None);
