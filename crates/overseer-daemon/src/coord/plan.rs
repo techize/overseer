@@ -694,6 +694,7 @@ mod tests {
             Board {
                 slots: (0..7).map(empty_slot).collect(),
                 work: WorkView {
+                    notes_off: None,
                     items: vec![
                         item("DEMO-12", ItemKind::Ticket, None, None),
                         item("DEMO-13", ItemKind::Ticket, None, None),

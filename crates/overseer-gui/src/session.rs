@@ -1634,6 +1634,7 @@ mod tests {
             stage_since: None,
         };
         let view = WorkView {
+            notes_off: None,
             items: vec![
                 item("ov-3", ItemKind::Bead, Some(2), true),
                 item("DEMO-12", ItemKind::Ticket, Some(2), false),
@@ -1698,6 +1699,7 @@ mod tests {
             stage_since: None,
         };
         let view = WorkView {
+            notes_off: None,
             items: vec![
                 item("ov-3", ItemKind::Bead, Some(2)),
                 item("DEMO-12", ItemKind::Ticket, Some(2)),
@@ -1723,6 +1725,7 @@ mod tests {
     fn owns_rows_say_not_read_yet_before_the_first_read() {
         use overseer_proto::{ItemKind, SourceStatus, WorkItem};
         let view = WorkView {
+            notes_off: None,
             items: vec![WorkItem {
                 key: "ov-3".into(),
                 kind: ItemKind::Bead,

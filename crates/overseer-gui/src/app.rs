@@ -332,6 +332,7 @@ const KICKOFF_RETURN_DELAY: Duration = Duration::from_millis(100);
 /// The work view before the daemon's first answer.
 pub fn empty_work() -> WorkView {
     WorkView {
+        notes_off: None,
         items: Vec::new(),
         sources: Vec::new(),
         notices: Vec::new(),

@@ -26,6 +26,10 @@ pub struct Config {
     /// `.overseer-notes` marker, or was defaulted to `~/OverseerNotes`).
     #[serde(skip)]
     pub notes_owned: bool,
+    /// Set at daemon start when Overseer would not take the notes folder:
+    /// the board banner's text. Never read from `config.toml`.
+    #[serde(skip)]
+    pub notes_refused: Option<String>,
     /// Minutes a lock may go unused before the board flags it as long-held.
     pub lock_idle_mins: u64,
     /// The 2ndBrain writer is opt-in: while false, none of its tools, hook
@@ -109,6 +113,7 @@ impl Default for Config {
             jira_board: String::new(),
             jira_cloud_id: String::new(),
             notes_owned: false,
+            notes_refused: None,
             lock_idle_mins: 60,
             brain_writer: false,
             shared_files: [

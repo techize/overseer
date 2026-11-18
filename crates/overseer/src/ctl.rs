@@ -1428,6 +1428,7 @@ mod tests {
     fn view(beads_at: Option<i64>) -> WorkView {
         use overseer_proto::SourceStatus;
         WorkView {
+            notes_off: None,
             items: vec![WorkItem {
                 key: "ov-3".into(),
                 kind: ItemKind::Bead,

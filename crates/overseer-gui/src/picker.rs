@@ -681,6 +681,7 @@ mod tests {
     /// DEMO-12 with two beads, DEMO-40 with none, then a bead on its own.
     fn view() -> WorkView {
         WorkView {
+            notes_off: None,
             items: vec![
                 item("DEMO-12", "Login page", None, None),
                 item("ov-3", "Fix the redirect", Some("DEMO-12"), Some(2)),

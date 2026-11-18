@@ -982,6 +982,18 @@ impl OverseerApp {
                             ),
                     ),
             )
+            // A notes folder Overseer would not take: notes stay off until
+            // the user picks another folder, so say so above everything.
+            .children(self.work.notes_off.clone().map(|text| {
+                div()
+                    .p_2()
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(rgb(colors::ORANGE))
+                    .text_sm()
+                    .text_color(rgb(colors::ORANGE))
+                    .child(text)
+            }))
             // The coordinator panel with the open PRs to its right; the
             // PR panel wraps below in a window too narrow for both.
             .child(
@@ -1156,6 +1168,7 @@ mod tests {
 
     fn no_work() -> WorkView {
         WorkView {
+            notes_off: None,
             items: vec![],
             sources: vec![],
             notices: vec![],

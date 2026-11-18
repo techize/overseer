@@ -338,6 +338,7 @@ mod tests {
 
     fn view(items: Vec<WorkItem>) -> WorkView {
         WorkView {
+            notes_off: None,
             items,
             sources: vec![],
             notices: vec![],

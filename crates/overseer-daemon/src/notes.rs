@@ -76,7 +76,14 @@ pub fn prepare(config: &mut crate::Config) -> Option<String> {
     let err = ensure_owned(&dir, config.user()).err()?;
     tracing::warn!("notes folder not ready, sprint notes are off: {err}");
     disown(config);
-    Some(refused_text(&dir, &err))
+    // A CURRENT_SESSION.md in the refused folder is one Overseer will not
+    // write either, so sessions are not told to keep it.
+    if config.current_session.starts_with(&dir) {
+        config.current_session = std::path::PathBuf::new();
+    }
+    let text = refused_text(&dir, &err);
+    config.notes_refused = Some(text.clone());
+    Some(text)
 }
 
 fn refused_text(dir: &Path, err: &io::Error) -> String {
@@ -360,10 +367,13 @@ mod tests {
             brain_dir: t.path().to_path_buf(),
             notes_owned: true,
             brain_writer: true,
+            current_session: t.path().join("CURRENT_SESSION.md"),
             ..crate::Config::default()
         };
         let text = prepare(&mut c).unwrap();
         assert!(!c.notes_owned && !c.brain_writer);
+        assert_eq!(c.notes_refused.as_deref(), Some(text.as_str()));
+        assert_eq!(c.current_session, std::path::PathBuf::new());
         assert!(text.contains(&t.path().display().to_string()), "{text}");
         assert!(text.contains("no .overseer-notes marker"), "{text}");
         assert!(text.contains("set notes_dir"), "{text}");
@@ -374,6 +384,21 @@ mod tests {
             ..crate::Config::default()
         };
         assert_eq!(prepare(&mut c), None);
+    }
+
+    #[test]
+    fn prepare_keeps_a_current_session_file_outside_the_refused_folder() {
+        let t = tempfile::tempdir().unwrap();
+        std::fs::write(t.path().join("a.md"), "x").unwrap();
+        let cs = std::path::PathBuf::from("/demo-home/.claude/CURRENT_SESSION.md");
+        let mut c = crate::Config {
+            brain_dir: t.path().to_path_buf(),
+            notes_owned: true,
+            current_session: cs.clone(),
+            ..crate::Config::default()
+        };
+        assert!(prepare(&mut c).is_some());
+        assert_eq!(c.current_session, cs);
     }
 
     #[test]
