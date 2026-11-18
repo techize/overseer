@@ -151,3 +151,27 @@ async fn unknown_kind_rejected() {
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     assert!(err.to_string().contains("unknown frame kind"), "{err}");
 }
+
+async fn decode_raw(kind: u8, payload: &[u8]) -> std::io::Error {
+    let mut buf = ((payload.len() + 1) as u32).to_be_bytes().to_vec();
+    buf.push(kind);
+    buf.extend_from_slice(payload);
+    let mut rd = &buf[..];
+    read_frame(&mut rd).await.unwrap_err()
+}
+
+#[tokio::test]
+async fn an_undecodable_request_keeps_its_seq() {
+    let err = decode_raw(0, br#"{"seq":7,"req":{"type":"NoSuchRequest"}}"#).await;
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(overseer_proto::undecodable_request(&err), Some(7));
+    for payload in [
+        &br#"{"req":{"type":"NoSuchRequest"}}"#[..],
+        &br#"{"seq":8589934592,"req":{}}"#[..],
+        &b"not json"[..],
+    ] {
+        let err = decode_raw(0, payload).await;
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(overseer_proto::undecodable_request(&err), None);
+    }
+}

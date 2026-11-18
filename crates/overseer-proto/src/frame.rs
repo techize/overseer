@@ -49,6 +49,46 @@ fn invalid(e: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e.to_string())
 }
 
+/// A request frame whose payload parsed as JSON with a `u32` `seq` but not as
+/// a [`Request`], for example one a newer client sends to an older daemon.
+#[derive(Debug)]
+pub struct UndecodableRequest {
+    pub seq: u32,
+    pub why: String,
+}
+
+impl std::fmt::Display for UndecodableRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "request {} could not be decoded: {}", self.seq, self.why)
+    }
+}
+
+impl std::error::Error for UndecodableRequest {}
+
+/// The `seq` of the request `e` failed to decode, when it carried a readable one.
+pub fn undecodable_request(e: &io::Error) -> Option<u32> {
+    e.get_ref()?
+        .downcast_ref::<UndecodableRequest>()
+        .map(|u| u.seq)
+}
+
+fn request_error(payload: &[u8], e: serde_json::Error) -> io::Error {
+    let seq = serde_json::from_slice::<serde_json::Value>(payload)
+        .ok()
+        .and_then(|v| v.get("seq")?.as_u64())
+        .and_then(|n| u32::try_from(n).ok());
+    match seq {
+        Some(seq) => io::Error::new(
+            io::ErrorKind::InvalidData,
+            UndecodableRequest {
+                seq,
+                why: e.to_string(),
+            },
+        ),
+        None => invalid(e),
+    }
+}
+
 fn json<T: Serialize>(v: &T) -> io::Result<Vec<u8>> {
     serde_json::to_vec(v).map_err(invalid)
 }
@@ -75,7 +115,10 @@ fn encode(frame: &Frame) -> io::Result<(u8, Vec<u8>)> {
 fn decode(kind: u8, payload: &[u8]) -> io::Result<Frame> {
     match kind {
         KIND_REQUEST => {
-            let r: ReqIn = serde_json::from_slice(payload).map_err(invalid)?;
+            let r: ReqIn = match serde_json::from_slice(payload) {
+                Ok(r) => r,
+                Err(e) => return Err(request_error(payload, e)),
+            };
             Ok(Frame::Request {
                 seq: r.seq,
                 req: r.req,

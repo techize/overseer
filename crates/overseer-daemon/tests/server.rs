@@ -139,6 +139,15 @@ impl Client {
         write_frame(&mut self.w, &frame).await.unwrap();
     }
 
+    /// Writes one frame of any kind with a payload the proto crate cannot build.
+    async fn send_raw(&mut self, kind: u8, payload: &[u8]) {
+        use tokio::io::AsyncWriteExt;
+        let mut buf = ((payload.len() + 1) as u32).to_be_bytes().to_vec();
+        buf.push(kind);
+        buf.extend_from_slice(payload);
+        self.w.write_all(&buf).await.unwrap();
+    }
+
     async fn recv(&mut self) -> Option<Frame> {
         if let Some(f) = self.backlog.pop_front() {
             return Some(f);
@@ -223,6 +232,35 @@ async fn start_list_stop() {
     assert_eq!(c.request(Request::StopSlot { id: 1 }).await, Response::Ok);
     let info = c.exited_event(1).await;
     assert!(matches!(info.state, SlotState::Exited { .. }));
+}
+
+#[tokio::test]
+async fn an_unknown_request_is_answered_and_the_connection_stays_open() {
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    c.send_raw(0, br#"{"seq":7,"req":{"type":"NoSuchRequest"}}"#)
+        .await;
+    assert_eq!(
+        c.recv().await,
+        Some(Frame::Response {
+            seq: 7,
+            resp: Response::Error {
+                message: overseer_daemon::server::UNKNOWN_REQUEST.into()
+            }
+        })
+    );
+    assert!(matches!(
+        c.request(Request::ListSlots).await,
+        Response::Slots(_)
+    ));
+}
+
+#[tokio::test]
+async fn a_frame_without_a_seq_still_closes_the_connection() {
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    c.send_raw(0, br#"{"req":{"type":"NoSuchRequest"}}"#).await;
+    assert_eq!(c.recv().await, None);
 }
 
 #[tokio::test]
