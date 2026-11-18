@@ -40,7 +40,7 @@ use crate::daemon_info::DaemonKnown;
 use crate::locks_view::LocksState;
 use crate::picker::{Picker, PickerEvent};
 use crate::plan_view::{PlanEvent, PlanView};
-use crate::session::{detail_still_owned, take_reply, DetailState, OpenDetail};
+use crate::session::{detail_still_owned, detail_unavailable, take_reply, DetailState, OpenDetail};
 use crate::session::{incarnation, keep_view, restart_begin, restart_on_change, Incarnation};
 use crate::session::{reply_note, EntryAction, EntryKind, PanelEntry, RestartPlan};
 use crate::settings_view::{SettingsEvent, SettingsPanel};
@@ -478,6 +478,8 @@ pub struct OverseerApp {
     /// The daemon's last answer to an entry: (slot, is for Holds, text).
     pub(crate) entry_note: Option<(SlotId, bool, String)>,
     pub(crate) entry_focus: FocusHandle,
+    /// The last detail request number, so a late reply can be told apart.
+    detail_req: u64,
     /// The owned item whose detail the session panel shows instead of its
     /// boxes; see `open_detail`.
     pub(crate) detail: Option<OpenDetail>,
@@ -570,6 +572,7 @@ impl OverseerApp {
             entry: None,
             entry_note: None,
             entry_focus: cx.focus_handle(),
+            detail_req: 0,
             terminals: HashMap::new(),
             dialog: None,
             picker: None,
@@ -984,19 +987,34 @@ impl OverseerApp {
         slot: SlotId,
         key: String,
         refresh: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let show_all = self
             .detail
             .as_ref()
             .is_some_and(|d| d.slot == slot && d.key == key && d.show_all);
+        self.detail_req += 1;
+        let req_no = self.detail_req;
+        // The hidden Claim/Message entry must not keep the keyboard focus.
+        self.entry = None;
+        window.focus(&self.session_focus);
+        let unavailable = detail_unavailable(&self.daemon, overseer_proto::current_build());
         self.detail = Some(OpenDetail {
             slot,
             key: key.clone(),
-            state: DetailState::Loading,
+            state: match &unavailable {
+                Some(why) => DetailState::Failed(why.clone()),
+                None => DetailState::Loading,
+            },
+            req: req_no,
             show_all,
         });
         cx.notify();
+        if unavailable.is_some() {
+            // An older daemon hangs up on a request it cannot decode.
+            return;
+        }
         let client = self.client.clone();
         cx.spawn(async move |this, cx| {
             let req = Request::GetItemDetail {
@@ -1010,7 +1028,7 @@ impl OverseerApp {
                 Err(e) => Err(format!("{} ({e:#})", crate::terminal_view::LOST_DAEMON)),
             };
             let _ = this.update(cx, |this, cx| {
-                take_reply(&mut this.detail, &key, resp);
+                take_reply(&mut this.detail, &key, req_no, resp);
                 cx.notify();
             });
         })

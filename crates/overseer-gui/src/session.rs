@@ -25,6 +25,7 @@ use crate::board::{
     activity_detail, activity_state, format_elapsed, local_hhmm, one_line, owned_by, slot_title,
     tilde, Tone,
 };
+use crate::daemon_info::DaemonKnown;
 use crate::start_dialog::{edit_key, DialogKey, TextField};
 
 // ---------------------------------------------------------------------------
@@ -264,6 +265,9 @@ pub struct OpenDetail {
     pub slot: SlotId,
     pub key: String,
     pub state: DetailState,
+    /// Which request this view waits for; a reply carrying another number
+    /// is stale and dropped.
+    pub req: u64,
     /// The whole body shows, not only the first `BODY_PREVIEW_LINES`.
     pub show_all: bool,
 }
@@ -390,8 +394,14 @@ pub fn detail_model(
                     format!("{} ago", crate::sprint_view::age_text(now - t)),
                 ));
             }
-            if let Some(text) = d.body.as_deref().or(d.overview.as_deref()) {
-                body = body_lines(text);
+            let text = [d.body.as_deref(), d.overview.as_deref()]
+                .into_iter()
+                .flatten()
+                .find(|t| !t.trim().is_empty());
+            match text {
+                Some(text) => body = body_lines(text),
+                None if d.error.is_none() => body = vec![BodyLine::Text("No description".into())],
+                None => {}
             }
             notice = d.error.clone();
             children = d
@@ -448,10 +458,31 @@ pub fn detail_still_owned(open: &OpenDetail, view: &WorkView) -> bool {
         .any(|i| i.key == open.key && i.owner == Some(open.slot))
 }
 
-/// Puts a reply for `key` into the open detail. A reply for another key (one
-/// that was closed or replaced while the request ran) is dropped.
-pub fn take_reply(open: &mut Option<OpenDetail>, key: &str, resp: Result<ItemDetail, String>) {
-    if let Some(o) = open.as_mut().filter(|o| o.key == key) {
+/// Why a detail request must not be sent to the daemon, if it must not: an
+/// older build cannot decode `GetItemDetail` and hangs up on it, which drops
+/// the app's whole connection.
+pub fn detail_unavailable(daemon: &DaemonKnown, app_build: &str) -> Option<String> {
+    let old = match daemon {
+        DaemonKnown::Old => true,
+        DaemonKnown::Info(info) => overseer_proto::build_notice(app_build, &info.build).is_some(),
+        DaemonKnown::Unknown => false,
+    };
+    old.then(|| {
+        "The daemon runs an older build and cannot fetch details. Restart the daemon to finish the upgrade (overseer ctl restart, or Settings)."
+            .to_string()
+    })
+}
+
+/// Puts a reply for request `req` of `key` into the open detail. A reply for
+/// another key, or an older request for the same key (one that was closed,
+/// reopened or refreshed while it ran), is dropped.
+pub fn take_reply(
+    open: &mut Option<OpenDetail>,
+    key: &str,
+    req: u64,
+    resp: Result<ItemDetail, String>,
+) {
+    if let Some(o) = open.as_mut().filter(|o| o.key == key && o.req == req) {
         o.state = match resp {
             Ok(d) => DetailState::Loaded(d),
             Err(e) => DetailState::Failed(e),
@@ -1107,7 +1138,9 @@ impl OverseerApp {
             )
             .child(
                 button("detail-refresh", "Refresh", true).on_click(cx.listener(
-                    move |this, _, _, cx| this.open_detail(id, refresh_key.clone(), true, cx),
+                    move |this, _, window, cx| {
+                        this.open_detail(id, refresh_key.clone(), true, window, cx)
+                    },
                 )),
             );
         let rows: Vec<_> = m
@@ -1222,8 +1255,8 @@ impl OverseerApp {
                     .text_sm()
                     .cursor_pointer()
                     .hover(|s| s.bg(rgb(colors::CARD_HOVER)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.open_detail(id, open_key.clone(), false, cx)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_detail(id, open_key.clone(), false, window, cx)
                     }))
                     .child(
                         div()
@@ -2612,6 +2645,7 @@ mod tests {
             slot: 2,
             key: key.into(),
             state,
+            req: 1,
             show_all: false,
         }
     }
@@ -2806,15 +2840,64 @@ mod tests {
     #[test]
     fn a_late_reply_for_another_key_is_ignored() {
         let mut o = Some(open("DEMO-2", DetailState::Loading));
-        take_reply(&mut o, "DEMO-1", Ok(demo_detail("DEMO-1")));
+        take_reply(&mut o, "DEMO-1", 1, Ok(demo_detail("DEMO-1")));
         assert_eq!(o.as_ref().unwrap().state, DetailState::Loading);
-        take_reply(&mut o, "DEMO-2", Err("no".into()));
+        take_reply(&mut o, "DEMO-2", 1, Err("no".into()));
         assert_eq!(o.as_ref().unwrap().state, DetailState::Failed("no".into()));
-        take_reply(&mut o, "DEMO-2", Ok(demo_detail("DEMO-2")));
+        take_reply(&mut o, "DEMO-2", 1, Ok(demo_detail("DEMO-2")));
         assert!(matches!(o.unwrap().state, DetailState::Loaded(_)));
         // Closed meanwhile: nothing reopens.
         let mut none = None;
-        take_reply(&mut none, "DEMO-2", Ok(demo_detail("DEMO-2")));
+        take_reply(&mut none, "DEMO-2", 1, Ok(demo_detail("DEMO-2")));
         assert!(none.is_none());
+    }
+
+    #[test]
+    fn an_older_request_for_the_same_key_cannot_overwrite_a_newer_one() {
+        // Refresh pressed while the first fetch still hangs: request 2 is
+        // the one the view waits for.
+        let mut o = Some(open("DEMO-1", DetailState::Loading));
+        o.as_mut().unwrap().req = 2;
+        take_reply(&mut o, "DEMO-1", 2, Ok(demo_detail("DEMO-1")));
+        assert!(matches!(o.as_ref().unwrap().state, DetailState::Loaded(_)));
+        // The first request times out late.
+        take_reply(&mut o, "DEMO-1", 1, Err("timed out".into()));
+        assert!(matches!(o.unwrap().state, DetailState::Loaded(_)));
+    }
+
+    #[test]
+    fn an_empty_description_says_so() {
+        let view = demo_view(vec![demo_item("DEMO-1", Some(2))]);
+        for body in [None, Some(String::new()), Some("  \n ".to_string())] {
+            let mut d = demo_detail("DEMO-1");
+            d.body = body;
+            let o = open("DEMO-1", DetailState::Loaded(d));
+            let m = detail_model(&o, &view, 0, None);
+            assert_eq!(m.body, [BodyLine::Text("No description".into())]);
+        }
+        // A failed fetch says why instead.
+        let mut d = demo_detail("DEMO-1");
+        d.error = Some("Jira is off".into());
+        let o = open("DEMO-1", DetailState::Loaded(d));
+        assert!(detail_model(&o, &view, 0, None).body.is_empty());
+    }
+
+    #[test]
+    fn an_older_daemon_is_not_sent_the_detail_request() {
+        assert_eq!(detail_unavailable(&DaemonKnown::Unknown, "b2"), None);
+        let why = detail_unavailable(&DaemonKnown::Old, "b2").unwrap();
+        assert!(why.contains("older build"), "{why}");
+        assert!(why.contains("Restart the daemon"), "{why}");
+        let info = |build: &str| {
+            DaemonKnown::Info(overseer_proto::DaemonInfo {
+                version: "0".into(),
+                build: build.into(),
+                pid: 1,
+                started_at: 0,
+                exe: "/demo/overseer".into(),
+            })
+        };
+        assert_eq!(detail_unavailable(&info("b2"), "b2"), None);
+        assert!(detail_unavailable(&info("b1"), "b2").is_some());
     }
 }
