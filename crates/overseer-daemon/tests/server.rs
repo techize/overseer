@@ -3503,6 +3503,99 @@ async fn a_dropped_relay_is_never_typed_and_the_rest_still_go() {
     assert_eq!(stub.reads(), pasted(HELLO));
 }
 
+const NOW_HOLD: &str = "S1 has released custom:a. You now hold it.";
+
+/// S1 hands custom:a to S2 while S2 works, so the notice waits.
+async fn hand_custom_a_to_busy_s2(c: &mut Client, stub: &BoxStub) {
+    c.start_stub(2, stub).await;
+    c.hook(hook(2, HookKind::UserPromptSubmit)).await;
+    c.request(claim_target(1, "custom:a", None)).await;
+    assert!(matches!(
+        c.request(claim_target(2, "custom:a", None)).await,
+        Response::Queued { .. }
+    ));
+    c.request(Request::ReleaseTarget {
+        slot: 1,
+        target: t("custom:a"),
+    })
+    .await;
+    let v = c.locks().await;
+    assert_eq!(holds(&v), [(t("custom:a"), 2, ClaimKind::Claim)]);
+    let notice = v.relays.iter().find(|r| r.text == NOW_HOLD).unwrap();
+    assert_eq!(
+        notice.kind,
+        RelayKind::Lock {
+            target: t("custom:a")
+        }
+    );
+}
+
+#[tokio::test]
+async fn a_notice_for_a_target_still_held_goes_in_the_same_paste() {
+    let stub = box_stub("notice-held");
+    let d = start_daemon_with(temp_socket(), stub.env()).await;
+    let mut c = Client::connect(&d.socket).await;
+    hand_custom_a_to_busy_s2(&mut c, &stub).await;
+    assert_eq!(c.relay(None, 2, "hello").await, queued_for(2));
+    c.hook(hook(2, HookKind::Stop)).await;
+    let both = pasted(&format!("{NOW_HOLD}\n\n{HELLO}"));
+    assert_eq!(stub.read_until(&both).await, both);
+    let v = c
+        .locks_until(|v| v.relays.iter().all(|r| r.state == RelayState::Delivered))
+        .await;
+    assert!(v.relays.iter().all(|r| r.drop_reason.is_none()), "{v:?}");
+}
+
+#[tokio::test]
+async fn a_notice_for_a_target_since_released_is_dropped_not_typed() {
+    let stub = box_stub("notice-gone");
+    let d = start_daemon_with(temp_socket(), stub.env()).await;
+    let mut c = Client::connect(&d.socket).await;
+    hand_custom_a_to_busy_s2(&mut c, &stub).await;
+    assert_eq!(c.relay(None, 2, "hello").await, queued_for(2));
+    c.request(Request::ReleaseTarget {
+        slot: 2,
+        target: t("custom:a"),
+    })
+    .await;
+    c.hook(hook(2, HookKind::Stop)).await;
+    assert_eq!(stub.read_until(&pasted(HELLO)).await, pasted(HELLO));
+    let v = c
+        .locks_until(|v| v.relays.iter().any(|r| r.state == RelayState::Delivered))
+        .await;
+    let notice = v.relays.iter().find(|r| r.text == NOW_HOLD).unwrap();
+    assert_eq!(notice.state, RelayState::Dropped);
+    assert_eq!(
+        notice.drop_reason.as_deref(),
+        Some("no longer holds custom:a")
+    );
+    sleep(Duration::from_millis(1500)).await;
+    assert_eq!(stub.reads(), pasted(HELLO));
+}
+
+#[tokio::test]
+async fn nothing_is_pasted_when_every_notice_is_stale() {
+    let stub = box_stub("notice-only");
+    let d = start_daemon_with(temp_socket(), stub.env()).await;
+    let mut c = Client::connect(&d.socket).await;
+    hand_custom_a_to_busy_s2(&mut c, &stub).await;
+    c.request(Request::ReleaseTarget {
+        slot: 2,
+        target: t("custom:a"),
+    })
+    .await;
+    c.hook(hook(2, HookKind::Stop)).await;
+    let v = c
+        .locks_until(|v| v.relays.iter().all(|r| r.state == RelayState::Dropped))
+        .await;
+    assert_eq!(
+        v.relays[0].drop_reason.as_deref(),
+        Some("no longer holds custom:a")
+    );
+    assert!(v.relays[0].held.is_none(), "{v:?}");
+    stub.reads_nothing_for(2).await;
+}
+
 #[tokio::test]
 async fn drop_every_relay_to_a_slot_says_how_many() {
     let d = lock_daemon().await;

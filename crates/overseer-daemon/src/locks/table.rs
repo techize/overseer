@@ -383,7 +383,10 @@ fn hand_on(
             slot_name(holder)
         )
     };
-    let relay = queue_relay_on(conn, &Sender::Overseer, slot, &text, None, now)?;
+    let notice = RelayKind::Lock {
+        target: target.into(),
+    };
+    let relay = queue_kind_on(conn, &Sender::Overseer, slot, &text, None, &notice, now)?;
     let kind = match via {
         Via::Hook => ClaimKind::Grant,
         Via::Tool => ClaimKind::Claim,
@@ -725,6 +728,33 @@ pub(crate) fn pending_relays_on(conn: &Connection, to: SlotId) -> Result<Vec<Rel
     ))?;
     let rows = stmt.query_map(params![to], relay_row)?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// `relays` less the lock notices that no longer hold: a "You now hold
+/// it." notice whose receiver does not hold its target any more is dropped
+/// at `now`, and the rest are returned in order.
+pub(crate) fn recheck_lock_notices_on(
+    conn: &Connection,
+    relays: &[Relay],
+    now: i64,
+) -> Result<Vec<Relay>> {
+    let mut kept = Vec::with_capacity(relays.len());
+    for r in relays {
+        if let RelayKind::Lock { target } = &r.kind {
+            if holder_on(conn, target)?.map(|h| h.slot) != Some(r.to) {
+                conn.execute(
+                    &format!(
+                        "UPDATE relays SET dropped_at = ?2, drop_reason = ?3
+                         WHERE id = ?1 AND {PENDING}"
+                    ),
+                    params![r.id, now, format!("no longer holds {target}")],
+                )?;
+                continue;
+            }
+        }
+        kept.push(r.clone());
+    }
+    Ok(kept)
 }
 
 /// Marks pending relays delivered at `now`. Ones already delivered keep
@@ -1594,6 +1624,72 @@ mod tests {
             assert_eq!(state_and_reason(c, seen).0, RelayState::Delivered);
             assert_eq!(state_and_reason(c, first).0, RelayState::Pending);
             assert_eq!(state_and_reason(c, again).0, RelayState::Pending);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn a_hand_over_notice_has_kind_lock_and_its_target() {
+        with(|c| {
+            take(c, T, 1, ClaimKind::Claim, 10);
+            queue(c, T, 2, Via::Hook, 11);
+            release_on(c, T, Releaser::Slot(1), None, 20)?;
+            let r = &pending_relays_on(c, 2)?[0];
+            assert_eq!(r.kind, RelayKind::Lock { target: T.into() });
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn recheck_keeps_a_notice_for_a_target_still_held() {
+        with(|c| {
+            take(c, T, 1, ClaimKind::Claim, 10);
+            queue(c, T, 2, Via::Hook, 11);
+            release_on(c, T, Releaser::Slot(1), None, 20)?;
+            let note = queue_relay_on(c, &Sender::You, 2, "hello", None, 21)?;
+            let pending = pending_relays_on(c, 2)?;
+            let kept = recheck_lock_notices_on(c, &pending, 30)?;
+            assert_eq!(kept, pending);
+            assert_eq!(state_and_reason(c, note), (RelayState::Pending, None));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn recheck_drops_a_notice_for_a_target_since_released() {
+        with(|c| {
+            take(c, T, 1, ClaimKind::Claim, 10);
+            queue(c, T, 2, Via::Hook, 11);
+            release_on(c, T, Releaser::Slot(1), None, 20)?;
+            let note = queue_relay_on(c, &Sender::You, 2, "hello", None, 21)?;
+            release_on(c, T, Releaser::Slot(2), None, 22)?;
+            let pending = pending_relays_on(c, 2)?;
+            let notice = pending[0].id;
+            let kept = recheck_lock_notices_on(c, &pending, 30)?;
+            assert_eq!(kept.iter().map(|r| r.id).collect::<Vec<_>>(), vec![note]);
+            assert_eq!(
+                state_and_reason(c, notice),
+                (RelayState::Dropped, Some(format!("no longer holds {T}")))
+            );
+            assert_eq!(relay_on(c, notice)?.unwrap().dropped_at, Some(30));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn recheck_drops_a_notice_for_a_target_now_held_by_another() {
+        with(|c| {
+            take(c, T, 1, ClaimKind::Claim, 10);
+            queue(c, T, 2, Via::Hook, 11);
+            queue(c, T, 3, Via::Hook, 12);
+            release_on(c, T, Releaser::Slot(1), None, 20)?;
+            release_on(c, T, Releaser::Slot(2), None, 21)?;
+            assert_eq!(holders(c), vec![(T.into(), 3, ClaimKind::Grant)]);
+            let to_2 = pending_relays_on(c, 2)?;
+            assert!(recheck_lock_notices_on(c, &to_2, 30)?.is_empty());
+            assert_eq!(state_and_reason(c, to_2[0].id).0, RelayState::Dropped);
+            let to_3 = pending_relays_on(c, 3)?;
+            assert_eq!(recheck_lock_notices_on(c, &to_3, 30)?, to_3);
             Ok(())
         })
     }

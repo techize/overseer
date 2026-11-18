@@ -23,7 +23,7 @@ use tokio::time::Instant;
 
 use super::screen::{input_box, shows_working, InputBox};
 use crate::ledger::Ledger;
-use crate::locks::table::{mark_delivered_on, pending_relays_on};
+use crate::locks::table::{mark_delivered_on, pending_relays_on, recheck_lock_notices_on};
 use crate::locks::LockService;
 use crate::manager::{SlotManager, SLOT_COUNT};
 use crate::work::store::unix_now;
@@ -47,6 +47,8 @@ const JUST_SENT: &str = "just delivered, waiting for the session";
 /// Without bracketed paste every newline is an Enter, and a later one could
 /// land on a prompt the first one brought up.
 const NO_BRACKETS: &str = "bracketed paste is off";
+/// The ledger could not say whether lock notices still hold.
+const RECHECK_FAILED: &str = "lock notices could not be checked";
 
 /// Whether a slot in `state` doing `activity` may be typed into now, else
 /// why not.
@@ -218,12 +220,14 @@ impl Courier {
                 .deliver(&info, &relays, &mut answered[id as usize])
                 .await
             {
-                Ok(()) => {
+                Ok(true) => {
                     sent[id as usize] = Some(Sent {
                         activity: info.activity.clone(),
                         at: Instant::now(),
                     })
                 }
+                // Every relay had gone stale: nothing was typed.
+                Ok(false) => self.locks.set_held(id, None),
                 Err(reason) => self.locks.set_held(id, Some(reason)),
             }
         }
@@ -231,7 +235,11 @@ impl Courier {
     }
 
     /// Types `relays` into the slot `info` describes if it is ready, and
-    /// marks them delivered. Otherwise the reason they wait.
+    /// marks them delivered: `Ok(true)`. Otherwise the reason they wait.
+    ///
+    /// Just before the paste, lock notices are checked again: one whose
+    /// target the slot no longer holds is dropped, not typed. `Ok(false)`
+    /// says none were left, so nothing was typed.
     ///
     /// A slot waiting at a prompt is ready once the prompt is answered: the
     /// screen shows the empty box and no working line on this look and on
@@ -242,7 +250,7 @@ impl Courier {
         info: &SlotInfo,
         relays: &[Relay],
         answered: &mut Option<Activity>,
-    ) -> Result<(), &'static str> {
+    ) -> Result<bool, &'static str> {
         let id = info.id;
         let at_prompt = match ready(&info.state, info.activity.as_ref()) {
             Ok(()) => false,
@@ -276,8 +284,13 @@ impl Courier {
             InputBox::Typed => return Err(TYPED),
             InputBox::NotFound => return Err(NO_BOX),
         }
+        let relays = self.recheck(id, relays)?;
+        if relays.is_empty() {
+            *answered = None;
+            return Ok(false);
+        }
         // A hook may have come in while the screen was read.
-        let text = strip_controls(&compose(relays, id, &self.user));
+        let text = strip_controls(&compose(&relays, id, &self.user));
         if text.contains('\n') && !modes.bracketed_paste {
             return Err(NO_BRACKETS);
         }
@@ -306,7 +319,29 @@ impl Courier {
             .locks
             .change("relay delivery", |c| mark_delivered_on(c, &ids, now));
         tracing::info!("{} relay(s) delivered to {}", ids.len(), slot_name(id));
-        Ok(())
+        Ok(true)
+    }
+
+    /// `relays` less the lock notices that went stale while they waited,
+    /// which are dropped. Announced only when one was.
+    fn recheck(&self, id: SlotId, relays: &[Relay]) -> Result<Vec<Relay>, &'static str> {
+        let now = unix_now();
+        let kept = self
+            .ledger
+            .transaction(|c| recheck_lock_notices_on(c, relays, now))
+            .map_err(|e| {
+                tracing::warn!("{} lock notices not rechecked: {e:#}", slot_name(id));
+                RECHECK_FAILED
+            })?;
+        if kept.len() < relays.len() {
+            tracing::info!(
+                "{} stale lock notice(s) to {} dropped",
+                relays.len() - kept.len(),
+                slot_name(id)
+            );
+            self.locks.announce();
+        }
+        Ok(kept)
     }
 }
 
