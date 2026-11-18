@@ -17,10 +17,11 @@ use serde_json::{json, Value};
 const CALL_WITHIN: Duration = Duration::from_secs(5);
 
 /// Budget for an item detail that has to be fetched from Jira or bd. It
-/// covers the daemon's wait for the login-shell PATH, the Keychain lookup
-/// (up to 30 s) and the fetch itself (up to 30 s), so a call the daemon would
-/// answer is not cut off.
-const DETAIL_CALL_WITHIN: Duration = Duration::from_secs(90);
+/// covers the daemon's worst case on the REST path: the wait for the
+/// login-shell PATH (5 s), the Keychain lookup (30 s) and the REST call
+/// (up to 60 s, a cloud id lookup plus the issue, 30 s each), 95 s in all,
+/// so a call the daemon would answer is not cut off.
+const DETAIL_CALL_WITHIN: Duration = Duration::from_secs(100);
 
 /// A 2ndBrain write waits its turn in the queue, and a commit blocked by an
 /// `index.lock` is answered after up to 600 s (as `Queued`).
@@ -936,12 +937,13 @@ mod tests {
     }
 
     #[test]
-    fn item_detail_waits_longer_than_two_source_timeouts() {
+    fn item_detail_outlasts_the_daemons_rest_worst_case() {
         let within = call_within(&Request::GetItemDetail {
             key: "DEMO-12".into(),
             refresh: false,
         });
-        assert!(within > Duration::from_secs(60), "{within:?}");
+        // 5 s PATH wait + 30 s Keychain + 60 s REST.
+        assert!(within > Duration::from_secs(95), "{within:?}");
         assert!(within < BRAIN_CALL_WITHIN);
     }
 
