@@ -216,6 +216,40 @@ pub struct PullRequest {
     pub created: Option<i64>,
     /// The ticket key found in the title or branch.
     pub ticket: Option<String>,
+    /// The reviews Bitbucket reports, or `None` when the source does not
+    /// list participants (`bb` does not).
+    #[serde(default)]
+    pub approvals: Option<Approvals>,
+}
+
+/// The reviews on a pull request, not counting its author's own.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Approvals {
+    pub human: u32,
+    /// Approvals from the accounts in `ai_reviewers`.
+    pub ai: u32,
+    /// Someone asked for changes.
+    pub changes_requested: bool,
+}
+
+impl Approvals {
+    /// Enough to merge: 2 human approvals, or 1 human and 1 AI, and no one
+    /// asking for changes.
+    pub fn ready(&self) -> bool {
+        !self.changes_requested && (self.human >= 2 || (self.human >= 1 && self.ai >= 1))
+    }
+
+    /// `1H 1AI`, `2H` or `1AI`; empty with no approvals.
+    pub fn badge(&self) -> String {
+        let mut parts = Vec::new();
+        if self.human > 0 {
+            parts.push(format!("{}H", self.human));
+        }
+        if self.ai > 0 {
+            parts.push(format!("{}AI", self.ai));
+        }
+        parts.join(" ")
+    }
 }
 
 /// Where today falls in the sprint.
@@ -1013,6 +1047,24 @@ pub enum Event {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn approvals_ready_rule_and_badge() {
+        let a = |human, ai, changes_requested| Approvals {
+            human,
+            ai,
+            changes_requested,
+        };
+        assert!(a(2, 0, false).ready());
+        assert!(a(1, 1, false).ready());
+        assert!(!a(1, 0, false).ready());
+        assert!(!a(0, 2, false).ready(), "AI approvals alone are not enough");
+        assert!(!a(2, 1, true).ready());
+        assert_eq!(a(1, 1, false).badge(), "1H 1AI");
+        assert_eq!(a(2, 0, false).badge(), "2H");
+        assert_eq!(a(0, 1, false).badge(), "1AI");
+        assert_eq!(a(0, 0, true).badge(), "");
+    }
+
     #[test]
     fn old_work_view_json_still_reads() {
         let v: WorkView = serde_json::from_str(

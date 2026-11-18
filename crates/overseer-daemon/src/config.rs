@@ -61,6 +61,9 @@ pub struct Config {
     pub pr_poll_secs: u64,
     /// Only this author's pull requests; empty shows all authors.
     pub pr_author: String,
+    /// Bitbucket accounts whose PR approvals count as AI reviews, by
+    /// nickname, display name, account id or uuid. Anyone else is human.
+    pub ai_reviewers: Vec<String>,
     /// A Bitbucket workspace whose repos are found and polled; empty turns
     /// this off. Works alongside `pr_repos`.
     pub pr_workspace: String,
@@ -143,6 +146,7 @@ impl Default for Config {
             ]),
             pr_poll_secs: 300,
             pr_author: String::new(),
+            ai_reviewers: Vec::new(),
             pr_workspace: String::new(),
             pr_project: String::new(),
             pr_active_days: 30,

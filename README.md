@@ -100,6 +100,12 @@ remote (`https://bitbucket.org/demo-ws/demo-api.git` or
 With no Bitbucket token saved, the PR source runs `pr_command` (`bb`) as
 before.
 
+With a token, each PR row also shows its approvals, for example `1H 1AI`
+(the author's own approval does not count). A PR with 2 human approvals, or
+1 human and 1 AI approval, and no request for changes is marked `ready` and
+sorts to the top. Name the AI reviewer accounts in `ai_reviewers`. `bb` does
+not report approvals, so without a token the rows show none.
+
 ### The notes folder
 
 Overseer keeps journals, session notes and sprint files in a notes folder
@@ -417,6 +423,7 @@ itself: each `pr_repos` folder's `origin` remote names its repo, and
 | `pr_command` | `bb pullrequest list --state open --output json` | Command run in each repo folder when no Bitbucket token is saved. |
 | `pr_poll_secs` | `300` | Seconds between polls. |
 | `pr_author` | `""` | Empty shows every open PR in those repos; otherwise only that author's. |
+| `ai_reviewers` | `[]` | Bitbucket accounts (nickname, display name, account id or uuid) whose approvals count as AI reviews. Anyone else counts as human. |
 | `pr_workspace` | `""` | A Bitbucket workspace whose repos are found and polled. Empty turns this off. |
 | `pr_project` | `""` | Only repos in this Bitbucket project key. Empty means the whole workspace. |
 | `pr_active_days` | `30` | Only repos updated in this many days are polled. `0` polls every repo. |
