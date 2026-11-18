@@ -48,6 +48,12 @@ pub struct Config {
     /// Minutes between timed backups; 0 turns the backup off.
     pub backup_mins: u64,
     pub push: bool,
+    /// When a merge of the notes folder's remote conflicts, files matching
+    /// these take this folder's copy (`notes_merge_ours`) or the remote's
+    /// (`notes_merge_theirs`); any other conflict stops the merge. An entry
+    /// ending in `/` matches the folder, any other the path or file name.
+    pub notes_merge_ours: Vec<String>,
+    pub notes_merge_theirs: Vec<String>,
     /// Run in `brain_dir` after the queue drains; skipped when the file is missing.
     pub sync_command: Vec<String>,
     pub bd_command: Vec<String>,
@@ -130,6 +136,11 @@ impl Default for Config {
             current_session: PathBuf::from("~/.claude/CURRENT_SESSION.md"),
             backup_mins: 5,
             push: true,
+            notes_merge_ours: ["06-Daily/", "Sessions/", "CURRENT_SESSION.md"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            notes_merge_theirs: Vec::new(),
             sync_command: ["05-Meta/Sync-System/sync-run.sh", "--auto"]
                 .iter()
                 .map(|s| s.to_string())

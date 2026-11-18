@@ -596,6 +596,21 @@ pub enum Request {
         slot: SlotId,
         text: String,
     },
+    /// Fetches the notes folder, merges its remote and pushes. `confirm`
+    /// pushes a merge that was held for making a file much shorter.
+    SyncNotes {
+        #[serde(default)]
+        from: Option<SlotId>,
+        #[serde(default)]
+        confirm: bool,
+    },
+    /// Writes `path` as it was at commit `rev` and commits it.
+    RestoreNotesFile {
+        #[serde(default)]
+        from: Option<SlotId>,
+        path: String,
+        rev: String,
+    },
     /// Runs a `bd` write under the 2ndBrain lock.
     RunBd {
         #[serde(default)]

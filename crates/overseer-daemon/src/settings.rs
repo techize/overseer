@@ -278,6 +278,12 @@ pub const CATALOGUE: &[Spec] = &[
     daemon("push", BRAIN, SettingKind::Bool, |c| {
         SettingValue::Bool(c.push)
     }),
+    daemon("notes_merge_ours", BRAIN, SettingKind::List, |c| {
+        list(&c.notes_merge_ours)
+    }),
+    daemon("notes_merge_theirs", BRAIN, SettingKind::List, |c| {
+        list(&c.notes_merge_theirs)
+    }),
     read_only(
         "brain_writer",
         BRAIN,

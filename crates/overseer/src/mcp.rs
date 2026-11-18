@@ -23,6 +23,8 @@ fn call_within(req: &Request) -> Duration {
         | Request::AppendJournal { .. }
         | Request::EditShared { .. }
         | Request::UpdateCurrentSession { .. }
+        | Request::SyncNotes { .. }
+        | Request::RestoreNotesFile { .. }
         // Approving a plan creates worktrees and starts sessions.
         | Request::ProposePlan { .. }
         | Request::DecidePlan { .. } => BRAIN_CALL_WITHIN,
@@ -130,6 +132,28 @@ fn tools() -> Value {
                     "text": {"type": "string", "description": "Your section's text."}
                 },
                 "required": ["text"]
+            }
+        },
+        {
+            "name": "sync_2ndbrain",
+            "description": "Bring the notes folder level with its remote: fetch, merge the remote's commits and push. Conflicts in the journal, session notes and CURRENT_SESSION.md keep this folder's copy; any other conflict stops the merge and changes nothing. A merge that makes a file much shorter is kept here but not pushed: check the file (restore_2ndbrain_file brings back the old copy), then call again with confirm.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "confirm": {"type": "boolean", "description": "Push a merge that was held because it made a file much shorter. Only after you have checked that file."}
+                }
+            }
+        },
+        {
+            "name": "restore_2ndbrain_file",
+            "description": "Put a notes file back as it was at an earlier commit and commit that. Use it when a merge cut a file short: the held-push message names the commit from before the merge.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "The file, relative to the notes folder or absolute."},
+                    "rev": {"type": "string", "description": "The commit to take it from, for example the hash a held push names."}
+                },
+                "required": ["path", "rev"]
             }
         },
         {
@@ -270,6 +294,15 @@ fn opt_str_arg(args: &Value, name: &str) -> Result<Option<String>, String> {
     }
 }
 
+/// An optional true or false: absent or null is `None`.
+fn opt_bool_arg(args: &Value, name: &str) -> Result<Option<bool>, String> {
+    match args.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        Some(_) => Err(format!("`{name}` must be true or false")),
+    }
+}
+
 /// `"S3"` or `3`. `None` when it is neither shape. A well-formed number too
 /// large for a slot id maps to `Some(SlotId::MAX)`, which the daemon rejects
 /// as an unknown slot.
@@ -356,6 +389,15 @@ fn tool_request(name: &str, args: &Value, slot: Option<SlotId>) -> Result<ToolPl
         "update_current_session" => ToolPlan::Send(Request::UpdateCurrentSession {
             slot: own,
             text: str_arg(args, "text")?.to_owned(),
+        }),
+        "sync_2ndbrain" => ToolPlan::Send(Request::SyncNotes {
+            from: slot,
+            confirm: opt_bool_arg(args, "confirm")?.unwrap_or(false),
+        }),
+        "restore_2ndbrain_file" => ToolPlan::Send(Request::RestoreNotesFile {
+            from: slot,
+            path: str_arg(args, "path")?.to_owned(),
+            rev: str_arg(args, "rev")?.to_owned(),
         }),
         "get_board" => ToolPlan::Send(Request::GetBoard),
         "get_work_items" => ToolPlan::Send(Request::ListWorkItems),
@@ -659,6 +701,31 @@ mod tests {
                     text: "working on DEMO-12".into(),
                 },
             ),
+            (
+                "sync_2ndbrain",
+                json!({}),
+                Request::SyncNotes {
+                    from: Some(2),
+                    confirm: false,
+                },
+            ),
+            (
+                "sync_2ndbrain",
+                json!({"confirm": true}),
+                Request::SyncNotes {
+                    from: Some(2),
+                    confirm: true,
+                },
+            ),
+            (
+                "restore_2ndbrain_file",
+                json!({"path": "notes.md", "rev": "abc1234"}),
+                Request::RestoreNotesFile {
+                    from: Some(2),
+                    path: "notes.md".into(),
+                    rev: "abc1234".into(),
+                },
+            ),
         ];
         for (name, args, want) in cases {
             let (out, seen) = call_with(
@@ -709,6 +776,16 @@ mod tests {
                 "`text` must be a string",
             ),
             ("update_current_session", json!({}), "missing `text`"),
+            (
+                "sync_2ndbrain",
+                json!({"confirm": "yes"}),
+                "`confirm` must be true or false",
+            ),
+            (
+                "restore_2ndbrain_file",
+                json!({"path": "notes.md"}),
+                "missing `rev`",
+            ),
         ];
         for (name, args, why) in bad {
             let (out, seen) = call_with(&tool(name, args), Some(1), Ok(Response::Ok));
@@ -784,7 +861,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_has_fourteen_tools() {
+    fn tools_list_has_sixteen_tools() {
         let (out, _) = call_with(&rpc("tools/list", json!({})), Some(1), Ok(Response::Ok));
         let out = out.unwrap();
         let names: Vec<&str> = out["result"]["tools"]
@@ -804,6 +881,8 @@ mod tests {
                 "append_journal",
                 "edit_shared_file",
                 "update_current_session",
+                "sync_2ndbrain",
+                "restore_2ndbrain_file",
                 "get_board",
                 "get_work_items",
                 "propose_plan",
@@ -812,7 +891,7 @@ mod tests {
                 "set_board_summary"
             ]
         );
-        assert_eq!(names.len(), 14);
+        assert_eq!(names.len(), 16);
     }
 
     #[test]

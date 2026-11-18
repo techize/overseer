@@ -881,6 +881,8 @@ fn handle_frame(
                 | Request::AppendJournal { .. }
                 | Request::EditShared { .. }
                 | Request::UpdateCurrentSession { .. }
+                | Request::SyncNotes { .. }
+                | Request::RestoreNotesFile { .. }
                 | Request::RunBd { .. }),
         } => {
             let Some(brain) = ctx.brain.cloned() else {
@@ -973,6 +975,8 @@ async fn brain_request(brain: &BrainService, req: Request, label: &str) -> Respo
         Request::Commit { from, .. }
         | Request::AppendJournal { from, .. }
         | Request::EditShared { from, .. }
+        | Request::SyncNotes { from, .. }
+        | Request::RestoreNotesFile { from, .. }
         | Request::RunBd { from, .. } => match sender(*from) {
             Ok(s) => s,
             Err(message) => return Response::Error { message },
@@ -1000,6 +1004,11 @@ async fn brain_request(brain: &BrainService, req: Request, label: &str) -> Respo
             brain.update_current_session(slot, label, &text).await
         }
         Request::RunBd { args, stdin, .. } => brain.run_bd(args, stdin).await,
+        Request::SyncNotes { confirm, .. } => brain.sync_notes(confirm).await,
+        Request::RestoreNotesFile { path, rev, .. } => {
+            let owners = brain.context().owners;
+            brain.restore_file(from, &path, &rev, &owners).await
+        }
         other => Response::Error {
             message: format!("not a notes writer request: {other:?}"),
         },
@@ -1110,6 +1119,8 @@ fn handle_request(
         | Request::AppendJournal { .. }
         | Request::EditShared { .. }
         | Request::UpdateCurrentSession { .. }
+        | Request::SyncNotes { .. }
+        | Request::RestoreNotesFile { .. }
         | Request::RunBd { .. } => err(WRITER_OFF.to_string()),
         Request::BrainStatus => Response::Brain(ctx.brain.map_or_else(
             || BrainService::off_view(&ctx.settings.running.brain_dir),
