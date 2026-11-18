@@ -41,7 +41,7 @@ use crate::locks_view::LocksState;
 use crate::picker::{Picker, PickerEvent};
 use crate::plan_view::{PlanEvent, PlanView};
 use crate::session::{
-    detail_gate, detail_still_owned, reopen, take_reply, DetailGate, DetailState, OpenDetail,
+    detail_gate, detail_still_owned, fail_detail, reopen, take_reply, DetailGate, OpenDetail,
 };
 use crate::session::{incarnation, keep_view, restart_begin, restart_on_change, Incarnation};
 use crate::session::{reply_note, EntryAction, EntryKind, PanelEntry, RestartPlan};
@@ -1041,8 +1041,7 @@ impl OverseerApp {
             DetailGate::Wait => self.detail_waiting = Some(refresh),
             DetailGate::Refuse(why) => {
                 if let Some(d) = self.detail.as_mut() {
-                    d.refreshing = false;
-                    d.state = DetailState::Failed(why);
+                    fail_detail(d, why);
                 }
             }
         }

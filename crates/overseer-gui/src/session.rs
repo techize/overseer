@@ -591,17 +591,28 @@ pub fn take_reply(
     resp: Result<ItemDetail, String>,
 ) {
     if let Some(o) = open.as_mut().filter(|o| o.key == key && o.req == req) {
-        o.refreshing = false;
-        o.state = match (resp, std::mem::replace(&mut o.state, DetailState::Loading)) {
-            (Ok(d), _) => DetailState::Loaded(d),
-            // A failed refresh keeps the text it would have replaced.
-            (Err(e), DetailState::Loaded(mut prev)) => {
-                prev.error = Some(e);
-                DetailState::Loaded(prev)
+        match resp {
+            Ok(d) => {
+                o.refreshing = false;
+                o.state = DetailState::Loaded(d);
             }
-            (Err(e), _) => DetailState::Failed(e),
-        };
+            Err(e) => fail_detail(o, e),
+        }
     }
+}
+
+/// Says why the open detail could not be fetched. A loaded detail keeps its
+/// text and shows `why` as its notice, so a failed or refused refresh never
+/// leaves the panel emptier than before; anything else is `Failed`.
+pub fn fail_detail(open: &mut OpenDetail, why: String) {
+    open.refreshing = false;
+    open.state = match std::mem::replace(&mut open.state, DetailState::Loading) {
+        DetailState::Loaded(mut prev) => {
+            prev.error = Some(why);
+            DetailState::Loaded(prev)
+        }
+        _ => DetailState::Failed(why),
+    };
 }
 
 /// One line of the Holds box.
@@ -3108,6 +3119,27 @@ mod tests {
         let m = detail_model(&o, &view, 100, None);
         assert_eq!(m.body, [BodyLine::Text("Kept body".into())]);
         assert_eq!(m.notice.as_deref(), Some("lost"));
+    }
+
+    #[test]
+    fn a_refused_refresh_keeps_the_text() {
+        let view = demo_view(vec![demo_item("DEMO-1", Some(2))]);
+        let mut d = demo_detail("DEMO-1");
+        d.body = Some("Kept body".into());
+        let prev = open("DEMO-1", DetailState::Loaded(d));
+        let mut o = reopen(Some(&prev), 2, "DEMO-1", 2, true);
+        fail_detail(&mut o, "Cannot fetch details: restart both".into());
+        assert!(matches!(o.state, DetailState::Loaded(_)));
+        assert!(!o.refreshing);
+        let m = detail_model(&o, &view, 100, None);
+        assert_eq!(m.body, [BodyLine::Text("Kept body".into())]);
+        assert_eq!(
+            m.notice.as_deref(),
+            Some("Cannot fetch details: restart both")
+        );
+        let mut o = open("DEMO-1", DetailState::Loading);
+        fail_detail(&mut o, "why".into());
+        assert_eq!(o.state, DetailState::Failed("why".into()));
     }
 
     #[test]
