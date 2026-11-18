@@ -16,8 +16,12 @@ use serde_json::{json, Value};
 /// Budget for connect plus the round trip of one tool call.
 const CALL_WITHIN: Duration = Duration::from_secs(5);
 
-/// Budget for an item detail that has to be fetched from Jira or bd.
-const DETAIL_CALL_WITHIN: Duration = Duration::from_secs(30);
+/// Budget for an item detail that has to be fetched from Jira or bd. It
+/// covers the daemon's wait for the login-shell PATH, the Keychain lookup
+/// (up to 30 s) and the fetch itself (up to 30 s), so a call the daemon would
+/// answer is not cut off.
+const DETAIL_CALL_WITHIN: Duration = Duration::from_secs(90);
+
 /// A 2ndBrain write waits its turn in the queue, and a commit blocked by an
 /// `index.lock` is answered after up to 600 s (as `Queued`).
 const BRAIN_CALL_WITHIN: Duration = Duration::from_secs(660);
@@ -929,6 +933,16 @@ mod tests {
                 message: String::new()
             }) > Duration::from_secs(600)
         );
+    }
+
+    #[test]
+    fn item_detail_waits_longer_than_two_source_timeouts() {
+        let within = call_within(&Request::GetItemDetail {
+            key: "DEMO-12".into(),
+            refresh: false,
+        });
+        assert!(within > Duration::from_secs(60), "{within:?}");
+        assert!(within < BRAIN_CALL_WITHIN);
     }
 
     #[test]
