@@ -706,9 +706,22 @@ fn sender_name(s: Sender) -> String {
     }
 }
 
+/// One row of a relay list: the line shown, and the relay's id while it is
+/// pending, for its Drop button.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayRow {
+    pub line: String,
+    pub pending: Option<i64>,
+}
+
+/// How long a pending relay has waited at `now`: `pending 32m`.
+pub fn pending_age(r: &overseer_proto::Relay, now: i64) -> String {
+    format!("pending {}", crate::sprint_view::age_text(now - r.at))
+}
+
 /// The relays to or from `slot`, newest first (by delivery time when
 /// delivered, else creation time, ties by id): `14:05 from S0: <text>`,
-/// `14:06 to S0: <text>`. A pending one ends `(pending: <reason>)`, a
+/// `14:06 to S0: <text>`. A pending one ends `(pending 32m: <reason>)`, a
 /// dropped one `(for S3, dropped: <reason>)`.
 ///
 /// Only the current session's relays are listed: those it received or sent
@@ -718,8 +731,9 @@ pub fn relay_rows(
     view: &LockView,
     slot: SlotId,
     start: Option<i64>,
+    now: i64,
     clock: impl Fn(i64) -> String,
-) -> Vec<String> {
+) -> Vec<RelayRow> {
     let when = |r: &overseer_proto::Relay| r.delivered_at.or(r.dropped_at).unwrap_or(r.at);
     let current = |r: &overseer_proto::Relay| {
         // A relay this slot sent belongs to the session that sent it; one
@@ -745,8 +759,12 @@ pub fn relay_rows(
             };
             let mut line = format!("{time} {who}: {}", one_line(&r.text, 80));
             match (r.state, &r.held) {
-                (RelayState::Pending, Some(why)) => line.push_str(&format!(" (pending: {why})")),
-                (RelayState::Pending, None) => line.push_str(" (pending)"),
+                (RelayState::Pending, Some(why)) => {
+                    line.push_str(&format!(" ({}: {why})", pending_age(r, now)))
+                }
+                (RelayState::Pending, None) => {
+                    line.push_str(&format!(" ({})", pending_age(r, now)))
+                }
                 (RelayState::Dropped, _) => line.push_str(&format!(
                     " (for {}, {})",
                     slot_name(r.to),
@@ -754,7 +772,10 @@ pub fn relay_rows(
                 )),
                 (RelayState::Delivered, _) => {}
             }
-            line
+            RelayRow {
+                line,
+                pending: (r.state == RelayState::Pending).then_some(r.id),
+            }
         })
         .collect()
 }
@@ -1686,10 +1707,23 @@ impl OverseerApp {
 
     fn render_relays(&self, id: SlotId, cx: &mut Context<Self>) -> impl IntoElement {
         let start = self.coord.session_start(&self.slots[id as usize]);
-        let rows: Vec<_> = relay_rows(&self.locks, id, start, local_hhmm)
+        let now = crate::app::now_secs();
+        let rows: Vec<_> = relay_rows(&self.locks, id, start, now, local_hhmm)
             .into_iter()
             .take(RELAY_ROWS)
-            .map(|line| div().text_sm().truncate().child(line))
+            .map(|row| {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_sm()
+                    .child(div().flex_1().min_w(px(0.)).truncate().child(row.line))
+                    .children(row.pending.map(|relay| {
+                        button(("drop-relay", relay as u64), "Drop", true)
+                            .flex_none()
+                            .on_click(cx.listener(move |this, _, _, cx| this.drop_relay(relay, cx)))
+                    }))
+            })
             .collect();
         let empty = rows.is_empty();
         panel_box("Relays")
@@ -2420,6 +2454,18 @@ mod tests {
         crate::app::empty_locks()
     }
 
+    fn lines(rows: &[RelayRow]) -> Vec<String> {
+        rows.iter().map(|r| r.line.clone()).collect()
+    }
+
+    #[test]
+    fn pending_age_counts_from_when_it_was_queued() {
+        let r = relay(1, Sender::You, 2, 1000, None, None, "hi");
+        assert_eq!(pending_age(&r, 1000 + 32 * 60), "pending 32m");
+        assert_eq!(pending_age(&r, 1000 + 5 * 3600), "pending 5h");
+        assert_eq!(pending_age(&r, 900), "pending 0m", "clock skew");
+    }
+
     #[test]
     fn holds_rows_list_kind_since_and_waiters() {
         let mut v = locks();
@@ -2521,15 +2567,19 @@ mod tests {
                 "other",
             ),
         ];
+        let rows = relay_rows(&v, 2, Some(0), 108 + 32 * 60, clock);
         assert_eq!(
-            relay_rows(&v, 2, Some(0), clock),
+            lines(&rows),
             vec![
-                "T108 from Overseer: moved (pending)".to_string(),
-                "T107 from you: line one line two (pending: session is working)".to_string(),
+                "T108 from Overseer: moved (pending 32m)".to_string(),
+                "T107 from you: line one line two (pending 32m: session is working)".to_string(),
                 "T106 to S0: done with DEMO-33".to_string(),
                 "T105 from S0: argo is free".to_string(),
             ]
         );
+        // Only pending rows get a Drop button.
+        let drops: Vec<_> = rows.iter().map(|r| r.pending).collect();
+        assert_eq!(drops, vec![Some(4), Some(3), None, None]);
     }
 
     #[test]
@@ -2551,7 +2601,7 @@ mod tests {
         ];
         let clock = |t: i64| format!("T{t}");
         assert_eq!(
-            relay_rows(&v, 2, Some(0), clock),
+            lines(&relay_rows(&v, 2, Some(0), 200, clock)),
             vec![
                 "T120 from S0: status? (for S2, dropped: dropped by S0)".to_string(),
                 "T110 to S0: on it (for S0, dropped: session ended)".to_string(),
@@ -2591,17 +2641,17 @@ mod tests {
         ];
         let clock = |t: i64| format!("T{t}");
         assert_eq!(
-            relay_rows(&v, 2, Some(200), clock),
+            lines(&relay_rows(&v, 2, Some(200), 210, clock)),
             vec![
                 "T206 to S0: on it".to_string(),
                 "T201 from you: welcome".to_string(),
-                "T90 from Overseer: queued (pending)".to_string(),
+                "T90 from Overseer: queued (pending 2m)".to_string(),
             ]
         );
         // No session: only what is waiting.
         assert_eq!(
-            relay_rows(&v, 2, None, clock),
-            vec!["T90 from Overseer: queued (pending)".to_string()]
+            lines(&relay_rows(&v, 2, None, 210, clock)),
+            vec!["T90 from Overseer: queued (pending 2m)".to_string()]
         );
     }
 

@@ -649,6 +649,17 @@ pub enum Request {
         to: SlotId,
         text: String,
     },
+    /// Drops pending relays unsent: the one with `id`, or every one to
+    /// `to`. `from` is the slot asking, which may only drop relays it sent;
+    /// `None` is you. Answered with `Text` saying how many were dropped.
+    DropRelays {
+        #[serde(default)]
+        from: Option<SlotId>,
+        #[serde(default)]
+        id: Option<i64>,
+        #[serde(default)]
+        to: Option<SlotId>,
+    },
     CheckBash(BashCheck),
     /// Queues a pathspec commit of `paths` in the 2ndBrain. `from` is
     /// `None` for you.
@@ -1680,6 +1691,28 @@ mod tests {
         assert_eq!(
             r.drop_text().as_deref(),
             Some("dropped: replaced by plan 20's kickoff")
+        );
+    }
+
+    #[test]
+    fn drop_relays_reads_with_only_one_of_its_fields() {
+        let req: Request = serde_json::from_str(r#"{"type":"DropRelays","id":7}"#).unwrap();
+        assert_eq!(
+            req,
+            Request::DropRelays {
+                from: None,
+                id: Some(7),
+                to: None,
+            }
+        );
+        let req: Request = serde_json::from_str(r#"{"type":"DropRelays","to":2}"#).unwrap();
+        assert_eq!(
+            req,
+            Request::DropRelays {
+                from: None,
+                id: None,
+                to: Some(2),
+            }
         );
     }
 

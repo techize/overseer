@@ -593,6 +593,73 @@ pub(crate) fn drop_relays_to_on(
     )?)
 }
 
+/// Drops every relay still pending for `to` that slot `sent_by` sent,
+/// saying `reason`. Returns how many.
+pub(crate) fn drop_relays_from_to_on(
+    conn: &Connection,
+    sent_by: SlotId,
+    to: SlotId,
+    reason: &str,
+    now: i64,
+) -> Result<usize> {
+    Ok(conn.execute(
+        &format!(
+            "UPDATE relays SET dropped_at = ?3, drop_reason = ?4
+             WHERE to_slot = ?2 AND sender = 'slot' AND from_slot = ?1 AND {PENDING}"
+        ),
+        params![sent_by, to, now, reason],
+    )?)
+}
+
+/// The relay with `id`, whatever its state.
+pub(crate) fn relay_on(conn: &Connection, id: i64) -> Result<Option<Relay>> {
+    Ok(conn
+        .query_row(
+            &format!("SELECT {RELAY_COLS} FROM relays WHERE id = ?1"),
+            params![id],
+            relay_row,
+        )
+        .optional()?)
+}
+
+/// Drops pending relay `id`, saying `reason`. With `sent_by`, only a relay
+/// that slot sent. The inner `Err` is the refusal: no such relay, another
+/// sender's, or one already delivered or dropped.
+pub(crate) fn drop_relay_on(
+    conn: &Connection,
+    id: i64,
+    sent_by: Option<SlotId>,
+    reason: &str,
+    now: i64,
+) -> Result<Result<(), String>> {
+    let Some(r) = relay_on(conn, id)? else {
+        return Ok(Err(format!("there is no relay {id}")));
+    };
+    if let Some(s) = sent_by.filter(|s| r.from != Sender::Slot { slot: *s }) {
+        return Ok(Err(format!(
+            "relay {id} was not sent by {}; a session can only drop relays it sent",
+            slot_name(s)
+        )));
+    }
+    match r.state {
+        RelayState::Delivered => {
+            return Ok(Err(format!(
+                "relay {id} was already delivered, so it cannot be dropped"
+            )))
+        }
+        RelayState::Dropped => {
+            let why = r.drop_reason.map(|w| format!(" ({w})")).unwrap_or_default();
+            return Ok(Err(format!("relay {id} was already dropped{why}")));
+        }
+        RelayState::Pending => {}
+    }
+    conn.execute(
+        &format!("UPDATE relays SET dropped_at = ?2, drop_reason = ?3 WHERE id = ?1 AND {PENDING}"),
+        params![id, now, reason],
+    )?;
+    Ok(Ok(()))
+}
+
 /// Releases every claim made for work item `item`, whoever holds it.
 pub(crate) fn release_item_on(conn: &Connection, item: &str, now: i64) -> Result<Vec<Handoff>> {
     claims_where(conn, "WHERE item = ?1", params![item])?
@@ -1366,6 +1433,90 @@ mod tests {
                 got,
                 kinds.into_iter().map(|k| (k, None)).collect::<Vec<_>>()
             );
+            Ok(())
+        })
+    }
+
+    fn state_and_reason(c: &Connection, id: i64) -> (RelayState, Option<String>) {
+        let r = relay_on(c, id).unwrap().unwrap();
+        (r.state, r.drop_reason)
+    }
+
+    #[test]
+    fn drop_one_relay_by_id_leaves_the_rest_pending() {
+        with(|c| {
+            let a = queue_relay_on(c, &Sender::You, 2, "first", None, 10)?;
+            let b = queue_relay_on(c, &Sender::You, 2, "second", None, 11)?;
+            assert_eq!(drop_relay_on(c, a, None, "dropped by you", 20)?, Ok(()));
+            assert_eq!(
+                state_and_reason(c, a),
+                (RelayState::Dropped, Some(t("dropped by you")))
+            );
+            assert_eq!(texts(c, 2), vec!["second"]);
+            assert_eq!(state_and_reason(c, b), (RelayState::Pending, None));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn a_delivered_or_dropped_relay_cannot_be_dropped() {
+        with(|c| {
+            let done = queue_relay_on(c, &Sender::You, 2, "seen", None, 10)?;
+            mark_delivered_on(c, &[done], 11)?;
+            assert_eq!(
+                drop_relay_on(c, done, None, "dropped by you", 20)?,
+                Err(format!(
+                    "relay {done} was already delivered, so it cannot be dropped"
+                ))
+            );
+            assert_eq!(state_and_reason(c, done).0, RelayState::Delivered);
+            let gone = queue_relay_on(c, &Sender::You, 3, "bye", None, 12)?;
+            end_session_on(c, 3, 13)?;
+            assert_eq!(
+                drop_relay_on(c, gone, None, "dropped by you", 20)?,
+                Err(format!("relay {gone} was already dropped (session ended)"))
+            );
+            assert_eq!(
+                drop_relay_on(c, 999, None, "dropped by you", 20)?,
+                Err("there is no relay 999".into())
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn a_slot_may_drop_only_the_relays_it_sent() {
+        with(|c| {
+            let mine = queue_relay_on(c, &Sender::Slot { slot: 0 }, 2, "status?", None, 10)?;
+            let yours = queue_relay_on(c, &Sender::You, 2, "hello", None, 11)?;
+            assert_eq!(
+                drop_relay_on(c, yours, Some(0), "dropped by S0", 20)?,
+                Err(format!(
+                    "relay {yours} was not sent by S0; a session can only drop relays it sent"
+                ))
+            );
+            assert_eq!(
+                drop_relay_on(c, mine, Some(0), "dropped by S0", 20)?,
+                Ok(())
+            );
+            assert_eq!(texts(c, 2), vec!["hello"]);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn drop_to_a_slot_counts_and_can_keep_to_one_sender() {
+        with(|c| {
+            queue_relay_on(c, &Sender::Slot { slot: 0 }, 2, "a", None, 10)?;
+            queue_relay_on(c, &Sender::Slot { slot: 0 }, 2, "b", None, 11)?;
+            queue_relay_on(c, &Sender::You, 2, "c", None, 12)?;
+            queue_relay_on(c, &Sender::Slot { slot: 0 }, 3, "d", None, 13)?;
+            assert_eq!(drop_relays_from_to_on(c, 0, 2, "dropped by S0", 20)?, 2);
+            assert_eq!(texts(c, 2), vec!["c"]);
+            assert_eq!(drop_relays_to_on(c, 2, "dropped by you", 21)?, 1);
+            assert!(texts(c, 2).is_empty());
+            assert_eq!(texts(c, 3), vec!["d"]);
+            assert_eq!(drop_relays_to_on(c, 2, "dropped by you", 22)?, 0);
             Ok(())
         })
     }

@@ -121,6 +121,18 @@ fn error(message: impl Into<String>) -> Response {
     }
 }
 
+/// `Dropped 2 relays to S2.`; `mine` says the count is only of the
+/// caller's own relays.
+fn dropped_text(n: usize, to: SlotId, mine: bool) -> String {
+    let to = slot_name(to);
+    let yours = if mine { " you sent" } else { "" };
+    match n {
+        0 => format!("Dropped 0 relays: none{yours} to {to} were pending."),
+        1 => format!("Dropped 1 relay{yours} to {to}."),
+        n => format!("Dropped {n} relays{yours} to {to}."),
+    }
+}
+
 impl LockService {
     pub fn new(
         ledger: Arc<Ledger>,
@@ -312,6 +324,52 @@ impl LockService {
             Ok(h)
         });
         self.released(target, done)
+    }
+
+    /// `DropRelays`: drops pending relay `id`, or every pending relay to
+    /// `to`. `from` is the slot asking, which may only drop relays it sent;
+    /// `None` is the user.
+    pub fn drop_relays(
+        &self,
+        from: Option<SlotId>,
+        id: Option<i64>,
+        to: Option<SlotId>,
+        now: i64,
+    ) -> Response {
+        if let Some(s) = from.into_iter().chain(to).find(|s| !valid_id(*s)) {
+            return error(format!("invalid slot id {s}"));
+        }
+        let reason = from.map_or_else(
+            || "dropped by you".to_string(),
+            |s| format!("dropped by {}", slot_name(s)),
+        );
+        match (id, to) {
+            (Some(id), None) => {
+                match self.change("drop relay", |c| {
+                    table::drop_relay_on(c, id, from, &reason, now)
+                }) {
+                    Ok(Ok(())) => Response::Text {
+                        text: format!("Dropped relay {id}."),
+                    },
+                    Ok(Err(refusal)) => error(refusal),
+                    Err(e) => error(format!("ledger: {e:#}")),
+                }
+            }
+            (None, Some(to)) => {
+                let done = self.change("drop relays", |c| match from {
+                    Some(f) => table::drop_relays_from_to_on(c, f, to, &reason, now),
+                    None => table::drop_relays_to_on(c, to, &reason, now),
+                });
+                match done {
+                    Ok(n) => Response::Text {
+                        text: dropped_text(n, to, from.is_some()),
+                    },
+                    Err(e) => error(format!("ledger: {e:#}")),
+                }
+            }
+            (Some(_), Some(_)) => error("give a relay id or a slot, not both"),
+            (None, None) => error("give a relay id or a slot to drop relays to"),
+        }
     }
 
     fn released(&self, target: &str, done: Result<Option<table::Handoff>>) -> Response {

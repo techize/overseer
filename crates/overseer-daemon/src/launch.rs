@@ -192,10 +192,11 @@ fn hook_shape(event: &str) -> (Option<&'static str>, u64) {
 }
 
 /// The Overseer MCP tools a session may use without being asked.
-const ALLOWED_TOOLS: [&str; 17] = [
+const ALLOWED_TOOLS: [&str; 18] = [
     "mcp__overseer__claim_target",
     "mcp__overseer__release_target",
     "mcp__overseer__notify_session",
+    "mcp__overseer__drop_relay",
     "mcp__overseer__list_targets",
     "mcp__overseer__commit_2ndbrain",
     "mcp__overseer__append_journal",
@@ -617,6 +618,7 @@ mod tests {
                 "mcp__overseer__claim_target",
                 "mcp__overseer__release_target",
                 "mcp__overseer__notify_session",
+                "mcp__overseer__drop_relay",
                 "mcp__overseer__list_targets",
                 "mcp__overseer__commit_2ndbrain",
                 "mcp__overseer__append_journal",

@@ -3457,6 +3457,99 @@ async fn two_pending_relays_go_in_one_paste() {
     assert_eq!(c.relay(Some(2), 0, "on it").await, queued_for(0));
 }
 
+impl Client {
+    async fn drop_relays(&mut self, from: Option<u8>, id: Option<i64>, to: Option<u8>) -> Response {
+        self.request(Request::DropRelays { from, id, to }).await
+    }
+}
+
+fn text(t: &str) -> Response {
+    Response::Text { text: t.into() }
+}
+
+#[tokio::test]
+async fn a_dropped_relay_is_never_typed_and_the_rest_still_go() {
+    let stub = box_stub("drop-one");
+    let d = start_daemon_with(temp_socket(), stub.env()).await;
+    let mut c = Client::connect(&d.socket).await;
+    c.start_stub(2, &stub).await;
+    c.hook(hook(2, HookKind::UserPromptSubmit)).await;
+    assert_eq!(c.relay(None, 2, "stale news").await, queued_for(2));
+    assert_eq!(c.relay(None, 2, "hello").await, queued_for(2));
+    let v = c.locks().await;
+    let stale = v.relays.iter().find(|r| r.text == "stale news").unwrap().id;
+    assert_eq!(
+        c.drop_relays(None, Some(stale), None).await,
+        text(&format!("Dropped relay {stale}."))
+    );
+    c.hook(hook(2, HookKind::Stop)).await;
+    assert_eq!(stub.read_until(&pasted(HELLO)).await, pasted(HELLO));
+    let v = c
+        .locks_until(|v| v.relays.iter().any(|r| r.state == RelayState::Delivered))
+        .await;
+    let dropped = v.relays.iter().find(|r| r.id == stale).unwrap();
+    assert_eq!(dropped.state, RelayState::Dropped);
+    assert_eq!(dropped.drop_reason.as_deref(), Some("dropped by you"));
+    // Delivered now, so it cannot be dropped, and the answer says why.
+    let hello = v.relays.iter().find(|r| r.text == "hello").unwrap().id;
+    assert!(
+        is_error(
+            &c.drop_relays(None, Some(hello), None).await,
+            &format!("relay {hello} was already delivered, so it cannot be dropped")
+        ),
+        "a delivered relay was dropped"
+    );
+    sleep(Duration::from_millis(1500)).await;
+    assert_eq!(stub.reads(), pasted(HELLO));
+}
+
+#[tokio::test]
+async fn drop_every_relay_to_a_slot_says_how_many() {
+    let d = lock_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    assert_eq!(c.start(2).await, Response::Ok);
+    assert_eq!(c.start(0).await, Response::Ok);
+    assert_eq!(c.relay(Some(0), 2, "status?").await, queued_for(2));
+    assert_eq!(c.relay(None, 2, "one").await, queued_for(2));
+    assert_eq!(c.relay(None, 2, "two").await, queued_for(2));
+    // S0 drops only its own.
+    assert_eq!(
+        c.drop_relays(Some(0), None, Some(2)).await,
+        text("Dropped 1 relay you sent to S2.")
+    );
+    assert_eq!(
+        c.drop_relays(None, None, Some(2)).await,
+        text("Dropped 2 relays to S2.")
+    );
+    assert_eq!(
+        c.drop_relays(None, None, Some(2)).await,
+        text("Dropped 0 relays: none to S2 were pending.")
+    );
+    let reasons: Vec<_> = c
+        .locks()
+        .await
+        .relays
+        .iter()
+        .map(|r| (r.text.clone(), r.drop_reason.clone()))
+        .collect();
+    assert_eq!(
+        reasons,
+        vec![
+            ("two".to_string(), Some("dropped by you".to_string())),
+            ("one".to_string(), Some("dropped by you".to_string())),
+            ("status?".to_string(), Some("dropped by S0".to_string())),
+        ]
+    );
+    assert!(is_error(
+        &c.drop_relays(None, Some(1), Some(2)).await,
+        "give a relay id or a slot, not both"
+    ));
+    assert!(is_error(
+        &c.drop_relays(None, None, None).await,
+        "give a relay id or a slot to drop relays to"
+    ));
+}
+
 #[tokio::test]
 async fn pending_relay_delivers_after_restart_and_resume() {
     let stub = box_stub("restart");

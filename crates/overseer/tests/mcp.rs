@@ -324,3 +324,74 @@ fn get_item_detail_returns_a_bead() {
     assert!(text.contains("Show the item body."), "{text}");
     assert!(text.contains("Depends on: demo-2 (blocks)"), "{text}");
 }
+
+#[test]
+fn a_session_drops_only_the_relays_it_sent() {
+    use overseer_proto::{Request, Response};
+    let d = TempDaemon::start("droprelay");
+    let socket = d.home.join("overseer.sock");
+    let ask = |req: Request| {
+        d.rt.block_on(async {
+            let c = Client::connect(&socket).await.unwrap();
+            c.request(req).await.unwrap()
+        })
+    };
+    // S2 runs `cat`, which never reports activity, so relays stay pending.
+    let start = Request::StartSlot {
+        id: 2,
+        label: "demo lane".into(),
+        cwd: "/tmp".into(),
+        command: None,
+        prompt: None,
+    };
+    assert_eq!(ask(start), Response::Ok);
+    let mut s0 = Mcp::start(&d.home, "S0");
+    let (text, err) = s0.tool("notify_session", json!({"slot": "S2", "text": "status?"}));
+    assert!(!err, "{text}");
+    let yours = ask(Request::SendRelay {
+        from: None,
+        to: 2,
+        text: "hello from Demo".into(),
+    });
+    assert!(matches!(yours, Response::Text { .. }), "{yours:?}");
+    let Response::Locks(v) = ask(Request::ListLocks) else {
+        panic!("no lock view")
+    };
+    let id_of = |t: &str| v.relays.iter().find(|r| r.text == t).unwrap().id;
+    let (mine, demos) = (id_of("status?"), id_of("hello from Demo"));
+
+    let (text, err) = s0.tool("list_targets", json!({}));
+    assert!(!err, "{text}");
+    assert!(
+        text.contains(&format!("relay #{mine} to S2, pending 0m: status?")),
+        "{text}"
+    );
+    assert!(!text.contains("hello from Demo"), "{text}");
+
+    let (text, err) = s0.tool("drop_relay", json!({"id": demos}));
+    assert!(err, "dropped another sender's relay: {text}");
+    assert_eq!(
+        text,
+        format!("relay {demos} was not sent by S0; a session can only drop relays it sent")
+    );
+    let (text, err) = s0.tool("drop_relay", json!({"to": "S2"}));
+    assert_eq!(
+        (text.as_str(), err),
+        ("Dropped 1 relay you sent to S2.", false)
+    );
+    let Response::Locks(v) = ask(Request::ListLocks) else {
+        panic!("no lock view")
+    };
+    let state = |id: i64| {
+        let r = v.relays.iter().find(|r| r.id == id).unwrap();
+        (r.state, r.drop_reason.clone())
+    };
+    assert_eq!(
+        state(mine),
+        (
+            overseer_proto::RelayState::Dropped,
+            Some("dropped by S0".into())
+        )
+    );
+    assert_eq!(state(demos), (overseer_proto::RelayState::Pending, None));
+}

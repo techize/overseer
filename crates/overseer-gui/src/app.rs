@@ -1001,6 +1001,20 @@ impl OverseerApp {
         self.send(Request::Release { key }, cx);
     }
 
+    /// Drops pending relay `id` unsent, as the user. The new state comes
+    /// back as a `LocksChanged` event; a refusal shows in the status line.
+    pub(crate) fn drop_relay(&mut self, id: i64, cx: &mut Context<Self>) {
+        self.status = None;
+        self.send(
+            Request::DropRelays {
+                from: None,
+                id: Some(id),
+                to: None,
+            },
+            cx,
+        );
+    }
+
     /// Shows `key`'s detail in `slot`'s panel and asks the daemon for it;
     /// `refresh` skips the daemon's cache and keeps a loaded detail shown
     /// until the reply. The cached fields show at once.
