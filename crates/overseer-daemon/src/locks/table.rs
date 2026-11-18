@@ -146,21 +146,25 @@ fn relay_kind_cols(k: &RelayKind) -> (&'static str, Option<String>) {
     }
 }
 
-/// A relay kind from its `kind` and `ref` columns. NULL is `note`.
-fn relay_kind_from(
-    col: usize,
-    kind: Option<&str>,
-    r: Option<String>,
-) -> rusqlite::Result<RelayKind> {
-    Ok(match (kind, r) {
-        (None | Some("note"), _) => RelayKind::Note,
-        (Some("kickoff"), Some(plan)) => RelayKind::Kickoff {
-            plan: plan
-                .parse()
-                .map_err(|_| bad_column(col + 1, "kickoff plan", &plan))?,
-        },
-        (Some("lock"), Some(target)) => RelayKind::Lock { target },
-        (Some(other), _) => return Err(bad_column(col, "relay kind", other)),
+/// A relay kind from its `kind` and `ref` columns. NULL is `note`. A row
+/// whose kind is unknown or whose `ref` is missing or bad also reads as a
+/// note, with a warning, so one bad row never fails every relay read.
+fn relay_kind_from(id: i64, kind: Option<&str>, r: Option<String>) -> RelayKind {
+    let r = r.filter(|r| !r.is_empty());
+    let read = match (kind, r.as_deref()) {
+        (None | Some("note"), _) => Some(RelayKind::Note),
+        (Some("kickoff"), Some(plan)) => plan.parse().ok().map(|plan| RelayKind::Kickoff { plan }),
+        (Some("lock"), Some(target)) => Some(RelayKind::Lock {
+            target: target.into(),
+        }),
+        _ => None,
+    };
+    read.unwrap_or_else(|| {
+        tracing::warn!(
+            "relay {id}: kind {:?} with ref {r:?} read as a note",
+            kind.unwrap_or_default()
+        );
+        RelayKind::Note
     })
 }
 
@@ -193,7 +197,7 @@ fn relay_row(r: &Row) -> rusqlite::Result<Relay> {
         state,
         delivered_at,
         dropped_at,
-        kind: relay_kind_from(8, kind.as_deref(), r.get(9)?)?,
+        kind: relay_kind_from(r.get(0)?, kind.as_deref(), r.get(9)?),
         drop_reason: r.get(10)?,
         held: None,
     })
@@ -596,22 +600,50 @@ pub(crate) fn drop_relays_to_on(
     )?)
 }
 
-/// Drops every relay still pending for `to` that slot `sent_by` sent,
-/// saying `reason`. Returns how many.
+/// Drops by hand every relay still pending for `to`, or with `sent_by`
+/// only the ones that slot sent, saying `reason`. Each lock notice among
+/// them gives up its hold (see `give_up_notice_hold_on`). Returns how many.
 pub(crate) fn drop_relays_from_to_on(
     conn: &Connection,
-    sent_by: SlotId,
+    sent_by: Option<SlotId>,
     to: SlotId,
     reason: &str,
     now: i64,
 ) -> Result<usize> {
-    Ok(conn.execute(
-        &format!(
-            "UPDATE relays SET dropped_at = ?3, drop_reason = ?4
-             WHERE to_slot = ?2 AND sender = 'slot' AND from_slot = ?1 AND {PENDING}"
-        ),
-        params![sent_by, to, now, reason],
-    )?)
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id FROM relays
+         WHERE to_slot = ?1 AND {PENDING}
+           AND (?2 IS NULL OR (sender = 'slot' AND from_slot = ?2))
+         ORDER BY id"
+    ))?;
+    let ids = stmt
+        .query_map(params![to, sent_by], |r| r.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for id in &ids {
+        conn.execute(
+            "UPDATE relays SET dropped_at = ?2, drop_reason = ?3 WHERE id = ?1",
+            params![id, now, reason],
+        )?;
+        give_up_notice_hold_on(conn, *id, now)?;
+    }
+    Ok(ids.len())
+}
+
+/// After lock notice `relay` was dropped by hand: the slot it was for was
+/// never told it holds the target, so if it still holds it through the
+/// claim that notice announced, the target goes to the next waiter as on a
+/// release.
+fn give_up_notice_hold_on(conn: &Connection, relay: i64, now: i64) -> Result<Option<Handoff>> {
+    let held = conn
+        .query_row(
+            "SELECT c.target, c.slot FROM claims c JOIN relays r ON r.id = c.relay_id
+             WHERE c.relay_id = ?1 AND c.slot = r.to_slot",
+            params![relay],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, SlotId>(1)?)),
+        )
+        .optional()?;
+    held.map(|(target, slot)| hand_on(conn, &target, slot, None, None, now))
+        .transpose()
 }
 
 /// The relay with `id`, whatever its state.
@@ -660,6 +692,7 @@ pub(crate) fn drop_relay_on(
         &format!("UPDATE relays SET dropped_at = ?2, drop_reason = ?3 WHERE id = ?1 AND {PENDING}"),
         params![id, now, reason],
     )?;
+    give_up_notice_hold_on(conn, id, now)?;
     Ok(Ok(()))
 }
 
@@ -755,6 +788,39 @@ pub(crate) fn recheck_lock_notices_on(
         kept.push(r.clone());
     }
     Ok(kept)
+}
+
+/// Claims a batch the courier read earlier, just before its paste: of
+/// `snapshot`, the relays still pending, less stale lock notices (which are
+/// dropped), are marked delivered at `now` and returned. One dropped since
+/// the snapshot is left out, so it is never typed in.
+pub(crate) fn claim_batch_on(
+    conn: &Connection,
+    snapshot: &[Relay],
+    now: i64,
+) -> Result<Vec<Relay>> {
+    let mut still = Vec::with_capacity(snapshot.len());
+    for r in snapshot {
+        if let Some(cur) = relay_on(conn, r.id)? {
+            if cur.state == RelayState::Pending {
+                still.push(cur);
+            }
+        }
+    }
+    let kept = recheck_lock_notices_on(conn, &still, now)?;
+    let ids: Vec<i64> = kept.iter().map(|r| r.id).collect();
+    mark_delivered_on(conn, &ids, now)?;
+    Ok(kept)
+}
+
+/// Puts claimed relays back to pending after their paste failed.
+pub(crate) fn unclaim_on(conn: &Connection, ids: &[i64]) -> Result<()> {
+    let mut stmt =
+        conn.prepare("UPDATE relays SET delivered_at = NULL WHERE id = ?1 AND dropped_at IS NULL")?;
+    for id in ids {
+        stmt.execute(params![id])?;
+    }
+    Ok(())
 }
 
 /// Marks pending relays delivered at `now`. Ones already delivered keep
@@ -1557,7 +1623,10 @@ mod tests {
             queue_relay_on(c, &Sender::Slot { slot: 0 }, 2, "b", None, 11)?;
             queue_relay_on(c, &Sender::You, 2, "c", None, 12)?;
             queue_relay_on(c, &Sender::Slot { slot: 0 }, 3, "d", None, 13)?;
-            assert_eq!(drop_relays_from_to_on(c, 0, 2, "dropped by S0", 20)?, 2);
+            assert_eq!(
+                drop_relays_from_to_on(c, Some(0), 2, "dropped by S0", 20)?,
+                2
+            );
             assert_eq!(texts(c, 2), vec!["c"]);
             assert_eq!(drop_relays_to_on(c, 2, "dropped by you", 21)?, 1);
             assert!(texts(c, 2).is_empty());
@@ -1690,6 +1759,129 @@ mod tests {
             assert_eq!(state_and_reason(c, to_2[0].id).0, RelayState::Dropped);
             let to_3 = pending_relays_on(c, 3)?;
             assert_eq!(recheck_lock_notices_on(c, &to_3, 30)?, to_3);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn claim_batch_leaves_out_a_relay_dropped_since_the_snapshot() {
+        with(|c| {
+            let a = queue_relay_on(c, &Sender::You, 2, "stale news", None, 10)?;
+            let b = queue_relay_on(c, &Sender::You, 2, "hello", None, 11)?;
+            let snapshot = pending_relays_on(c, 2)?;
+            drop_relay_on(c, a, None, "dropped by you", 20)?.unwrap();
+            let kept = claim_batch_on(c, &snapshot, 30)?;
+            assert_eq!(kept.iter().map(|r| r.id).collect::<Vec<_>>(), vec![b]);
+            assert_eq!(
+                state_and_reason(c, a),
+                (RelayState::Dropped, Some(t("dropped by you")))
+            );
+            let got = relay_on(c, b)?.unwrap();
+            assert_eq!(
+                (got.state, got.delivered_at),
+                (RelayState::Delivered, Some(30))
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn claim_batch_drops_a_stale_lock_notice() {
+        with(|c| {
+            take(c, T, 1, ClaimKind::Claim, 10);
+            queue(c, T, 2, Via::Hook, 11);
+            release_on(c, T, Releaser::Slot(1), None, 20)?;
+            let note = queue_relay_on(c, &Sender::You, 2, "hello", None, 21)?;
+            release_on(c, T, Releaser::Slot(2), None, 22)?;
+            let snapshot = pending_relays_on(c, 2)?;
+            let kept = claim_batch_on(c, &snapshot, 30)?;
+            assert_eq!(kept.iter().map(|r| r.id).collect::<Vec<_>>(), vec![note]);
+            assert_eq!(
+                state_and_reason(c, snapshot[0].id),
+                (RelayState::Dropped, Some(format!("no longer holds {T}")))
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn unclaim_puts_a_batch_whose_paste_failed_back_to_pending() {
+        with(|c| {
+            let a = queue_relay_on(c, &Sender::You, 2, "hello", None, 10)?;
+            let snapshot = pending_relays_on(c, 2)?;
+            claim_batch_on(c, &snapshot, 30)?;
+            assert!(pending_relays_on(c, 2)?.is_empty());
+            unclaim_on(c, &[a])?;
+            assert_eq!(state_and_reason(c, a), (RelayState::Pending, None));
+            assert_eq!(relay_on(c, a)?.unwrap().delivered_at, None);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn hand_dropping_a_lock_notice_hands_the_target_to_the_next_waiter() {
+        with(|c| {
+            take(c, T, 1, ClaimKind::Claim, 10);
+            queue(c, T, 2, Via::Hook, 11);
+            queue(c, T, 3, Via::Hook, 12);
+            release_on(c, T, Releaser::Slot(1), None, 20)?;
+            let notice = pending_relays_on(c, 2)?[0].id;
+            assert_eq!(
+                drop_relay_on(c, notice, None, "dropped by you", 30)?,
+                Ok(())
+            );
+            assert_eq!(
+                state_and_reason(c, notice),
+                (RelayState::Dropped, Some(t("dropped by you")))
+            );
+            assert_eq!(holders(c), vec![(T.into(), 3, ClaimKind::Grant)]);
+            assert!(waits_on(c)?.is_empty());
+            assert_eq!(
+                texts(c, 3),
+                vec![format!("S2 has released {T}. You now hold it.")]
+            );
+            assert!(texts(c, 2).is_empty());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn hand_dropping_a_lock_notice_with_no_waiter_frees_the_target() {
+        with(|c| {
+            take(c, T, 1, ClaimKind::Claim, 10);
+            queue(c, T, 2, Via::Tool, 11);
+            take(c, "custom:b", 2, ClaimKind::Claim, 12);
+            release_on(c, T, Releaser::Slot(1), None, 20)?;
+            queue_relay_on(c, &Sender::You, 2, "hello", None, 21)?;
+            assert_eq!(drop_relays_from_to_on(c, None, 2, "dropped by you", 30)?, 2);
+            // The tool claim made with no notice stays.
+            assert_eq!(holders(c), vec![(t("custom:b"), 2, ClaimKind::Claim)]);
+            assert!(pending_relays_on(c, 2)?.is_empty());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn a_relay_with_a_bad_kind_or_ref_reads_as_a_note() {
+        with(|c| {
+            let good = queue_relay_on(c, &Sender::You, 2, "fine", None, 10)?;
+            for (kind, r) in [
+                ("kickoff", None),
+                ("kickoff", Some("plan nine")),
+                ("lock", None),
+                ("lock", Some("")),
+                ("bogus", Some("x")),
+            ] {
+                let id = queue_relay_on(c, &Sender::You, 2, kind, None, 11)?;
+                c.execute(
+                    "UPDATE relays SET kind = ?2, ref = ?3 WHERE id = ?1",
+                    params![id, kind, r],
+                )?;
+            }
+            let all = pending_relays_on(c, 2)?;
+            assert_eq!(all.len(), 6);
+            assert!(all.iter().all(|r| r.kind == RelayKind::Note), "{all:?}");
+            assert_eq!(relay_on(c, good)?.unwrap().kind, RelayKind::Note);
             Ok(())
         })
     }

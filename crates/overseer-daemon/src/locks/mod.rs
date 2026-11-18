@@ -356,9 +356,8 @@ impl LockService {
                 }
             }
             (None, Some(to)) => {
-                let done = self.change("drop relays", |c| match from {
-                    Some(f) => table::drop_relays_from_to_on(c, f, to, &reason, now),
-                    None => table::drop_relays_to_on(c, to, &reason, now),
+                let done = self.change("drop relays", |c| {
+                    table::drop_relays_from_to_on(c, from, to, &reason, now)
                 });
                 match done {
                     Ok(n) => Response::Text {

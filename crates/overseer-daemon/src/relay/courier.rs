@@ -23,7 +23,7 @@ use tokio::time::Instant;
 
 use super::screen::{input_box, shows_working, InputBox};
 use crate::ledger::Ledger;
-use crate::locks::table::{mark_delivered_on, pending_relays_on, recheck_lock_notices_on};
+use crate::locks::table::{claim_batch_on, pending_relays_on, unclaim_on};
 use crate::locks::LockService;
 use crate::manager::{SlotManager, SLOT_COUNT};
 use crate::work::store::unix_now;
@@ -47,8 +47,8 @@ const JUST_SENT: &str = "just delivered, waiting for the session";
 /// Without bracketed paste every newline is an Enter, and a later one could
 /// land on a prompt the first one brought up.
 const NO_BRACKETS: &str = "bracketed paste is off";
-/// The ledger could not say whether lock notices still hold.
-const RECHECK_FAILED: &str = "lock notices could not be checked";
+/// The ledger could not claim the batch for a paste.
+const CLAIM_FAILED: &str = "relays could not be claimed";
 
 /// Whether a slot in `state` doing `activity` may be typed into now, else
 /// why not.
@@ -237,9 +237,11 @@ impl Courier {
     /// Types `relays` into the slot `info` describes if it is ready, and
     /// marks them delivered: `Ok(true)`. Otherwise the reason they wait.
     ///
-    /// Just before the paste, lock notices are checked again: one whose
+    /// Just before the paste the batch is claimed (`claim_batch_on`): a
+    /// relay dropped since it was read is left out, and a lock notice whose
     /// target the slot no longer holds is dropped, not typed. `Ok(false)`
-    /// says none were left, so nothing was typed.
+    /// says none were left, so nothing was typed. If the paste fails, the
+    /// claimed relays go back to pending.
     ///
     /// A slot waiting at a prompt is ready once the prompt is answered: the
     /// screen shows the empty box and no working line on this look and on
@@ -284,28 +286,39 @@ impl Courier {
             InputBox::Typed => return Err(TYPED),
             InputBox::NotFound => return Err(NO_BOX),
         }
-        let relays = self.recheck(id, relays)?;
-        if relays.is_empty() {
-            *answered = None;
-            return Ok(false);
-        }
-        // A hook may have come in while the screen was read.
-        let text = strip_controls(&compose(&relays, id, &self.user));
-        if text.contains('\n') && !modes.bracketed_paste {
+        // The batch can only shrink once claimed, so if all of it fits,
+        // what is left does too.
+        let whole = strip_controls(&compose(relays, id, &self.user));
+        if whole.contains('\n') && !modes.bracketed_paste {
             return Err(NO_BRACKETS);
         }
+        // A hook may have come in while the screen was read.
         let latest = self.manager.lock().unwrap().list().swap_remove(id as usize);
         match ready(&latest.state, latest.activity.as_ref()) {
             Err(AT_PROMPT) if at_prompt && latest.activity == info.activity => {}
             other => other?,
         }
+        // From here a drop of a claimed relay is refused as delivered, and
+        // one dropped before is left out.
+        let relays = self.claim(id, relays)?;
         *answered = None;
+        if relays.is_empty() {
+            self.locks.set_held(id, None);
+            return Ok(false);
+        }
+        let ids: Vec<i64> = relays.iter().map(|r| r.id).collect();
+        let text = strip_controls(&compose(&relays, id, &self.user));
+        if text.contains('\n') && !modes.bracketed_paste {
+            self.unclaim(id, &ids);
+            return Err(NO_BRACKETS);
+        }
         self.locks.set_held(id, None);
         let paste = encode_paste(&text, &modes);
         let writer = slot.clone();
         let wrote = tokio::task::spawn_blocking(move || writer.write(&paste)).await;
         if let Ok(Err(e)) | Err(e) = wrote.map_err(std::io::Error::other) {
             tracing::warn!("relay to {} not written: {e}", slot_name(id));
+            self.unclaim(id, &ids);
             return Err(NOT_RUNNING);
         }
         tokio::time::sleep(RETURN_DELAY).await;
@@ -313,35 +326,27 @@ impl Courier {
         if let Err(e) = slot.write(b"\r") {
             tracing::warn!("relay to {} not submitted: {e}", slot_name(id));
         }
-        let ids: Vec<i64> = relays.iter().map(|r| r.id).collect();
-        let now = unix_now();
-        let _ = self
-            .locks
-            .change("relay delivery", |c| mark_delivered_on(c, &ids, now));
         tracing::info!("{} relay(s) delivered to {}", ids.len(), slot_name(id));
         Ok(true)
     }
 
-    /// `relays` less the lock notices that went stale while they waited,
-    /// which are dropped. Announced only when one was.
-    fn recheck(&self, id: SlotId, relays: &[Relay]) -> Result<Vec<Relay>, &'static str> {
+    /// Of `relays`, read earlier, the ones still pending less stale lock
+    /// notices (which are dropped), marked delivered in one transaction.
+    fn claim(&self, id: SlotId, relays: &[Relay]) -> Result<Vec<Relay>, &'static str> {
         let now = unix_now();
-        let kept = self
-            .ledger
-            .transaction(|c| recheck_lock_notices_on(c, relays, now))
+        self.locks
+            .change("relay delivery", |c| claim_batch_on(c, relays, now))
             .map_err(|e| {
-                tracing::warn!("{} lock notices not rechecked: {e:#}", slot_name(id));
-                RECHECK_FAILED
-            })?;
-        if kept.len() < relays.len() {
-            tracing::info!(
-                "{} stale lock notice(s) to {} dropped",
-                relays.len() - kept.len(),
-                slot_name(id)
-            );
-            self.locks.announce();
+                tracing::warn!("relays to {} not claimed: {e:#}", slot_name(id));
+                CLAIM_FAILED
+            })
+    }
+
+    /// Puts relays claimed for a paste that did not happen back to pending.
+    fn unclaim(&self, id: SlotId, ids: &[i64]) {
+        if let Err(e) = self.locks.change("relay unclaim", |c| unclaim_on(c, ids)) {
+            tracing::warn!("relays to {} not put back: {e:#}", slot_name(id));
         }
-        Ok(kept)
     }
 }
 

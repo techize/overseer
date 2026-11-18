@@ -3597,6 +3597,46 @@ async fn nothing_is_pasted_when_every_notice_is_stale() {
 }
 
 #[tokio::test]
+async fn dropping_a_lock_notice_by_hand_hands_the_target_on() {
+    let d = lock_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    c.request(claim_target(1, "custom:a", None)).await;
+    c.request(claim_target(2, "custom:a", None)).await;
+    c.request(claim_target(3, "custom:a", None)).await;
+    c.request(Request::ReleaseTarget {
+        slot: 1,
+        target: t("custom:a"),
+    })
+    .await;
+    let v = c.locks().await;
+    assert_eq!(holds(&v), [(t("custom:a"), 2, ClaimKind::Claim)]);
+    let notice = v.relays.iter().find(|r| r.to == 2).unwrap().id;
+    assert_eq!(
+        c.drop_relays(None, Some(notice), None).await,
+        text(&format!("Dropped relay {notice}."))
+    );
+    let v = c.locks().await;
+    assert_eq!(holds(&v), [(t("custom:a"), 3, ClaimKind::Claim)]);
+    let states = relay_states(&v);
+    assert!(
+        states.contains(&(
+            3,
+            t("S2 has released custom:a. You now hold it."),
+            RelayState::Pending
+        )),
+        "{states:?}"
+    );
+    let dropped = v.relays.iter().find(|r| r.id == notice).unwrap();
+    assert_eq!(dropped.drop_reason.as_deref(), Some("dropped by you"));
+    // With no one waiting, dropping S3's notice frees the target.
+    assert_eq!(
+        c.drop_relays(None, None, Some(3)).await,
+        text("Dropped 1 relay to S3.")
+    );
+    assert!(c.locks().await.claims.is_empty());
+}
+
+#[tokio::test]
 async fn drop_every_relay_to_a_slot_says_how_many() {
     let d = lock_daemon().await;
     let mut c = Client::connect(&d.socket).await;
