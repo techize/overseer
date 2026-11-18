@@ -225,6 +225,21 @@ pub fn hover_model(c: &TicketCard, slots: &[SlotInfo], work: &WorkView, now: i64
             text.push(' ');
             text.push_str(&age_text(now - created));
         }
+        if let Some(a) = p.approvals {
+            let state = if a.ready() {
+                "ready to merge"
+            } else if a.changes_requested {
+                "changes requested"
+            } else {
+                ""
+            };
+            for part in [a.badge().as_str(), state] {
+                if !part.is_empty() {
+                    text.push_str(" · ");
+                    text.push_str(part);
+                }
+            }
+        }
         lines.push(("PR".to_string(), text));
     }
     if c.beads > 0 {
@@ -353,6 +368,12 @@ pub struct PrRow {
     /// The Running or Resumable slot that owns the PR's ticket: a click
     /// opens it.
     pub slot: Option<SlotId>,
+    /// `1H 1AI`, or empty with no approvals or no participants read.
+    pub approvals: String,
+    /// Approved enough to merge.
+    pub ready: bool,
+    /// Someone asked for changes.
+    pub changes: bool,
 }
 
 /// The Running or Resumable slot owning `ticket`, if any: the same owners
@@ -370,12 +391,12 @@ fn live_owner(view: &WorkView, slots: &[SlotInfo], ticket: &str) -> Option<SlotI
         .map(|i| i.id)
 }
 
-/// Open PRs oldest first (no date last), at most 8, and how many are left.
-/// A row is linked to its ticket's owner while that slot is Running or
-/// Resumable.
+/// Open PRs ready to merge first, then oldest first (no date last), at
+/// most 8, and how many are left. A row is linked to its ticket's owner
+/// while that slot is Running or Resumable.
 pub fn pr_rows(view: &WorkView, slots: &[SlotInfo], now: i64) -> (Vec<PrRow>, usize) {
     let mut prs: Vec<_> = view.prs.iter().collect();
-    prs.sort_by_key(|p| (p.created.is_none(), p.created));
+    prs.sort_by_key(|p| (!pr_ready(p), p.created.is_none(), p.created));
     let more = prs.len().saturating_sub(MAX_PR_ROWS);
     prs.truncate(MAX_PR_ROWS);
     let rows = prs
@@ -389,9 +410,17 @@ pub fn pr_rows(view: &WorkView, slots: &[SlotInfo], now: i64) -> (Vec<PrRow>, us
             tone: p.created.map_or(AgeTone::Unknown, |c| pr_age_tone(now - c)),
             url: p.url.clone(),
             slot: p.ticket.as_deref().and_then(|t| live_owner(view, slots, t)),
+            approvals: p.approvals.map(|a| a.badge()).unwrap_or_default(),
+            ready: pr_ready(p),
+            changes: p.approvals.is_some_and(|a| a.changes_requested),
         })
         .collect();
     (rows, more)
+}
+
+/// Bitbucket reports enough approvals to merge `p`.
+fn pr_ready(p: &PullRequest) -> bool {
+    p.approvals.is_some_and(|a| a.ready())
 }
 
 /// `OPEN PRS · 3`, or `OPEN PRS · 3 · oldest 6d` when any PR has a date.
@@ -866,6 +895,28 @@ impl OverseerApp {
                             .text_color(rgb(colors::TEXT_DIM))
                             .child(r.title),
                     )
+                    .children((!r.approvals.is_empty()).then(|| {
+                        div()
+                            .flex_none()
+                            .text_color(rgb(colors::TEXT_DIM))
+                            .child(r.approvals.clone())
+                    }))
+                    .children(r.ready.then(|| {
+                        div()
+                            .flex_none()
+                            .px_1()
+                            .rounded(px(4.))
+                            .border_1()
+                            .border_color(rgb(colors::GREEN))
+                            .text_color(rgb(colors::GREEN))
+                            .child("ready")
+                    }))
+                    .children(r.changes.then(|| {
+                        div()
+                            .flex_none()
+                            .text_color(rgb(colors::ORANGE))
+                            .child("changes")
+                    }))
                     .children(r.age.map(|a| {
                         div()
                             .flex_none()
@@ -1136,6 +1187,7 @@ mod tests {
             author: None,
             created,
             ticket: None,
+            approvals: None,
         }
     }
 
@@ -1360,6 +1412,39 @@ mod tests {
         assert_eq!(p.expected, None);
         assert_eq!(behind_text(&p), None);
         assert!(progress(&view(vec![])).is_none());
+    }
+
+    #[test]
+    fn ready_prs_sort_first_with_their_badge() {
+        use overseer_proto::Approvals;
+        let now = 10 * 86_400;
+        let with = |id, human, ai, changes_requested| PullRequest {
+            approvals: Some(Approvals {
+                human,
+                ai,
+                changes_requested,
+            }),
+            ..pr(id, Some(now - id as i64 * 86_400))
+        };
+        let mut v = view(vec![]);
+        // Oldest first would be 5, 4, 3, 2, 1.
+        v.prs = vec![
+            with(1, 1, 1, false),
+            with(2, 2, 0, true),
+            pr(3, Some(0)),
+            with(4, 1, 0, false),
+            with(5, 0, 0, false),
+        ];
+        let (rows, _) = pr_rows(&v, &[], now);
+        let ids: Vec<_> = rows.iter().map(|r| r.id).collect();
+        assert_eq!(ids, [1, 3, 5, 4, 2]);
+        assert!(rows[0].ready && !rows[0].changes);
+        assert_eq!(rows[0].approvals, "1H 1AI");
+        let changed = rows.iter().find(|r| r.id == 2).unwrap();
+        assert!(!changed.ready && changed.changes);
+        assert_eq!(changed.approvals, "2H");
+        let unknown = rows.iter().find(|r| r.id == 3).unwrap();
+        assert_eq!((unknown.approvals.as_str(), unknown.ready), ("", false));
     }
 
     #[test]

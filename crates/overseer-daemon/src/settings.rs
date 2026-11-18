@@ -195,6 +195,13 @@ pub const CATALOGUE: &[Spec] = &[
         |c| text(&c.pr_author),
     ),
     daemon_note(
+        "ai_reviewers",
+        WORK,
+        SettingKind::List,
+        "Accounts whose PR approvals count as AI; anyone else is human",
+        |c| list(&c.ai_reviewers),
+    ),
+    daemon_note(
         "ticket_pattern",
         WORK,
         SettingKind::Pattern,

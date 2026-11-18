@@ -68,10 +68,11 @@ impl BitbucketApi {
         self.all_pages(token, url)
     }
 
-    /// The open pull requests of `workspace/slug`. Blocking.
+    /// The open pull requests of `workspace/slug`, with their participants
+    /// so approvals can be counted. Blocking.
     pub fn open_prs(&self, token: &str, workspace: &str, slug: &str) -> Result<String, String> {
         let url = format!(
-            "{}repositories/{}/{}/pullrequests?state=OPEN&pagelen=50",
+            "{}repositories/{}/{}/pullrequests?state=OPEN&pagelen=50&fields=%2Bvalues.participants",
             self.base,
             encode(workspace),
             encode(slug)
@@ -243,24 +244,27 @@ mod tests {
     #[test]
     fn open_prs_follows_next() {
         let p1 = r#"{"values":[{"id":7,"title":"DEMO-12 widget","source":{"branch":{"name":"feature/DEMO-12"}},
-            "author":{"display_name":"Dana Demo"},"links":{"html":{"href":"https://bitbucket.org/demo-ws/demo-api/pull-requests/7"}}}],
-            "next":"{base}/2.0/repositories/demo-ws/demo-api/pullrequests?state=OPEN&pagelen=50&page=2"}"#;
+            "author":{"display_name":"Dana Demo"},"links":{"html":{"href":"https://bitbucket.org/demo-ws/demo-api/pull-requests/7"}},
+            "participants":[{"user":{"display_name":"Robin Demo"},"approved":true,"state":"approved"}]}],
+            "next":"{base}/2.0/repositories/demo-ws/demo-api/pullrequests?state=OPEN&pagelen=50&fields=%2Bvalues.participants&page=2"}"#;
         let p2 = r#"{"values":[{"id":8,"title":"Tidy logs"}],"page":2}"#;
         let (base, rx) = fake(vec![(200, p1.into()), (200, p2.into())]);
         let out = api(&base).open_prs("tok", "demo-ws", "demo-api").unwrap();
-        let prs = super::super::parse_prs(&out, "demo-api").unwrap();
+        let prs = super::super::parse_prs(&out, "demo-api", &[]).unwrap();
         let ids: Vec<_> = prs.iter().map(|p| p.id).collect();
         assert_eq!(ids, [7, 8]);
         assert_eq!(prs[0].author.as_deref(), Some("Dana Demo"));
         assert_eq!(prs[0].branch, "feature/DEMO-12");
+        assert_eq!(prs[0].approvals.map(|a| a.human), Some(1));
+        assert_eq!(prs[1].approvals, None, "page 2 left participants out");
         let seen: Vec<_> = rx.try_iter().collect();
         assert_eq!(
             seen[0].path,
-            "/2.0/repositories/demo-ws/demo-api/pullrequests?state=OPEN&pagelen=50"
+            "/2.0/repositories/demo-ws/demo-api/pullrequests?state=OPEN&pagelen=50&fields=%2Bvalues.participants"
         );
         assert_eq!(
             seen[1].path,
-            "/2.0/repositories/demo-ws/demo-api/pullrequests?state=OPEN&pagelen=50&page=2"
+            "/2.0/repositories/demo-ws/demo-api/pullrequests?state=OPEN&pagelen=50&fields=%2Bvalues.participants&page=2"
         );
     }
 

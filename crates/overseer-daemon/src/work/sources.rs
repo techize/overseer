@@ -5,7 +5,7 @@ use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
-use overseer_proto::PullRequest;
+use overseer_proto::{Approvals, PullRequest};
 use serde_json::Value;
 
 use super::sprint::{to_days, Ymd};
@@ -199,8 +199,14 @@ fn find_list(out: &str, keys: &[&str]) -> Option<Vec<Value>> {
 
 /// Parse `bb pullrequest list --output json`. Text before the JSON is skipped,
 /// even text holding a bracket. Accepts an array or an object holding `values` (else
-/// `pullrequests`). Entries without a usable id are skipped.
-pub fn parse_prs(out: &str, repo: &str) -> Result<Vec<PullRequest>, String> {
+/// `pullrequests`). Entries without a usable id are skipped. Approvals are
+/// read from `participants` when an entry has that list; approvers named in
+/// `ai_reviewers` count as AI.
+pub fn parse_prs(
+    out: &str,
+    repo: &str,
+    ai_reviewers: &[String],
+) -> Result<Vec<PullRequest>, String> {
     let arr =
         &find_list(out, &["values", "pullrequests"]).ok_or("bb output: no pull request list")?;
     let at = |item: &Value, path: &[&str]| {
@@ -229,9 +235,70 @@ pub fn parse_prs(out: &str, repo: &str) -> Result<Vec<PullRequest>, String> {
                 .or_else(|| at(item, &["author", "nickname"])),
             created: str_of(item, "created_on").and_then(|s| parse_iso_time(&s)),
             ticket: None,
+            approvals: approvals(item, ai_reviewers),
         });
     }
     Ok(prs)
+}
+
+/// The reviews in a PR's `participants`, or `None` without that list. The
+/// author's own review is left out. A participant whose `state` is
+/// `changes_requested` marks the PR as asked for changes.
+fn approvals(item: &Value, ai_reviewers: &[String]) -> Option<Approvals> {
+    let participants = item.get("participants")?.as_array()?;
+    let author = item.get("author");
+    let mut counts = Approvals::default();
+    for p in participants {
+        let Some(user) = p.get("user") else {
+            continue;
+        };
+        if author.is_some_and(|a| same_user(a, user)) {
+            continue;
+        }
+        let state = p.get("state").and_then(Value::as_str);
+        if state == Some("changes_requested") {
+            counts.changes_requested = true;
+        }
+        let approved =
+            p.get("approved").and_then(Value::as_bool) == Some(true) || state == Some("approved");
+        if !approved {
+            continue;
+        }
+        if is_ai(user, ai_reviewers) {
+            counts.ai += 1;
+        } else {
+            counts.human += 1;
+        }
+    }
+    Some(counts)
+}
+
+/// The names a Bitbucket user goes by, in order of how surely they name
+/// one account: `uuid`, `account_id`, `nickname`, `display_name`.
+const USER_KEYS: [&str; 4] = ["uuid", "account_id", "nickname", "display_name"];
+
+/// `a` and `b` are one account: the first of `USER_KEYS` both have matches.
+fn same_user(a: &Value, b: &Value) -> bool {
+    USER_KEYS
+        .iter()
+        .find_map(|k| match (str_of(a, k), str_of(b, k)) {
+            (Some(x), Some(y)) => Some(x.trim().eq_ignore_ascii_case(y.trim())),
+            _ => None,
+        })
+        .unwrap_or(false)
+}
+
+/// `user` goes by one of `ai_reviewers` under any of `USER_KEYS`, ignoring
+/// case and the braces around a `uuid`.
+fn is_ai(user: &Value, ai_reviewers: &[String]) -> bool {
+    let bare = |s: &str| s.trim().trim_matches(['{', '}']).to_lowercase();
+    let names: Vec<String> = USER_KEYS
+        .iter()
+        .filter_map(|k| str_of(user, k))
+        .map(|s| bare(&s))
+        .filter(|s| !s.is_empty())
+        .collect();
+    ai_reviewers.iter().any(|r| names.contains(&bare(r)))
 }
 
 /// Parse `bb repo list --output json` into (name, last update) pairs, as
@@ -481,7 +548,12 @@ mod tests {
 
     #[test]
     fn parses_bb_values_fixture() {
-        let prs = parse_prs(include_str!("../../tests/fixtures/bb-prs.json"), "demo-api").unwrap();
+        let prs = parse_prs(
+            include_str!("../../tests/fixtures/bb-prs.json"),
+            "demo-api",
+            &[],
+        )
+        .unwrap();
         assert_eq!(prs.len(), 2);
         assert_eq!(prs[0].repo, "demo-api");
         assert_eq!(prs[0].branch, "feature/DEMO-12-widget");
@@ -494,12 +566,46 @@ mod tests {
             r#"note: cached
 [{"id":"7","title":"a"},{"title":"no id"},{"id":8}]"#,
             "demo-web",
+            &[],
         )
         .unwrap();
         assert_eq!(prs.iter().map(|p| p.id).collect::<Vec<_>>(), [7, 8]);
         assert_eq!(prs[1].title, "");
         assert_eq!(prs[0].created, None);
-        assert!(parse_prs("nothing here", "x").is_err());
+        assert!(parse_prs("nothing here", "x", &[]).is_err());
+    }
+
+    #[test]
+    fn approvals_split_human_and_ai_and_skip_the_author() {
+        let out = r#"{"values":[
+          {"id":1,"author":{"uuid":"{a-1}","nickname":"dana"},"participants":[
+            {"user":{"uuid":"{a-1}","nickname":"dana"},"approved":true,"state":"approved"},
+            {"user":{"uuid":"{h-1}","nickname":"robin"},"approved":true,"state":"approved"},
+            {"user":{"uuid":"{b-1}","nickname":"demo-review-bot"},"approved":true,"state":"approved"},
+            {"user":{"uuid":"{h-2}","nickname":"sam"},"approved":false,"state":null}]},
+          {"id":2,"author":{"nickname":"dana"},"participants":[
+            {"user":{"nickname":"robin"},"approved":true},
+            {"user":{"account_id":"712:bot"},"approved":true},
+            {"user":{"nickname":"sam"},"approved":false,"state":"changes_requested"}]},
+          {"id":3,"participants":[]},
+          {"id":4}]}"#;
+        let ai = ["Demo-Review-Bot".to_owned(), "712:bot".to_owned()];
+        let prs = parse_prs(out, "demo-api", &ai).unwrap();
+        let a = |i: usize| prs[i].approvals.unwrap();
+        assert_eq!((a(0).human, a(0).ai, a(0).changes_requested), (1, 1, false));
+        assert!(a(0).ready());
+        assert_eq!((a(1).human, a(1).ai, a(1).changes_requested), (1, 1, true));
+        assert!(!a(1).ready(), "changes requested is never ready");
+        assert_eq!(a(2), Approvals::default());
+        assert_eq!(prs[3].approvals, None, "no participants list: unknown");
+    }
+
+    #[test]
+    fn an_ai_reviewer_can_be_named_by_its_uuid() {
+        let out = r#"[{"id":1,"participants":[
+            {"user":{"uuid":"{B-1}","display_name":"Review Bot"},"approved":true}]}]"#;
+        let prs = parse_prs(out, "demo-api", &["b-1".to_owned()]).unwrap();
+        assert_eq!(prs[0].approvals.unwrap().ai, 1);
     }
 
     #[test]
@@ -522,12 +628,13 @@ mod tests {
         let prs = parse_prs(
             "[notice] cached credentials\n{\"values\":[{\"id\":4,\"title\":\"x\"}]}",
             "demo-api",
+            &[],
         )
         .unwrap();
         assert_eq!(prs.iter().map(|p| p.id).collect::<Vec<_>>(), [4]);
-        let prs = parse_prs("warn {x}\n[{\"id\":5}]", "demo-api").unwrap();
+        let prs = parse_prs("warn {x}\n[{\"id\":5}]", "demo-api", &[]).unwrap();
         assert_eq!(prs[0].id, 5);
-        assert!(parse_prs("[notice] only text", "demo-api").is_err());
+        assert!(parse_prs("[notice] only text", "demo-api", &[]).is_err());
     }
 
     #[test]

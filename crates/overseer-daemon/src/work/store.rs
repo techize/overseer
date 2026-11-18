@@ -227,6 +227,7 @@ async fn read_target(
     repo: &str,
     target: &PrTarget,
     vars: &Vars,
+    ai_reviewers: &[String],
 ) -> Result<Vec<PullRequest>, String> {
     let out = match (reader, target) {
         (PrReader::Command(cmd), PrTarget::Folder(dir)) => {
@@ -249,7 +250,7 @@ async fn read_target(
             run_blocking_for("Bitbucket", move || api.open_prs(&token, &ws, &slug)).await?
         }
     };
-    parse_prs(&out, repo)
+    parse_prs(&out, repo, ai_reviewers)
 }
 
 /// The workspace and slug of `dir`'s `origin` remote. A missing folder
@@ -318,6 +319,8 @@ pub struct WorkStore {
     pr_repos_command: Vec<String>,
     /// Lowercased and trimmed; empty keeps every author.
     pr_author: String,
+    /// Accounts whose approvals count as AI.
+    ai_reviewers: Arc<[String]>,
     /// Which board stage each Jira status belongs to.
     stages: Stages,
     beads_poll: Duration,
@@ -387,6 +390,7 @@ async fn poll_prs(
     reader: &PrReader,
     targets: &[(String, PrTarget)],
     vars: Arc<Vars>,
+    ai_reviewers: Arc<[String]>,
 ) -> Vec<Result<Vec<PullRequest>, String>> {
     let mut results: Vec<Option<Result<Vec<PullRequest>, String>>> =
         targets.iter().map(|_| None).collect();
@@ -398,9 +402,15 @@ async fn poll_prs(
             let Some((i, (repo, target))) = next.next() else {
                 break;
             };
-            let (reader, repo, target, vars) =
-                (reader.clone(), repo.clone(), target.clone(), vars.clone());
-            running.spawn(async move { (i, read_target(&reader, &repo, &target, &vars).await) });
+            let (reader, repo, target, vars, ai) = (
+                reader.clone(),
+                repo.clone(),
+                target.clone(),
+                vars.clone(),
+                ai_reviewers.clone(),
+            );
+            running
+                .spawn(async move { (i, read_target(&reader, &repo, &target, &vars, &ai).await) });
         }
         match running.join_next().await {
             Some(Ok((i, read))) => results[i] = Some(read),
@@ -547,6 +557,7 @@ impl WorkStore {
             pr_active_days: cfg.pr_active_days,
             pr_repos_command: cfg.pr_repos_command.clone(),
             pr_author: cfg.pr_author.trim().to_lowercase(),
+            ai_reviewers: cfg.ai_reviewers.clone().into(),
             stages: Stages::from_config(cfg),
             beads_poll: Duration::from_secs(cfg.beads_poll_secs.max(1)),
             jira_poll: Duration::from_secs(cfg.jira_poll_secs.max(1)),
@@ -874,7 +885,7 @@ impl WorkStore {
                 };
                 let repos_error = self.read_repo_list(&reader, &vars).await;
                 let targets = self.pr_targets(unix_now());
-                let got = poll_prs(&reader, &targets, vars).await;
+                let got = poll_prs(&reader, &targets, vars, self.ai_reviewers.clone()).await;
                 let now = unix_now();
                 let mut cache = self.cache();
                 let mut errors = Vec::new();
@@ -2431,7 +2442,7 @@ esac"#,
             [
                 "/2.0/repositories/demo-ws?pagelen=100&sort=-updated_on&q=project.key%3D%22DEMO%22",
                 "/2.0/repositories/demo-ws?page=2",
-                "/2.0/repositories/demo-ws/demo-api/pullrequests?state=OPEN&pagelen=50",
+                "/2.0/repositories/demo-ws/demo-api/pullrequests?state=OPEN&pagelen=50&fields=%2Bvalues.participants",
             ]
         );
         // base64("demo@example.test:bb-tok")
@@ -2470,7 +2481,7 @@ esac"#,
         assert_eq!(seen.len(), 1);
         assert_eq!(
             seen[0].path,
-            "/2.0/repositories/demo-ws/demo-web/pullrequests?state=OPEN&pagelen=50"
+            "/2.0/repositories/demo-ws/demo-web/pullrequests?state=OPEN&pagelen=50&fields=%2Bvalues.participants"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
