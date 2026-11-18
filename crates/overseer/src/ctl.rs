@@ -201,7 +201,8 @@ pub enum SettingsCmd {
 #[derive(Subcommand)]
 pub enum RelayCmd {
     /// Drop a pending relay unsent: the one with <id> (as `ctl locks`
-    /// shows it), or with `--to` every one queued for that slot.
+    /// shows it), or with `--to` every one queued for that slot. Inside a
+    /// session ($OVERSEER_SLOT set) only relays that session sent.
     #[command(group(clap::ArgGroup::new("which").required(true).args(["id", "to"])))]
     Drop {
         id: Option<i64>,
@@ -331,7 +332,7 @@ fn parse_slot(text: &str) -> anyhow::Result<SlotId> {
 }
 
 /// Cut to `max` chars on one line, with `...` when cut.
-fn cut(text: &str, max: usize) -> String {
+pub(crate) fn cut(text: &str, max: usize) -> String {
     let line = text.lines().next().unwrap_or("");
     if line.chars().count() > max || text.lines().count() > 1 {
         let head: String = line.chars().take(max.saturating_sub(3)).collect();
@@ -595,12 +596,14 @@ pub fn format_work(v: &WorkView) -> Vec<String> {
 }
 
 /// `5m`, or `2h` from an hour on.
-fn short_age(secs: i64) -> String {
+pub(crate) fn short_age(secs: i64) -> String {
     let mins = secs.max(0) / 60;
     if mins < 60 {
         format!("{mins}m")
-    } else {
+    } else if mins < 24 * 60 {
         format!("{}h", mins / 60)
+    } else {
+        format!("{}d", mins / (24 * 60))
     }
 }
 
@@ -1188,7 +1191,11 @@ pub async fn run(cmd: CtlCmd) -> anyhow::Result<()> {
             action: RelayCmd::Drop { id, to },
         } => print_text_or_queued(
             client
-                .request(Request::DropRelays { from: None, id, to })
+                .request(Request::DropRelays {
+                    from: env_slot(),
+                    id,
+                    to,
+                })
                 .await?,
         ),
         CtlCmd::ForceRelease { target } => print_text_or_queued(
@@ -1519,6 +1526,15 @@ mod tests {
         assert!(wants_stdin(&v(&["create", "--body-file=-"])));
         assert!(!wants_stdin(&v(&["list"])));
         assert!(!wants_stdin(&v(&["create", "--title", "a-b", "-x"])));
+    }
+
+    #[test]
+    fn short_age_counts_minutes_hours_and_days() {
+        assert_eq!(short_age(59), "0m");
+        assert_eq!(short_age(32 * 60), "32m");
+        assert_eq!(short_age(5 * 3600), "5h");
+        assert_eq!(short_age(3 * 86_400), "3d");
+        assert_eq!(short_age(-30), "0m");
     }
 
     #[test]

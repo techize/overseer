@@ -565,12 +565,12 @@ fn format_locks_for(view: &overseer_proto::LockView, slot: SlotId, now: i64) -> 
                 && r.state == overseer_proto::RelayState::Pending
         })
         .map(|r| {
-            let mins = (now - r.at).max(0) / 60;
-            let line = r.text.lines().next().unwrap_or("");
             format!(
-                "relay #{} to {}, pending {mins}m: {line}",
+                "relay #{} to {}, pending {}: {}",
                 r.id,
-                slot_name(r.to)
+                slot_name(r.to),
+                crate::ctl::short_age(now - r.at),
+                crate::ctl::cut(&r.text, 80)
             )
         })
         .collect();
@@ -624,21 +624,20 @@ fn call_tool(params: &Value, slot: Option<SlotId>, call: &mut Call) -> Result<Va
         Some(_) => return Err("`arguments` must be an object".into()),
     };
     let ToolPlan::Send(req) = tool_request(name, args, slot)?;
-    if slot.is_none() {
+    let Some(slot) = slot else {
         if name == "update_current_session" {
             return Ok(tool_result(NEEDS_A_SLOT, true));
         }
         return Ok(tool_result(NOT_IN_A_SLOT, true));
-    }
+    };
     Ok(match call(req) {
         Err(reason) => tool_result(format!("Overseer is not reachable: {reason}"), true),
         Ok(Response::Error { message }) => tool_result(message, true),
         Ok(Response::Text { text }) => tool_result(text, false),
         Ok(Response::Queued { message }) => tool_result(message, false),
-        Ok(Response::Locks(view)) => tool_result(
-            format_locks_for(&view, slot.unwrap_or(0), crate::ctl::now_secs()),
-            false,
-        ),
+        Ok(Response::Locks(view)) => {
+            tool_result(format_locks_for(&view, slot, crate::ctl::now_secs()), false)
+        }
         Ok(Response::Board(view)) => tool_result(
             crate::ctl::format_board(&view, crate::ctl::now_secs(), &crate::ctl::user_name()),
             false,
@@ -1319,8 +1318,15 @@ mod tests {
         };
         assert_eq!(
             format_locks_for(&v, 0, 100 + 5 * 60),
-            "No targets are held.\nYour pending relays:\nrelay #7 to S2, pending 5m: status?"
+            "No targets are held.\nYour pending relays:\nrelay #7 to S2, pending 5m: status?..."
         );
+        // The same ages as ctl and the GUI: hours, then days.
+        assert!(
+            format_locks_for(&v, 0, 100 + 5 * 3600).ends_with("pending 5h: status?..."),
+            "{}",
+            format_locks_for(&v, 0, 100 + 5 * 3600)
+        );
+        assert!(format_locks_for(&v, 0, 100 + 3 * 86_400).ends_with("pending 3d: status?..."));
         assert_eq!(format_locks_for(&v, 3, 400), "No targets are held.");
     }
 

@@ -753,6 +753,48 @@ fn send_queues_a_relay() {
 }
 
 #[test]
+fn relay_drop_in_a_session_drops_only_its_own() {
+    let env = Env::new();
+    for slot in ["0", "3"] {
+        env.ctl(&["start", slot, "--cwd", "/tmp", "--", "/bin/sleep", "30"])
+            .assert()
+            .success();
+    }
+    env.ctl(&["send", "3", "status?"])
+        .env("OVERSEER_SLOT", "S0")
+        .assert()
+        .success();
+    env.ctl(&["send", "3", "hello"]).assert().success();
+    let out = env
+        .ctl(&["relay", "drop", "2"])
+        .env("OVERSEER_SLOT", "S0")
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("relay 2 was not sent by S0; a session can only drop relays it sent"),
+        "{err}"
+    );
+    assert_eq!(
+        stdout_of(
+            env.ctl(&["relay", "drop", "--to", "S3"])
+                .env("OVERSEER_SLOT", "S0")
+        ),
+        "Dropped 1 relay you sent to S3.\n"
+    );
+    let out = stdout_of(&mut env.ctl(&["locks"]));
+    let lines: Vec<_> = out.lines().filter(|l| l.starts_with("relay")).collect();
+    assert_eq!(lines.len(), 2, "{out}");
+    assert!(lines[0].starts_with("relay #2  S3  pending"), "{out}");
+    assert_eq!(
+        lines[1], "relay #1  S3  dropped: dropped by S0  status?",
+        "{out}"
+    );
+}
+
+#[test]
 fn relay_drop_by_id_and_by_slot() {
     let env = Env::new();
     env.ctl(&["start", "3", "--cwd", "/tmp", "--", "/bin/sleep", "30"])
