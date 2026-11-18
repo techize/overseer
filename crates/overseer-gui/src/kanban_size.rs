@@ -1,5 +1,5 @@
 //! The kanban's height on the board: by default it fills the space left
-//! below the session cards; dragging its top edge sets a fixed height,
+//! below the session cards; dragging its bottom edge sets a fixed height,
 //! kept as `kanban_height` in `<state dir>/gui.toml`; a double click on the
 //! edge goes back to filling.
 
@@ -42,9 +42,10 @@ pub fn save_to(path: &Path, height: Option<f32>) -> std::io::Result<()> {
 }
 
 /// The height while dragging: the pointer moved from `start_y` to `y`
-/// (up is taller), starting at `start_h`, kept within `MIN..=max`.
+/// (down is taller, as the handle is the bottom edge), starting at
+/// `start_h`, kept within `MIN..=max`.
 pub fn dragged(start_h: f32, start_y: f32, y: f32, max: f32) -> f32 {
-    (start_h + start_y - y).clamp(MIN, max.max(MIN))
+    (start_h + y - start_y).clamp(MIN, max.max(MIN))
 }
 
 #[cfg(test)]
@@ -52,12 +53,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dragging_up_grows_and_stays_in_bounds() {
-        assert_eq!(dragged(300., 500., 450., 800.), 350.);
-        assert_eq!(dragged(300., 500., 600., 800.), 200.);
-        assert_eq!(dragged(300., 500., 900., 800.), MIN);
-        assert_eq!(dragged(300., 500., -900., 800.), 800.);
-        assert_eq!(dragged(300., 500., 450., 100.), MIN);
+    fn dragging_down_grows_and_stays_in_bounds() {
+        assert_eq!(dragged(300., 500., 550., 800.), 350.);
+        assert_eq!(dragged(300., 500., 400., 800.), 200.);
+        assert_eq!(dragged(300., 500., 500., 800.), 300.);
+        assert_eq!(dragged(300., 500., -900., 800.), MIN);
+        assert_eq!(dragged(300., 500., 1900., 800.), 800.);
+        assert_eq!(dragged(300., 500., 550., 100.), MIN);
     }
 
     #[test]
