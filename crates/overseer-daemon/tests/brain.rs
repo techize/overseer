@@ -943,6 +943,13 @@ async fn a_bd_sync_owed_at_a_restart_still_runs() {
     let _after = v.service(ledger.clone(), v.options());
     until("bd sync", || v.log("bd.log").len() == 2).await;
     assert!(v.log("bd.log")[1].ends_with("|sync"));
+    // The fake bd logs while it runs, and the owed row clears only once the
+    // sync returns. Wait for the row too, or the drop below can cancel the
+    // drain in between and the third start rightly syncs again.
+    until("owed cleared", || {
+        matches!(ledger.brain_run("bd_pending"), Ok(Some((_, false, _))))
+    })
+    .await;
     // Run, so no longer owed: a third start syncs nothing.
     drop(_after);
     let _again = v.service(ledger, v.options());
