@@ -938,8 +938,9 @@ impl WorkStore {
     }
 
     /// Writes the active sprint's tickets into the owned notes folder, off
-    /// the async thread. Only for an owned folder with an active sprint; an
-    /// error is logged and costs nothing else.
+    /// the async thread. Only for an owned folder with an active sprint, and
+    /// only tickets the board lists in that sprint; an error is logged and
+    /// costs nothing else.
     async fn sync_notes(&self) {
         if !self.notes_owned {
             return;
@@ -948,7 +949,12 @@ impl WorkStore {
             return;
         };
         let (dir, site) = (self.brain_dir.clone(), self.jira_site.clone());
-        let (name, tickets) = (sprint_folder_name(&sprint.name), self.tickets());
+        let tickets: Vec<Ticket> = self
+            .tickets()
+            .into_iter()
+            .filter(|t| sprint.keys.contains(&t.key))
+            .collect();
+        let name = sprint_folder_name(&sprint.name);
         let done = tokio::task::spawn_blocking(move || {
             crate::notes::sync_sprint(&dir, &name, &tickets, &site, unix_now())
         })
@@ -2844,6 +2850,8 @@ esac"#,
         assert_eq!(s.view().sprint.as_deref(), Some("No active sprint"));
         assert_eq!(s.view().sprint_day, None);
         let long_ago = ActiveSprint {
+            id: 1,
+            keys: Default::default(),
             name: "DEMO Sprint 26-01".into(),
             start: ymd(2020, 1, 6),
             end: ymd(2020, 1, 17),
@@ -2894,6 +2902,8 @@ esac"#,
             st.jira = JiraSource::Api(Arc::new(api));
         }
         let sprint = ActiveSprint {
+            id: 1,
+            keys: Default::default(),
             name: "DEMO Sprint 26-01".into(),
             start: ymd(2020, 1, 6),
             end: ymd(2020, 1, 17),
@@ -2921,6 +2931,44 @@ esac"#,
         assert!(v.items.iter().any(|i| i.key == "DEMO-1"));
         assert_eq!(s.active_sprint(), Some(sprint));
         assert_eq!(v.sprint, header);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_notes_sync_skips_tickets_outside_the_sprint() {
+        let dir = temp_dir("sprint-scope");
+        crate::notes::ensure_owned(&dir, "Demo").unwrap();
+        let s = store_with(|c| {
+            c.brain_dir = dir.clone();
+            c.notes_owned = true;
+        });
+        let ticket = |key: &str| Ticket {
+            key: key.into(),
+            title: format!("Work {key}"),
+            status: "To Do".into(),
+            priority: None,
+        };
+        {
+            let mut c = s.cache();
+            c.tickets = vec![ticket("DEMO-1"), ticket("DEMO-2")];
+            c.active_sprint = Some(ActiveSprint {
+                id: 4,
+                name: "DEMO Sprint 26-01".into(),
+                start: ymd(2026, 11, 16),
+                end: ymd(2026, 11, 27),
+                keys: ["DEMO-1".to_owned()].into(),
+            });
+        }
+        s.sync_notes().await;
+        let sprint = dir
+            .join("Sprints")
+            .join(sprint_folder_name("DEMO Sprint 26-01"));
+        let names: Vec<String> = std::fs::read_dir(&sprint)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 1, "{names:?}");
+        assert!(names[0].starts_with("DEMO-1"), "{names:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

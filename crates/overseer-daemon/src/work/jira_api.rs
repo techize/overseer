@@ -5,6 +5,7 @@
 //! code runs them through [`run_blocking`]. The token is passed per call and
 //! never stored, logged or put in an error.
 
+use std::collections::BTreeSet;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -32,9 +33,12 @@ pub const API_TIMEOUT: Duration = Duration::from_secs(60);
 /// The board's running sprint.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActiveSprint {
+    pub id: u64,
     pub name: String,
     pub start: Ymd,
     pub end: Ymd,
+    /// The keys of every issue in the sprint, from the board.
+    pub keys: BTreeSet<String>,
 }
 
 /// A Jira Cloud client for one site, account and board.
@@ -159,21 +163,50 @@ impl JiraApi {
         Ok(out)
     }
 
-    /// The board's active sprint, or `None` when it has none. Blocking.
+    /// The board's active sprint with the keys of its issues, or `None`
+    /// when it has none. Blocking.
     pub fn active_sprint(&self, token: &str) -> Result<Option<ActiveSprint>, String> {
         let url = self.jira_url(&format!(
             "rest/agile/1.0/board/{}/sprint?state=active",
             self.board
         ))?;
-        let text = read(
+        let Some(mut sprint) = parse_active_sprint(&self.get(&url, token)?)? else {
+            return Ok(None);
+        };
+        sprint.keys = self.sprint_keys(token, sprint.id)?;
+        Ok(Some(sprint))
+    }
+
+    /// The keys of every issue in sprint `id`, page by page.
+    fn sprint_keys(&self, token: &str, id: u64) -> Result<BTreeSet<String>, String> {
+        let mut keys = BTreeSet::new();
+        let mut start = 0usize;
+        for _ in 0..MAX_PAGES {
+            let url = self.jira_url(&format!(
+                "rest/agile/1.0/sprint/{id}/issue?fields=summary&maxResults={PAGE_SIZE}&startAt={start}"
+            ))?;
+            let (page, total) = parse_sprint_issues(&self.get(&url, token)?)?;
+            start += page.len();
+            let done = page.is_empty() || total.is_some_and(|t| start >= t);
+            keys.extend(page);
+            if done {
+                return Ok(keys);
+            }
+        }
+        tracing::warn!("jira: sprint {id} issues stopped after {MAX_PAGES} pages");
+        Ok(keys)
+    }
+
+    /// A GET's body. Blocking.
+    fn get(&self, url: &str, token: &str) -> Result<String, String> {
+        read(
             self.agent
                 .0
-                .get(&url)
+                .get(url)
                 .set("Authorization", &self.auth(token))
                 .set("Accept", "application/json")
                 .call(),
-        )?;
-        parse_active_sprint(&text)
+        )
     }
 }
 
@@ -230,12 +263,29 @@ pub fn parse_active_sprint(json: &str) -> Result<Option<ActiveSprint>, String> {
         .iter()
         .filter_map(|s| {
             Some(ActiveSprint {
+                id: s.get("id")?.as_u64()?,
                 name: s.get("name")?.as_str()?.to_owned(),
                 start: date_of(s, "startDate")?,
                 end: date_of(s, "endDate")?,
+                keys: BTreeSet::new(),
             })
         })
         .max_by_key(|s| s.start))
+}
+
+/// One page of a sprint's issues: their keys and the `total` Jira reports.
+pub fn parse_sprint_issues(json: &str) -> Result<(Vec<String>, Option<usize>), String> {
+    let v: Value = serde_json::from_str(json).map_err(|e| format!("jira sprint issues: {e}"))?;
+    let issues = v
+        .get("issues")
+        .and_then(Value::as_array)
+        .ok_or("jira sprint issues: no issues list")?;
+    let keys = issues
+        .iter()
+        .filter_map(|i| i.get("key")?.as_str().map(str::to_owned))
+        .collect();
+    let total = v.get("total").and_then(Value::as_u64).map(|t| t as usize);
+    Ok((keys, total))
 }
 
 /// Run a blocking Jira call off the async runtime, giving up after
@@ -444,18 +494,44 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn active_sprint_asks_the_board() {
-        let body = r#"{"values":[{"name":"Sprint 42",
+    fn active_sprint_asks_the_board_then_lists_its_issues() {
+        let body = r#"{"values":[{"id":42,"name":"Sprint 42",
             "startDate":"2026-11-17T09:00:00.000Z","endDate":"2026-11-28T17:00:00.000Z"}]}"#;
-        let (base, rx) = fake(vec![(200, body.into())]);
+        let page1 = r#"{"startAt":0,"maxResults":100,"total":3,"issues":[{"key":"DEMO-1"},{"key":"DEMO-2"}]}"#;
+        let page2 = r#"{"startAt":2,"maxResults":100,"total":3,"issues":[{"key":"DEMO-9"}]}"#;
+        let (base, rx) = fake(vec![
+            (200, body.into()),
+            (200, page1.into()),
+            (200, page2.into()),
+        ]);
         let s = api(&base).active_sprint("tok").unwrap().unwrap();
-        assert_eq!(s.name, "Sprint 42");
-        let seen = rx.recv().unwrap();
-        assert_eq!(seen.method, "GET");
+        assert_eq!((s.id, s.name.as_str()), (42, "Sprint 42"));
         assert_eq!(
-            seen.path,
-            "/ex/jira/demo-cloud/rest/agile/1.0/board/7/sprint?state=active"
+            s.keys.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["DEMO-1", "DEMO-2", "DEMO-9"]
         );
+        let paths: Vec<_> = rx.try_iter().map(|s| (s.method, s.path)).collect();
+        let get = |p: &str| {
+            (
+                "GET".to_owned(),
+                format!("/ex/jira/demo-cloud/rest/agile/1.0/{p}"),
+            )
+        };
+        assert_eq!(
+            paths,
+            [
+                get("board/7/sprint?state=active"),
+                get("sprint/42/issue?fields=summary&maxResults=100&startAt=0"),
+                get("sprint/42/issue?fields=summary&maxResults=100&startAt=2"),
+            ]
+        );
+    }
+
+    #[test]
+    fn no_active_sprint_lists_no_issues() {
+        let (base, rx) = fake(vec![(200, r#"{"values":[]}"#.into())]);
+        assert_eq!(api(&base).active_sprint("tok").unwrap(), None);
+        assert_eq!(rx.try_iter().count(), 1);
     }
 
     #[test]
