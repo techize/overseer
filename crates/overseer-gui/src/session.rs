@@ -296,7 +296,14 @@ pub fn reopen(
     let same = prev.filter(|p| p.slot == slot && p.key == key);
     let kept = same
         .filter(|p| refresh && matches!(p.state, DetailState::Loaded(_)))
-        .map(|p| p.state.clone());
+        .map(|p| match &p.state {
+            // The old failure is over once a new fetch starts.
+            DetailState::Loaded(d) => DetailState::Loaded(ItemDetail {
+                error: None,
+                ..d.clone()
+            }),
+            other => other.clone(),
+        });
     OpenDetail {
         slot,
         key: key.to_string(),
@@ -3103,6 +3110,26 @@ mod tests {
         let o = reopen(Some(&prev), 2, "DEMO-1", 3, false);
         assert_eq!(o.state, DetailState::Loading);
         assert!(!o.refreshing);
+    }
+
+    #[test]
+    fn a_refresh_clears_the_old_error_on_the_kept_copy() {
+        let view = demo_view(vec![demo_item("DEMO-1", Some(2))]);
+        let mut d = demo_detail("DEMO-1");
+        d.body = Some("Kept body".into());
+        d.error = Some("acli failed".into());
+        let prev = open("DEMO-1", DetailState::Loaded(d));
+        let o = reopen(Some(&prev), 2, "DEMO-1", 2, true);
+        assert!(o.refreshing);
+        match &o.state {
+            DetailState::Loaded(kept) => {
+                assert_eq!(kept.error, None);
+                assert_eq!(kept.body.as_deref(), Some("Kept body"));
+            }
+            other => panic!("expected Loaded, got {other:?}"),
+        }
+        let m = detail_model(&o, &view, 100, None);
+        assert_eq!(m.notice, None);
     }
 
     #[test]

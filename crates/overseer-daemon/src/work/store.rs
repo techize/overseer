@@ -10,7 +10,8 @@
 //! both win.
 //!
 //! Lock order: `change_turn`, then the ledger's lock, then the cache's.
-//! None is held across an await.
+//! None is held across an await. `detail_cache` and `detail_inflight` are
+//! never held together, nor with any of the above.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};

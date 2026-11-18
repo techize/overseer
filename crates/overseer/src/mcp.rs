@@ -296,15 +296,23 @@ fn detail_text(d: &ItemDetail) -> String {
         out.push_str(&format!(" \u{b7} Stage: {}", stage.label()));
     }
     out.push_str("\n\n");
-    match (&d.error, &d.body) {
-        (Some(error), _) => {
+    let body = d.body.as_deref().filter(|b| !b.trim().is_empty());
+    let overview = d
+        .overview
+        .as_deref()
+        .map(|o| format!("From the folder overview: {o}"));
+    match (&d.error, body) {
+        (Some(error), Some(body)) => out.push_str(&format!(
+            "Could not fetch the description: {error}\n\nLast fetched copy:\n{body}"
+        )),
+        (Some(error), None) => {
             out.push_str(&format!("Could not fetch the description: {error}"));
-            if let Some(overview) = &d.overview {
-                out.push_str(&format!("\n\nFrom the folder overview: {overview}"));
+            if let Some(overview) = overview {
+                out.push_str(&format!("\n\n{overview}"));
             }
         }
         (None, Some(body)) => out.push_str(body),
-        (None, None) => out.push_str("No description"),
+        (None, None) => out.push_str(overview.as_deref().unwrap_or("No description")),
     }
     if let Some(notes) = &d.notes {
         out.push_str(&format!("\n\nNotes:\n{notes}"));
@@ -1053,6 +1061,48 @@ mod tests {
         assert_eq!(
             detail_text(&demo_detail()),
             "DEMO-12 Fix the login\nStatus: In Progress \u{b7} Priority: not set\n\nNo description"
+        );
+    }
+
+    #[test]
+    fn detail_text_keeps_the_last_good_copy_on_an_error() {
+        let d = ItemDetail {
+            error: Some("acli failed".into()),
+            body: Some("Login fails on retry.".into()),
+            overview: Some("A demo project.".into()),
+            ..demo_detail()
+        };
+        assert_eq!(
+            detail_text(&d),
+            "DEMO-12 Fix the login\nStatus: In Progress \u{b7} Priority: not set\n\nCould not fetch the description: acli failed\n\nLast fetched copy:\nLogin fails on retry."
+        );
+        let blank = ItemDetail {
+            body: Some("  \n".into()),
+            ..d
+        };
+        assert_eq!(
+            detail_text(&blank),
+            "DEMO-12 Fix the login\nStatus: In Progress \u{b7} Priority: not set\n\nCould not fetch the description: acli failed\n\nFrom the folder overview: A demo project."
+        );
+    }
+
+    #[test]
+    fn detail_text_falls_back_to_the_overview_without_an_error() {
+        let d = ItemDetail {
+            overview: Some("A demo project.".into()),
+            ..demo_detail()
+        };
+        assert_eq!(
+            detail_text(&d),
+            "DEMO-12 Fix the login\nStatus: In Progress \u{b7} Priority: not set\n\nFrom the folder overview: A demo project."
+        );
+        let blank = ItemDetail {
+            body: Some(" ".into()),
+            ..d
+        };
+        assert_eq!(
+            detail_text(&blank),
+            "DEMO-12 Fix the login\nStatus: In Progress \u{b7} Priority: not set\n\nFrom the folder overview: A demo project."
         );
     }
 
