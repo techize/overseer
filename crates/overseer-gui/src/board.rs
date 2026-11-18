@@ -434,6 +434,13 @@ pub fn strip_text(v: &BrainView) -> (String, Tone) {
     if let Some(why) = brain_failure(v) {
         return (format!("Notes: {why}"), Tone::NeedsYou);
     }
+    // Commits on both sides: no push lands until the folder is merged (#39).
+    if let Some(r) = v.remote.as_ref().filter(|r| r.ahead > 0 && r.behind > 0) {
+        return (
+            format!("Notes: {} ahead, {} behind its remote", r.ahead, r.behind),
+            Tone::NeedsYou,
+        );
+    }
     let queued = v
         .entries
         .iter()
@@ -482,6 +489,27 @@ fn brain_failure(v: &BrainView) -> Option<String> {
         .as_ref()
         .filter(|r| !r.ok)
         .map(|r| short("sync", &r.detail))
+}
+
+/// The notes folder against its remote, first in the strip's list:
+/// `Remote: 3 ahead, 0 behind at 09:41; last push 09:12`.
+pub fn remote_line(v: &BrainView) -> Option<String> {
+    let r = v.remote.as_ref()?;
+    let mut line = format!(
+        "Remote: {} ahead, {} behind at {}",
+        r.ahead,
+        r.behind,
+        local_hhmm(r.checked_at)
+    );
+    match &v.last_push {
+        Some(p) if p.ok => line.push_str(&format!("; last push {}", local_hhmm(p.at))),
+        Some(p) => line.push_str(&format!("; last push failed {}", local_hhmm(p.at))),
+        None => line.push_str("; no push yet"),
+    }
+    if let Some(e) = &r.fetch_error {
+        line.push_str(&format!("; fetch failed: {}", one_line(e, 60)));
+    }
+    Some(line)
 }
 
 /// One line of the strip's list: `09:41 S1  Sessions/.../s1-demo.md  committed, pushed`.
@@ -1088,6 +1116,7 @@ impl OverseerApp {
                             .clone()
                             .map(|p| div().text_color(rgb(colors::ORANGE)).child(p)),
                     )
+                    .children(remote_line(&self.brain).map(|l| div().truncate().child(l)))
                     .children(
                         self.brain
                             .entries
@@ -1357,6 +1386,8 @@ mod tests {
 
     fn brain(entries: Vec<QueueEntry>) -> BrainView {
         BrainView {
+            remote: None,
+            last_push: None,
             on: true,
             entries,
             last_backup: None,
@@ -1489,6 +1520,51 @@ mod tests {
         assert_eq!(text, "Notes: writer off");
         assert_eq!(tone, Tone::Empty);
         assert_eq!(tone_color(tone), colors::GREY);
+    }
+
+    #[test]
+    fn strip_warns_of_a_diverged_folder_and_the_list_says_where_it_stands() {
+        let remote = |ahead, behind, fetch_error: Option<&str>| {
+            Some(overseer_proto::NotesRemote {
+                ahead,
+                behind,
+                checked_at: 100,
+                fetch_error: fetch_error.map(Into::into),
+            })
+        };
+        let mut v = brain(vec![q(1, 10, QueueState::Committed)]);
+        v.remote = remote(65, 4, None);
+        let (text, tone) = strip_text(&v);
+        assert_eq!(text, "Notes: 65 ahead, 4 behind its remote");
+        assert_eq!(tone, Tone::NeedsYou);
+        assert_eq!(
+            remote_line(&v).unwrap(),
+            format!(
+                "Remote: 65 ahead, 4 behind at {}; no push yet",
+                local_hhmm(100)
+            )
+        );
+        // Only ahead, or only behind, is not a problem by itself.
+        v.remote = remote(3, 0, None);
+        assert_eq!(strip_text(&v).1, Tone::Idle);
+        v.remote = remote(0, 2, None);
+        assert_eq!(strip_text(&v).1, Tone::Idle);
+        v.last_push = Some(BrainRun {
+            at: 90,
+            ok: true,
+            detail: String::new(),
+        });
+        v.remote = remote(0, 0, Some("could not resolve host"));
+        assert_eq!(
+            remote_line(&v).unwrap(),
+            format!(
+                "Remote: 0 ahead, 0 behind at {}; last push {}; fetch failed: could not resolve host",
+                local_hhmm(100),
+                local_hhmm(90)
+            )
+        );
+        v.remote = None;
+        assert_eq!(remote_line(&v), None);
     }
 
     #[test]

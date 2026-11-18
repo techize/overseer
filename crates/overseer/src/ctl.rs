@@ -486,7 +486,20 @@ pub fn format_brain(v: &BrainView) -> Vec<String> {
         ),
         run("backup", &v.last_backup),
         run("sync", &v.last_sync),
+        run("push", &v.last_push),
     ];
+    if let Some(r) = &v.remote {
+        let mut line = format!(
+            "remote  {} ahead  {} behind  checked {}",
+            r.ahead,
+            r.behind,
+            local_hhmm(r.checked_at)
+        );
+        if let Some(e) = &r.fetch_error {
+            line.push_str(&format!("  fetch failed: {e}"));
+        }
+        out.push(line);
+    }
     if let Some(p) = &v.push_problem {
         out.push(format!("push problem  {p}"));
     }
@@ -1250,6 +1263,42 @@ pub async fn run(cmd: CtlCmd) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn brain_summary_says_where_the_folder_stands_against_its_remote() {
+        let v = BrainView {
+            on: true,
+            entries: vec![],
+            last_backup: None,
+            last_sync: None,
+            push_problem: None,
+            brain_dir: None,
+            notes_dir: None,
+            remote: Some(overseer_proto::NotesRemote {
+                ahead: 65,
+                behind: 4,
+                checked_at: 100,
+                fetch_error: Some("could not resolve host".into()),
+            }),
+            last_push: Some(BrainRun {
+                at: 90,
+                ok: true,
+                detail: String::new(),
+            }),
+        };
+        let lines = format_brain(&v);
+        assert!(
+            lines.contains(&format!("last push  {}  ok", local_hhmm(90))),
+            "{lines:?}"
+        );
+        assert!(
+            lines.contains(&format!(
+                "remote  65 ahead  4 behind  checked {}  fetch failed: could not resolve host",
+                local_hhmm(100)
+            )),
+            "{lines:?}"
+        );
+    }
 
     #[test]
     fn settings_lines_group_keys_and_show_errors() {

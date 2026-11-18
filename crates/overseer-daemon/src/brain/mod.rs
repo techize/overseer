@@ -18,8 +18,8 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use overseer_proto::msg::{
-    BashCheck, BrainRun, BrainView, Event, QueueEntry, QueueState, Response, Sender, SlotId,
-    WriteCheck,
+    BashCheck, BrainRun, BrainView, Event, NotesRemote, QueueEntry, QueueState, Response, Sender,
+    SlotId, WriteCheck,
 };
 use tokio::sync::{broadcast, oneshot, Notify, OwnedMutexGuard};
 use tokio::time::Instant;
@@ -47,6 +47,9 @@ const MAX_ATTEMPTS: i64 = 4;
 const RECENT: usize = 20;
 /// The longest the worker sleeps with nothing due.
 const IDLE: Duration = Duration::from_secs(60);
+/// How often the notes folder is fetched and counted against its upstream,
+/// so a folder that stops pushing shows within minutes (#39).
+const REMOTE_CHECK: Duration = Duration::from_secs(10 * 60);
 /// How long a caller waits for its entry before being told it is still queued.
 const REPLY_WAIT: Duration = Duration::from_secs(600);
 const BD_TIMEOUT: Duration = Duration::from_secs(120);
@@ -146,6 +149,9 @@ pub struct BrainOptions {
     pub home: PathBuf,
     /// The overseer binary a rewritten `bd` write runs (`<program> ctl bd`).
     pub program: PathBuf,
+    /// Time between fetches that check the folder against its upstream;
+    /// `None` turns the check off.
+    pub remote_check: Option<Duration>,
 }
 
 impl BrainOptions {
@@ -160,6 +166,7 @@ impl BrainOptions {
                 .map(PathBuf::from)
                 .unwrap_or_default(),
             program: PathBuf::from("overseer"),
+            remote_check: Some(REMOTE_CHECK),
         }
     }
 }
@@ -209,6 +216,8 @@ struct Runtime {
     recovering: HashSet<i64>,
     /// Commits found by trailer that may not have been pushed.
     need_push: bool,
+    next_remote_check: Option<Instant>,
+    remote: Option<NotesRemote>,
 }
 
 pub struct BrainService {
@@ -265,6 +274,8 @@ impl BrainService {
         let rt = Runtime {
             push_problem,
             next_backup: opts.backup.map(|d| Instant::now() + d),
+            // The first check runs at the first tick.
+            next_remote_check: opts.remote_check.map(|_| Instant::now()),
             bd_sync_pending,
             last_change: bd_sync_pending.then(Instant::now),
             ..Runtime::default()
@@ -307,6 +318,8 @@ impl BrainService {
             push_problem: None,
             brain_dir: None,
             notes_dir: notes_dir.is_dir().then(|| notes_dir.to_path_buf()),
+            remote: None,
+            last_push: None,
         }
     }
 
@@ -347,6 +360,12 @@ impl BrainService {
                 .flatten()
                 .map(|(at, ok, detail)| BrainRun { at, ok, detail })
         };
+        // One lock: a second `self.rt()` in the literal would wait on the
+        // first, which lives to the end of the statement.
+        let (push_problem, remote) = {
+            let rt = self.rt();
+            (rt.push_problem.clone(), rt.remote.clone())
+        };
         BrainView {
             on: true,
             entries: self.ledger.queue_recent(RECENT).unwrap_or_else(|e| {
@@ -355,9 +374,11 @@ impl BrainService {
             }),
             last_backup: run("backup"),
             last_sync: run("sync"),
-            push_problem: self.rt().push_problem.clone(),
+            push_problem,
             brain_dir: Some(self.cfg.brain.clone()),
             notes_dir: Some(self.cfg.brain.clone()),
+            remote,
+            last_push: run("push"),
         }
     }
 
@@ -1048,6 +1069,17 @@ impl BrainService {
                 None => {}
             }
         }
+        let check_due = self.rt().next_remote_check;
+        if let (Some(at), Some(every)) = (check_due, self.opts.remote_check) {
+            let now = Instant::now();
+            if at <= now {
+                self.check_remote().await;
+                self.rt().next_remote_check = Some(Instant::now() + every);
+                wait = wait.min(every);
+            } else {
+                wait = wait.min(at - now);
+            }
+        }
         let backup_due = self.rt().next_backup;
         if let (Some(at), Some(every)) = (backup_due, self.opts.backup) {
             let now = Instant::now();
@@ -1072,6 +1104,44 @@ impl BrainService {
             }
         }
         wait
+    }
+
+    /// Fetches, then counts the folder against its upstream for the board.
+    /// A failed fetch is reported with the counts from the refs as they
+    /// are. A folder with no upstream has nothing to show.
+    pub async fn check_remote(&self) {
+        let g = self.git.lock().await;
+        if !self.git.has_upstream(&g).await {
+            self.rt().remote = None;
+            drop(g);
+            self.announce();
+            return;
+        }
+        let fetch_error = self.git.fetch(&g).await.err().map(|e| e.to_string());
+        if let Some(e) = &fetch_error {
+            tracing::warn!("notes folder fetch failed: {e}");
+        }
+        self.count_remote(&g, fetch_error).await;
+        drop(g);
+        self.announce();
+    }
+
+    /// Recounts ahead and behind from the refs as they are.
+    async fn count_remote(&self, g: &VaultGuard<'_>, fetch_error: Option<String>) {
+        match self.git.ahead_behind(g).await {
+            Ok((ahead, behind)) => {
+                self.rt().remote = Some(NotesRemote {
+                    ahead,
+                    behind,
+                    checked_at: unix_now(),
+                    fetch_error,
+                });
+            }
+            Err(e) => {
+                tracing::warn!("notes folder upstream count failed: {e}");
+                self.rt().remote = None;
+            }
+        }
     }
 
     /// Commits the queued entries in order. Returns a wait when an entry
@@ -1411,14 +1481,19 @@ impl BrainService {
                 for e in self.ledger.queue_unpushed().unwrap_or_default() {
                     self.note_push(e.id, e.commit.as_deref(), true, None);
                 }
-                let had = {
+                {
                     let mut rt = self.rt();
                     rt.conflict_problem = false;
-                    rt.push_problem.take().is_some()
-                };
-                if had || id.is_none() {
-                    let _ = self.ledger.set_brain_run("push", now, true, "");
+                    rt.push_problem = None;
                 }
+                // The remote answered, so any fetch error has passed. The
+                // counts go first, so whoever sees the push sees them too.
+                if self.git.has_upstream(g).await {
+                    self.count_remote(g, None).await;
+                }
+                // Every good push is recorded: the board shows when the
+                // folder last reached its remote.
+                let _ = self.ledger.set_brain_run("push", now, true, "");
             }
             Err(err) => {
                 let line = match &err {

@@ -120,6 +120,7 @@ impl Vault {
 
     fn options(&self) -> BrainOptions {
         BrainOptions {
+            remote_check: None,
             drain: DRAIN,
             backup: None,
             retry: Duration::from_millis(100),
@@ -265,6 +266,69 @@ async fn session_commit_is_queued_committed_and_pushed() {
     let head = sh(&v.vault, &["rev-parse", "HEAD"]);
     assert_eq!(e.commit.as_deref(), Some(head.trim()));
     assert!(svc.view().on);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_board_hears_how_the_folder_stands_against_its_remote() {
+    let v = Vault::new("remote-health");
+    // Push off, as on a machine where another tool pushes (#39).
+    let (events, _) = broadcast::channel(256);
+    let cfg = Config {
+        push: false,
+        ..v.config()
+    };
+    let svc = BrainService::with_options(&cfg, Arc::new(Ledger::in_memory()), events, v.options())
+        .expect("writer is on");
+    write(&v.vault.join(S1_NOTE), "# S1\n");
+    let r = svc
+        .commit(
+            Sender::Slot { slot: 1 },
+            vec![S1_NOTE.into()],
+            "S1: note".into(),
+            &owners(),
+        )
+        .await;
+    assert!(text(&r).contains("committed"), "{r:?}");
+    svc.check_remote().await;
+    let remote = svc.view().remote.expect("checked");
+    assert_eq!((remote.ahead, remote.behind), (1, 0));
+    assert_eq!(remote.fetch_error, None);
+    assert_eq!(svc.view().last_push, None);
+
+    let other = v.base.join("other");
+    sh(
+        &v.base,
+        &[
+            "clone",
+            "-q",
+            v.remote.to_str().unwrap(),
+            other.to_str().unwrap(),
+        ],
+    );
+    sh(&other, &["config", "user.name", "Test"]);
+    sh(&other, &["config", "user.email", "test@example.com"]);
+    write(&other.join("other.md"), "o\n");
+    sh(&other, &["add", "-A"]);
+    sh(&other, &["commit", "-m", "other"]);
+    sh(&other, &["push", "-q"]);
+    svc.check_remote().await;
+    let remote = svc.view().remote.expect("checked");
+    assert_eq!((remote.ahead, remote.behind), (1, 1));
+    drop(svc);
+
+    // With push on, a good push is timed and the counts come back to 0 ahead.
+    let svc = v.service(Arc::new(Ledger::in_memory()), v.options());
+    write(&v.vault.join(S1_NOTE), "# S1 again\n");
+    svc.commit(
+        Sender::Slot { slot: 1 },
+        vec![S1_NOTE.into()],
+        "S1: again".into(),
+        &owners(),
+    )
+    .await;
+    until("the push", || svc.view().last_push.is_some_and(|p| p.ok)).await;
+    let remote = svc.view().remote.expect("counted after the push");
+    assert_eq!(remote.ahead, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
