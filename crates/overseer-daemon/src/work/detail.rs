@@ -111,9 +111,10 @@ pub struct IssueDetail {
     pub body: Option<String>,
 }
 
-fn json_from(out: &str, what: &str) -> Result<Value, String> {
+/// The first JSON value in `out`, starting at the first of `starts`.
+fn json_from(out: &str, what: &str, starts: &[char]) -> Result<Value, String> {
     let start = out
-        .find(['[', '{'])
+        .find(starts)
         .ok_or_else(|| format!("{what} output: no JSON found"))?;
     serde_json::Deserializer::from_str(&out[start..])
         .into_iter::<Value>()
@@ -134,7 +135,7 @@ fn named(v: Option<&Value>) -> Option<String> {
 /// Reads a Jira issue from the REST shape (fields under `fields`) or the flat
 /// shape acli prints, skipping any text before the first JSON.
 pub fn parse_issue_detail(out: &str) -> Result<IssueDetail, String> {
-    let v = json_from(out, "jira")?;
+    let v = json_from(out, "jira", &['{'])?;
     let f = v.get("fields").unwrap_or(&v);
     let title = f
         .get("summary")
@@ -167,7 +168,7 @@ fn non_empty(v: Option<&Value>) -> Option<&str> {
 
 /// Reads `bd show --json` output: an object, or an array holding it first.
 pub fn parse_bead_detail(out: &str) -> Result<BeadDetail, String> {
-    let v = json_from(out, "bd")?;
+    let v = json_from(out, "bd", &['[', '{'])?;
     let obj = match &v {
         Value::Array(a) => a.first().ok_or("bd output: empty list")?,
         other => other,
@@ -281,6 +282,10 @@ mod tests {
         assert_eq!(d.body.as_deref(), Some("plain"));
 
         let d = parse_issue_detail(&format!("Loading...\n{flat}")).unwrap();
+        assert_eq!(d.title, "T");
+
+        // A bracketed log prefix is not the start of the JSON.
+        let d = parse_issue_detail(&format!("[INFO] fetching DEMO-2\n{flat}")).unwrap();
         assert_eq!(d.title, "T");
 
         assert!(parse_issue_detail("not json").is_err());
