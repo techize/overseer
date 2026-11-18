@@ -680,7 +680,9 @@ pub(crate) fn queue_relay_on(
     queue_kind_on(conn, from, to, text, reply_to, &RelayKind::Note, now)
 }
 
-/// `queue_relay_on` for a relay of `kind`.
+/// `queue_relay_on` for a relay of `kind`. A plan's kickoff first drops any
+/// kickoff from another plan still pending for `to`: only the newest plan's
+/// stands.
 pub(crate) fn queue_kind_on(
     conn: &Connection,
     from: &Sender,
@@ -690,6 +692,20 @@ pub(crate) fn queue_kind_on(
     kind: &RelayKind,
     now: i64,
 ) -> Result<i64> {
+    if let RelayKind::Kickoff { plan } = kind {
+        conn.execute(
+            &format!(
+                "UPDATE relays SET dropped_at = ?3, drop_reason = ?4
+                 WHERE to_slot = ?1 AND kind = 'kickoff' AND ref IS NOT ?2 AND {PENDING}"
+            ),
+            params![
+                to,
+                plan.to_string(),
+                now,
+                format!("replaced by plan {plan}'s kickoff")
+            ],
+        )?;
+    }
     let (sender, from_slot) = sender_cols(from);
     let (kind, r) = relay_kind_cols(kind);
     conn.execute(
@@ -1517,6 +1533,67 @@ mod tests {
             assert!(texts(c, 2).is_empty());
             assert_eq!(texts(c, 3), vec!["d"]);
             assert_eq!(drop_relays_to_on(c, 2, "dropped by you", 22)?, 0);
+            Ok(())
+        })
+    }
+
+    fn kickoff(c: &Connection, to: SlotId, plan: i64, now: i64) -> i64 {
+        let text = format!("plan {plan} for S{to}");
+        queue_kind_on(
+            c,
+            &Sender::Overseer,
+            to,
+            &text,
+            None,
+            &RelayKind::Kickoff { plan },
+            now,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_newer_plans_kickoff_replaces_a_pending_one() {
+        with(|c| {
+            let old = kickoff(c, 2, 19, 10);
+            let note = queue_relay_on(c, &Sender::You, 2, "hello", None, 11)?;
+            let lock = queue_kind_on(
+                c,
+                &Sender::Overseer,
+                2,
+                "S1 has released custom:a. You now hold it.",
+                None,
+                &RelayKind::Lock {
+                    target: "custom:a".into(),
+                },
+                12,
+            )?;
+            let other_slot = kickoff(c, 3, 19, 13);
+            let new = kickoff(c, 2, 20, 20);
+            assert_eq!(
+                state_and_reason(c, old),
+                (
+                    RelayState::Dropped,
+                    Some(t("replaced by plan 20's kickoff"))
+                )
+            );
+            for id in [note, lock, other_slot, new] {
+                assert_eq!(state_and_reason(c, id), (RelayState::Pending, None), "{id}");
+            }
+            assert_eq!(relay_on(c, old)?.unwrap().dropped_at, Some(20));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn a_delivered_kickoff_and_the_same_plans_kickoff_stay() {
+        with(|c| {
+            let seen = kickoff(c, 2, 18, 10);
+            mark_delivered_on(c, &[seen], 11)?;
+            let first = kickoff(c, 2, 20, 12);
+            let again = kickoff(c, 2, 20, 13);
+            assert_eq!(state_and_reason(c, seen).0, RelayState::Delivered);
+            assert_eq!(state_and_reason(c, first).0, RelayState::Pending);
+            assert_eq!(state_and_reason(c, again).0, RelayState::Pending);
             Ok(())
         })
     }

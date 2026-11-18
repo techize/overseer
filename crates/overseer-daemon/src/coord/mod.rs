@@ -11,14 +11,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use overseer_proto::msg::{
-    slot_name, ActivityKind, CoordView, Event, ReportKind, Response, Sender, SlotId, SlotInfo,
-    SlotState,
+    slot_name, ActivityKind, CoordView, Event, RelayKind, ReportKind, Response, Sender, SlotId,
+    SlotInfo, SlotState,
 };
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
 use crate::ledger::Ledger;
-use crate::locks::table::queue_relay_on;
+use crate::locks::table::queue_kind_on;
 use crate::locks::{local_hhmm, LockService};
 use crate::manager::valid_id;
 
@@ -95,8 +95,20 @@ impl CoordService {
 
     /// Queues a relay from Overseer for `to`; announced as a lock change.
     fn tell(&self, locks: &LockService, to: SlotId, text: &str, now: i64) -> anyhow::Result<()> {
+        self.tell_as(locks, to, text, &RelayKind::Note, now)
+    }
+
+    /// `tell`, for a relay of `kind`.
+    fn tell_as(
+        &self,
+        locks: &LockService,
+        to: SlotId,
+        text: &str,
+        kind: &RelayKind,
+        now: i64,
+    ) -> anyhow::Result<()> {
         locks.change("coordinator relay", |conn| {
-            queue_relay_on(conn, &Sender::Overseer, to, text, None, now).map(|_| ())
+            queue_kind_on(conn, &Sender::Overseer, to, text, None, kind, now).map(|_| ())
         })
     }
 

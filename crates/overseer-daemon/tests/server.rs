@@ -9,8 +9,8 @@ use overseer_daemon::{run, DaemonConfig};
 use overseer_proto::{
     read_frame, write_frame, Activity, ActivityKind, BashCheck, BoardView, ClaimKind, CoordView,
     Event, Frame, HookEvent, HookKind, ItemKind, LockView, Plan, PlanDecision, PlanSlot, PlanState,
-    PlanTarget, PlanWorktree, RelayState, ReportKind, Request, Response, Sender, SlotInfo,
-    SlotState, SourceStatus, WorkItem, WorkView,
+    PlanTarget, PlanWorktree, RelayKind, RelayState, ReportKind, Request, Response, Sender,
+    SlotInfo, SlotState, SourceStatus, WorkItem, WorkView,
 };
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::UnixStream;
@@ -4541,6 +4541,51 @@ async fn approve_runs_every_step() {
     assert_eq!(record.state, PlanState::Approved);
     assert!(!record.edited);
     assert_eq!(record.outcome, lines);
+}
+
+/// Plan 2's kickoff replaces plan 1's while S3 is too busy to have had it.
+#[tokio::test]
+async fn a_newer_plans_kickoff_replaces_the_pending_one() {
+    let rig = PlanRig::new("replace-kickoff");
+    let (_d, mut c) = rig.start().await;
+    let (_s0, s3) = live_s0_and_s3(&mut c, "replace-kickoff").await;
+    c.hook(hook(3, HookKind::UserPromptSubmit)).await;
+    let first = plan_of(vec![rig.slot3()]);
+    assert!(matches!(
+        c.propose(Some(0), first.clone()).await,
+        Response::Text { .. }
+    ));
+    assert!(matches!(c.approve(1, first).await, Response::Text { .. }));
+    let mut later = rig.slot3();
+    later.kickoff = "Drop that, look at the logs.".into();
+    let second = plan_of(vec![later]);
+    assert!(matches!(
+        c.propose(Some(0), second.clone()).await,
+        Response::Text { .. }
+    ));
+    assert!(matches!(c.approve(2, second).await, Response::Text { .. }));
+    let v = c.locks().await;
+    let to_s3: Vec<_> = v
+        .relays
+        .iter()
+        .filter(|r| r.to == 3)
+        .map(|r| (r.kind.clone(), r.state, r.drop_reason.clone()))
+        .collect();
+    assert_eq!(
+        to_s3,
+        vec![
+            (RelayKind::Kickoff { plan: 2 }, RelayState::Pending, None),
+            (
+                RelayKind::Kickoff { plan: 1 },
+                RelayState::Dropped,
+                Some("replaced by plan 2's kickoff".to_string())
+            ),
+        ]
+    );
+    // Only plan 2's kickoff is typed in once S3 is idle.
+    c.hook(hook(3, HookKind::Stop)).await;
+    let got = s3.read_until("Drop that, look at the logs.").await;
+    assert!(!got.contains("Pick this up next."), "{got}");
 }
 
 #[tokio::test]
