@@ -160,12 +160,22 @@ fn relay_kind_from(id: i64, kind: Option<&str>, r: Option<String>) -> RelayKind 
         _ => None,
     };
     read.unwrap_or_else(|| {
-        tracing::warn!(
-            "relay {id}: kind {:?} with ref {r:?} read as a note",
-            kind.unwrap_or_default()
-        );
+        let kind = kind.unwrap_or_default();
+        // Relays are read about once a second: warn once per row.
+        if first_bad_kind(id) {
+            tracing::warn!("relay {id}: kind {kind:?} with ref {r:?} read as a note");
+        } else {
+            tracing::debug!("relay {id}: kind {kind:?} with ref {r:?} read as a note");
+        }
         RelayKind::Note
     })
+}
+
+/// True the first time relay `id` is found with a bad kind in this process.
+fn first_bad_kind(id: i64) -> bool {
+    static SEEN: std::sync::Mutex<std::collections::BTreeSet<i64>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    SEEN.lock().unwrap_or_else(|e| e.into_inner()).insert(id)
 }
 
 /// A relay still waiting to be typed in.
@@ -1975,6 +1985,15 @@ mod tests {
             kept_by_2(c, notice, ClaimKind::Claim);
             Ok(())
         })
+    }
+
+    #[test]
+    fn a_bad_kind_is_warned_about_once_per_relay() {
+        // Ids no real row in these tests has: the set is process-wide.
+        assert!(first_bad_kind(-41));
+        assert!(!first_bad_kind(-41));
+        assert!(!first_bad_kind(-41));
+        assert!(first_bad_kind(-42));
     }
 
     /// A ledger in a fresh file, so a test can reopen it.

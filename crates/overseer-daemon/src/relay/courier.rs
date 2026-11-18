@@ -343,10 +343,17 @@ impl Courier {
     }
 
     /// Puts relays claimed for a paste that did not happen back to pending.
+    /// A write fails mostly because the session went away, and its end
+    /// skipped these as delivered: so relays for slots with no session are
+    /// then dropped, and a later session never gets the old one's.
     fn unclaim(&self, id: SlotId, ids: &[i64]) {
         if let Err(e) = self.locks.change("relay unclaim", |c| unclaim_on(c, ids)) {
-            tracing::warn!("relays to {} not put back: {e:#}", slot_name(id));
+            tracing::error!(
+                "relays {ids:?} to {} not put back, so they read as delivered: {e:#}",
+                slot_name(id)
+            );
         }
+        self.locks.drop_sessionless_relays(unix_now());
     }
 }
 
