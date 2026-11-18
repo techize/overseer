@@ -405,7 +405,8 @@ pub fn strip_lines(view: &LockView, clock: impl Fn(i64) -> String, max: usize) -
                 RelayState::Delivered => format!("{time} told {to}: {text}"),
                 RelayState::Pending => format!("{time} for {to}, pending: {text}"),
                 RelayState::Dropped => {
-                    format!("{time} for {to}, dropped: session ended: {text}")
+                    let dropped = r.drop_text().unwrap_or_default();
+                    format!("{time} for {to}, {dropped}: {text}")
                 }
             }
         })
@@ -1260,6 +1261,8 @@ mod tests {
             },
             delivered_at,
             dropped_at: None,
+            kind: overseer_proto::RelayKind::Note,
+            drop_reason: None,
             held: None,
         }
     }
@@ -1633,16 +1636,30 @@ mod tests {
             Relay {
                 state: RelayState::Dropped,
                 dropped_at: Some(400),
+                drop_reason: Some("session ended".into()),
                 ..relay(1, 3, 100, None, "hello")
             },
             relay(2, 4, 300, None, "wait for it"),
+            Relay {
+                state: RelayState::Dropped,
+                dropped_at: Some(250),
+                drop_reason: Some("no longer holds deploy:demo/api".into()),
+                ..relay(
+                    3,
+                    4,
+                    200,
+                    None,
+                    "S1 has released deploy:demo/api. You now hold it.",
+                )
+            },
         ];
         let lines = strip_lines(&v, |t: i64| format!("t{t}"), 5);
         assert_eq!(
             lines,
             [
                 "t400 for S3, dropped: session ended: hello",
-                "t300 for S4, pending: wait for it"
+                "t300 for S4, pending: wait for it",
+                "t250 for S4, dropped: no longer holds deploy:demo/api: S1 has released deploy:demo/api. You now hold it.",
             ]
         );
         // A dropped relay is not pending.

@@ -187,7 +187,17 @@ const V8_SCHEMA: &str = "UPDATE ticket_stages SET stage = 'Blocked' WHERE stage 
 UPDATE ticket_stages SET stage = 'InProgress' WHERE stage = 'InReview';
 UPDATE ticket_stages SET stage = 'ToBeTested' WHERE stage = 'Testing'";
 
-const VERSION: i64 = 8;
+/// What version 9 adds: what each relay is about (`kind`: `note`, `kickoff`
+/// or `lock`, NULL reading as `note`; `ref`: a kickoff's plan id or a lock
+/// notice's target) and why a dropped one was dropped. Before it the only
+/// drop was a session ending. Not idempotent, like V4.
+const V9_SCHEMA: &str = "ALTER TABLE relays ADD COLUMN kind TEXT;
+ALTER TABLE relays ADD COLUMN ref TEXT;
+ALTER TABLE relays ADD COLUMN drop_reason TEXT;
+UPDATE relays SET drop_reason = 'session ended'
+ WHERE dropped_at IS NOT NULL AND delivered_at IS NULL";
+
+const VERSION: i64 = 9;
 
 /// Reports and state changes kept per slot.
 const REPORTS_PER_SLOT: i64 = 200;
@@ -201,7 +211,7 @@ fn migrate(conn: &Connection) -> Result<()> {
     if version >= VERSION {
         return Ok(());
     }
-    let steps: [(i64, &str); 8] = [
+    let steps: [(i64, &str); 9] = [
         (1, SESSIONS_SCHEMA),
         (2, V2_SCHEMA),
         (3, V3_SCHEMA),
@@ -210,6 +220,7 @@ fn migrate(conn: &Connection) -> Result<()> {
         (6, V6_SCHEMA),
         (7, V7_SCHEMA),
         (8, V8_SCHEMA),
+        (9, V9_SCHEMA),
     ];
     let mut batch = String::from("BEGIN;\n");
     for (n, sql) in steps {
@@ -1172,7 +1183,7 @@ mod tests {
         assert!(l.notices().unwrap().is_empty());
         l.log(1, "k", None, "e", "d").unwrap();
         lock_tables_are_empty(&l);
-        assert_eq!(user_version(&l), 8);
+        assert_eq!(user_version(&l), VERSION);
         let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
     }
 
@@ -1197,14 +1208,14 @@ mod tests {
             .unwrap();
         }
         let l = Ledger::open(&path).unwrap();
-        assert_eq!(user_version(&l), 8);
+        assert_eq!(user_version(&l), VERSION);
         assert_eq!(l.assignments().unwrap(), vec![("DEMO-12".to_string(), 3)]);
         assert_eq!(l.notices().unwrap()[0].text, "moved");
         lock_tables_are_empty(&l);
         drop(l);
         // Opening a v5 file again changes nothing.
         let l = Ledger::open(&path).unwrap();
-        assert_eq!(user_version(&l), 8);
+        assert_eq!(user_version(&l), VERSION);
         assert_eq!(l.assignments().unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
     }
@@ -1213,7 +1224,7 @@ mod tests {
     fn fresh_file_is_created_at_5() {
         let path = temp_db("fresh");
         let l = Ledger::open(&path).unwrap();
-        assert_eq!(user_version(&l), 8);
+        assert_eq!(user_version(&l), VERSION);
         lock_tables_are_empty(&l);
         let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
     }
@@ -1242,7 +1253,7 @@ mod tests {
             .unwrap();
         }
         let l = Ledger::open(&path).unwrap();
-        assert_eq!(user_version(&l), 8);
+        assert_eq!(user_version(&l), VERSION);
         let live = l.live_at_shutdown().unwrap();
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].session_id, "old-id");
@@ -1253,7 +1264,7 @@ mod tests {
         drop(l);
         // Opening a v5 file again changes nothing.
         let l = Ledger::open(&path).unwrap();
-        assert_eq!(user_version(&l), 8);
+        assert_eq!(user_version(&l), VERSION);
         assert_eq!(l.live_at_shutdown().unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
     }
@@ -1302,14 +1313,14 @@ mod tests {
         let path = temp_db("migrate-v4");
         v4_file(&path);
         let l = Ledger::open(&path).unwrap();
-        assert_eq!(user_version(&l), 8);
+        assert_eq!(user_version(&l), VERSION);
         assert_eq!(l.live_at_shutdown().unwrap().len(), 1);
         assert_eq!(l.session_note(2).unwrap().as_deref(), Some("Sessions/n.md"));
         assert_eq!(l.queue_recent(10).unwrap().len(), 1);
         assert_eq!(l.add_plan(&tplan(3), &[], 10).unwrap(), (1, None));
         drop(l);
         let l = Ledger::open(&path).unwrap();
-        assert_eq!(user_version(&l), 8);
+        assert_eq!(user_version(&l), VERSION);
         assert_eq!(l.plans(10).unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
     }
@@ -1332,7 +1343,7 @@ mod tests {
             .unwrap();
         }
         let l = Ledger::open(&path).unwrap();
-        assert_eq!(user_version(&l), 8);
+        assert_eq!(user_version(&l), VERSION);
         assert_eq!(l.lock_view(50, 3600).unwrap().claims.len(), 1);
         assert_eq!(l.session_note(2).unwrap(), None);
         assert!(l.plans(10).unwrap().is_empty());
@@ -1344,7 +1355,7 @@ mod tests {
     fn fresh_file_is_v5() {
         let path = temp_db("fresh-v5");
         let l = Ledger::open(&path).unwrap();
-        assert_eq!(user_version(&l), 8);
+        assert_eq!(user_version(&l), VERSION);
         assert!(l.plans(10).unwrap().is_empty());
         assert!(l.reports(10).unwrap().is_empty());
         assert_eq!(l.summary().unwrap(), None);
@@ -1846,7 +1857,7 @@ mod tests {
             .unwrap();
         }
         let l = Ledger::open(&path).unwrap();
-        assert_eq!(user_version(&l), 8);
+        assert_eq!(user_version(&l), VERSION);
         assert_eq!(l.lock_view(50, 3600).unwrap().claims.len(), 1);
         assert!(l.transaction(stages_on).unwrap().is_empty());
         l.transaction(|c| record_stages_on(c, &[("DEMO-1".into(), Stage::ToDo)], 5))
@@ -1887,6 +1898,57 @@ mod tests {
         assert_eq!(
             l.transaction(stages_on).unwrap()["DEMO-1"],
             (Stage::Blocked, 100, true)
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn v9_gives_relays_a_kind_and_old_drops_their_reason() {
+        use overseer_proto::msg::{RelayKind, RelayState};
+        let path = temp_db("migrate-v9");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(&format!(
+                "{SESSIONS_SCHEMA};\n{V2_SCHEMA};\n{V3_SCHEMA};\n{V4_SCHEMA};\n{V5_SCHEMA};\n{V6_SCHEMA};\n{V7_SCHEMA};\n{V8_SCHEMA};\nPRAGMA user_version = 8;"
+            ))
+            .unwrap();
+            conn.execute_batch(
+                "INSERT INTO relays (at, sender, to_slot, text) VALUES (10, 'you', 2, 'waiting');
+                 INSERT INTO relays (at, sender, to_slot, text, dropped_at)
+                 VALUES (11, 'overseer', 3, 'gone', 12);
+                 INSERT INTO relays (at, sender, to_slot, text, delivered_at)
+                 VALUES (13, 'you', 2, 'seen', 14);",
+            )
+            .unwrap();
+        }
+        let l = Ledger::open(&path).unwrap();
+        assert_eq!(user_version(&l), 9);
+        let v = l.lock_view(50, 3600).unwrap();
+        let got: Vec<_> = v
+            .relays
+            .iter()
+            .map(|r| {
+                (
+                    r.text.as_str(),
+                    r.state,
+                    r.kind.clone(),
+                    r.drop_reason.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("seen", RelayState::Delivered, RelayKind::Note, None),
+                (
+                    "gone",
+                    RelayState::Dropped,
+                    RelayKind::Note,
+                    Some("session ended")
+                ),
+                ("waiting", RelayState::Pending, RelayKind::Note, None),
+            ]
         );
         let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
     }

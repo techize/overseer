@@ -373,7 +373,7 @@ pub fn format_locks(v: &LockView, now: i64) -> Vec<String> {
     for r in &v.relays {
         let state = match (r.state, r.held.as_deref()) {
             (RelayState::Delivered, _) => continue,
-            (RelayState::Dropped, _) => "dropped: session ended".to_string(),
+            (RelayState::Dropped, _) => r.drop_text().unwrap_or_default(),
             // No reason from the courier yet: it simply has not been delivered.
             (RelayState::Pending, None) => "pending".to_string(),
             (RelayState::Pending, Some(why)) => format!("pending ({why})"),
@@ -1437,6 +1437,8 @@ mod tests {
             state,
             delivered_at: None,
             dropped_at: (state == RelayState::Dropped).then_some(5),
+            kind: overseer_proto::RelayKind::Note,
+            drop_reason: (state == RelayState::Dropped).then(|| "session ended".into()),
             held: held.map(Into::into),
         };
         let v = LockView {
@@ -1452,6 +1454,10 @@ mod tests {
             }],
             waits: vec![],
             relays: vec![
+                Relay {
+                    drop_reason: Some("replaced by plan 20's kickoff".into()),
+                    ..relay(5, 3, RelayState::Dropped, None, "start on DEMO-1")
+                },
                 relay(4, 3, RelayState::Dropped, None, "status?"),
                 relay(
                     3,
@@ -1470,6 +1476,7 @@ mod tests {
             format_locks(&v, 0),
             vec![
                 format!("argo:uat/demo-api  S1  pin  since {at}  for DEMO-12  at abc123"),
+                "relay  S3  dropped: replaced by plan 20's kickoff  start on DEMO-1".to_string(),
                 "relay  S3  dropped: session ended  status?".to_string(),
                 "relay  S2  pending (session is working)  hello".to_string(),
                 "relay  S2  pending  again".to_string(),
@@ -1660,6 +1667,8 @@ mod tests {
                     state: RelayState::Pending,
                     delivered_at: None,
                     dropped_at: None,
+                    kind: overseer_proto::RelayKind::Note,
+                    drop_reason: None,
                     held: None,
                 }],
                 flag_after_secs: 3600,

@@ -169,7 +169,7 @@ impl LockService {
         let done = self.ledger.transaction(|conn| {
             let mut n = 0;
             for &slot in &dead {
-                n += table::drop_relays_to_on(conn, slot, now)?;
+                n += table::drop_relays_to_on(conn, slot, table::SESSION_ENDED, now)?;
             }
             Ok(n)
         });
@@ -307,7 +307,7 @@ impl LockService {
             let h =
                 table::release_on(conn, target, Releaser::Force(holder, &self.user), None, now)?;
             for &slot in &dead {
-                table::drop_relays_to_on(conn, slot, now)?;
+                table::drop_relays_to_on(conn, slot, table::SESSION_ENDED, now)?;
             }
             Ok(h)
         });

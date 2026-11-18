@@ -709,7 +709,7 @@ fn sender_name(s: Sender) -> String {
 /// The relays to or from `slot`, newest first (by delivery time when
 /// delivered, else creation time, ties by id): `14:05 from S0: <text>`,
 /// `14:06 to S0: <text>`. A pending one ends `(pending: <reason>)`, a
-/// dropped one `(for S3, dropped: session ended)`.
+/// dropped one `(for S3, dropped: <reason>)`.
 ///
 /// Only the current session's relays are listed: those it received or sent
 /// since `start` (`CoordView::session_start`), and any still pending. With
@@ -748,8 +748,9 @@ pub fn relay_rows(
                 (RelayState::Pending, Some(why)) => line.push_str(&format!(" (pending: {why})")),
                 (RelayState::Pending, None) => line.push_str(" (pending)"),
                 (RelayState::Dropped, _) => line.push_str(&format!(
-                    " (for {}, dropped: session ended)",
-                    slot_name(r.to)
+                    " (for {}, {})",
+                    slot_name(r.to),
+                    r.drop_text().unwrap_or_default()
                 )),
                 (RelayState::Delivered, _) => {}
             }
@@ -2409,6 +2410,8 @@ mod tests {
             },
             delivered_at,
             dropped_at: None,
+            kind: overseer_proto::RelayKind::Note,
+            drop_reason: None,
             held: held.map(Into::into),
         }
     }
@@ -2536,11 +2539,13 @@ mod tests {
             overseer_proto::Relay {
                 state: RelayState::Dropped,
                 dropped_at: Some(120),
+                drop_reason: Some("dropped by S0".into()),
                 ..relay(1, Sender::Slot { slot: 0 }, 2, 100, None, None, "status?")
             },
             overseer_proto::Relay {
                 state: RelayState::Dropped,
                 dropped_at: Some(110),
+                drop_reason: Some("session ended".into()),
                 ..relay(2, Sender::Slot { slot: 2 }, 0, 105, None, None, "on it")
             },
         ];
@@ -2548,7 +2553,7 @@ mod tests {
         assert_eq!(
             relay_rows(&v, 2, Some(0), clock),
             vec![
-                "T120 from S0: status? (for S2, dropped: session ended)".to_string(),
+                "T120 from S0: status? (for S2, dropped: dropped by S0)".to_string(),
                 "T110 to S0: on it (for S0, dropped: session ended)".to_string(),
             ]
         );

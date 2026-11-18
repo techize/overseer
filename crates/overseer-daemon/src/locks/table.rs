@@ -6,7 +6,9 @@
 //! unix seconds, passed in by the caller.
 
 use anyhow::{bail, Result};
-use overseer_proto::msg::{slot_name, Claim, ClaimKind, Relay, RelayState, Sender, SlotId, Wait};
+use overseer_proto::msg::{
+    slot_name, Claim, ClaimKind, Relay, RelayKind, RelayState, Sender, SlotId, Wait,
+};
 use rusqlite::types::Type;
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
@@ -129,7 +131,38 @@ fn claim_row(r: &Row) -> rusqlite::Result<Claim> {
     })
 }
 
-const RELAY_COLS: &str = "id, at, sender, from_slot, to_slot, text, delivered_at, dropped_at";
+const RELAY_COLS: &str =
+    "id, at, sender, from_slot, to_slot, text, delivered_at, dropped_at, kind, ref, drop_reason";
+
+/// Why relays are dropped when their slot's session ends.
+pub(crate) const SESSION_ENDED: &str = "session ended";
+
+/// The `kind` and `ref` columns for a relay kind.
+fn relay_kind_cols(k: &RelayKind) -> (&'static str, Option<String>) {
+    match k {
+        RelayKind::Note => ("note", None),
+        RelayKind::Kickoff { plan } => ("kickoff", Some(plan.to_string())),
+        RelayKind::Lock { target } => ("lock", Some(target.clone())),
+    }
+}
+
+/// A relay kind from its `kind` and `ref` columns. NULL is `note`.
+fn relay_kind_from(
+    col: usize,
+    kind: Option<&str>,
+    r: Option<String>,
+) -> rusqlite::Result<RelayKind> {
+    Ok(match (kind, r) {
+        (None | Some("note"), _) => RelayKind::Note,
+        (Some("kickoff"), Some(plan)) => RelayKind::Kickoff {
+            plan: plan
+                .parse()
+                .map_err(|_| bad_column(col + 1, "kickoff plan", &plan))?,
+        },
+        (Some("lock"), Some(target)) => RelayKind::Lock { target },
+        (Some(other), _) => return Err(bad_column(col, "relay kind", other)),
+    })
+}
 
 /// A relay still waiting to be typed in.
 const PENDING: &str = "delivered_at IS NULL AND dropped_at IS NULL";
@@ -150,6 +183,7 @@ fn relay_row(r: &Row) -> rusqlite::Result<Relay> {
         (None, Some(_)) => RelayState::Dropped,
         (None, None) => RelayState::Pending,
     };
+    let kind: Option<String> = r.get(8)?;
     Ok(Relay {
         id: r.get(0)?,
         at: r.get(1)?,
@@ -159,6 +193,8 @@ fn relay_row(r: &Row) -> rusqlite::Result<Relay> {
         state,
         delivered_at,
         dropped_at,
+        kind: relay_kind_from(8, kind.as_deref(), r.get(9)?)?,
+        drop_reason: r.get(10)?,
         held: None,
     })
 }
@@ -536,15 +572,24 @@ pub(crate) fn drop_slot_on(conn: &Connection, slot: SlotId, now: i64) -> Result<
 /// it.
 pub(crate) fn end_session_on(conn: &Connection, slot: SlotId, now: i64) -> Result<Vec<Handoff>> {
     let handoffs = drop_slot_on(conn, slot, now)?;
-    drop_relays_to_on(conn, slot, now)?;
+    drop_relays_to_on(conn, slot, SESSION_ENDED, now)?;
     Ok(handoffs)
 }
 
-/// Drops every relay still pending for `to`. Returns how many.
-pub(crate) fn drop_relays_to_on(conn: &Connection, to: SlotId, now: i64) -> Result<usize> {
+/// Drops every relay still pending for `to`, saying `reason`. Returns how
+/// many.
+pub(crate) fn drop_relays_to_on(
+    conn: &Connection,
+    to: SlotId,
+    reason: &str,
+    now: i64,
+) -> Result<usize> {
     Ok(conn.execute(
-        &format!("UPDATE relays SET dropped_at = ?2 WHERE to_slot = ?1 AND {PENDING}"),
-        params![to, now],
+        &format!(
+            "UPDATE relays SET dropped_at = ?2, drop_reason = ?3
+             WHERE to_slot = ?1 AND {PENDING}"
+        ),
+        params![to, now, reason],
     )?)
 }
 
@@ -565,11 +610,26 @@ pub(crate) fn queue_relay_on(
     reply_to: Option<i64>,
     now: i64,
 ) -> Result<i64> {
+    queue_kind_on(conn, from, to, text, reply_to, &RelayKind::Note, now)
+}
+
+/// `queue_relay_on` for a relay of `kind`.
+pub(crate) fn queue_kind_on(
+    conn: &Connection,
+    from: &Sender,
+    to: SlotId,
+    text: &str,
+    reply_to: Option<i64>,
+    kind: &RelayKind,
+    now: i64,
+) -> Result<i64> {
     let (sender, from_slot) = sender_cols(from);
+    let (kind, r) = relay_kind_cols(kind);
     conn.execute(
-        "INSERT INTO relays (at, sender, from_slot, to_slot, text, reply_to, delivered_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
-        params![now, sender, from_slot, to, text, reply_to],
+        "INSERT INTO relays (at, sender, from_slot, to_slot, text, reply_to, delivered_at,
+                             kind, ref)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8)",
+        params![now, sender, from_slot, to, text, reply_to, kind, r],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -1145,16 +1205,23 @@ mod tests {
             let dropped: Vec<_> = relays_on(c, 50)?
                 .into_iter()
                 .filter(|r| r.to == 2 && r.delivered_at.is_none())
-                .map(|r| (r.text, r.state, r.dropped_at))
+                .map(|r| (r.text, r.state, r.dropped_at, r.drop_reason))
                 .collect();
+            let ended = Some(t("session ended"));
             assert_eq!(
                 dropped,
                 vec![
-                    (t("check DEMO-12"), RelayState::Dropped, Some(20)),
+                    (
+                        t("check DEMO-12"),
+                        RelayState::Dropped,
+                        Some(20),
+                        ended.clone()
+                    ),
                     (
                         t("S1 has released b. You now hold it."),
                         RelayState::Dropped,
-                        Some(20)
+                        Some(20),
+                        ended
                     ),
                 ]
             );
@@ -1276,6 +1343,29 @@ mod tests {
             assert_eq!(pending_relays_on(c, 2)?.len(), 1);
             let d = relays_on(c, 1)?;
             assert_eq!(d[2].delivered_at, Some(20));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn relay_kinds_are_stored_and_read_back() {
+        with(|c| {
+            let kinds = [
+                RelayKind::Note,
+                RelayKind::Kickoff { plan: 19 },
+                RelayKind::Lock { target: T.into() },
+            ];
+            for (n, k) in kinds.iter().enumerate() {
+                queue_kind_on(c, &Sender::Overseer, 2, &format!("m{n}"), None, k, 10)?;
+            }
+            let got: Vec<_> = pending_relays_on(c, 2)?
+                .into_iter()
+                .map(|r| (r.kind, r.drop_reason))
+                .collect();
+            assert_eq!(
+                got,
+                kinds.into_iter().map(|k| (k, None)).collect::<Vec<_>>()
+            );
             Ok(())
         })
     }

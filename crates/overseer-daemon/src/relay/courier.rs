@@ -371,6 +371,8 @@ mod tests {
             state: RelayState::Pending,
             delivered_at: None,
             dropped_at: None,
+            kind: overseer_proto::RelayKind::Note,
+            drop_reason: None,
             held: None,
         }
     }
