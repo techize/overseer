@@ -1130,6 +1130,7 @@ fn handle_request(
         Request::ForceRelease { target, holder } => {
             locks.force_release(&target, holder, unix_now())
         }
+        Request::DropRelays { from, id, to } => locks.drop_relays(from, id, to, unix_now()),
         Request::SendRelay { from, to, text } => {
             // An empty or exited slot has no session to type into; a
             // resumable one gets it once resumed.

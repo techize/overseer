@@ -437,7 +437,8 @@ impl CoordService {
         slots.sort_by_key(|s| s.slot);
         let mut outcome = Vec::new();
         for s in slots {
-            self.run_slot(s, &template, ctx, now, &mut outcome).await;
+            self.run_slot(id, s, &template, ctx, now, &mut outcome)
+                .await;
         }
         if let Err(e) = self.ledger.set_plan_outcome(id, &outcome) {
             tracing::warn!("outcome of plan {id} not stored: {e:#}");
@@ -468,6 +469,7 @@ impl CoordService {
     /// with one line saying so; the next slot goes on.
     async fn run_slot(
         &self,
+        plan: i64,
         ps: &PlanSlot,
         template: &str,
         ctx: &PlanCtx,
@@ -603,7 +605,8 @@ impl CoordService {
                 ));
                 return;
             }
-            match self.tell(&ctx.locks, slot, &kickoff, now) {
+            let kind = overseer_proto::RelayKind::Kickoff { plan };
+            match self.tell_as(&ctx.locks, slot, &kickoff, &kind, now) {
                 Ok(()) => out.push(format!("{name}: kickoff queued")),
                 Err(e) => out.push(skipped("kickoff", &format!("ledger: {e:#}"))),
             }

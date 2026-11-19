@@ -441,8 +441,23 @@ pub enum Sender {
 pub enum RelayState {
     Pending,
     Delivered,
-    /// Retired unsent: the session it was for ended first.
+    /// Retired unsent; `Relay::drop_reason` says why.
     Dropped,
+}
+
+/// What a relay is about, so it can be retired once it no longer applies.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum RelayKind {
+    /// A message, or a notice with nothing to re-check.
+    #[default]
+    Note,
+    /// A plan's kickoff for a running slot. A later plan's kickoff to the
+    /// same slot replaces it while it is pending.
+    Kickoff { plan: i64 },
+    /// `... You now hold it.` for `target`. Dropped unsent when the slot no
+    /// longer holds it.
+    Lock { target: String },
 }
 
 /// A message from one session (or Overseer, or you) to a slot's session.
@@ -458,9 +473,25 @@ pub struct Relay {
     /// When a `Dropped` relay was retired.
     #[serde(default)]
     pub dropped_at: Option<i64>,
+    #[serde(default)]
+    pub kind: RelayKind,
+    /// Why a `Dropped` relay was retired, e.g. `session ended`.
+    #[serde(default)]
+    pub drop_reason: Option<String>,
     /// Why a pending relay is waiting, e.g. `session is working`. Filled by
     /// the courier.
     pub held: Option<String>,
+}
+
+impl Relay {
+    /// `dropped: <reason>` for a dropped relay (`dropped` when no reason
+    /// was kept), else `None`.
+    pub fn drop_text(&self) -> Option<String> {
+        (self.state == RelayState::Dropped).then(|| match self.drop_reason.as_deref() {
+            Some(why) => format!("dropped: {why}"),
+            None => "dropped".into(),
+        })
+    }
 }
 
 /// Every claim, wait and relay worth showing. `relays` holds every pending
@@ -617,6 +648,17 @@ pub enum Request {
         from: Option<SlotId>,
         to: SlotId,
         text: String,
+    },
+    /// Drops pending relays unsent: the one with `id`, or every one to
+    /// `to`. `from` is the slot asking, which may only drop relays it sent;
+    /// `None` is you. Answered with `Text` saying how many were dropped.
+    DropRelays {
+        #[serde(default)]
+        from: Option<SlotId>,
+        #[serde(default)]
+        id: Option<i64>,
+        #[serde(default)]
+        to: Option<SlotId>,
     },
     CheckBash(BashCheck),
     /// Queues a pathspec commit of `paths` in the 2ndBrain. `from` is
@@ -1632,6 +1674,73 @@ mod tests {
         )
         .unwrap();
         assert_eq!(relay.dropped_at, None);
+        assert_eq!(relay.kind, RelayKind::Note);
+        assert_eq!(relay.drop_reason, None);
+    }
+
+    #[test]
+    fn drop_text_names_the_reason() {
+        let mut r: Relay = serde_json::from_str(
+            r#"{"id":1,"at":2,"from":{"type":"You"},"to":3,"text":"hi","state":"Pending","delivered_at":null,"held":null}"#,
+        )
+        .unwrap();
+        assert_eq!(r.drop_text(), None);
+        r.state = RelayState::Dropped;
+        assert_eq!(r.drop_text().as_deref(), Some("dropped"));
+        r.drop_reason = Some("replaced by plan 20's kickoff".into());
+        assert_eq!(
+            r.drop_text().as_deref(),
+            Some("dropped: replaced by plan 20's kickoff")
+        );
+    }
+
+    #[test]
+    fn drop_relays_reads_with_only_one_of_its_fields() {
+        let req: Request = serde_json::from_str(r#"{"type":"DropRelays","id":7}"#).unwrap();
+        assert_eq!(
+            req,
+            Request::DropRelays {
+                from: None,
+                id: Some(7),
+                to: None,
+            }
+        );
+        let req: Request = serde_json::from_str(r#"{"type":"DropRelays","to":2}"#).unwrap();
+        assert_eq!(
+            req,
+            Request::DropRelays {
+                from: None,
+                id: None,
+                to: Some(2),
+            }
+        );
+    }
+
+    #[test]
+    fn relay_kinds_and_drop_reasons_round_trip() {
+        for kind in [
+            RelayKind::Note,
+            RelayKind::Kickoff { plan: 20 },
+            RelayKind::Lock {
+                target: "deploy:demo/api".into(),
+            },
+        ] {
+            let relay = Relay {
+                id: 1,
+                at: 2,
+                from: Sender::Overseer,
+                to: 3,
+                text: "hi".into(),
+                state: RelayState::Dropped,
+                delivered_at: None,
+                dropped_at: Some(4),
+                kind,
+                drop_reason: Some("replaced by plan 20's kickoff".into()),
+                held: None,
+            };
+            let json = serde_json::to_string(&relay).unwrap();
+            assert_eq!(serde_json::from_str::<Relay>(&json).unwrap(), relay);
+        }
     }
 
     #[test]
@@ -1711,6 +1820,8 @@ mod tests {
             state,
             delivered_at: None,
             dropped_at: None,
+            kind: RelayKind::Note,
+            drop_reason: None,
             held: None,
         };
         LockView {

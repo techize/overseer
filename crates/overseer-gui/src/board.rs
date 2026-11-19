@@ -390,8 +390,13 @@ pub fn pending_label(n: usize) -> Option<String> {
 
 /// The relay strip: the newest `max` relays, newest first, by delivery (or
 /// drop) time when retired and creation time otherwise. `clock` renders a
-/// time.
-pub fn strip_lines(view: &LockView, clock: impl Fn(i64) -> String, max: usize) -> Vec<String> {
+/// time; a pending relay shows its age at `now`.
+pub fn strip_lines(
+    view: &LockView,
+    now: i64,
+    clock: impl Fn(i64) -> String,
+    max: usize,
+) -> Vec<crate::session::RelayRow> {
     let when = |r: &overseer_proto::Relay| r.delivered_at.or(r.dropped_at).unwrap_or(r.at);
     let mut relays: Vec<_> = view.relays.iter().collect();
     relays.sort_by_key(|r| std::cmp::Reverse((when(r), r.id)));
@@ -401,12 +406,20 @@ pub fn strip_lines(view: &LockView, clock: impl Fn(i64) -> String, max: usize) -
         .map(|r| {
             let text = one_line(&r.text, 80);
             let (time, to) = (clock(when(r)), slot_name(r.to));
-            match r.state {
+            let line = match r.state {
                 RelayState::Delivered => format!("{time} told {to}: {text}"),
-                RelayState::Pending => format!("{time} for {to}, pending: {text}"),
-                RelayState::Dropped => {
-                    format!("{time} for {to}, dropped: session ended: {text}")
+                RelayState::Pending => {
+                    let pending = crate::session::pending_age(r, now);
+                    format!("{time} for {to}, {pending}: {text}")
                 }
+                RelayState::Dropped => {
+                    let dropped = r.drop_text().unwrap_or_default();
+                    format!("{time} for {to}, {dropped}: {text}")
+                }
+            };
+            crate::session::RelayRow {
+                line,
+                pending: (r.state == RelayState::Pending).then_some(r.id),
             }
         })
         .collect()
@@ -894,7 +907,7 @@ impl OverseerApp {
         let running = running_count(&self.slots);
         let need_you = needs_you_count(&self.slots);
         let your_turn = your_turn_count(&self.slots);
-        let strip = strip_lines(&self.locks, local_hhmm, 5);
+        let strip = strip_lines(&self.locks, now, local_hhmm, 5);
         let (summary_title, summary_body) = summary_lines(&self.coord, local_hhmm);
         let plan_line = plan_line(&self.coord);
         let outcome_lines = outcome_lines(&self.coord);
@@ -1101,7 +1114,29 @@ impl OverseerApp {
                     .flex_col()
                     .text_xs()
                     .text_color(rgb(colors::TEXT_DIM))
-                    .children(strip.into_iter().map(|l| div().truncate().child(l)))
+                    .children(strip.into_iter().map(|row| {
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().flex_1().min_w(px(0.)).truncate().child(row.line))
+                            .children(row.pending.map(|relay| {
+                                div()
+                                    .id(("strip-drop-relay", relay as u64))
+                                    .flex_none()
+                                    .px_1()
+                                    .rounded(px(4.))
+                                    .border_1()
+                                    .border_color(rgb(colors::BUTTON_BORDER))
+                                    .text_color(rgb(colors::ACCENT))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(rgb(colors::CARD_HOVER)))
+                                    .child("Drop")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.drop_relay(relay, cx)
+                                    }))
+                            }))
+                    }))
             }))
             .children(show_list.then(|| {
                 div()
@@ -1260,6 +1295,8 @@ mod tests {
             },
             delivered_at,
             dropped_at: None,
+            kind: overseer_proto::RelayKind::Note,
+            drop_reason: None,
             held: None,
         }
     }
@@ -1615,15 +1652,19 @@ mod tests {
             relay(4, 6, 50, Some(60), "old"),
         ];
         let clock = |t: i64| format!("t{t}");
-        let lines = strip_lines(&v, clock, 3);
+        let rows = strip_lines(&v, 420, clock, 3);
+        let lines: Vec<_> = rows.iter().map(|r| r.line.clone()).collect();
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0], "t500 told S3: done it");
-        assert_eq!(lines[1], "t300 for S4, pending: wait for it");
-        let cut = lines[2].strip_prefix("t200 for S5, pending: ").unwrap();
+        assert_eq!(lines[1], "t300 for S4, pending 2m: wait for it");
+        let cut = lines[2].strip_prefix("t200 for S5, pending 3m: ").unwrap();
         assert!(cut.starts_with("line one xxx"), "{cut}");
         assert_eq!(cut.chars().count(), 81);
         assert!(cut.ends_with('…'));
-        assert_eq!(strip_lines(&v, clock, 10).len(), 4);
+        // Pending rows carry their id, for the Drop button.
+        let drops: Vec<_> = rows.iter().map(|r| r.pending).collect();
+        assert_eq!(drops, vec![None, Some(2), Some(3)]);
+        assert_eq!(strip_lines(&v, 420, clock, 10).len(), 4);
     }
 
     #[test]
@@ -1633,16 +1674,33 @@ mod tests {
             Relay {
                 state: RelayState::Dropped,
                 dropped_at: Some(400),
+                drop_reason: Some("session ended".into()),
                 ..relay(1, 3, 100, None, "hello")
             },
             relay(2, 4, 300, None, "wait for it"),
+            Relay {
+                state: RelayState::Dropped,
+                dropped_at: Some(250),
+                drop_reason: Some("no longer holds deploy:demo/api".into()),
+                ..relay(
+                    3,
+                    4,
+                    200,
+                    None,
+                    "S1 has released deploy:demo/api. You now hold it.",
+                )
+            },
         ];
-        let lines = strip_lines(&v, |t: i64| format!("t{t}"), 5);
+        let lines: Vec<_> = strip_lines(&v, 420, |t: i64| format!("t{t}"), 5)
+            .into_iter()
+            .map(|r| r.line)
+            .collect();
         assert_eq!(
             lines,
             [
                 "t400 for S3, dropped: session ended: hello",
-                "t300 for S4, pending: wait for it"
+                "t300 for S4, pending 2m: wait for it",
+                "t250 for S4, dropped: no longer holds deploy:demo/api: S1 has released deploy:demo/api. You now hold it.",
             ]
         );
         // A dropped relay is not pending.

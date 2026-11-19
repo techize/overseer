@@ -63,6 +63,11 @@ pub enum CtlCmd {
     },
     /// Take a slot's hold on a target away and grant it to the next waiter.
     ForceRelease { target: String },
+    /// Act on queued relays: `relay drop <id>` or `relay drop --to S2`.
+    Relay {
+        #[command(subcommand)]
+        action: RelayCmd,
+    },
     /// List work items with owners, source health and notices.
     Items {
         /// Print the raw WorkView as JSON.
@@ -194,6 +199,20 @@ pub enum SettingsCmd {
 }
 
 #[derive(Subcommand)]
+pub enum RelayCmd {
+    /// Drop a pending relay unsent: the one with <id> (as `ctl locks`
+    /// shows it), or with `--to` every one queued for that slot. Inside a
+    /// session ($OVERSEER_SLOT set) only relays that session sent.
+    #[command(group(clap::ArgGroup::new("which").required(true).args(["id", "to"])))]
+    Drop {
+        id: Option<i64>,
+        /// The slot, as 2 or S2.
+        #[arg(long, value_parser = parse_slot)]
+        to: Option<SlotId>,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum PlanCmd {
     /// Approve plan <id> as it is stored. Only you can.
     Approve { id: i64 },
@@ -313,7 +332,7 @@ fn parse_slot(text: &str) -> anyhow::Result<SlotId> {
 }
 
 /// Cut to `max` chars on one line, with `...` when cut.
-fn cut(text: &str, max: usize) -> String {
+pub(crate) fn cut(text: &str, max: usize) -> String {
     let line = text.lines().next().unwrap_or("");
     if line.chars().count() > max || text.lines().count() > 1 {
         let head: String = line.chars().take(max.saturating_sub(3)).collect();
@@ -373,13 +392,16 @@ pub fn format_locks(v: &LockView, now: i64) -> Vec<String> {
     for r in &v.relays {
         let state = match (r.state, r.held.as_deref()) {
             (RelayState::Delivered, _) => continue,
-            (RelayState::Dropped, _) => "dropped: session ended".to_string(),
+            (RelayState::Dropped, _) => r.drop_text().unwrap_or_default(),
             // No reason from the courier yet: it simply has not been delivered.
-            (RelayState::Pending, None) => "pending".to_string(),
-            (RelayState::Pending, Some(why)) => format!("pending ({why})"),
+            (RelayState::Pending, None) => format!("pending {}", short_age(now - r.at)),
+            (RelayState::Pending, Some(why)) => {
+                format!("pending {} ({why})", short_age(now - r.at))
+            }
         };
         out.push(format!(
-            "relay  {}  {state}  {}",
+            "relay #{}  {}  {state}  {}",
+            r.id,
             slot_name(r.to),
             cut(&r.text, 80)
         ));
@@ -574,12 +596,14 @@ pub fn format_work(v: &WorkView) -> Vec<String> {
 }
 
 /// `5m`, or `2h` from an hour on.
-fn short_age(secs: i64) -> String {
+pub(crate) fn short_age(secs: i64) -> String {
     let mins = secs.max(0) / 60;
     if mins < 60 {
         format!("{mins}m")
-    } else {
+    } else if mins < 24 * 60 {
         format!("{}h", mins / 60)
+    } else {
+        format!("{}d", mins / (24 * 60))
     }
 }
 
@@ -1163,6 +1187,17 @@ pub async fn run(cmd: CtlCmd) -> anyhow::Result<()> {
                 })
                 .await?,
         ),
+        CtlCmd::Relay {
+            action: RelayCmd::Drop { id, to },
+        } => print_text_or_queued(
+            client
+                .request(Request::DropRelays {
+                    from: env_slot(),
+                    id,
+                    to,
+                })
+                .await?,
+        ),
         CtlCmd::ForceRelease { target } => print_text_or_queued(
             client
                 .request(Request::ForceRelease {
@@ -1430,13 +1465,15 @@ mod tests {
         use overseer_proto::{Claim, Relay, Sender};
         let relay = |id, to, state, held: Option<&str>, text: &str| Relay {
             id,
-            at: 0,
+            at: 100,
             from: Sender::You,
             to,
             text: text.into(),
             state,
             delivered_at: None,
             dropped_at: (state == RelayState::Dropped).then_some(5),
+            kind: overseer_proto::RelayKind::Note,
+            drop_reason: (state == RelayState::Dropped).then(|| "session ended".into()),
             held: held.map(Into::into),
         };
         let v = LockView {
@@ -1452,6 +1489,10 @@ mod tests {
             }],
             waits: vec![],
             relays: vec![
+                Relay {
+                    drop_reason: Some("replaced by plan 20's kickoff".into()),
+                    ..relay(5, 3, RelayState::Dropped, None, "start on DEMO-1")
+                },
                 relay(4, 3, RelayState::Dropped, None, "status?"),
                 relay(
                     3,
@@ -1467,12 +1508,13 @@ mod tests {
         };
         let at = local_hhmm(0);
         assert_eq!(
-            format_locks(&v, 0),
+            format_locks(&v, 100 + 32 * 60),
             vec![
                 format!("argo:uat/demo-api  S1  pin  since {at}  for DEMO-12  at abc123"),
-                "relay  S3  dropped: session ended  status?".to_string(),
-                "relay  S2  pending (session is working)  hello".to_string(),
-                "relay  S2  pending  again".to_string(),
+                "relay #5  S3  dropped: replaced by plan 20's kickoff  start on DEMO-1".to_string(),
+                "relay #4  S3  dropped: session ended  status?".to_string(),
+                "relay #3  S2  pending 32m (session is working)  hello".to_string(),
+                "relay #2  S2  pending 32m  again".to_string(),
             ]
         );
     }
@@ -1484,6 +1526,36 @@ mod tests {
         assert!(wants_stdin(&v(&["create", "--body-file=-"])));
         assert!(!wants_stdin(&v(&["list"])));
         assert!(!wants_stdin(&v(&["create", "--title", "a-b", "-x"])));
+    }
+
+    #[test]
+    fn short_age_counts_minutes_hours_and_days() {
+        assert_eq!(short_age(59), "0m");
+        assert_eq!(short_age(32 * 60), "32m");
+        assert_eq!(short_age(5 * 3600), "5h");
+        assert_eq!(short_age(3 * 86_400), "3d");
+        assert_eq!(short_age(-30), "0m");
+    }
+
+    #[test]
+    fn relay_drop_takes_an_id_or_a_slot() {
+        use clap::Parser;
+        let drop = |args: &[&str]| {
+            let mut all = vec!["t", "relay", "drop"];
+            all.extend_from_slice(args);
+            Cli::try_parse_from(all).map(|cli| match cli.cmd {
+                CtlCmd::Relay {
+                    action: RelayCmd::Drop { id, to },
+                } => (id, to),
+                _ => panic!("not relay drop"),
+            })
+        };
+        assert_eq!(drop(&["7"]).unwrap(), (Some(7), None));
+        assert_eq!(drop(&["--to", "S2"]).unwrap(), (None, Some(2)));
+        assert_eq!(drop(&["--to", "2"]).unwrap(), (None, Some(2)));
+        assert!(drop(&[]).is_err(), "needs an id or a slot");
+        assert!(drop(&["7", "--to", "S2"]).is_err(), "not both");
+        assert!(drop(&["--to", "S9"]).is_err(), "no such slot");
     }
 
     #[test]
@@ -1660,6 +1732,8 @@ mod tests {
                     state: RelayState::Pending,
                     delivered_at: None,
                     dropped_at: None,
+                    kind: overseer_proto::RelayKind::Note,
+                    drop_reason: None,
                     held: None,
                 }],
                 flag_after_secs: 3600,

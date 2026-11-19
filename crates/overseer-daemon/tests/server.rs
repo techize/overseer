@@ -9,8 +9,8 @@ use overseer_daemon::{run, DaemonConfig};
 use overseer_proto::{
     read_frame, write_frame, Activity, ActivityKind, BashCheck, BoardView, ClaimKind, CoordView,
     Event, Frame, HookEvent, HookKind, ItemKind, LockView, Plan, PlanDecision, PlanSlot, PlanState,
-    PlanTarget, PlanWorktree, RelayState, ReportKind, Request, Response, Sender, SlotInfo,
-    SlotState, SourceStatus, WorkItem, WorkView,
+    PlanTarget, PlanWorktree, RelayKind, RelayState, ReportKind, Request, Response, Sender,
+    SlotInfo, SlotState, SourceStatus, WorkItem, WorkView,
 };
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::UnixStream;
@@ -3457,6 +3457,260 @@ async fn two_pending_relays_go_in_one_paste() {
     assert_eq!(c.relay(Some(2), 0, "on it").await, queued_for(0));
 }
 
+impl Client {
+    async fn drop_relays(&mut self, from: Option<u8>, id: Option<i64>, to: Option<u8>) -> Response {
+        self.request(Request::DropRelays { from, id, to }).await
+    }
+}
+
+fn text(t: &str) -> Response {
+    Response::Text { text: t.into() }
+}
+
+#[tokio::test]
+async fn a_dropped_relay_is_never_typed_and_the_rest_still_go() {
+    let stub = box_stub("drop-one");
+    let d = start_daemon_with(temp_socket(), stub.env()).await;
+    let mut c = Client::connect(&d.socket).await;
+    c.start_stub(2, &stub).await;
+    c.hook(hook(2, HookKind::UserPromptSubmit)).await;
+    assert_eq!(c.relay(None, 2, "stale news").await, queued_for(2));
+    assert_eq!(c.relay(None, 2, "hello").await, queued_for(2));
+    let v = c.locks().await;
+    let stale = v.relays.iter().find(|r| r.text == "stale news").unwrap().id;
+    assert_eq!(
+        c.drop_relays(None, Some(stale), None).await,
+        text(&format!("Dropped relay {stale}."))
+    );
+    c.hook(hook(2, HookKind::Stop)).await;
+    assert_eq!(stub.read_until(&pasted(HELLO)).await, pasted(HELLO));
+    let v = c
+        .locks_until(|v| v.relays.iter().any(|r| r.state == RelayState::Delivered))
+        .await;
+    let dropped = v.relays.iter().find(|r| r.id == stale).unwrap();
+    assert_eq!(dropped.state, RelayState::Dropped);
+    assert_eq!(dropped.drop_reason.as_deref(), Some("dropped by you"));
+    // Delivered now, so it cannot be dropped, and the answer says why.
+    let hello = v.relays.iter().find(|r| r.text == "hello").unwrap().id;
+    assert!(
+        is_error(
+            &c.drop_relays(None, Some(hello), None).await,
+            &format!("relay {hello} was already delivered, so it cannot be dropped")
+        ),
+        "a delivered relay was dropped"
+    );
+    sleep(Duration::from_millis(1500)).await;
+    assert_eq!(stub.reads(), pasted(HELLO));
+}
+
+const NOW_HOLD: &str = "S1 has released custom:a. You now hold it.";
+
+/// S1 hands custom:a to S2 while S2 works, so the notice waits.
+async fn hand_custom_a_to_busy_s2(c: &mut Client, stub: &BoxStub) {
+    c.start_stub(2, stub).await;
+    c.hook(hook(2, HookKind::UserPromptSubmit)).await;
+    c.request(claim_target(1, "custom:a", None)).await;
+    assert!(matches!(
+        c.request(claim_target(2, "custom:a", None)).await,
+        Response::Queued { .. }
+    ));
+    c.request(Request::ReleaseTarget {
+        slot: 1,
+        target: t("custom:a"),
+    })
+    .await;
+    let v = c.locks().await;
+    assert_eq!(holds(&v), [(t("custom:a"), 2, ClaimKind::Claim)]);
+    let notice = v.relays.iter().find(|r| r.text == NOW_HOLD).unwrap();
+    assert_eq!(
+        notice.kind,
+        RelayKind::Lock {
+            target: t("custom:a")
+        }
+    );
+}
+
+#[tokio::test]
+async fn a_notice_for_a_target_still_held_goes_in_the_same_paste() {
+    let stub = box_stub("notice-held");
+    let d = start_daemon_with(temp_socket(), stub.env()).await;
+    let mut c = Client::connect(&d.socket).await;
+    hand_custom_a_to_busy_s2(&mut c, &stub).await;
+    assert_eq!(c.relay(None, 2, "hello").await, queued_for(2));
+    c.hook(hook(2, HookKind::Stop)).await;
+    let both = pasted(&format!("{NOW_HOLD}\n\n{HELLO}"));
+    assert_eq!(stub.read_until(&both).await, both);
+    let v = c
+        .locks_until(|v| v.relays.iter().all(|r| r.state == RelayState::Delivered))
+        .await;
+    assert!(v.relays.iter().all(|r| r.drop_reason.is_none()), "{v:?}");
+}
+
+#[tokio::test]
+async fn a_notice_for_a_target_since_released_is_dropped_not_typed() {
+    let stub = box_stub("notice-gone");
+    let d = start_daemon_with(temp_socket(), stub.env()).await;
+    let mut c = Client::connect(&d.socket).await;
+    hand_custom_a_to_busy_s2(&mut c, &stub).await;
+    assert_eq!(c.relay(None, 2, "hello").await, queued_for(2));
+    c.request(Request::ReleaseTarget {
+        slot: 2,
+        target: t("custom:a"),
+    })
+    .await;
+    c.hook(hook(2, HookKind::Stop)).await;
+    assert_eq!(stub.read_until(&pasted(HELLO)).await, pasted(HELLO));
+    let v = c
+        .locks_until(|v| v.relays.iter().any(|r| r.state == RelayState::Delivered))
+        .await;
+    let notice = v.relays.iter().find(|r| r.text == NOW_HOLD).unwrap();
+    assert_eq!(notice.state, RelayState::Dropped);
+    assert_eq!(
+        notice.drop_reason.as_deref(),
+        Some("no longer holds custom:a")
+    );
+    sleep(Duration::from_millis(1500)).await;
+    assert_eq!(stub.reads(), pasted(HELLO));
+}
+
+#[tokio::test]
+async fn nothing_is_pasted_when_every_notice_is_stale() {
+    let stub = box_stub("notice-only");
+    let d = start_daemon_with(temp_socket(), stub.env()).await;
+    let mut c = Client::connect(&d.socket).await;
+    hand_custom_a_to_busy_s2(&mut c, &stub).await;
+    c.request(Request::ReleaseTarget {
+        slot: 2,
+        target: t("custom:a"),
+    })
+    .await;
+    c.hook(hook(2, HookKind::Stop)).await;
+    let v = c
+        .locks_until(|v| v.relays.iter().all(|r| r.state == RelayState::Dropped))
+        .await;
+    assert_eq!(
+        v.relays[0].drop_reason.as_deref(),
+        Some("no longer holds custom:a")
+    );
+    assert!(v.relays[0].held.is_none(), "{v:?}");
+    stub.reads_nothing_for(2).await;
+}
+
+#[tokio::test]
+async fn dropping_a_lock_notice_by_hand_hands_the_target_on() {
+    let d = lock_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    c.request(claim_target(1, "custom:a", None)).await;
+    c.request(claim_target(2, "custom:a", None)).await;
+    c.request(claim_target(3, "custom:a", None)).await;
+    c.request(Request::ReleaseTarget {
+        slot: 1,
+        target: t("custom:a"),
+    })
+    .await;
+    let v = c.locks().await;
+    assert_eq!(holds(&v), [(t("custom:a"), 2, ClaimKind::Claim)]);
+    let notice = v.relays.iter().find(|r| r.to == 2).unwrap().id;
+    assert_eq!(
+        c.drop_relays(None, Some(notice), None).await,
+        text(&format!("Dropped relay {notice}."))
+    );
+    let v = c.locks().await;
+    assert_eq!(holds(&v), [(t("custom:a"), 3, ClaimKind::Claim)]);
+    let states = relay_states(&v);
+    assert!(
+        states.contains(&(
+            3,
+            t("S2 has released custom:a. You now hold it."),
+            RelayState::Pending
+        )),
+        "{states:?}"
+    );
+    let dropped = v.relays.iter().find(|r| r.id == notice).unwrap();
+    assert_eq!(dropped.drop_reason.as_deref(), Some("dropped by you"));
+    // With no one waiting, dropping S3's notice frees the target.
+    assert_eq!(
+        c.drop_relays(None, None, Some(3)).await,
+        text("Dropped 1 relay to S3.")
+    );
+    assert!(c.locks().await.claims.is_empty());
+}
+
+/// S2 runs its deploy on the grant before the notice reaches it; dropping
+/// the notice then must not take the target from it.
+#[tokio::test]
+async fn dropping_the_notice_of_a_grant_in_use_keeps_the_hold() {
+    let d = lock_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    let api = "deploy:demo/api";
+    assert_eq!(c.check(1, "tu-1", "demo-deploy api").await, None);
+    assert!(c.check(2, "tu-2", "demo-deploy api").await.is_some());
+    assert!(c.check(3, "tu-3", "demo-deploy api").await.is_some());
+    c.hook(post_tool_use(1, "tu-1")).await;
+    assert_eq!(holds(&c.locks().await), [(t(api), 2, ClaimKind::Grant)]);
+    assert_eq!(c.check(2, "tu-4", "demo-deploy api").await, None);
+    let v = c.locks().await;
+    assert_eq!(holds(&v), [(t(api), 2, ClaimKind::Command)]);
+    let notice = v.relays.iter().find(|r| r.to == 2).unwrap().id;
+    assert_eq!(
+        c.drop_relays(None, None, Some(2)).await,
+        text("Dropped 1 relay to S2.")
+    );
+    let v = c.locks().await;
+    assert_eq!(holds(&v), [(t(api), 2, ClaimKind::Command)]);
+    assert_eq!(queued(&v), [(t(api), 3)]);
+    let dropped = v.relays.iter().find(|r| r.id == notice).unwrap();
+    assert_eq!(dropped.state, RelayState::Dropped);
+    assert!(v.relays.iter().all(|r| r.to != 3), "{v:?}");
+}
+
+#[tokio::test]
+async fn drop_every_relay_to_a_slot_says_how_many() {
+    let d = lock_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    assert_eq!(c.start(2).await, Response::Ok);
+    assert_eq!(c.start(0).await, Response::Ok);
+    assert_eq!(c.relay(Some(0), 2, "status?").await, queued_for(2));
+    assert_eq!(c.relay(None, 2, "one").await, queued_for(2));
+    assert_eq!(c.relay(None, 2, "two").await, queued_for(2));
+    // S0 drops only its own.
+    assert_eq!(
+        c.drop_relays(Some(0), None, Some(2)).await,
+        text("Dropped 1 relay you sent to S2.")
+    );
+    assert_eq!(
+        c.drop_relays(None, None, Some(2)).await,
+        text("Dropped 2 relays to S2.")
+    );
+    assert_eq!(
+        c.drop_relays(None, None, Some(2)).await,
+        text("Dropped 0 relays: none to S2 were pending.")
+    );
+    let reasons: Vec<_> = c
+        .locks()
+        .await
+        .relays
+        .iter()
+        .map(|r| (r.text.clone(), r.drop_reason.clone()))
+        .collect();
+    assert_eq!(
+        reasons,
+        vec![
+            ("two".to_string(), Some("dropped by you".to_string())),
+            ("one".to_string(), Some("dropped by you".to_string())),
+            ("status?".to_string(), Some("dropped by S0".to_string())),
+        ]
+    );
+    assert!(is_error(
+        &c.drop_relays(None, Some(1), Some(2)).await,
+        "give a relay id or a slot, not both"
+    ));
+    assert!(is_error(
+        &c.drop_relays(None, None, None).await,
+        "give a relay id or a slot to drop relays to"
+    ));
+}
+
 #[tokio::test]
 async fn pending_relay_delivers_after_restart_and_resume() {
     let stub = box_stub("restart");
@@ -4448,6 +4702,51 @@ async fn approve_runs_every_step() {
     assert_eq!(record.state, PlanState::Approved);
     assert!(!record.edited);
     assert_eq!(record.outcome, lines);
+}
+
+/// Plan 2's kickoff replaces plan 1's while S3 is too busy to have had it.
+#[tokio::test]
+async fn a_newer_plans_kickoff_replaces_the_pending_one() {
+    let rig = PlanRig::new("replace-kickoff");
+    let (_d, mut c) = rig.start().await;
+    let (_s0, s3) = live_s0_and_s3(&mut c, "replace-kickoff").await;
+    c.hook(hook(3, HookKind::UserPromptSubmit)).await;
+    let first = plan_of(vec![rig.slot3()]);
+    assert!(matches!(
+        c.propose(Some(0), first.clone()).await,
+        Response::Text { .. }
+    ));
+    assert!(matches!(c.approve(1, first).await, Response::Text { .. }));
+    let mut later = rig.slot3();
+    later.kickoff = "Drop that, look at the logs.".into();
+    let second = plan_of(vec![later]);
+    assert!(matches!(
+        c.propose(Some(0), second.clone()).await,
+        Response::Text { .. }
+    ));
+    assert!(matches!(c.approve(2, second).await, Response::Text { .. }));
+    let v = c.locks().await;
+    let to_s3: Vec<_> = v
+        .relays
+        .iter()
+        .filter(|r| r.to == 3)
+        .map(|r| (r.kind.clone(), r.state, r.drop_reason.clone()))
+        .collect();
+    assert_eq!(
+        to_s3,
+        vec![
+            (RelayKind::Kickoff { plan: 2 }, RelayState::Pending, None),
+            (
+                RelayKind::Kickoff { plan: 1 },
+                RelayState::Dropped,
+                Some("replaced by plan 2's kickoff".to_string())
+            ),
+        ]
+    );
+    // Only plan 2's kickoff is typed in once S3 is idle.
+    c.hook(hook(3, HookKind::Stop)).await;
+    let got = s3.read_until("Drop that, look at the logs.").await;
+    assert!(!got.contains("Pick this up next."), "{got}");
 }
 
 #[tokio::test]

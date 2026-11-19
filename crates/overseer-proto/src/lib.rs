@@ -20,8 +20,8 @@ pub use msg::{
     Activity, ActivityKind, Approvals, BashCheck, BoardView, BrainRun, BrainView, ChildBead, Claim,
     ClaimKind, CoordView, DaemonInfo, Event, HookEvent, HookKind, ItemDetail, ItemKind, LockView,
     NotesRemote, Notice, Plan, PlanDecision, PlanRecord, PlanSlot, PlanState, PlanTarget,
-    PlanWorktree, PullRequest, QueueEntry, QueueState, Relay, RelayState, Report, ReportKind,
-    Request, Response, Sender, SlotId, SlotInfo, SlotState, SourceStatus, SprintDay, Stage,
-    Summary, TokenKind, Wait, WorkItem, WorkView, WriteCheck, CHECK_ENV, JIRA_OFF, PRS_OFF,
+    PlanWorktree, PullRequest, QueueEntry, QueueState, Relay, RelayKind, RelayState, Report,
+    ReportKind, Request, Response, Sender, SlotId, SlotInfo, SlotState, SourceStatus, SprintDay,
+    Stage, Summary, TokenKind, Wait, WorkItem, WorkView, WriteCheck, CHECK_ENV, JIRA_OFF, PRS_OFF,
     UNKNOWN_STATUS,
 };

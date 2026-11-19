@@ -94,6 +94,17 @@ fn tools() -> Value {
             }
         },
         {
+            "name": "drop_relay",
+            "description": "Withdraw a message you sent with notify_session that has not been typed in yet. Give `id` for one message (list_targets shows the ids of your pending ones) or `to` for every pending message you sent to that slot. You can only drop your own.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer", "description": "The relay id, for example 7."},
+                    "to": {"type": ["string", "integer"], "description": "The slot, as S3 or 3."}
+                }
+            }
+        },
+        {
             "name": "list_targets",
             "description": "List the targets that are held, who holds them and who is waiting. Read-only.",
             "inputSchema": {"type": "object", "properties": {}}
@@ -447,6 +458,30 @@ fn tool_request(name: &str, args: &Value, slot: Option<SlotId>) -> Result<ToolPl
                 text: str_arg(args, "text")?.to_owned(),
             })
         }
+        "drop_relay" => {
+            let id = match args.get("id") {
+                None | Some(Value::Null) => None,
+                Some(v) => Some(
+                    v.as_i64()
+                        .ok_or_else(|| "`id` must be a relay id like 7".to_string())?,
+                ),
+            };
+            let to = match args.get("to") {
+                None | Some(Value::Null) => None,
+                Some(v) => Some(
+                    slot_arg(v)
+                        .ok_or_else(|| "`to` must be a slot like \"S3\" or 3".to_string())?,
+                ),
+            };
+            if id.is_some() == to.is_some() {
+                return Err("give exactly one of `id` and `to`".into());
+            }
+            ToolPlan::Send(Request::DropRelays {
+                from: Some(own),
+                id,
+                to,
+            })
+        }
         "list_targets" => ToolPlan::Send(Request::ListLocks),
         "commit_2ndbrain" => ToolPlan::Send(Request::Commit {
             from: slot,
@@ -518,6 +553,34 @@ enum ToolPlan {
     Send(Request),
 }
 
+/// `format_locks`, then the relays `slot` sent that are still pending
+/// (`relay #7 to S2, pending 5m: <text>`), so it can drop one by id.
+fn format_locks_for(view: &overseer_proto::LockView, slot: SlotId, now: i64) -> String {
+    let mut out = format_locks(view);
+    let mine: Vec<String> = view
+        .relays
+        .iter()
+        .filter(|r| {
+            r.from == (overseer_proto::Sender::Slot { slot })
+                && r.state == overseer_proto::RelayState::Pending
+        })
+        .map(|r| {
+            format!(
+                "relay #{} to {}, pending {}: {}",
+                r.id,
+                slot_name(r.to),
+                crate::ctl::short_age(now - r.at),
+                crate::ctl::cut(&r.text, 80)
+            )
+        })
+        .collect();
+    if !mine.is_empty() {
+        out.push_str("\nYour pending relays:\n");
+        out.push_str(&mine.join("\n"));
+    }
+    out
+}
+
 /// `repo:demo-api:main  S1  since 08:40  for DEMO-33`, then one
 /// `  waiting: S2` line per queued slot, or `No targets are held.`
 fn format_locks(view: &overseer_proto::LockView) -> String {
@@ -561,18 +624,20 @@ fn call_tool(params: &Value, slot: Option<SlotId>, call: &mut Call) -> Result<Va
         Some(_) => return Err("`arguments` must be an object".into()),
     };
     let ToolPlan::Send(req) = tool_request(name, args, slot)?;
-    if slot.is_none() {
+    let Some(slot) = slot else {
         if name == "update_current_session" {
             return Ok(tool_result(NEEDS_A_SLOT, true));
         }
         return Ok(tool_result(NOT_IN_A_SLOT, true));
-    }
+    };
     Ok(match call(req) {
         Err(reason) => tool_result(format!("Overseer is not reachable: {reason}"), true),
         Ok(Response::Error { message }) => tool_result(message, true),
         Ok(Response::Text { text }) => tool_result(text, false),
         Ok(Response::Queued { message }) => tool_result(message, false),
-        Ok(Response::Locks(view)) => tool_result(format_locks(&view), false),
+        Ok(Response::Locks(view)) => {
+            tool_result(format_locks_for(&view, slot, crate::ctl::now_secs()), false)
+        }
         Ok(Response::Board(view)) => tool_result(
             crate::ctl::format_board(&view, crate::ctl::now_secs(), &crate::ctl::user_name()),
             false,
@@ -956,7 +1021,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_has_seventeen_tools() {
+    fn tools_list_has_eighteen_tools() {
         let (out, _) = call_with(&rpc("tools/list", json!({})), Some(1), Ok(Response::Ok));
         let out = out.unwrap();
         let names: Vec<&str> = out["result"]["tools"]
@@ -971,6 +1036,7 @@ mod tests {
                 "claim_target",
                 "release_target",
                 "notify_session",
+                "drop_relay",
                 "list_targets",
                 "commit_2ndbrain",
                 "append_journal",
@@ -987,7 +1053,7 @@ mod tests {
                 "set_board_summary"
             ]
         );
-        assert_eq!(names.len(), 17);
+        assert_eq!(names.len(), 18);
     }
 
     fn demo_detail() -> ItemDetail {
@@ -1116,6 +1182,10 @@ mod tests {
             tool("notify_session", json!({"slot": "main", "text": "hi"})),
             tool("notify_session", json!({"slot": 1.5, "text": "hi"})),
             tool("notify_session", json!({"slot": "S1"})),
+            tool("drop_relay", json!({})),
+            tool("drop_relay", json!({"id": 7, "to": "S2"})),
+            tool("drop_relay", json!({"id": "seven"})),
+            tool("drop_relay", json!({"to": "main"})),
             tool("no_such_tool", json!({})),
             rpc("tools/call", json!({})),
             rpc(
@@ -1188,6 +1258,76 @@ mod tests {
             }]
         );
         assert_eq!(text_of(&out.unwrap()), ("Released uat/root.", false));
+    }
+
+    #[test]
+    fn drop_relay_sends_the_calling_slot_with_an_id_or_a_slot() {
+        let dropped = || {
+            Ok(Response::Text {
+                text: "Dropped relay 7.".into(),
+            })
+        };
+        let (out, seen) = call_with(&tool("drop_relay", json!({"id": 7})), Some(0), dropped());
+        assert_eq!(
+            seen,
+            [Request::DropRelays {
+                from: Some(0),
+                id: Some(7),
+                to: None
+            }]
+        );
+        assert_eq!(text_of(&out.unwrap()), ("Dropped relay 7.", false));
+        for to in [json!("S2"), json!(2)] {
+            let (_, seen) = call_with(&tool("drop_relay", json!({"to": to})), Some(3), dropped());
+            assert_eq!(
+                seen,
+                [Request::DropRelays {
+                    from: Some(3),
+                    id: None,
+                    to: Some(2)
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn list_targets_shows_the_callers_pending_relays() {
+        use overseer_proto::{LockView, Relay, RelayKind, RelayState, Sender};
+        let relay = |id, from, state| Relay {
+            id,
+            at: 100,
+            from,
+            to: 2,
+            text: "status?\nmore".into(),
+            state,
+            delivered_at: None,
+            dropped_at: None,
+            kind: RelayKind::Note,
+            drop_reason: None,
+            held: None,
+        };
+        let v = LockView {
+            claims: vec![],
+            waits: vec![],
+            relays: vec![
+                relay(9, Sender::You, RelayState::Pending),
+                relay(8, Sender::Slot { slot: 0 }, RelayState::Delivered),
+                relay(7, Sender::Slot { slot: 0 }, RelayState::Pending),
+            ],
+            flag_after_secs: 3600,
+        };
+        assert_eq!(
+            format_locks_for(&v, 0, 100 + 5 * 60),
+            "No targets are held.\nYour pending relays:\nrelay #7 to S2, pending 5m: status?..."
+        );
+        // The same ages as ctl and the GUI: hours, then days.
+        assert!(
+            format_locks_for(&v, 0, 100 + 5 * 3600).ends_with("pending 5h: status?..."),
+            "{}",
+            format_locks_for(&v, 0, 100 + 5 * 3600)
+        );
+        assert!(format_locks_for(&v, 0, 100 + 3 * 86_400).ends_with("pending 3d: status?..."));
+        assert_eq!(format_locks_for(&v, 3, 400), "No targets are held.");
     }
 
     #[test]
