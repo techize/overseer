@@ -67,6 +67,7 @@ mod tests {
             tool_use_id: None,
             notification_type: None,
             run: None,
+            agent_id: None,
         }
     }
 

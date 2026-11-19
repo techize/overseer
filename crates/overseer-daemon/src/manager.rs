@@ -436,6 +436,13 @@ impl SlotManager {
         if ev.run.as_deref().is_some_and(|run| run != entry.slot.run()) {
             return;
         }
+        // A subagent's or teammate's events describe its own work, not the
+        // main conversation's: a background one keeps calling tools after
+        // the main turn's Stop, and a PostToolUse from it would mark an idle
+        // session working until its next turn (#58).
+        if ev.agent_id.is_some() {
+            return;
+        }
         // A resumed or compacted session can report an id other than the one
         // we generated; the ledger needs the real one to resume it. Written
         // synchronously for the same reason as the start write.

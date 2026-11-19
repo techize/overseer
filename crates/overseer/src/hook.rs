@@ -71,6 +71,7 @@ pub fn parse_hook(event: &str, slot_env: &str, stdin: &[u8]) -> Option<HookEvent
         tool_use_id: text("tool_use_id"),
         notification_type: text("notification_type"),
         run: std::env::var("OVERSEER_RUN").ok(),
+        agent_id: text("agent_id"),
     })
 }
 
@@ -297,6 +298,18 @@ mod tests {
         let ev = parse_hook("Notification", "S1", note).unwrap();
         assert_eq!(ev.notification_type.as_deref(), Some("idle_prompt"));
         assert_eq!(ev.tool_use_id, None);
+    }
+
+    #[test]
+    fn parse_hook_marks_a_subagent_event() {
+        let sub = br#"{"tool_name":"Bash","agent_id":"ag-1","agent_type":"Explore","tool_input":{"command":"ls"}}"#;
+        let ev = parse_hook("PostToolUse", "S1", sub).unwrap();
+        assert_eq!(ev.agent_id.as_deref(), Some("ag-1"));
+        let main = br#"{"tool_name":"Bash","tool_input":{"command":"ls"}}"#;
+        assert_eq!(
+            parse_hook("PostToolUse", "S1", main).unwrap().agent_id,
+            None
+        );
     }
 
     #[test]

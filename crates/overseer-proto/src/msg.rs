@@ -128,6 +128,10 @@ pub struct HookEvent {
     /// sent it, so a late event from a killed run is not applied to the next.
     #[serde(default)]
     pub run: Option<String>,
+    /// Claude Code's `agent_id`, set when the event fires inside a subagent
+    /// or teammate rather than the main conversation.
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1491,6 +1495,7 @@ mod tests {
             tool_use_id: None,
             notification_type: None,
             run: None,
+            agent_id: None,
         });
         let back: Request = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
         assert_eq!(back, req);
