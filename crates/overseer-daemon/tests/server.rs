@@ -5478,6 +5478,42 @@ mod restart {
     }
 
     #[tokio::test]
+    async fn a_hook_sent_while_down_is_applied_after_restart() {
+        let d = start_daemon().await;
+        let mut c = Client::connect(&d.socket).await;
+        let run_cmd = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "echo \"RUN=[$OVERSEER_RUN]\"; exec cat".to_string(),
+        ];
+        c.start_cmd(1, run_cmd).await;
+        assert_eq!(c.request(Request::Attach { id: 1 }).await, Response::Ok);
+        let out = c.output_until(1, "]").await;
+        let at = out.find("RUN=[").expect("run printed") + 5;
+        let run = out[at..at + out[at..].find(']').unwrap()].to_string();
+        assert!(!run.is_empty());
+        c.hook(hook(1, HookKind::SessionStart)).await;
+        assert_eq!(activity_of(&c.list().await[1]).kind, ActivityKind::Idle);
+        drop(c);
+
+        let down = stop_keeping(d).await;
+        // What `overseer hook` leaves when it finds no daemon.
+        let mut working = hook(1, HookKind::UserPromptSubmit);
+        working.run = Some(run);
+        overseer_proto::spool::append(&down.state_dir, &working).unwrap();
+        let d = start_daemon_at(down.socket.clone()).await;
+        let mut c = Client::connect(&d.socket).await;
+        assert_eq!(activity_of(&c.list().await[1]).kind, ActivityKind::Working);
+        assert!(
+            !down
+                .state_dir
+                .join(overseer_proto::spool::SPOOL_FILE)
+                .exists(),
+            "spool not taken"
+        );
+    }
+
+    #[tokio::test]
     async fn output_while_down_is_shown_after_restart() {
         let d = start_daemon().await;
         let go = dir_of(&d).join("go");

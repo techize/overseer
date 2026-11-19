@@ -10,7 +10,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use overseer_proto::{
-    paths, BashCheck, Client, HookEvent, HookKind, Request, Response, SlotId, WriteCheck, CHECK_ENV,
+    paths, spool, BashCheck, Client, HookEvent, HookKind, Request, Response, SlotId, WriteCheck,
+    CHECK_ENV,
 };
 
 /// Total budget for connect plus the round trip. A hook that waits longer
@@ -231,13 +232,24 @@ pub fn run(event: &str) {
     // Plain connect: a hook must never start a daemon.
     // The timeout is built inside the async block: it needs the runtime's
     // timer, which only exists once `block_on` is running.
-    rt.block_on(async {
-        let _ = tokio::time::timeout(DELIVER_WITHIN, async {
-            let client = Client::connect(paths::socket_path()).await.ok()?;
-            client.request(Request::Hook(ev)).await.ok()
+    let unreachable = rt.block_on(async {
+        tokio::time::timeout(DELIVER_WITHIN, async {
+            match Client::connect(paths::socket_path()).await {
+                Ok(client) => {
+                    let _ = client.request(Request::Hook(ev.clone())).await;
+                    false
+                }
+                Err(_) => true,
+            }
         })
-        .await;
+        .await
+        .unwrap_or(false)
     });
+    // No daemon is listening: leave the event for the next one to apply. A
+    // daemon that answered too slowly was reached, so nothing is spooled.
+    if unreachable {
+        let _ = spool::append(&paths::state_dir(), &ev);
+    }
 }
 
 #[cfg(test)]

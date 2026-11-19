@@ -10,8 +10,8 @@ use bytes::Bytes;
 use overseer_proto::{
     read_frame,
     settings::{SettingEdit, TokenStatus},
-    slot_name, write_frame, BoardView, DaemonInfo, Event, Frame, Request, Response, SlotId,
-    SlotState, TokenKind,
+    slot_name, write_frame, BoardView, DaemonInfo, Event, Frame, HookEvent, Request, Response,
+    SlotId, SlotState, TokenKind,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
@@ -316,6 +316,21 @@ pub async fn run(mut cfg: DaemonConfig) -> anyhow::Result<()> {
     let ended = sessionless(&mgr.list());
     locks.reconcile_exits(&ended, unix_now());
     let manager: Manager = Arc::new(Mutex::new(mgr));
+    // Hooks that found no daemon were spooled. They come after the restore,
+    // so what happened while down wins over the saved activity; an event of
+    // a run that is no longer there is dropped by the same run check as a
+    // live one. A spool that cannot be read never blocks startup.
+    match overseer_proto::spool::take(&state_dir) {
+        Ok(events) => {
+            if !events.is_empty() {
+                tracing::info!("applying {} hook events spooled while down", events.len());
+            }
+            for ev in &events {
+                apply_hook(&manager, &locks, ev);
+            }
+        }
+        Err(e) => tracing::warn!("hook spool not read: {e:#}"),
+    }
     if let Some(b) = &brain {
         {
             let (manager, store, ledger) = (manager.clone(), store.clone(), ledger.clone());
@@ -1345,11 +1360,18 @@ fn handle_request(
         // Always Ok: a hook runs inside Claude and must never see a failure
         // because of the daemon's state.
         Request::Hook(ev) => {
-            manager.lock().unwrap().hook(&ev);
-            locks.on_hook(&ev, unix_now());
+            apply_hook(manager, locks, &ev);
             Response::Ok
         }
     }
+}
+
+/// Applies one hook event to its slot and to the lock table. Shared by the
+/// `Hook` request and the replay of the events spooled while the daemon was
+/// down.
+fn apply_hook(manager: &Manager, locks: &LockService, ev: &HookEvent) {
+    manager.lock().unwrap().hook(ev);
+    locks.on_hook(ev, unix_now());
 }
 
 /// Largest Output frame built by merging queued chunks.

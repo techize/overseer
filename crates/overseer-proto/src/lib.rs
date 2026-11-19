@@ -6,6 +6,7 @@ pub mod frame;
 pub mod msg;
 pub mod paths;
 pub mod settings;
+pub mod spool;
 
 pub use build::{
     build_from_plist, build_notice, build_of_exe, compare_builds, current_build, local_hhmm,

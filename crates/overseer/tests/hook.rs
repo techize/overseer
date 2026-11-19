@@ -53,6 +53,22 @@ fn silent_and_fast_without_a_daemon() {
 }
 
 #[test]
+fn a_hook_with_no_daemon_spools_one_event_and_exits_zero() {
+    let home = std::env::temp_dir().join(format!("ovhook-spool-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    run_hook(&home);
+    let spool = std::fs::read_to_string(home.join(overseer_proto::spool::SPOOL_FILE))
+        .expect("the event was spooled");
+    assert_eq!(spool.lines().count(), 1, "{spool:?}");
+    let events = overseer_proto::spool::take(&home).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].slot, 1);
+    assert_eq!(events[0].event, HookKind::Stop);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn silent_and_fast_with_a_daemon() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let home = std::env::temp_dir().join(format!("ovhook-d-{}", std::process::id()));
