@@ -47,6 +47,17 @@ enum Cmd {
     },
     /// Remove the LaunchAgent.
     UninstallAgent,
+    /// Keep one session's terminal alive across daemon restarts (run by the
+    /// daemon, not by hand). Reads the session's spawn spec from stdin.
+    #[command(hide = true)]
+    Hold {
+        /// The daemon's state directory.
+        #[arg(required_unless_present = "end", conflicts_with = "end")]
+        state_dir: Option<std::path::PathBuf>,
+        /// End the holder named by this pid file.
+        #[arg(long, value_name = "PIDFILE")]
+        end: Option<std::path::PathBuf>,
+    },
 }
 
 fn default_command() -> Vec<String> {
@@ -75,6 +86,9 @@ fn main() {
         return;
     };
     let result = match command {
+        // No logger and no stdio: the holder outlives the daemon's pipes.
+        Cmd::Hold { end: None, .. } => overseer_daemon::holder::main(),
+        Cmd::Hold { end: Some(_), .. } => Err(anyhow::anyhow!("hold --end is not yet supported")),
         // No logger and no stderr: a hook must be silent and always exit 0.
         Cmd::Hook { event } => {
             hook::run(&event);

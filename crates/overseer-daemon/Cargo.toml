@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "overseer-test-holder"
+path = "src/bin/test_holder.rs"
+test = false
+
 [dependencies]
 overseer-proto = { path = "../overseer-proto" }
 overseer-term = { path = "../overseer-term" }
