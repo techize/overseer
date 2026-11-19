@@ -204,7 +204,7 @@ impl Drop for HeldPty {
 }
 
 /// Whether a process with this pid exists.
-fn alive(pid: u32) -> bool {
+pub(crate) fn alive(pid: u32) -> bool {
     let Ok(pid) = i32::try_from(pid) else {
         return false;
     };
@@ -214,7 +214,7 @@ fn alive(pid: u32) -> bool {
             || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
 }
 
-fn read_pid_file(path: &Path) -> Option<PidFile> {
+pub(crate) fn read_pid_file(path: &Path) -> Option<PidFile> {
     serde_json::from_slice(&std::fs::read(path).ok()?).ok()
 }
 

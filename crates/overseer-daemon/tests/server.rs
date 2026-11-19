@@ -5668,4 +5668,107 @@ mod restart {
         assert_eq!(c.relay(None, 1, "hello").await, queued_for(1));
         c.delivered_after_redraw(1).await;
     }
+
+    /// Stands in for a holder that is alive but never greets: two `sleep`
+    /// processes named by its pid file (each leading its own process
+    /// group) and a listener on its socket that accepts and says nothing.
+    struct MuteHolder {
+        holder: std::process::Child,
+        child: std::process::Child,
+        pid_file: PathBuf,
+        /// Connections the daemon has opened and then closed.
+        closed: std::sync::Arc<AtomicU32>,
+    }
+
+    impl MuteHolder {
+        fn new(state_dir: &Path, slot: u8) -> MuteHolder {
+            use std::os::unix::fs::DirBuilderExt;
+            use std::os::unix::process::CommandExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(overseer_daemon::holder::holders_dir(state_dir))
+                .unwrap();
+            let sleep_60 = || {
+                std::process::Command::new("/bin/sleep")
+                    .arg("60")
+                    .process_group(0)
+                    .spawn()
+                    .unwrap()
+            };
+            let (holder, child) = (sleep_60(), sleep_60());
+            let pid_file = pid_path(state_dir, slot);
+            let pid = PidFile {
+                holder: holder.id(),
+                child: child.id(),
+                version: overseer_daemon::holder::HOLDER_PROTOCOL,
+            };
+            std::fs::write(&pid_file, serde_json::to_vec(&pid).unwrap()).unwrap();
+            let listener =
+                std::os::unix::net::UnixListener::bind(socket_path(state_dir, slot)).unwrap();
+            let closed = std::sync::Arc::new(AtomicU32::new(0));
+            let seen = closed.clone();
+            std::thread::spawn(move || {
+                for conn in listener.incoming() {
+                    let Ok(mut conn) = conn else { return };
+                    let seen = seen.clone();
+                    std::thread::spawn(move || {
+                        use std::io::Read;
+                        let mut buf = [0u8; 1024];
+                        while matches!(conn.read(&mut buf), Ok(n) if n > 0) {}
+                        seen.fetch_add(1, Ordering::SeqCst);
+                    });
+                }
+            });
+            MuteHolder {
+                holder,
+                child,
+                pid_file,
+                closed,
+            }
+        }
+
+        fn ended(&mut self) -> bool {
+            self.holder.try_wait().unwrap().is_some() && self.child.try_wait().unwrap().is_some()
+        }
+    }
+
+    impl Drop for MuteHolder {
+        fn drop(&mut self) {
+            // Gone before anything reads the pid file again: its pids may
+            // be reused once reaped.
+            let _ = std::fs::remove_file(&self.pid_file);
+            let _ = self.holder.kill();
+            let _ = self.child.kill();
+            let _ = self.holder.wait();
+            let _ = self.child.wait();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_holder_that_never_greets_keeps_a_card_stop_can_end() {
+        let socket = temp_socket();
+        let state_dir = socket.parent().unwrap().join("state");
+        let mut mute = MuteHolder::new(&state_dir, 1);
+        let child = mute.child.id();
+        let d = start_daemon_at(socket).await;
+        // The daemon gives up on the hello and starts serving.
+        let closed = mute.closed.clone();
+        until("the attach to time out", WAIT * 3, || {
+            closed.load(Ordering::SeqCst) >= 1
+        })
+        .await;
+        let mut c = Client::connect(&d.socket).await;
+        let info = c.list().await.remove(1);
+        assert_eq!(running_pid(&info), child, "{info:?}");
+        assert!(info.held, "{info:?}");
+        // A new session there would take the live holder's socket.
+        assert!(matches!(c.start(1).await, Response::Error { .. }));
+        assert_eq!(c.request(Request::StopSlot { id: 1 }).await, Response::Ok);
+        until("the session to end", WAIT, || mute.ended()).await;
+        let info = c.list().await.remove(1);
+        assert!(!matches!(info.state, SlotState::Running { .. }), "{info:?}");
+        // Reaped, and its pid file gone, before the daemon guard looks.
+        drop(mute);
+    }
 }
