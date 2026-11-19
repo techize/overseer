@@ -641,9 +641,11 @@ pub fn summary_lines(view: &CoordView, clock: impl Fn(i64) -> String) -> (String
     }
 }
 
-/// The coordinator panel's line for the plan waiting for Jonathan.
+/// The coordinator panel's line for the plan waiting for Jonathan. A click
+/// on it opens the plan view like `p`, so it names the plan `open_plan`
+/// opens.
 pub fn plan_line(view: &CoordView) -> Option<String> {
-    let plan = view.plans.iter().find(|p| p.state == PlanState::Pending)?;
+    let plan = view.pending_plan()?;
     Some(format!("Plan {} waiting for you (p)", plan.id))
 }
 
@@ -1082,10 +1084,16 @@ impl OverseerApp {
                     )
                     .children(plan_line.map(|line| {
                         div()
+                            .id("plan-line")
+                            .cursor_pointer()
                             .text_sm()
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(colors::ORANGE))
+                            .hover(|s| s.underline())
                             .child(line)
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.open_plan(window, cx)),
+                            )
                     }))
                     .children((!outcome_lines.is_empty()).then(|| {
                         div()
@@ -2244,6 +2252,26 @@ mod tests {
         assert_eq!(
             plan_line(&view).as_deref(),
             Some("Plan 7 waiting for you (p)")
+        );
+    }
+
+    #[test]
+    fn plan_line_names_the_plan_a_click_opens() {
+        use overseer_proto::PlanState;
+        let mut view = crate::app::empty_coord();
+        view.plans
+            .push(crate::app::test_plan(5, PlanState::Approved));
+        // Only an approved plan: no line, so nothing to click that would
+        // find no plan waiting.
+        assert_eq!(plan_line(&view), None);
+        assert!(view.pending_plan().is_none());
+        view.plans
+            .push(crate::app::test_plan(7, PlanState::Pending));
+        let opened = view.pending_plan().map(|p| p.id);
+        assert_eq!(opened, Some(7));
+        assert_eq!(
+            plan_line(&view),
+            Some(format!("Plan {} waiting for you (p)", opened.unwrap()))
         );
     }
 
