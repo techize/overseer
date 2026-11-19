@@ -3391,6 +3391,30 @@ async fn working_slot_with_an_idle_screen_gets_the_relay() {
     c.all_delivered(2).await;
 }
 
+/// A relay only just queued stays for the courier: a tool reply takes
+/// relays only once they have waited (#58). A slot with no session gets
+/// nothing either way.
+#[tokio::test]
+async fn a_fresh_relay_is_not_taken_into_a_tool_reply() {
+    let stub = box_stub("fresh");
+    let d = start_daemon_with(temp_socket(), stub.env()).await;
+    let mut c = Client::connect(&d.socket).await;
+    let pid = c.start_stub(2, &stub).await;
+    stub.set_box(Some("@working"), pid).await;
+    c.hook(hook(2, HookKind::UserPromptSubmit)).await;
+    assert_eq!(c.relay(None, 2, "hello").await, queued_for(2));
+    for slot in [2, 4] {
+        assert_eq!(
+            c.request(Request::TakeStaleRelays { slot }).await,
+            Response::Text {
+                text: String::new()
+            }
+        );
+    }
+    let v = c.locks().await;
+    assert_eq!(v.relays[0].state, RelayState::Pending);
+}
+
 #[tokio::test]
 async fn permission_prompt_never_gets_a_relay() {
     let stub = box_stub("permission");

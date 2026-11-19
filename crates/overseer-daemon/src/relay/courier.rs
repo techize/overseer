@@ -30,7 +30,7 @@ use tokio::time::Instant;
 
 use super::screen::{input_box, shows_working, InputBox};
 use crate::ledger::Ledger;
-use crate::locks::table::{claim_batch_on, pending_relays_on, unclaim_on};
+use crate::locks::table::{claim_batch_on, claim_stale_on, pending_relays_on, unclaim_on};
 use crate::locks::LockService;
 use crate::manager::{SlotManager, SLOT_COUNT};
 use crate::work::store::unix_now;
@@ -46,6 +46,12 @@ const COOLDOWN: Duration = Duration::from_secs(10);
 /// working line before it counts as idle. A running turn always draws its
 /// working line, so this only has to outlast a redraw.
 const QUIET_FOR: Duration = Duration::from_secs(10);
+/// A relay pending this long also goes out in the slot's next Overseer
+/// MCP tool reply, for when it cannot be typed in (#58).
+pub const STALE_AFTER: Duration = Duration::from_secs(5 * 60);
+/// Heads relays shown in a tool reply.
+const STALE_HEADER: &str =
+    "Overseer could not type these messages into your session, so here they are:";
 /// Screen rows logged when the input box cannot be found.
 const LOGGED_ROWS: usize = 12;
 
@@ -200,6 +206,31 @@ impl Courier {
     /// Something may have a relay to deliver: look now.
     pub fn poke(&self) {
         self.wake.notify_one();
+    }
+
+    /// The text of `slot`'s pending relays, marked delivered at `now`, if
+    /// the oldest has waited `STALE_AFTER` or more; else empty. For
+    /// `TakeStaleRelays`: the session reads them in an MCP tool's reply.
+    /// The claim is the courier's own, so a relay is never both pasted and
+    /// shown, and a lock notice that no longer holds is dropped.
+    pub fn take_stale(&self, slot: SlotId, now: i64) -> Result<String, String> {
+        let stale_by = now - STALE_AFTER.as_secs() as i64;
+        let relays = self
+            .locks
+            .change("stale relays", |c| claim_stale_on(c, slot, stale_by, now))
+            .map_err(|e| format!("{e:#}"))?;
+        if relays.is_empty() {
+            return Ok(String::new());
+        }
+        let ids: Vec<i64> = relays.iter().map(|r| r.id).collect();
+        tracing::info!(
+            "relays {ids:?} to {} shown in a tool reply after waiting",
+            slot_name(slot)
+        );
+        Ok(format!(
+            "{STALE_HEADER}\n\n{}",
+            strip_controls(&compose(&relays, slot, &self.user))
+        ))
     }
 
     async fn run(self: Arc<Self>, mut events: broadcast::Receiver<Event>) {
