@@ -5,6 +5,7 @@ pub mod brain;
 pub mod config;
 pub mod coord;
 pub mod env;
+pub mod holder;
 pub mod launch;
 pub mod ledger;
 pub mod locks;
