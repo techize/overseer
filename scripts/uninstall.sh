@@ -1,7 +1,8 @@
 #!/bin/sh
-# Remove the LaunchAgent, the ~/.local/bin/overseer link and
-# ~/Applications/Overseer.app. State and logs are left in place. With
-# OVERSEER_HOME set, that home's agent, app and link instead (see
+# End every running session, remove the LaunchAgent, the
+# ~/.local/bin/overseer link and ~/Applications/Overseer.app. State and logs
+# are left in place; the sessions come back as resumable after a reinstall.
+# With OVERSEER_HOME set, that home's agent, app and link instead (see
 # scripts/locations.sh).
 #
 # Environment:
@@ -14,6 +15,32 @@ set -eu
 root=$(cd "$(dirname "$0")/.." && pwd)
 . "$root/scripts/locations.sh"
 label=uk.co.techize.overseer
+
+# Sessions kept by a holder outlive the daemon, so end them first. With a
+# daemon running, it does that through its shutdown path, which keeps the
+# sessions resumable. Without one, each holder is ended from its pid file.
+if [ -x "$app_bin" ]; then
+    ov=$app_bin
+else
+    ov=$(command -v overseer || true)
+fi
+state=${OVERSEER_HOME:-"$HOME/Library/Application Support/Overseer"}
+if [ -n "$ov" ]; then
+    left=0
+    if ! "$ov" ctl stop-all 2>/dev/null; then
+        for pidfile in "$state"/holders/*.pid; do
+            [ -e "$pidfile" ] || continue
+            "$ov" hold --end "$pidfile" || left=1
+        done
+    fi
+    if [ "$left" = 1 ]; then
+        echo "uninstall.sh: a session could not be ended; $state/holders is left in place" >&2
+    else
+        rm -rf "$state/holders"
+    fi
+elif [ -d "$state/holders" ]; then
+    echo "No overseer binary; sessions kept in $state/holders are not ended."
+fi
 
 if [ -x "$app_bin" ]; then
     # It knows this home's label and plist, and honours OVERSEER_LAUNCHCTL.

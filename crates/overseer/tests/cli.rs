@@ -1167,8 +1167,8 @@ fn pid_after(text: &str, marker: &str) -> u32 {
     rest.split_whitespace().next().unwrap().parse().unwrap()
 }
 
-const WARNING_START: &str = "The daemon (build dev) has 1 running session: S1 demo lane. \
-    Restarting it ends them; each comes back as resumable, and r on its card resumes it.";
+/// Said when a restart leaves the running sessions alone.
+const KEPT_NOTE: &str = "Running sessions are kept: they reattach to the new daemon.";
 
 /// S1 running the sleeping `claude`, labelled `demo lane`.
 fn start_claude(env: &Env) -> u32 {
@@ -1182,7 +1182,7 @@ fn start_claude(env: &Env) -> u32 {
 }
 
 #[test]
-fn install_agent_keeps_a_daemon_with_running_sessions() {
+fn install_agent_restarts_a_daemon_with_held_sessions_without_asking() {
     let env = Env::new();
     let pid = start_claude(&env);
     let out = stdout_of(
@@ -1190,21 +1190,16 @@ fn install_agent_keeps_a_daemon_with_running_sessions() {
             .pipe_stdin("/dev/null")
             .unwrap(),
     );
-    assert!(out.contains(WARNING_START), "{out}");
+    assert!(out.contains(KEPT_NOTE), "{out}");
     assert!(
-        out.contains(
-            "The daemon keeps running build dev. Run overseer ctl restart when you are ready to finish the upgrade."
-        ),
+        out.contains("Restarted the daemon (build dev to dev)."),
         "{out}"
     );
+    assert!(!out.contains("Restart the daemon now?"), "{out}");
+    assert!(!out.contains("would end"), "{out}");
     let s1 = status_line(&env, 1);
     assert!(s1.starts_with("S1  running  pid "), "{s1}");
     assert_eq!(pid_after(&s1, "pid "), pid);
-    // The stub's `print` fails, so `bootout` is never logged anyway; the
-    // `bootstrap` check and the unchanged pid are the real guards.
-    let log = env.launchctl_log();
-    assert!(!log.contains("bootout"), "{log}");
-    assert!(!log.contains("bootstrap"), "{log}");
 }
 
 #[test]
@@ -1212,7 +1207,7 @@ fn install_agent_yes_restarts_and_the_session_survives() {
     let env = Env::new();
     let pid = start_claude(&env);
     let out = stdout_of(&mut env.agent_claude(&["install-agent", "--yes"]));
-    assert!(out.contains(WARNING_START), "{out}");
+    assert!(out.contains(KEPT_NOTE), "{out}");
     assert!(
         out.contains("Restarted the daemon (build dev to dev)."),
         "{out}"
@@ -1279,7 +1274,7 @@ fn ctl_restart_yes_brings_the_daemon_back() {
     let pid = start_claude(&env);
     let before = pid_after(&stdout_of(&mut env.ctl(&["version"])), "  pid ");
     let out = stdout_of(&mut env.ctl(&["restart", "--yes"]));
-    let warned = out.find(WARNING_START).unwrap_or_else(|| panic!("{out}"));
+    let warned = out.find(KEPT_NOTE).unwrap_or_else(|| panic!("{out}"));
     let restarted = out
         .find("Restarted the daemon (build dev to dev).")
         .unwrap_or_else(|| panic!("{out}"));
@@ -1293,20 +1288,41 @@ fn ctl_restart_yes_brings_the_daemon_back() {
 }
 
 #[test]
-fn ctl_restart_without_a_terminal_keeps_running_sessions() {
+fn ctl_restart_without_a_terminal_keeps_held_sessions_running() {
     let env = Env::new();
     let pid = start_claude(&env);
+    let before = pid_after(&stdout_of(&mut env.ctl(&["version"])), "  pid ");
     let out = stdout_of(env.ctl(&["restart"]).pipe_stdin("/dev/null").unwrap());
-    assert!(out.contains(WARNING_START), "{out}");
-    assert!(
-        out.contains(
-            "Kept the daemon (build dev) because 1 running session would end: S1 demo lane. \
-             Run overseer ctl restart --yes to restart it anyway."
-        ),
-        "{out}"
-    );
-    assert!(!out.contains("when you are ready"), "{out}");
+    assert!(out.contains(KEPT_NOTE), "{out}");
+    assert!(!out.contains("Kept the daemon"), "{out}");
+    let after = pid_after(&stdout_of(&mut env.ctl(&["version"])), "  pid ");
+    assert_ne!(before, after);
     assert_eq!(pid_after(&status_line(&env, 1), "pid "), pid);
+}
+
+#[test]
+fn ctl_stop_all_with_no_daemon_fails_without_starting_one() {
+    let env = Env::new();
+    let out = env
+        .ctl(&["stop-all"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no daemon is running"),
+        "{out:?}"
+    );
+    assert!(!env.home.join("overseer.sock").exists(), "a daemon started");
+}
+
+#[test]
+fn ctl_stop_all_ends_sessions_and_they_come_back_resumable() {
+    let env = Env::new();
+    start_claude(&env);
+    env.ctl(&["stop-all"]).assert().success();
+    let s1 = status_line(&env, 1);
+    assert!(!s1.starts_with("S1  running"), "{s1}");
 }
 
 /// How a fake daemon on `<home>/overseer.sock` treats requests.

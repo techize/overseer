@@ -5573,6 +5573,55 @@ mod restart {
     }
 
     #[tokio::test]
+    async fn stop_all_ends_sessions_but_keeps_them_resumable() {
+        let d0 = start_daemon().await;
+        let dir = dir_of(&d0).join("claude");
+        drop(d0);
+        let (bin, log) = stub_claude(&dir);
+        let d = start_daemon_with(temp_socket(), claude_env(&dir, true)).await;
+        let mut c = Client::connect(&d.socket).await;
+        for id in [1, 2] {
+            c.start_cmd(id, vec![bin.to_string_lossy().into_owned()])
+                .await;
+        }
+        wait_for_log(&log, 2).await;
+        let slots = c.list().await;
+        let pids = [running_pid(&slots[1]), running_pid(&slots[2])];
+        let down = Down {
+            socket: d.socket.clone(),
+            state_dir: d.state_dir.clone(),
+        };
+
+        assert_eq!(c.request(Request::StopAll).await, Response::Ok);
+        for pid in pids {
+            until("the child to end", WAIT, || !pid_alive(pid)).await;
+        }
+        // Holders have gone, leaving no exit file to read as exited.
+        for id in [1, 2] {
+            let (exit, pid) = (
+                exit_path(&down.state_dir, id),
+                pid_path(&down.state_dir, id),
+            );
+            until("the holder to end", WAIT, || !pid.exists()).await;
+            assert!(!exit.exists(), "exit file left for S{id}");
+        }
+        drop(c);
+
+        let down2 = stop_keeping(d).await;
+        let d = start_daemon_with(down2.socket.clone(), claude_env(&dir, true)).await;
+        let mut c = Client::connect(&d.socket).await;
+        let slots = c.list().await;
+        for id in [1, 2] {
+            assert!(
+                matches!(&slots[id].state, SlotState::Resumable { .. }),
+                "{:?}",
+                slots[id]
+            );
+        }
+        drop(down);
+    }
+
+    #[tokio::test]
     async fn killed_holder_falls_back_to_resumable() {
         let d0 = start_daemon().await;
         let dir = dir_of(&d0).join("claude");
@@ -6120,6 +6169,41 @@ mod restart {
         let o = older_session().await;
         let mut c = Client::connect(&o.d.socket).await;
         assert_eq!(c.request(Request::StopSlot { id: 2 }).await, Response::Ok);
+        let state_dir = o.d.state_dir.clone();
+        let (exit, pid) = (exit_path(&state_dir, 2), pid_path(&state_dir, 2));
+        // The old holder has gone and no exit file of its is left.
+        until("the old holder to end", WAIT * 2, || {
+            !pid.exists() && !exit.exists()
+        })
+        .await;
+        sleep(Duration::from_millis(500)).await;
+        assert!(!exit.exists(), "exit file left behind");
+        drop(c);
+        let OlderSession {
+            d,
+            old,
+            _down,
+            session_id,
+            claude_dir,
+            ..
+        } = o;
+        drop(old);
+        let down = stop_keeping(d).await;
+        let d = start_daemon_with(down.socket.clone(), claude_env(&claude_dir, true)).await;
+        let mut c = Client::connect(&d.socket).await;
+        let info = c.list().await.remove(2);
+        assert!(
+            matches!(&info.state, SlotState::Resumable { session_id: s, .. } if *s == session_id),
+            "{info:?}"
+        );
+        drop(_down);
+    }
+
+    #[tokio::test]
+    async fn a_stop_all_older_build_session_is_still_resumable_after_a_restart() {
+        let o = older_session().await;
+        let mut c = Client::connect(&o.d.socket).await;
+        assert_eq!(c.request(Request::StopAll).await, Response::Ok);
         let state_dir = o.d.state_dir.clone();
         let (exit, pid) = (exit_path(&state_dir, 2), pid_path(&state_dir, 2));
         // The old holder has gone and no exit file of its is left.

@@ -6,7 +6,9 @@
 #
 # Environment:
 #   YES=1                  restart the daemon without asking, even with
-#                          sessions running (install-agent --yes)
+#                          sessions running that a restart would end
+#                          (install-agent --yes); sessions kept by a holder
+#                          survive a restart and never need it
 #   NO_RESTART=1           keep a running daemon (install-agent --no-restart)
 #   OVERSEER_INSTALL_RUST=1  install Rust through rustup without asking
 #   OVERSEER_INSTALL_BINARY=<path>  use this binary instead of building

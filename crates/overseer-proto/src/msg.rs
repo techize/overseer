@@ -598,6 +598,10 @@ pub enum Request {
         rows: u16,
     },
     Shutdown,
+    /// Ends every session, held ones included, leaving their ledger rows
+    /// live so the next daemon offers them as resumable. For uninstall;
+    /// stop the daemon after it.
+    StopAll,
     /// A Claude Code hook event, relayed by `overseer hook`.
     Hook(HookEvent),
     /// The cached work-item list with owners, source health and notices.

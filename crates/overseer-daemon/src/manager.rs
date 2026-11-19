@@ -794,6 +794,14 @@ impl SlotManager {
     }
 
     pub fn stop(&mut self, id: SlotId) -> Result<(), String> {
+        self.stop_slot(id, false).map(drop)
+    }
+
+    /// [`SlotManager::stop`]; with `keep_live` a session this daemon could
+    /// not attach is ended without its ledger row being closed and with the
+    /// exit file its holder leaves removed, so the next daemon offers it as
+    /// resumable. Returns the thread that finishes a by-pid end, if any.
+    fn stop_slot(&mut self, id: SlotId, keep_live: bool) -> Result<Option<Ending>, String> {
         if !valid_id(id) {
             return Err(invalid_id(id));
         }
@@ -810,7 +818,7 @@ impl SlotManager {
                 }
             }
             let _ = self.events.send(Event::SlotChanged(Self::empty_info(id)));
-            return Ok(());
+            return Ok(None);
         }
         if let Some(r) = self.unreachable(id) {
             let slots = self.slots.lock().unwrap();
@@ -827,20 +835,25 @@ impl SlotManager {
                 let older = r.older.clone();
                 // A resumed older session must not read as exited after a
                 // restart: the exit file its holder leaves is removed.
-                let exit_file = older.as_ref().filter(|o| o.session_id.is_some()).and(
-                    self.launch
-                        .as_ref()
-                        .map(|l| (pid_path(&l.state_dir, id), exit_path(&l.state_dir, id))),
-                );
-                end_in_background(id, r.pids.clone(), exit_file);
+                let resumed = keep_live || older.as_ref().is_some_and(|o| o.session_id.is_some());
+                let exit_file = resumed
+                    .then(|| {
+                        self.launch
+                            .as_ref()
+                            .map(|l| (pid_path(&l.state_dir, id), exit_path(&l.state_dir, id)))
+                    })
+                    .flatten();
+                let ending = end_in_background(id, r.pids.clone(), exit_file);
+
                 // An older build's session is offered for resume, so its
                 // ledger row stays live; any other session has ended.
                 let resume = older
                     .as_ref()
                     .and_then(|o| Some((o.session_id.clone()?, o.started)));
+                let ledger = self.launch.as_ref().filter(|_| !keep_live);
                 let ended = resume
                     .is_none()
-                    .then(|| end_once(&r.ended, self.launch.as_ref().map(|l| &*l.ledger), id).0);
+                    .then(|| end_once(&r.ended, ledger.map(|l| &*l.ledger), id).0);
                 drop(slots);
                 let restored = self.restored[id as usize].as_mut().unwrap();
                 restored.unreachable = None;
@@ -859,13 +872,13 @@ impl SlotManager {
                     (None, at) => ended_info(&restored.info, at.unwrap_or_else(unix_now)),
                 };
                 let _ = self.events.send(Event::SlotChanged(restored.info.clone()));
-                return Ok(());
+                return Ok(ending);
             }
         }
         match &self.slots.lock().unwrap()[id as usize] {
             Some(e) if matches!(e.slot.info().state, SlotState::Running { .. }) => {
                 e.slot.kill();
-                Ok(())
+                Ok(None)
             }
             _ => Err(format!("{} is not running", slot_name(id))),
         }
@@ -959,6 +972,58 @@ impl SlotManager {
             snapshot,
             pos,
         })
+    }
+
+    /// Ends every session, held ones included, for uninstall. Like
+    /// shutdown, it records no exits: the ledger rows stay live and the
+    /// next daemon offers each session as resumable. Held slots get a `Kill`
+    /// and local ones are killed; a session this daemon could not attach
+    /// (the unreachable placeholder, an older build's holder) is ended by
+    /// pid. The exit file a holder leaves is removed once it has gone, since
+    /// a restart reads one as an exit. Waits for that, so it is done when
+    /// this returns. Locks and relays are kept. Leaves the daemon marked as
+    /// shutting down: stop it afterwards.
+    pub fn end_all(&mut self) {
+        self.shutting_down.store(true, Ordering::SeqCst);
+        let mut waits: Vec<Ending> = Vec::new();
+        {
+            let slots = self.slots.lock().unwrap();
+            for entry in slots.iter().flatten() {
+                if !matches!(entry.slot.info().state, SlotState::Running { .. }) {
+                    continue;
+                }
+                let id = entry.slot.info().id;
+                let files = self
+                    .launch
+                    .as_ref()
+                    .filter(|_| entry.slot.is_held())
+                    .map(|l| (pid_path(&l.state_dir, id), exit_path(&l.state_dir, id)));
+                let pids = files
+                    .as_ref()
+                    .and_then(|(pid_file, _)| client::read_pid_file(pid_file));
+                entry.slot.kill();
+                if let (Some(pids), Some((pid_file, exit))) = (pids, files) {
+                    let spawned = std::thread::Builder::new()
+                        .name(format!("end-{}", slot_name(id)))
+                        .spawn(move || clear_exit_file(id, &pids, &pid_file, &exit));
+                    match spawned {
+                        Ok(handle) => waits.push(handle),
+                        Err(e) => tracing::warn!("{} exit file not cleared: {e}", slot_name(id)),
+                    }
+                }
+            }
+        }
+        for id in 0..SLOT_COUNT as SlotId {
+            if self.unreachable(id).is_some() {
+                match self.stop_slot(id, true) {
+                    Ok(ending) => waits.extend(ending),
+                    Err(e) => tracing::warn!("{e}"),
+                }
+            }
+        }
+        for handle in waits {
+            let _ = handle.join();
+        }
     }
 
     /// Called on daemon shutdown. Held sessions keep running under their
@@ -1222,7 +1287,11 @@ const HOLDER_GONE_WAIT: Duration = Duration::from_secs(10);
 /// the holder to go. With `exit_file` (the slot's pid and exit file
 /// paths), once the holder has gone the exit file it wrote is removed,
 /// unless a new holder has taken the slot meanwhile.
-fn end_in_background(id: SlotId, pids: PidFile, exit_file: Option<(PathBuf, PathBuf)>) {
+fn end_in_background(
+    id: SlotId,
+    pids: PidFile,
+    exit_file: Option<(PathBuf, PathBuf)>,
+) -> Option<Ending> {
     tracing::info!(
         "{} ending a session by pid (holder {}, child {})",
         slot_name(id),
@@ -1233,25 +1302,38 @@ fn end_in_background(id: SlotId, pids: PidFile, exit_file: Option<(PathBuf, Path
         .name(format!("end-{}", slot_name(id)))
         .spawn(move || {
             end_by_pid(&pids);
-            let Some((pid_file, exit)) = exit_file else {
-                return;
-            };
-            // The holder writes its exit file, then removes its pid file.
-            let ours = || client::read_pid_file(&pid_file).is_some_and(|p| p == pids);
-            let deadline = std::time::Instant::now() + HOLDER_GONE_WAIT;
-            while ours() && !holder_gone(&pids) && std::time::Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            match client::read_pid_file(&pid_file) {
-                Some(p) if p != pids => {}
-                Some(_) if !holder_gone(&pids) => {
-                    tracing::warn!("{} holder still there; exit file kept", slot_name(id));
-                }
-                _ => remove_file(&exit),
+            if let Some((pid_file, exit)) = exit_file {
+                clear_exit_file(id, &pids, &pid_file, &exit);
             }
         });
-    if let Err(e) = spawned {
-        tracing::warn!("{} not ended: {e}", slot_name(id));
+    match spawned {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            tracing::warn!("{} not ended: {e}", slot_name(id));
+            None
+        }
+    }
+}
+
+/// The thread [`end_in_background`] starts.
+type Ending = std::thread::JoinHandle<()>;
+
+/// Waits for the holder `pids` to go, then removes the exit file it wrote,
+/// so the session reads as live (resumable) after a restart rather than as
+/// exited. Leaves it when a new holder has taken the slot meanwhile.
+fn clear_exit_file(id: SlotId, pids: &PidFile, pid_file: &Path, exit: &Path) {
+    // The holder writes its exit file, then removes its pid file.
+    let ours = || client::read_pid_file(pid_file).is_some_and(|p| p == *pids);
+    let deadline = std::time::Instant::now() + HOLDER_GONE_WAIT;
+    while ours() && !holder_gone(pids) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    match client::read_pid_file(pid_file) {
+        Some(p) if p != *pids => {}
+        Some(_) if !holder_gone(pids) => {
+            tracing::warn!("{} holder still there; exit file kept", slot_name(id));
+        }
+        _ => remove_file(exit),
     }
 }
 

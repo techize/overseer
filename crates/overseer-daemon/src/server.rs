@@ -1325,6 +1325,10 @@ fn handle_request(
             None => err(format!("{} is empty", slot_name(id))),
         },
         Request::Shutdown => Response::Ok,
+        Request::StopAll => {
+            manager.lock().unwrap().end_all();
+            Response::Ok
+        }
         // Coordinator requests.
         Request::GetBoard => Response::Board(BoardView {
             slots: manager.lock().unwrap().list(),
