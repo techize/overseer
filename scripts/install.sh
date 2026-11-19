@@ -20,6 +20,7 @@ set -eu
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 . "$root/scripts/locations.sh"
+. "$root/scripts/target-dir.sh"
 cargo_home=${CARGO_HOME:-"$HOME/.cargo"}
 rustup_args="-y --no-modify-path --profile minimal --default-toolchain none"
 rustup_cmd="curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- $rustup_args"
@@ -73,7 +74,6 @@ if [ -n "${OVERSEER_INSTALL_BINARY:-}" ]; then
     bin=$OVERSEER_INSTALL_BINARY
 else
     have_cargo || install_rust
-    bin="${CARGO_TARGET_DIR:-$root/target}/release/overseer"
     # $CARGO_HOME/bin goes first so rustup's cargo and the toolchain that
     # rust-toolchain.toml picks are the ones used. Only the build sees it,
     # not the PATH install-agent records for the daemon.
@@ -83,6 +83,7 @@ else
         cd "$root"
         cargo build --release -p overseer
     )
+    bin="$(PATH="$cargo_home/bin:$PATH" target_dir "$root")/release/overseer"
 fi
 
 "$root/scripts/bundle.sh" "$bin" "$app"

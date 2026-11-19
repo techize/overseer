@@ -2,13 +2,18 @@
 # Assemble Overseer.app around a built binary and sign it ad hoc.
 #
 # Usage: scripts/bundle.sh [binary] [app dir]
-# Defaults: target/release/overseer and ~/Applications/Overseer.app
+# Defaults: release/overseer in cargo's target folder and ~/Applications/Overseer.app
 # OVERSEER_BUILD overrides the build id, which is otherwise
 # <short commit>[-dirty]-<UTC yyyymmddHHMM>.
 set -eu
 
 root=$(cd "$(dirname "$0")/.." && pwd)
-bin=${1:-"$root/target/release/overseer"}
+. "$root/scripts/target-dir.sh"
+if [ -n "${1:-}" ]; then
+    bin=$1
+else
+    bin="$(target_dir "$root")/release/overseer"
+fi
 app=${2:-"$HOME/Applications/Overseer.app"}
 
 if [ ! -x "$bin" ]; then

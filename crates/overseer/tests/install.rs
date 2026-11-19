@@ -305,14 +305,16 @@ fn install_stops_when_install_agent_fails() {
     assert!(!text.contains("Overseer is installed."), "{text}");
 }
 
-/// The cargo stand-in rustup "installs": it logs its arguments and copies
-/// the test binary to where a release build would leave it.
+/// The cargo stand-in rustup "installs". `cargo metadata` reports its target
+/// folder: STUB_TARGET_DIR when set (as a .cargo/config.toml would), else
+/// CARGO_TARGET_DIR. Any other command is logged and copies the test binary
+/// to where a release build would leave it.
 fn write_rust_stubs(rig: &Rig) {
     let cargo = rig.path("cargo-stub");
     rig.write_exe(
         &cargo,
         &format!(
-            "#!/bin/sh\necho \"$*\" >> '{log}'\nmkdir -p \"$CARGO_TARGET_DIR/release\"\ncp '{bin}' \"$CARGO_TARGET_DIR/release/overseer\"\n",
+            "#!/bin/sh\ntarget=${{STUB_TARGET_DIR:-$CARGO_TARGET_DIR}}\nif [ \"$1\" = metadata ]; then\n    printf '{{\"packages\":[],\"target_directory\":\"%s\",\"version\":1}}\\n' \"$target\"\n    exit 0\nfi\necho \"$*\" >> '{log}'\nmkdir -p \"$target/release\"\ncp '{bin}' \"$target/release/overseer\"\n",
             log = rig.path("cargo.log").display(),
             bin = assert_cmd::cargo::cargo_bin("overseer").display(),
         ),
@@ -419,6 +421,32 @@ fn install_uses_cargo_from_cargo_home_when_it_is_not_on_path() {
     assert!(!rig.path("curl.log").exists(), "curl ran: {text}");
     let cargo = std::fs::read_to_string(rig.path("cargo.log")).unwrap();
     assert_eq!(cargo, "build --release -p overseer\n");
+}
+
+#[test]
+fn install_finds_the_binary_in_the_target_dir_cargo_reports() {
+    // A .cargo/config.toml above the checkout can send the build elsewhere;
+    // install.sh must pick the binary up from wherever cargo put it.
+    let rig = Rig::new();
+    write_rust_stubs(&rig);
+    let bin = rig.path("cargo/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::copy(rig.path("cargo-stub"), bin.join("cargo")).unwrap();
+    let elsewhere = rig.path("shared-target");
+    let out = rust_script(&rig)
+        .env("STUB_TARGET_DIR", &elsewhere)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{text}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(elsewhere.join("release/overseer").is_file());
+    assert!(!rig.path("target/release/overseer").exists());
+    assert!(rig.app_bin().is_file(), "{text}");
+    assert_no_real_label(&rig.launchctl_log());
 }
 
 #[test]
