@@ -172,6 +172,8 @@ fn run(args: Vec<OsString>, version: u32) -> anyhow::Result<std::convert::Infall
         holder: std::process::id(),
         child: pty.pid(),
         version,
+        holder_start: super::process_start(std::process::id()),
+        child_start: super::process_start(pty.pid()),
     };
     if let Err(e) = write_json_atomic(&pid_file, &pid) {
         pty.kill();

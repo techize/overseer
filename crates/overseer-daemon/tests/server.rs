@@ -5815,6 +5815,8 @@ mod restart {
                 holder: holder.id(),
                 child: child.id(),
                 version: overseer_daemon::holder::HOLDER_PROTOCOL,
+                holder_start: None,
+                child_start: None,
             };
             std::fs::write(&pid_file, serde_json::to_vec(&pid).unwrap()).unwrap();
             let listener =
@@ -6114,6 +6116,57 @@ mod restart {
         c.exited_event(2).await;
     }
 
+    /// After a reboot, a pid file's holder pid can belong to a new process
+    /// that runs a holder's binary (the GUI, or a daemon). Its start time
+    /// gives it away: the files are cleared, nothing is signalled, and the
+    /// slot takes a new session at once.
+    #[tokio::test]
+    async fn a_stale_pid_file_naming_a_reused_holder_pid_is_cleared() {
+        use std::os::unix::fs::DirBuilderExt;
+        use std::os::unix::process::CommandExt;
+        let socket = temp_socket();
+        let state_dir = socket.parent().unwrap().join("state");
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(overseer_daemon::holder::holders_dir(&state_dir))
+            .unwrap();
+        let mut other = Reap(
+            std::process::Command::new(HOLDER)
+                .arg("idle")
+                .process_group(0)
+                .spawn()
+                .unwrap(),
+        );
+        let id = other.0.id();
+        let start = overseer_daemon::holder::process_start(id).unwrap();
+        let (pid, sock) = (pid_path(&state_dir, 1), socket_path(&state_dir, 1));
+        let stale = PidFile {
+            holder: id,
+            child: id,
+            version: overseer_daemon::holder::HOLDER_PROTOCOL,
+            holder_start: Some(start + 1),
+            child_start: Some(start + 1),
+        };
+        std::fs::write(&pid, serde_json::to_vec(&stale).unwrap()).unwrap();
+        drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
+        let d = start_daemon_at(socket).await;
+        let mut c = Client::connect(&d.socket).await;
+        let info = c.list().await.remove(1);
+        assert!(!matches!(info.state, SlotState::Running { .. }), "{info:?}");
+        until("the stale files to go", WAIT, || {
+            !pid.exists() && !sock.exists()
+        })
+        .await;
+        c.start_cmd(1, fake(&[])).await;
+        assert_eq!(c.request(Request::StopSlot { id: 1 }).await, Response::Ok);
+        c.exited_event(1).await;
+        assert!(
+            other.0.try_wait().unwrap().is_none(),
+            "the other process was signalled"
+        );
+    }
+
     #[tokio::test]
     async fn a_stale_pid_file_never_signals_another_process() {
         use std::os::unix::fs::DirBuilderExt;
@@ -6139,6 +6192,8 @@ mod restart {
             holder: other.0.id(),
             child: other.0.id(),
             version: overseer_daemon::holder::HOLDER_PROTOCOL,
+            holder_start: None,
+            child_start: None,
         };
         std::fs::write(&pid, serde_json::to_vec(&stale).unwrap()).unwrap();
         drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());

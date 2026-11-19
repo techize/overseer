@@ -240,7 +240,9 @@ pub(crate) fn read_pid_file(path: &Path) -> Option<PidFile> {
 
 /// Ends a holder that never got going: it and its child, if it had one.
 pub(crate) fn abandon(holder: u32, state_dir: &Path, slot: SlotId) {
-    if let Some(p) = read_pid_file(&pid_path(state_dir, slot)).filter(|p| p.holder == holder) {
+    if let Some(p) = read_pid_file(&pid_path(state_dir, slot))
+        .filter(|p| p.holder == holder && super::child_is_named(p))
+    {
         // SAFETY: plain signals. The child leads its own process group.
         unsafe {
             libc::kill(-(p.child as i32), libc::SIGKILL);

@@ -416,12 +416,16 @@ fn holder_alive_knows_a_holder_from_another_process() {
         holder: id,
         child: id,
         version: HOLDER_PROTOCOL,
+        holder_start: None,
+        child_start: None,
     };
     assert!(!holder_alive(&named), "a sleep taken for a holder");
     let gone = PidFile {
         holder: u32::MAX,
         child: u32::MAX,
         version: HOLDER_PROTOCOL,
+        holder_start: None,
+        child_start: None,
     };
     assert!(!holder_alive(&gone));
 }
@@ -443,6 +447,8 @@ fn end_by_pid_never_signals_another_process() {
         holder: id,
         child: id,
         version: HOLDER_PROTOCOL,
+        holder_start: None,
+        child_start: None,
     });
     std::thread::sleep(Duration::from_millis(200));
     assert!(other.0.try_wait().unwrap().is_none(), "signalled");
@@ -522,6 +528,82 @@ fn another_program_named_by_a_pid_file_is_not_a_holder() {
         holder: id,
         child: id,
         version: HOLDER_PROTOCOL,
+        holder_start: None,
+        child_start: None,
     };
     assert!(holder_gone(&p), "sleep taken for a holder");
+}
+
+/// A live process with a holder's name that serves nothing, leading its
+/// own process group: what a stale pid file's holder pid may have become.
+fn idle_holder() -> Reap {
+    use std::os::unix::process::CommandExt;
+    Reap(
+        Command::new(HOLDER)
+            .arg("idle")
+            .process_group(0)
+            .spawn()
+            .unwrap(),
+    )
+}
+
+fn start_of(pid: u32) -> u64 {
+    overseer_daemon::holder::process_start(pid).expect("start time readable")
+}
+
+#[test]
+fn a_reused_holder_pid_is_not_a_holder() {
+    let idle = idle_holder();
+    let id = idle.0.id();
+    let start = start_of(id);
+    let named = |holder_start| PidFile {
+        holder: id,
+        child: id,
+        version: HOLDER_PROTOCOL,
+        holder_start,
+        child_start: None,
+    };
+    assert!(
+        holder_alive(&named(Some(start))),
+        "its own holder not known"
+    );
+    // Another process that happens to run a holder's binary now has the pid.
+    let reused = named(Some(start + 1));
+    assert!(!holder_alive(&reused), "a reused pid taken for its holder");
+    assert!(holder_gone(&reused), "a reused pid not taken for gone");
+    // A pid file from before start times were recorded: the name decides.
+    assert!(holder_alive(&named(None)));
+}
+
+#[test]
+fn a_reused_child_pid_is_never_signalled() {
+    let mut holder = idle_holder();
+    let mut child = other_process();
+    let p = PidFile {
+        holder: holder.0.id(),
+        child: child.0.id(),
+        version: HOLDER_PROTOCOL,
+        holder_start: Some(start_of(holder.0.id())),
+        // The child the holder wrote down is gone; another process got its pid.
+        child_start: Some(start_of(child.0.id()) + 1),
+    };
+    end_by_pid(&p);
+    assert!(
+        child.0.try_wait().unwrap().is_none(),
+        "a reused child pid was signalled"
+    );
+    // The holder itself is still shown to be one, so it is ended.
+    let start = Instant::now();
+    while holder.0.try_wait().unwrap().is_none() {
+        assert!(start.elapsed() < WAIT, "the holder was not ended");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn a_holder_records_its_own_and_its_childs_start() {
+    let h = Holder::start("sleep 30");
+    let p = h.pid_file();
+    assert_eq!(p.holder_start, Some(start_of(p.holder)));
+    assert_eq!(p.child_start, Some(start_of(p.child)));
 }

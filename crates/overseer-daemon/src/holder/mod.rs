@@ -50,11 +50,55 @@ pub fn activity_path(state_dir: &Path, slot: SlotId) -> PathBuf {
 }
 
 /// Who a holder is: its own pid, its child's, and the protocol it speaks.
+/// The start times tell a pid that has been reused, after a crash or a
+/// reboot, from the process that wrote the file; a pid file from before
+/// they were recorded has none.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PidFile {
     pub holder: u32,
     pub child: u32,
     pub version: u32,
+    /// When the holder started, as [`process_start`] reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder_start: Option<u64>,
+    /// When the child started, as [`process_start`] reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_start: Option<u64>,
+}
+
+/// When process `pid` started, for telling it from a later process with
+/// the same pid: microseconds since the epoch on macOS, clock ticks since
+/// boot elsewhere. Only ever compared for equality. `None` when there is no
+/// such process or it cannot be read.
+#[cfg(target_os = "macos")]
+pub fn process_start(pid: u32) -> Option<u64> {
+    let pid = i32::try_from(pid).ok().filter(|p| *p > 0)?;
+    // SAFETY: a zeroed plain C struct, filled by the kernel up to the size
+    // passed.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    if n != size {
+        return None;
+    }
+    Some(info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn process_start(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The name, field 2, is in parentheses and may hold spaces.
+    let rest = &stat[stat.rfind(')')? + 2..];
+    // `rest` starts at field 3; the start time is field 22.
+    rest.split(' ').nth(19)?.parse().ok()
 }
 
 /// How a child ended while no daemon was there to see it.
@@ -121,16 +165,22 @@ pub enum HolderState {
 }
 
 /// What `pid_file`'s holder pid is now; see [`HolderState`]. Liveness is
-/// `kill(pid, 0)` alone; identity is checked only for a live pid. The
-/// executable path is gone once an install removes the binary a holder
-/// was started from, so the start name (`proc_name`, which survives that)
-/// is the fallback.
+/// `kill(pid, 0)` alone; identity is checked only for a live pid. A pid
+/// whose start time is not the recorded one has been reused: another
+/// process ([`HolderState::Other`]), whatever its name. Otherwise the
+/// executable path decides, and since it is gone once an install removes
+/// the binary a holder was started from, the start name (`proc_name`,
+/// which survives that) is the fallback.
 pub fn holder_state(pid_file: &PidFile) -> HolderState {
     let pid = pid_file.holder;
     if !client::alive(pid) {
         return HolderState::Dead;
     }
-    let state = identify(executable(pid).as_deref(), start_name(pid).as_deref());
+    let state = match pid_file.holder_start.map(|at| (at, process_start(pid))) {
+        Some((at, Some(now))) if now != at => HolderState::Other,
+        Some((_, None)) => HolderState::Unknown,
+        _ => identify(executable(pid).as_deref(), start_name(pid).as_deref()),
+    };
     // Gone between the checks: a reading of a reused pid is not trusted.
     if !client::alive(pid) {
         return HolderState::Dead;
@@ -212,11 +262,21 @@ fn start_name(pid: u32) -> Option<String> {
     Some(comm.trim_end_matches('\n').to_string())
 }
 
+/// Whether the pid file's child pid is still the child it names: always,
+/// for a pid file with no child start time; otherwise when the pid's start
+/// time is the recorded one.
+pub fn child_is_named(pid_file: &PidFile) -> bool {
+    pid_file
+        .child_start
+        .is_none_or(|at| process_start(pid_file.child) == Some(at))
+}
+
 /// Ends a holder's session without speaking its protocol, by the pids in
 /// its pid file: SIGTERM to the child's process group, then, if the holder
 /// has not gone on its own within [`END_GRACE`], SIGTERM to the holder.
 /// Does nothing unless [`holder_alive`]: the child's pid is only trusted
-/// while the holder that wrote it lives. Blocks up to [`END_GRACE`].
+/// while the holder that wrote it lives, and only while it is still that
+/// child ([`child_is_named`]). Blocks up to [`END_GRACE`].
 pub fn end_by_pid(pid_file: &PidFile) {
     if !holder_alive(pid_file) {
         return;
@@ -224,7 +284,7 @@ pub fn end_by_pid(pid_file: &PidFile) {
     // The child leads its own process group. A pid of 0 or 1 would signal
     // this process's group or every process, so it is never used.
     if let Ok(child) = i32::try_from(pid_file.child) {
-        if child > 1 && pid_file.child != pid_file.holder {
+        if child > 1 && pid_file.child != pid_file.holder && child_is_named(pid_file) {
             // SAFETY: a plain signal.
             unsafe { libc::kill(-child, libc::SIGTERM) };
         }

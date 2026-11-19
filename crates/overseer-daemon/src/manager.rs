@@ -441,6 +441,8 @@ impl SlotManager {
             holder: h.pid,
             child: h.child_pid,
             version: h.version,
+            holder_start: None,
+            child_start: None,
         });
         // Each source on its own: a stale pid file must not hide the Hello.
         let pids = client::read_pid_file(&pid_path(state_dir, id))
