@@ -6,8 +6,9 @@ use std::io::{self, BufReader, Write};
 use std::net::Shutdown;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -28,6 +29,9 @@ const CHUNK: usize = 64 * 1024;
 /// macOS limits a Unix socket path to 104 bytes, the NUL included.
 const MAX_SOCKET_PATH: usize = 103;
 const POLL: Duration = Duration::from_millis(10);
+/// How often a connection lost to a live holder checks the holder is still
+/// there.
+const LOST_WATCH: Duration = Duration::from_millis(200);
 
 /// `Some(Some(code))` or `Some(None)` (killed by signal) once exited.
 type ExitValue = Option<Option<i32>>;
@@ -56,6 +60,7 @@ impl std::error::Error for UnreadableHello {}
 /// is read from it.
 pub struct Greeting {
     stream: UnixStream,
+    socket: PathBuf,
     pub hello: HolderHello,
 }
 
@@ -85,7 +90,11 @@ impl Greeting {
             Err(e) => return Err(anyhow::Error::new(e).context("read holder hello")),
         };
         stream.set_read_timeout(None)?;
-        Ok(Greeting { stream, hello })
+        Ok(Greeting {
+            stream,
+            socket: socket.to_path_buf(),
+            hello,
+        })
     }
 
     /// Whether this daemon speaks the holder's protocol.
@@ -97,8 +106,17 @@ impl Greeting {
     /// reader thread passes every Output payload to `on_output`, in order,
     /// answers Exit with ExitSeen, and drops `on_output` when the connection
     /// ends.
+    ///
+    /// A connection that ends with no Exit while the holder is still alive
+    /// (identity-checked through its pid file) is lost, not exited: the
+    /// reader sets [`HeldPty::lost`] and reports the exit only once the
+    /// holder has gone, or once [`HeldPty::close`] lets the slot go.
     pub fn serve(self, mut on_output: OnOutput) -> anyhow::Result<HeldPty> {
-        let Greeting { stream, hello } = self;
+        let Greeting {
+            stream,
+            socket,
+            hello,
+        } = self;
         let writer = Arc::new(Mutex::new(stream.try_clone()?));
         let closer = stream.try_clone()?;
         // A burst arrives as many small frames: read them through a buffer.
@@ -116,8 +134,21 @@ impl Greeting {
         }
         reader.get_ref().set_read_timeout(None)?;
         let (exit_tx, exit_rx) = watch::channel::<ExitValue>(None);
+        let (lost_tx, lost_rx) = watch::channel(false);
+        let closing = Arc::new(AtomicBool::new(false));
         let exited_at = Arc::new(Mutex::new(None));
         let (reply, at) = (writer.clone(), exited_at.clone());
+        let let_go = closing.clone();
+        // The pid file names the holder with its start time; the Hello's
+        // pids are the fallback.
+        let fallback = PidFile {
+            holder: hello.pid,
+            child: hello.child_pid,
+            version: hello.version,
+            holder_start: None,
+            child_start: None,
+        };
+        let pid_file = socket.with_extension("pid");
         std::thread::Builder::new()
             .name(format!("held-read-{}", slot_name(hello.slot)))
             .spawn(move || {
@@ -140,9 +171,24 @@ impl Greeting {
                         Ok(None) | Err(_) => break,
                     }
                 }
-                // The holder went without reporting an exit: the child is
-                // lost to this daemon.
                 if exit_tx.borrow().is_none() {
+                    // No Exit: a holder still alive has only lost this
+                    // connection (another client took it, or it broke).
+                    let pids = read_pid_file(&pid_file).unwrap_or(fallback);
+                    let alive = || !let_go.load(Ordering::SeqCst) && !holder_gone(&pids);
+                    if alive() {
+                        tracing::warn!(
+                            "{} lost its holder connection; the holder (pid {}) is alive",
+                            slot_name(hello.slot),
+                            pids.holder
+                        );
+                        let _ = lost_tx.send(true);
+                        while alive() {
+                            std::thread::sleep(LOST_WATCH);
+                        }
+                    }
+                    // The holder went without reporting an exit, or the
+                    // slot was let go: the child is lost to this daemon.
                     *at.lock().unwrap() = Some(now_secs());
                     let _ = exit_tx.send(Some(None));
                 }
@@ -155,6 +201,8 @@ impl Greeting {
             closer,
             exit_rx,
             exited_at,
+            lost_rx,
+            closing,
         })
     }
 }
@@ -167,6 +215,11 @@ pub struct HeldPty {
     closer: UnixStream,
     exit_rx: watch::Receiver<ExitValue>,
     exited_at: Arc<Mutex<Option<i64>>>,
+    /// True once the connection ended with no Exit while the holder lives.
+    lost_rx: watch::Receiver<bool>,
+    /// Set by [`HeldPty::close`]: the end of the connection is this
+    /// daemon's doing.
+    closing: Arc<AtomicBool>,
 }
 
 impl HeldPty {
@@ -199,7 +252,15 @@ impl HeldPty {
     /// Closes the connection and leaves the child to its holder, which
     /// keeps it running for the next daemon.
     pub fn close(&self) {
+        self.closing.store(true, Ordering::SeqCst);
         let _ = self.closer.shutdown(Shutdown::Both);
+    }
+
+    /// Becomes true when the connection ends with no Exit while the holder
+    /// is still alive. The slot then reads as running until the holder goes
+    /// or the slot is let go.
+    pub fn lost(&self) -> watch::Receiver<bool> {
+        self.lost_rx.clone()
     }
 
     /// When the child exited, in Unix seconds, once it has. Set before
@@ -254,6 +315,16 @@ pub(crate) fn abandon(holder: u32, state_dir: &Path, slot: SlotId) {
     }
 }
 
+/// Whether a failed connect means nothing listens at the socket yet.
+fn not_listening(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<io::Error>().is_some_and(|e| {
+        matches!(
+            e.kind(),
+            io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+        )
+    })
+}
+
 /// Starts `<program> hold <state_dir>` for `spec` and connects to it. The
 /// caller starts reading with [`Greeting::serve`].
 ///
@@ -306,37 +377,41 @@ pub fn start(spec: &SpawnSpec, program: &Path, state_dir: &Path) -> anyhow::Resu
         .and_then(|mut stdin| stdin.write_all(&json).context("send spec to holder"));
     // Reaped here, so the holder is never left a zombie while the daemon
     // lives; the channel tells the wait below if it ends early.
+    let fail = |e: anyhow::Error| {
+        abandon(pid, state_dir, slot);
+        e
+    };
     let (ended_tx, ended_rx) = mpsc::channel::<io::Result<ExitStatus>>();
     std::thread::Builder::new()
         .name(format!("holder-reap-{name}"))
         .spawn(move || {
             let _ = ended_tx.send(child.wait());
         })
-        .context("spawn holder reaper thread")?;
-    let fail = |e: anyhow::Error| {
-        abandon(pid, state_dir, slot);
-        e
-    };
+        .context("spawn holder reaper thread")
+        .map_err(fail)?;
     fed.map_err(fail)?;
 
+    // The socket file appears at bind, a moment before the holder listens,
+    // so a refused or missing socket is retried until the deadline.
     let deadline = Instant::now() + HOLDER_START;
-    loop {
+    let greeting = loop {
         if let Ok(status) = ended_rx.try_recv() {
             let status = status.map_or_else(|e| e.to_string(), |s| s.to_string());
             bail!("holder for {name} exited while starting ({status})");
         }
-        if socket.exists() {
-            break;
-        }
+        let err = match Greeting::connect(&socket) {
+            Ok(greeting) => break greeting,
+            Err(e) if not_listening(&e) => e,
+            Err(e) => return Err(fail(e)),
+        };
         if Instant::now() >= deadline {
-            return Err(fail(anyhow!(
+            return Err(fail(err.context(format!(
                 "holder for {name} did not start within {}s",
                 HOLDER_START.as_secs()
-            )));
+            ))));
         }
         std::thread::sleep(POLL);
-    }
-    let greeting = Greeting::connect(&socket).map_err(fail)?;
+    };
     if !greeting.supported() {
         return Err(fail(anyhow!(
             "holder {} speaks protocol {}, not {HOLDER_PROTOCOL}",

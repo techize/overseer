@@ -6430,4 +6430,80 @@ mod restart {
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(saved.kind, ActivityKind::Working);
     }
+
+    /// A live holder whose socket refuses connections at restore (its file
+    /// replaced by a dead socket) keeps its card and its files: the daemon
+    /// never takes a live holder for gone.
+    #[tokio::test]
+    async fn a_live_holder_whose_socket_refuses_keeps_its_card() {
+        let d = start_daemon().await;
+        let mut c = Client::connect(&d.socket).await;
+        assert_eq!(c.start(1).await, Response::Ok);
+        let pid = running_pid(&c.list().await[1]);
+        drop(c);
+        let down = stop_keeping(d).await;
+        let sock = socket_path(&down.state_dir, 1);
+        std::fs::remove_file(&sock).unwrap();
+        // Bound and closed: the file stays and connects are refused.
+        drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
+
+        let d = start_daemon_at(down.socket.clone()).await;
+        let mut c = Client::connect(&d.socket).await;
+        let info = c.list().await.remove(1);
+        assert_eq!(running_pid(&info), pid, "{info:?}");
+        assert!(info.held, "{info:?}");
+        assert!(pid_path(&down.state_dir, 1).exists(), "pid file removed");
+        assert!(sock.exists(), "socket of a live holder removed");
+        assert_eq!(c.request(Request::StopSlot { id: 1 }).await, Response::Ok);
+        c.exited_event(1).await;
+    }
+
+    /// Another client taking a live holder's connection does not end the
+    /// session: the slot never reads as exited, and the daemon attaches the
+    /// holder again once it is free.
+    #[tokio::test]
+    async fn a_lost_connection_to_a_live_holder_is_attached_again() {
+        use overseer_daemon::holder::{read_frame, write_frame, Frame as Held, HOLDER_PROTOCOL};
+        let d = start_daemon().await;
+        let mut c = Client::connect(&d.socket).await;
+        assert_eq!(c.start(1).await, Response::Ok);
+        let pid = running_pid(&c.list().await[1]);
+        let mut w = Client::connect(&d.socket).await;
+
+        let sock = socket_path(&d.state_dir, 1);
+        let mut other = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+        other.set_read_timeout(Some(WAIT)).unwrap();
+        write_frame(
+            &mut other,
+            &Held::DaemonHello {
+                version: HOLDER_PROTOCOL,
+            },
+        )
+        .unwrap();
+        assert!(matches!(read_frame(&mut other), Ok(Some(Held::Hello(_)))));
+        // The daemon's connection is gone now; the slot still runs.
+        sleep(Duration::from_millis(300)).await;
+        let info = c.list().await.remove(1);
+        assert_eq!(running_pid(&info), pid, "{info:?}");
+        drop(other);
+
+        // Attached again: a SlotChanged for S1 that is not an exit.
+        let info = timeout(WAIT * 3, async {
+            loop {
+                match w.recv().await.expect("connection closed") {
+                    Frame::Event(Event::SlotChanged(info)) if info.id == 1 => return info,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("never attached again");
+        assert_eq!(running_pid(&info), pid, "{info:?}");
+        assert!(info.held, "{info:?}");
+        assert_eq!(c.request(Request::Attach { id: 1 }).await, Response::Ok);
+        c.type_line(1, "again").await;
+        c.output_until(1, "ECHO:again").await;
+        assert_eq!(c.request(Request::StopSlot { id: 1 }).await, Response::Ok);
+        c.exited_event(1).await;
+    }
 }

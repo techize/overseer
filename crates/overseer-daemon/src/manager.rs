@@ -207,6 +207,9 @@ fn ended_info(info: &SlotInfo, at: i64) -> SlotInfo {
 /// at start failed.
 const ATTACH_RETRIES: u32 = 3;
 const ATTACH_RETRY_PAUSE: Duration = Duration::from_secs(2);
+/// Before the first try at attaching a holder whose connection was lost:
+/// short, since the holder is known to be alive.
+const LOST_FIRST_PAUSE: Duration = Duration::from_millis(200);
 
 #[derive(Clone)]
 struct Launch {
@@ -388,12 +391,9 @@ impl SlotManager {
                 install(&ctx, &mut slots, id, slot, monitor_rx, trust_rx, session);
                 return;
             }
-            Attempt::Gone => {
-                tracing::info!("{} holder is gone; removing its socket", slot_name(id));
-                remove_file(&socket);
-                forget_stale_pid_file(state_dir, id);
-                return;
-            }
+            // Nothing listens, but the pid file decides: a live holder is
+            // never taken for gone.
+            Attempt::Gone => "nothing listens on its socket".to_string(),
             Attempt::Unsupported(hello) => {
                 self.keep_older(ctx, state_dir, id, row, session, hello.as_ref());
                 return;
@@ -775,6 +775,17 @@ impl SlotManager {
                 self.slots.clone(),
             ));
         }
+        if let (Some(launch), true) = (&self.launch, slot.is_held()) {
+            let ctx = Reattach {
+                slots: self.slots.clone(),
+                state_dir: launch.state_dir.clone(),
+                events: self.events.clone(),
+                ledger: launch.ledger.clone(),
+                shutting_down: self.shutting_down.clone(),
+                runtime: tokio::runtime::Handle::current(),
+            };
+            tokio::spawn(watch_lost(slot.clone(), ctx));
+        }
         tokio::spawn(monitor_exit(
             slot,
             monitor_rx,
@@ -916,11 +927,45 @@ impl SlotManager {
         }
         match &self.slots.lock().unwrap()[id as usize] {
             Some(e) if matches!(e.slot.info().state, SlotState::Running { .. }) => {
+                if e.slot.connection_lost() {
+                    return self.end_lost(id, keep_live);
+                }
                 e.slot.kill();
                 Ok(None)
             }
             _ => Err(format!("{} is not running", slot_name(id))),
         }
+    }
+
+    /// Ends by pid a held session whose connection was lost while its
+    /// holder lives: a Kill could not reach it. Its exit is recorded when
+    /// the holder goes, as for any held slot.
+    fn end_lost(&self, id: SlotId, keep_live: bool) -> Result<Option<Ending>, String> {
+        let Some(launch) = &self.launch else {
+            return Err(format!("{} is not reachable", slot_name(id)));
+        };
+        let (pid_file, exit) = (
+            pid_path(&launch.state_dir, id),
+            exit_path(&launch.state_dir, id),
+        );
+        let Some(pids) = client::read_pid_file(&pid_file) else {
+            return Err(format!(
+                "{} has no holder pid file; left it running",
+                slot_name(id)
+            ));
+        };
+        if holder_state(&pids) == HolderState::Unknown {
+            return Err(format!(
+                "{} cannot confirm that pid {} is still its holder; left it running",
+                slot_name(id),
+                pids.holder
+            ));
+        }
+        Ok(end_in_background(
+            id,
+            pids,
+            keep_live.then_some((pid_file, exit)),
+        ))
     }
 
     pub fn list(&self) -> Vec<SlotInfo> {
@@ -1044,6 +1089,16 @@ impl SlotManager {
                 let pids = files
                     .as_ref()
                     .and_then(|(pid_file, _)| client::read_pid_file(pid_file));
+                if entry.slot.connection_lost() {
+                    match self.end_lost(id, true) {
+                        Ok(ending) => waits.extend(ending.map(|h| (id, h))),
+                        Err(e) => {
+                            tracing::warn!("{e}");
+                            left.push(id);
+                        }
+                    }
+                    continue;
+                }
                 entry.slot.kill();
                 if let (Some(pids), Some((pid_file, exit))) = (pids, files) {
                     let spawned = std::thread::Builder::new()
@@ -1244,6 +1299,7 @@ fn install(
             ctx.slots.clone(),
         ));
     }
+    ctx.runtime.spawn(watch_lost(slot.clone(), ctx.clone()));
     ctx.runtime.spawn(monitor_exit(
         slot,
         monitor_rx,
@@ -1262,6 +1318,98 @@ struct Watch {
     ended: Ended,
     /// The placeholder's card.
     info: SlotInfo,
+}
+
+/// Waits for `slot`'s holder connection to be lost while the holder lives
+/// (see [`Slot::lost`]), then attaches the holder again in the background.
+/// Returns at once for a local slot, and when the slot exits first.
+async fn watch_lost(slot: Arc<Slot>, ctx: Reattach) {
+    let Some(mut lost) = slot.lost() else {
+        return;
+    };
+    let mut exit = slot.exit_watch();
+    tokio::select! {
+        r = lost.wait_for(|l| *l) => {
+            if r.is_err() {
+                return;
+            }
+        }
+        _ = exit.wait_for(Option::is_some) => return,
+    }
+    let id = slot.info().id;
+    let spawned = std::thread::Builder::new()
+        .name(format!("reattach-lost-{}", slot_name(id)))
+        .spawn(move || reattach_lost(ctx, slot));
+    if let Err(e) = spawned {
+        tracing::warn!("{} not attached again: {e}", slot_name(id));
+    }
+}
+
+/// Attaches again, up to [`ATTACH_RETRIES`] times, the live holder of
+/// `old`, a held slot whose connection was lost. On success the new slot
+/// takes `old`'s place with its session, activity and note; `old` is let
+/// go, so its exit is never recorded. Otherwise `old` stays: it reads as
+/// running, Stop ends it by pid, and its exit is recorded once the holder
+/// goes. Never records an exit itself.
+fn reattach_lost(ctx: Reattach, old: Arc<Slot>) {
+    let id = old.info().id;
+    let socket = socket_path(&ctx.state_dir, id);
+    let current = |slots: &[Option<Entry>; SLOT_COUNT]| {
+        slots[id as usize]
+            .as_ref()
+            .is_some_and(|e| Arc::ptr_eq(&e.slot, &old))
+    };
+    let stopped = || {
+        ctx.shutting_down.load(Ordering::SeqCst)
+            || old.exit_watch().borrow().is_some()
+            || !current(&ctx.slots.lock().unwrap())
+    };
+    for attempt in 0..ATTACH_RETRIES {
+        let pause = if attempt == 0 {
+            LOST_FIRST_PAUSE
+        } else {
+            ATTACH_RETRY_PAUSE
+        };
+        std::thread::sleep(pause);
+        if stopped() {
+            return;
+        }
+        match try_attach(&socket, id) {
+            Attempt::Got(slot, monitor_rx, trust_rx) => {
+                let mut slots = ctx.slots.lock().unwrap();
+                if ctx.shutting_down.load(Ordering::SeqCst) || !current(&slots) {
+                    slot.let_go();
+                    return;
+                }
+                let entry = slots[id as usize].take().expect("checked above");
+                let session = Session {
+                    command: Some(entry.command.clone()),
+                    session_id: entry.session_id.clone(),
+                    note: entry.session_note.clone(),
+                    activity: entry.activity.clone(),
+                };
+                // Let go before the new slot's watchers start: its exit
+                // monitor then finds the slot replaced and records nothing.
+                entry.slot.let_go();
+                let info = install(&ctx, &mut slots, id, slot, monitor_rx, trust_rx, session);
+                let _ = ctx.events.send(Event::SlotChanged(info));
+                return;
+            }
+            Attempt::Gone => {
+                tracing::warn!("{} holder alive but not listening", slot_name(id));
+            }
+            Attempt::Failed(why) => {
+                tracing::warn!("{} holder not attached again: {why}", slot_name(id));
+            }
+            Attempt::Unsupported(_) => break,
+        }
+    }
+    if !stopped() {
+        tracing::warn!(
+            "{} holder not attached again after {ATTACH_RETRIES} tries; Stop ends it",
+            slot_name(id)
+        );
+    }
 }
 
 /// Tries again, in the background, to attach a holder that is alive but
@@ -1305,7 +1453,11 @@ fn retry_attach(
                     Attempt::Failed(why) => {
                         tracing::warn!("{} holder still not attached: {why}", slot_name(id));
                     }
-                    Attempt::Gone | Attempt::Unsupported(_) => break,
+                    // The holder is alive (checked above), so try again.
+                    Attempt::Gone => {
+                        tracing::warn!("{} holder alive but not listening", slot_name(id));
+                    }
+                    Attempt::Unsupported(_) => break,
                 }
             }
             if retries > 0 && !stopped() && !holder_gone(&watch.pids) {

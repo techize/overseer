@@ -95,6 +95,13 @@ impl Backend {
         }
     }
 
+    fn lost(&self) -> Option<tokio::sync::watch::Receiver<bool>> {
+        match self {
+            Backend::Local(_) => None,
+            Backend::Held(p) => Some(p.lost()),
+        }
+    }
+
     fn exited_at(&self) -> Option<i64> {
         match self {
             Backend::Local(p) => p.exited_at(),
@@ -318,6 +325,22 @@ impl Slot {
     /// Whether a holder process keeps this slot's terminal.
     pub fn is_held(&self) -> bool {
         matches!(self.pty, Backend::Held(_))
+    }
+
+    /// For a held slot, becomes true when its connection is lost while its
+    /// holder lives (see [`HeldPty::lost`]). `None` for a local slot.
+    pub fn lost(&self) -> Option<tokio::sync::watch::Receiver<bool>> {
+        self.pty.lost()
+    }
+
+    /// The exit as it changes: `Some` once exited.
+    pub fn exit_watch(&self) -> tokio::sync::watch::Receiver<Option<Option<i32>>> {
+        self.pty.exit()
+    }
+
+    /// Whether this held slot's connection was lost while its holder lives.
+    pub fn connection_lost(&self) -> bool {
+        self.lost().is_some_and(|rx| *rx.borrow())
     }
 
     /// This spawn's `OVERSEER_RUN`.

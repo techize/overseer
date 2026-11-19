@@ -607,3 +607,55 @@ fn a_holder_records_its_own_and_its_childs_start() {
     assert_eq!(p.holder_start, Some(start_of(p.holder)));
     assert_eq!(p.child_start, Some(start_of(p.child)));
 }
+
+/// A holder whose socket is bound but not listening for a moment, as
+/// between a bind and its listen, still starts: the daemon retries the connect until the start deadline.
+#[test]
+fn a_socket_that_refuses_at_first_is_retried() {
+    use std::os::unix::fs::PermissionsExt;
+    let state = tempfile::Builder::new()
+        .prefix("ovh")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let bin = tempfile::Builder::new()
+        .prefix("ovb")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let late = bin.path().join("late-holder");
+    let sock = socket_path(state.path(), SLOT);
+    std::fs::write(
+        &late,
+        format!(
+            "#!/bin/sh\nOVERSEER_TEST_HOLDER_LATE='{sock}' exec '{HOLDER}' \"$@\"\n",
+            sock = sock.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&late, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let spec = SpawnSpec {
+        slot: SLOT,
+        label: "demo".into(),
+        cwd: PathBuf::from("/tmp"),
+        argv: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+        env: vec![("PATH".into(), "/usr/bin:/bin".into())],
+        cols: 80,
+        rows: 24,
+        run: RUN.into(),
+    };
+    let started = overseer_daemon::holder::client::start(&spec, &late, state.path());
+    let pid = pid_path(state.path(), SLOT);
+    let start = Instant::now();
+    while !pid.exists() && start.elapsed() < WAIT {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if let Ok(bytes) = std::fs::read(&pid) {
+        if let Ok(p) = serde_json::from_slice::<PidFile>(&bytes) {
+            end_by_pid(&p);
+            let start = Instant::now();
+            while pid_alive(p.holder) && start.elapsed() < WAIT {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+    started.expect("a socket refusing at first was not retried");
+}
