@@ -83,6 +83,17 @@ async fn start_daemon_full(
     settings: overseer_daemon::Config,
     patterns: Vec<Pattern>,
 ) -> Daemon {
+    start_daemon_holder(socket, env, settings, patterns, HOLDER.into()).await
+}
+
+/// [`start_daemon_full`], running sessions under the holder `holder`.
+async fn start_daemon_holder(
+    socket: PathBuf,
+    env: overseer_daemon::EnvSource,
+    settings: overseer_daemon::Config,
+    patterns: Vec<Pattern>,
+    holder: PathBuf,
+) -> Daemon {
     let state_dir = socket.parent().unwrap().join("state");
     let cfg = DaemonConfig {
         socket: socket.clone(),
@@ -91,7 +102,7 @@ async fn start_daemon_full(
         state_dir: state_dir.clone(),
         files: overseer_daemon::SettingsFiles::in_dir(&state_dir),
         hook_program: PathBuf::from("/bin/true"),
-        holder_program: Some(HOLDER.into()),
+        holder_program: Some(holder),
         settings,
         patterns,
     };
@@ -5859,7 +5870,7 @@ mod restart {
     /// The test holder as an older build would run it: it announces
     /// protocol 99. Started by hand for `slot` in `state_dir`, running
     /// `argv`.
-    fn start_old_holder(state_dir: &Path, slot: u8, argv: Vec<String>) -> Reap {
+    fn start_old_holder(program: &Path, state_dir: &Path, slot: u8, argv: Vec<String>) -> Reap {
         use std::io::Write;
         let spec = overseer_daemon::pty::SpawnSpec {
             slot,
@@ -5871,7 +5882,7 @@ mod restart {
             rows: 24,
             run: "demo-old".into(),
         };
-        let mut proc = std::process::Command::new(HOLDER)
+        let mut proc = std::process::Command::new(program)
             .arg("hold")
             .arg(state_dir)
             .env("OVERSEER_TEST_HOLDER_VERSION", "99")
@@ -5899,9 +5910,18 @@ mod restart {
         _down: Down,
         pids: PidFile,
         session_id: String,
+        /// The claude stub's folder, for [`claude_env`].
+        claude_dir: PathBuf,
     }
 
     async fn older_session() -> OlderSession {
+        older_session_from(None).await
+    }
+
+    /// [`older_session`]; with `Some(replace)`, the old holder runs from a
+    /// copy of the test holder that an install then removes and, with
+    /// `replace`, puts another file in place of.
+    async fn older_session_from(removed: Option<bool>) -> OlderSession {
         let d0 = start_daemon().await;
         let dir = dir_of(&d0).join("claude");
         drop(d0);
@@ -5917,9 +5937,22 @@ mod restart {
         let down = stop_keeping(d).await;
         // The session goes on under an older build's holder.
         end_holders(&down.state_dir);
-        let old = start_old_holder(&down.state_dir, 2, fake(&[]));
+        let program = if removed.is_some() {
+            let bin = dir.join("overseer-test-holder");
+            std::fs::copy(HOLDER, &bin).unwrap();
+            bin
+        } else {
+            PathBuf::from(HOLDER)
+        };
+        let old = start_old_holder(&program, &down.state_dir, 2, fake(&[]));
         let pid = pid_path(&down.state_dir, 2);
         until("the old holder's pid file", WAIT, || pid.exists()).await;
+        if let Some(replace) = removed {
+            std::fs::remove_file(&program).unwrap();
+            if replace {
+                std::fs::copy("/bin/echo", &program).unwrap();
+            }
+        }
         let pids: PidFile = serde_json::from_slice(&std::fs::read(&pid).unwrap()).unwrap();
         assert_eq!(pids.version, 99);
         let d = start_daemon_with(down.socket.clone(), claude_env(&dir, true)).await;
@@ -5929,6 +5962,7 @@ mod restart {
             _down: down,
             pids,
             session_id,
+            claude_dir: dir,
         }
     }
 
@@ -6027,5 +6061,121 @@ mod restart {
             other.0.try_wait().unwrap().is_none(),
             "the other process was signalled"
         );
+    }
+
+    /// A held session whose holder's binary an install removed (and with
+    /// `replace`, put another file in its place, as `bundle.sh` does)
+    /// survives a restart: the new daemon attaches it.
+    async fn a_session_outlives_its_holder_binary(replace: bool) {
+        let socket = temp_socket();
+        let bin = socket.parent().unwrap().join("overseer-test-holder");
+        std::fs::copy(HOLDER, &bin).unwrap();
+        let d = start_daemon_holder(
+            socket,
+            overseer_daemon::EnvSource::Inherit,
+            offline_settings(),
+            default_patterns(),
+            bin.clone(),
+        )
+        .await;
+        let mut c = Client::connect(&d.socket).await;
+        assert_eq!(c.start(1).await, Response::Ok);
+        assert_eq!(c.request(Request::Attach { id: 1 }).await, Response::Ok);
+        c.type_line(1, "before").await;
+        c.output_until(1, "ECHO:before").await;
+        let pid = running_pid(&c.list().await[1]);
+        drop(c);
+
+        let down = stop_keeping(d).await;
+        std::fs::remove_file(&bin).unwrap();
+        if replace {
+            std::fs::copy("/bin/echo", &bin).unwrap();
+        }
+        let d = start_daemon_at(down.socket.clone()).await;
+        let mut c = Client::connect(&d.socket).await;
+        let info = c.list().await.remove(1);
+        assert_eq!(running_pid(&info), pid, "{info:?}");
+        assert!(info.held, "{info:?}");
+        assert!(pid_path(&down.state_dir, 1).exists(), "pid file removed");
+        let snap = String::from_utf8_lossy(&c.snapshot(1).await).into_owned();
+        assert!(snap.contains("ECHO:before"), "{snap:?}");
+        // Still running a while later: nothing took it for dead.
+        sleep(Duration::from_millis(1500)).await;
+        assert_eq!(running_pid(&c.list().await[1]), pid);
+        assert!(matches!(c.start(1).await, Response::Error { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_session_outlives_its_replaced_holder_binary() {
+        a_session_outlives_its_holder_binary(true).await;
+    }
+
+    #[tokio::test]
+    async fn a_session_outlives_its_removed_holder_binary() {
+        a_session_outlives_its_holder_binary(false).await;
+    }
+
+    #[tokio::test]
+    async fn a_stopped_older_build_session_is_still_resumable_after_a_restart() {
+        let o = older_session().await;
+        let mut c = Client::connect(&o.d.socket).await;
+        assert_eq!(c.request(Request::StopSlot { id: 2 }).await, Response::Ok);
+        let state_dir = o.d.state_dir.clone();
+        let (exit, pid) = (exit_path(&state_dir, 2), pid_path(&state_dir, 2));
+        // The old holder has gone and no exit file of its is left.
+        until("the old holder to end", WAIT * 2, || {
+            !pid.exists() && !exit.exists()
+        })
+        .await;
+        sleep(Duration::from_millis(500)).await;
+        assert!(!exit.exists(), "exit file left behind");
+        drop(c);
+        let OlderSession {
+            d,
+            old,
+            _down,
+            session_id,
+            claude_dir,
+            ..
+        } = o;
+        drop(old);
+        let down = stop_keeping(d).await;
+        let d = start_daemon_with(down.socket.clone(), claude_env(&claude_dir, true)).await;
+        let mut c = Client::connect(&d.socket).await;
+        let info = c.list().await.remove(2);
+        assert!(
+            matches!(&info.state, SlotState::Resumable { session_id: s, .. } if *s == session_id),
+            "{info:?}"
+        );
+        drop(_down);
+    }
+
+    #[tokio::test]
+    async fn an_older_build_session_whose_binary_was_replaced_keeps_its_card() {
+        older_session_keeps_its_card(true).await;
+    }
+
+    #[tokio::test]
+    async fn an_older_build_session_whose_binary_was_removed_keeps_its_card() {
+        older_session_keeps_its_card(false).await;
+    }
+
+    async fn older_session_keeps_its_card(replace: bool) {
+        let o = older_session_from(Some(replace)).await;
+        let mut c = Client::connect(&o.d.socket).await;
+        let info = c.list().await.remove(2);
+        assert_eq!(running_pid(&info), o.pids.child, "{info:?}");
+        assert!(info.label.ends_with(" (older build)"), "{info:?}");
+        // Past a few holder watches: still running, still refusing.
+        sleep(Duration::from_millis(2500)).await;
+        let info = c.list().await.remove(2);
+        assert_eq!(running_pid(&info), o.pids.child, "{info:?}");
+        assert!(matches!(c.start(2).await, Response::Error { .. }));
+        assert!(pid_path(&o.d.state_dir, 2).exists(), "pid file removed");
+        assert_eq!(c.request(Request::StopSlot { id: 2 }).await, Response::Ok);
+        until("the child to end", Duration::from_secs(3), || {
+            !pid_alive(o.pids.child)
+        })
+        .await;
     }
 }

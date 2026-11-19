@@ -7,8 +7,8 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use overseer_daemon::holder::{
-    end_by_pid, exit_path, holder_alive, pid_path, read_frame, socket_path, write_frame, ExitFile,
-    Frame, PidFile, HOLDER_PROTOCOL,
+    end_by_pid, exit_path, holder_alive, holder_gone, pid_path, read_frame, socket_path,
+    write_frame, ExitFile, Frame, PidFile, HOLDER_PROTOCOL,
 };
 use overseer_daemon::pty::SpawnSpec;
 use overseer_daemon::slot::{Attached, Slot};
@@ -27,6 +27,11 @@ struct Holder {
 
 impl Holder {
     fn start(script: &str) -> Holder {
+        Holder::start_from(Path::new(HOLDER), script)
+    }
+
+    /// [`Holder::start`], running the holder from `program`.
+    fn start_from(program: &Path, script: &str) -> Holder {
         // Unix socket paths are short on macOS: keep the state dir in /tmp.
         let state = tempfile::Builder::new()
             .prefix("ovh")
@@ -42,7 +47,7 @@ impl Holder {
             rows: 24,
             run: RUN.into(),
         };
-        let mut proc = Command::new(HOLDER)
+        let mut proc = Command::new(program)
             .arg("hold")
             .arg(state.path())
             .stdin(Stdio::piped())
@@ -467,4 +472,56 @@ fn a_hello_that_cannot_be_read_is_unsupported() {
     assert!(matches!(attached, Attached::Unreadable));
     drop(attached);
     serve.join().unwrap();
+}
+
+/// A copy of the test holder in a fresh folder, so a test can do to it what
+/// an install does to the app's binary.
+fn holder_copy() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::Builder::new()
+        .prefix("ovb")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let bin = dir.path().join("overseer-test-holder");
+    std::fs::copy(HOLDER, &bin).unwrap();
+    (dir, bin)
+}
+
+/// A holder started from a binary that is then removed, as `bundle.sh`'s
+/// `rm -f`, and with `replace` another file copied to the same path, as
+/// its `cp`, is still known for a holder and can still be ended.
+fn holder_outlives_its_binary(replace: bool) {
+    let (_dir, bin) = holder_copy();
+    let mut h = Holder::start_from(&bin, "sleep 30");
+    std::fs::remove_file(&bin).unwrap();
+    if replace {
+        std::fs::copy("/bin/echo", &bin).unwrap();
+    }
+    let p = h.pid_file();
+    assert!(holder_alive(&p), "a live holder taken for something else");
+    assert!(!holder_gone(&p), "a live holder taken for dead");
+    end_by_pid(&p);
+    h.wait_for(|| !pid_alive(p.child), "the child to end");
+    h.wait_exit(WAIT);
+}
+
+#[test]
+fn a_holder_whose_binary_was_replaced_is_still_a_holder() {
+    holder_outlives_its_binary(true);
+}
+
+#[test]
+fn a_holder_whose_binary_was_removed_is_still_a_holder() {
+    holder_outlives_its_binary(false);
+}
+
+#[test]
+fn another_program_named_by_a_pid_file_is_not_a_holder() {
+    let other = other_process();
+    let id = other.0.id();
+    let p = PidFile {
+        holder: id,
+        child: id,
+        version: HOLDER_PROTOCOL,
+    };
+    assert!(holder_gone(&p), "sleep taken for a holder");
 }

@@ -14,8 +14,8 @@ use tokio::sync::broadcast;
 use crate::activity::apply;
 use crate::env::BaseEnv;
 use crate::holder::{
-    activity_path, client, end_by_pid, exit_path, holder_alive, pid_path, socket_path, ExitFile,
-    HolderHello, PidFile,
+    activity_path, client, end_by_pid, exit_path, holder_gone, holder_state, pid_path, socket_path,
+    ExitFile, HolderHello, HolderState, PidFile,
 };
 use crate::launch::{
     claude_argv, claude_projects_dir, first_prompt, has_transcript, is_claude, write_slot_files,
@@ -369,7 +369,7 @@ impl SlotManager {
         };
         // A holder that is still alive keeps its session: never offer a
         // resume over it, which its live pid file would refuse anyway.
-        let pids = client::read_pid_file(&pid_path(state_dir, id)).filter(holder_alive);
+        let pids = client::read_pid_file(&pid_path(state_dir, id)).filter(|p| !holder_gone(p));
         let Some(pids) = pids else {
             tracing::info!(
                 "{} holder is gone ({why}); removing its socket",
@@ -409,9 +409,10 @@ impl SlotManager {
             child: h.child_pid,
             version: h.version,
         });
+        // Each source on its own: a stale pid file must not hide the Hello.
         let pids = client::read_pid_file(&pid_path(state_dir, id))
-            .or(from_hello)
-            .filter(holder_alive);
+            .filter(|p| !holder_gone(p))
+            .or(from_hello.filter(|p| !holder_gone(p)));
         let Some(pids) = pids else {
             // It answered, so something listens there: leave it alone, but
             // never signal what cannot be shown to be a holder.
@@ -815,9 +816,23 @@ impl SlotManager {
             let slots = self.slots.lock().unwrap();
             // Unless a retry has attached it meanwhile, end it by pid.
             if slots[id as usize].is_none() {
+                if holder_state(&r.pids) == HolderState::Unknown {
+                    return Err(format!(
+                        "{} cannot confirm that pid {} is still its holder; left it running",
+                        slot_name(id),
+                        r.pids.holder
+                    ));
+                }
                 r.given_up.store(true, Ordering::SeqCst);
-                end_in_background(id, r.pids.clone());
                 let older = r.older.clone();
+                // A resumed older session must not read as exited after a
+                // restart: the exit file its holder leaves is removed.
+                let exit_file = older.as_ref().filter(|o| o.session_id.is_some()).and(
+                    self.launch
+                        .as_ref()
+                        .map(|l| (pid_path(&l.state_dir, id), exit_path(&l.state_dir, id))),
+                );
+                end_in_background(id, r.pids.clone(), exit_file);
                 // An older build's session is offered for resume, so its
                 // ledger row stays live; any other session has ended.
                 let resume = older
@@ -887,7 +902,7 @@ impl SlotManager {
         if u.ended.lock().unwrap().is_some() {
             return None;
         }
-        if holder_alive(&u.pids) {
+        if !holder_gone(&u.pids) {
             return Some(u);
         }
         let (at, now) = end_once(&u.ended, self.launch.as_ref().map(|l| &*l.ledger), id);
@@ -1000,7 +1015,7 @@ const OLDER_BUILD: &str = "this session runs on an older Overseer build; stop it
 fn forget_stale_pid_file(state_dir: &Path, id: SlotId) {
     let path = pid_path(state_dir, id);
     match crate::holder::load_pid_file(&path) {
-        Ok(Some(p)) if holder_alive(&p) => {}
+        Ok(Some(p)) if !holder_gone(&p) => {}
         Ok(None) => {}
         _ => {
             tracing::info!("{} removing a stale holder pid file", slot_name(id));
@@ -1148,7 +1163,7 @@ fn retry_attach(
             };
             for _ in 0..retries {
                 std::thread::sleep(ATTACH_RETRY_PAUSE);
-                if stopped() || !holder_alive(&watch.pids) {
+                if stopped() || holder_gone(&watch.pids) {
                     break;
                 }
                 match try_attach(&socket, id) {
@@ -1169,14 +1184,14 @@ fn retry_attach(
                     Attempt::Gone | Attempt::Unsupported(_) => break,
                 }
             }
-            if retries > 0 && !stopped() && holder_alive(&watch.pids) {
+            if retries > 0 && !stopped() && !holder_gone(&watch.pids) {
                 tracing::warn!(
                     "{} holder not attached after {ATTACH_RETRIES} more tries; Stop ends it",
                     slot_name(id)
                 );
             }
             while !stopped() {
-                if !holder_alive(&watch.pids) {
+                if holder_gone(&watch.pids) {
                     // Under the slots lock, as Stop ends it, and only while
                     // no session has taken the slot.
                     let slots = ctx.slots.lock().unwrap();
@@ -1198,10 +1213,16 @@ fn retry_attach(
     }
 }
 
+/// How long, after ending a session by pid, to wait for its holder to go
+/// before its exit file is removed.
+const HOLDER_GONE_WAIT: Duration = Duration::from_secs(10);
+
 /// Ends a session this daemon cannot reach by the pids in its holder's
 /// pid file ([`end_by_pid`]), on a thread of its own since that waits for
-/// the holder to go.
-fn end_in_background(id: SlotId, pids: PidFile) {
+/// the holder to go. With `exit_file` (the slot's pid and exit file
+/// paths), once the holder has gone the exit file it wrote is removed,
+/// unless a new holder has taken the slot meanwhile.
+fn end_in_background(id: SlotId, pids: PidFile, exit_file: Option<(PathBuf, PathBuf)>) {
     tracing::info!(
         "{} ending a session by pid (holder {}, child {})",
         slot_name(id),
@@ -1210,7 +1231,25 @@ fn end_in_background(id: SlotId, pids: PidFile) {
     );
     let spawned = std::thread::Builder::new()
         .name(format!("end-{}", slot_name(id)))
-        .spawn(move || end_by_pid(&pids));
+        .spawn(move || {
+            end_by_pid(&pids);
+            let Some((pid_file, exit)) = exit_file else {
+                return;
+            };
+            // The holder writes its exit file, then removes its pid file.
+            let ours = || client::read_pid_file(&pid_file).is_some_and(|p| p == pids);
+            let deadline = std::time::Instant::now() + HOLDER_GONE_WAIT;
+            while ours() && !holder_gone(&pids) && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            match client::read_pid_file(&pid_file) {
+                Some(p) if p != pids => {}
+                Some(_) if !holder_gone(&pids) => {
+                    tracing::warn!("{} holder still there; exit file kept", slot_name(id));
+                }
+                _ => remove_file(&exit),
+            }
+        });
     if let Err(e) = spawned {
         tracing::warn!("{} not ended: {e}", slot_name(id));
     }

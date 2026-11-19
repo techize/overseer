@@ -17,7 +17,7 @@ use overseer_proto::{slot_name, SlotId};
 use tokio::sync::watch;
 
 use super::frame::{read_frame, write_frame, Frame, HolderHello, HOLDER_PROTOCOL, SUPPORTED};
-use super::{exit_path, holder_alive, load_pid_file, pid_path, socket_path, PidFile};
+use super::{exit_path, holder_gone, load_pid_file, pid_path, socket_path, PidFile};
 use crate::pty::{OnOutput, SpawnSpec};
 
 /// How long a new holder has to start listening, and a connected one to
@@ -223,7 +223,7 @@ impl Drop for HeldPty {
 }
 
 /// Whether a process with this pid exists. For a holder's pid, use
-/// [`holder_alive`], which also checks what the process is.
+/// [`super::holder_state`], which also checks what the process is.
 pub(crate) fn alive(pid: u32) -> bool {
     let Ok(pid) = i32::try_from(pid) else {
         return false;
@@ -255,7 +255,7 @@ pub(crate) fn abandon(holder: u32, state_dir: &Path, slot: SlotId) {
 /// Starts `<program> hold <state_dir>` for `spec` and connects to it. The
 /// caller starts reading with [`Greeting::serve`].
 ///
-/// Refuses when the slot's pid file names a live holder ([`holder_alive`]) (after giving one
+/// Refuses when the slot's pid file names a holder not yet gone ([`holder_gone`]) (after giving one
 /// that is finishing up [`HOLDER_START`] to go), since a new holder would
 /// take its socket. A stale exit file is removed first, so an old exit is
 /// never read as the new child's.
@@ -271,10 +271,10 @@ pub fn start(spec: &SpawnSpec, program: &Path, state_dir: &Path) -> anyhow::Resu
     }
     if let Some(old) = read_pid_file(&pid_path(state_dir, slot)) {
         let deadline = Instant::now() + HOLDER_START;
-        while holder_alive(&old) && Instant::now() < deadline {
+        while !holder_gone(&old) && Instant::now() < deadline {
             std::thread::sleep(POLL);
         }
-        if holder_alive(&old) {
+        if !holder_gone(&old) {
             bail!("{name} already has a holder running (pid {})", old.holder);
         }
     }

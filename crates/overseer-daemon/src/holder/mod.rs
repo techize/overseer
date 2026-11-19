@@ -93,21 +93,82 @@ pub fn load_pid_file(path: &Path) -> io::Result<Option<PidFile>> {
 /// one the integration tests build.
 const HOLDER_PROGRAMS: &[&str] = &["overseer", "overseer-test-holder"];
 
+/// The start names of [`HOLDER_PROGRAMS`]. macOS keeps up to 32 bytes, so
+/// both are whole there; Linux keeps 15, which cuts the test holder's.
+#[cfg(target_os = "macos")]
+const HOLDER_NAMES: &[&str] = HOLDER_PROGRAMS;
+#[cfg(not(target_os = "macos"))]
+const HOLDER_NAMES: &[&str] = &["overseer", "overseer-test-h"];
+
 /// How long [`end_by_pid`] gives a holder to go on its own once its child
 /// has been asked to end.
 pub const END_GRACE: Duration = Duration::from_secs(2);
 
-/// Whether the holder a pid file names is alive and still an Overseer
-/// holder: the pid exists and its executable is `overseer` (or the test
-/// holder). A pid reused by any other program reads as not alive, so a
-/// stale pid file never leads to a signal.
+/// What the pid a pid file names as its holder is now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HolderState {
+    /// No process has the pid.
+    Dead,
+    /// An Overseer holder: its executable path, or failing that the name
+    /// it was started as, is a holder program's.
+    Holder,
+    /// Another program: its start name can be read and is not a holder's.
+    /// The pid file is stale.
+    Other,
+    /// A live process whose identity cannot be read either way. It may be
+    /// the holder, so it is never taken for dead and never signalled.
+    Unknown,
+}
+
+/// What `pid_file`'s holder pid is now; see [`HolderState`]. Liveness is
+/// `kill(pid, 0)` alone; identity is checked only for a live pid. The
+/// executable path is gone once an install removes the binary a holder
+/// was started from, so the start name (`proc_name`, which survives that)
+/// is the fallback.
+pub fn holder_state(pid_file: &PidFile) -> HolderState {
+    let pid = pid_file.holder;
+    if !client::alive(pid) {
+        return HolderState::Dead;
+    }
+    let state = identify(executable(pid).as_deref(), start_name(pid).as_deref());
+    // Gone between the checks: a reading of a reused pid is not trusted.
+    if !client::alive(pid) {
+        return HolderState::Dead;
+    }
+    state
+}
+
+/// Classifies a live process by its executable path and start name, either
+/// of which may be unreadable.
+pub fn identify(path: Option<&Path>, name: Option<&str>) -> HolderState {
+    let path_is_holder = path
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| HOLDER_PROGRAMS.contains(&n));
+    if path_is_holder || name.is_some_and(|n| HOLDER_NAMES.contains(&n)) {
+        return HolderState::Holder;
+    }
+    match name {
+        Some(_) => HolderState::Other,
+        None => HolderState::Unknown,
+    }
+}
+
+/// Whether the holder a pid file names is alive and shown to be an
+/// Overseer holder ([`HolderState::Holder`]): the only case in which it or
+/// its child may be signalled.
 pub fn holder_alive(pid_file: &PidFile) -> bool {
-    client::alive(pid_file.holder)
-        && executable(pid_file.holder).is_some_and(|path| {
-            path.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| HOLDER_PROGRAMS.contains(&n))
-        })
+    holder_state(pid_file) == HolderState::Holder
+}
+
+/// Whether the holder a pid file names has gone: its pid is dead, or now
+/// belongs to another program. A live process that cannot be identified is
+/// not gone.
+pub fn holder_gone(pid_file: &PidFile) -> bool {
+    matches!(
+        holder_state(pid_file),
+        HolderState::Dead | HolderState::Other
+    )
 }
 
 /// The executable a live process runs.
@@ -128,6 +189,27 @@ fn executable(pid: u32) -> Option<PathBuf> {
 #[cfg(not(target_os = "macos"))]
 fn executable(pid: u32) -> Option<PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+}
+
+/// The name a process was started as: the file name it was exec'd by, up
+/// to 32 bytes on macOS, which outlives the file itself.
+#[cfg(target_os = "macos")]
+fn start_name(pid: u32) -> Option<String> {
+    let pid = i32::try_from(pid).ok().filter(|p| *p > 0)?;
+    let mut buf = vec![0u8; 256];
+    // SAFETY: the buffer is as long as the size passed.
+    let n = unsafe { libc::proc_name(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    if n <= 0 {
+        return None;
+    }
+    buf.truncate(n as usize);
+    String::from_utf8(buf).ok()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn start_name(pid: u32) -> Option<String> {
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+    Some(comm.trim_end_matches('\n').to_string())
 }
 
 /// Ends a holder's session without speaking its protocol, by the pids in
@@ -173,4 +255,28 @@ pub fn main() -> ! {
 #[doc(hidden)]
 pub fn main_announcing(version: u32) -> ! {
     serve::main(version)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identity_takes_the_path_then_the_start_name() {
+        let app = Path::new("/Applications/Overseer.app/Contents/MacOS/overseer");
+        assert_eq!(identify(Some(app), None), HolderState::Holder);
+        // The binary was removed: no path, but the start name survives.
+        assert_eq!(identify(None, Some("overseer")), HolderState::Holder);
+        // Another file at a path that no longer matches.
+        let other = Path::new("/bin/sleep");
+        assert_eq!(identify(Some(other), Some("overseer")), HolderState::Holder);
+        assert_eq!(identify(Some(other), Some("sleep")), HolderState::Other);
+        assert_eq!(identify(None, Some("sleep")), HolderState::Other);
+        // Nothing readable proves anything: it is never taken for dead.
+        assert_eq!(identify(None, None), HolderState::Unknown);
+        assert_eq!(identify(Some(other), None), HolderState::Unknown);
+        // Only exact names count.
+        assert_eq!(identify(None, Some("overseer-x")), HolderState::Other);
+        assert_eq!(identify(None, Some("overseer-test-h")), HolderState::Other);
+    }
 }
