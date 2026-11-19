@@ -860,6 +860,7 @@ fn hook(slot: u8, event: HookKind) -> HookEvent {
         tool_use_id: None,
         notification_type: None,
         run: None,
+        agent_id: None,
     }
 }
 
@@ -928,6 +929,34 @@ async fn hook_requests_change_slot_activity() {
     let info = c.exited_event(2).await;
     assert_eq!(info.activity, None, "exit clears activity");
     assert_eq!(c.list().await[2].activity, None);
+}
+
+/// A background subagent keeps calling tools after the main turn's `Stop`.
+/// Its events say nothing about the main conversation, which is idle and
+/// ready for a relay (#58).
+#[tokio::test]
+async fn a_subagent_tool_call_after_stop_leaves_the_slot_idle() {
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    assert_eq!(c.start(2).await, Response::Ok);
+    assert_eq!(c.next_change(2).await.activity, None);
+    c.hook(hook(2, HookKind::UserPromptSubmit)).await;
+    c.next_change(2).await;
+    c.hook(hook(2, HookKind::Stop)).await;
+    assert_eq!(
+        activity_of(&c.next_change(2).await).kind,
+        ActivityKind::Idle
+    );
+    let mut sub = hook(2, HookKind::PostToolUse);
+    sub.tool = Some("Bash".into());
+    sub.agent_id = Some("ag-1".into());
+    c.hook(sub).await;
+    // The hook is answered before list is: had it applied, list shows it.
+    assert_eq!(
+        activity_of(&c.list().await[2]).kind,
+        ActivityKind::Idle,
+        "a subagent's tool call set the main session working"
+    );
 }
 
 #[tokio::test]
@@ -3336,6 +3365,28 @@ async fn working_slot_waits_until_stop() {
     c.held_for(2, "session is working").await;
     stub.reads_nothing_for(2).await;
     c.hook(hook(2, HookKind::Stop)).await;
+    assert_eq!(stub.read_until(&pasted(HELLO)).await, pasted(HELLO));
+    c.all_delivered(2).await;
+}
+
+/// A slot that reads as working (its Stop lost) but has shown the empty box
+/// and no working line for a while is idle: the relay goes (#58). Under the
+/// working line it keeps waiting.
+#[tokio::test]
+async fn working_slot_with_an_idle_screen_gets_the_relay() {
+    let stub = box_stub("quiet");
+    let d = start_daemon_with(temp_socket(), stub.env()).await;
+    let mut c = Client::connect(&d.socket).await;
+    let pid = c.start_stub(2, &stub).await;
+    stub.set_box(Some("@working"), pid).await;
+    c.hook(hook(2, HookKind::UserPromptSubmit)).await;
+    assert_eq!(c.relay(None, 2, "hello").await, queued_for(2));
+    c.held_for(2, "session is working").await;
+    // The working line is up: well past the quiet period, still nothing.
+    stub.reads_nothing_for(12).await;
+    // The turn ends but its Stop never arrives.
+    stub.set_box(None, pid).await;
+    stub.reads_nothing_for(7).await;
     assert_eq!(stub.read_until(&pasted(HELLO)).await, pasted(HELLO));
     c.all_delivered(2).await;
 }

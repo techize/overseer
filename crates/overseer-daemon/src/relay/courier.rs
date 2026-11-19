@@ -11,6 +11,13 @@
 //! hook, so the slot still reads as needing the user. A relay goes anyway
 //! once the screen has shown the empty box, with no working line, on two
 //! looks in a row.
+//!
+//! A slot that reads as working, but whose screen has shown the empty box
+//! and no working line for `QUIET_FOR`, is idle too: its `Stop` was lost,
+//! or something marked it working after the turn ended (#58).
+//!
+//! Each change in why a slot's relays wait is logged, and a box that cannot
+//! be found logs the bottom of the screen, so a stuck relay can be traced.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -35,8 +42,15 @@ const RETURN_DELAY: Duration = Duration::from_millis(100);
 /// After a delivery the slot is left alone until its activity changes or
 /// this passes, so one idle state never gets two pastes.
 const COOLDOWN: Duration = Duration::from_secs(10);
+/// How long a slot that reads as working must show the empty box and no
+/// working line before it counts as idle. A running turn always draws its
+/// working line, so this only has to outlast a redraw.
+const QUIET_FOR: Duration = Duration::from_secs(10);
+/// Screen rows logged when the input box cannot be found.
+const LOGGED_ROWS: usize = 12;
 
 const NOT_RUNNING: &str = "slot is not running";
+const WORKING: &str = "session is working";
 /// The hold reason for a slot at a prompt. The board shows it as
 /// `waiting at a prompt for <user>`: see `held_text`.
 pub(crate) const AT_PROMPT: &str = "waiting at a prompt";
@@ -61,7 +75,7 @@ pub fn ready(state: &SlotState, activity: Option<&Activity>) -> Result<(), &'sta
         ActivityKind::Idle => Ok(()),
         ActivityKind::NeedsYou if a.idle_wait => Ok(()),
         ActivityKind::NeedsYou => Err(AT_PROMPT),
-        ActivityKind::Working => Err("session is working"),
+        ActivityKind::Working => Err(WORKING),
     }
 }
 
@@ -121,6 +135,39 @@ struct Sent {
     at: Instant,
 }
 
+/// What the courier remembers about one slot between looks.
+#[derive(Default)]
+struct Watch {
+    /// The activity in which a prompt was last seen answered.
+    answered: Option<Activity>,
+    /// The working activity in which the screen was first seen quiet (the
+    /// empty box, no working line), and when.
+    quiet: Option<(Activity, Instant)>,
+    /// Why the slot's relays waited on the last look, for the log.
+    held: Option<&'static str>,
+}
+
+/// The bottom `LOGGED_ROWS` non-blank rows of `snap`, trailing blanks cut,
+/// one per line.
+fn bottom_rows(snap: &overseer_term::Snapshot) -> String {
+    let mut rows: Vec<String> = (0..snap.rows)
+        .rev()
+        .map(|r| {
+            let cells = &snap.cells[r * snap.cols..(r + 1) * snap.cols];
+            cells
+                .iter()
+                .map(|c| c.ch)
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .filter(|r| !r.is_empty())
+        .take(LOGGED_ROWS)
+        .collect();
+    rows.reverse();
+    rows.join("\n")
+}
+
 pub struct Courier {
     ledger: Arc<Ledger>,
     manager: Arc<Mutex<SlotManager>>,
@@ -157,9 +204,9 @@ impl Courier {
 
     async fn run(self: Arc<Self>, mut events: broadcast::Receiver<Event>) {
         let mut sent: [Option<Sent>; SLOT_COUNT] = Default::default();
-        let mut answered: [Option<Activity>; SLOT_COUNT] = Default::default();
+        let mut watch: [Watch; SLOT_COUNT] = Default::default();
         loop {
-            let pending = self.round(&mut sent, &mut answered).await;
+            let pending = self.round(&mut sent, &mut watch).await;
             let tick = async {
                 if pending {
                     tokio::time::sleep(TICK).await;
@@ -184,12 +231,10 @@ impl Courier {
     }
 
     /// One look at every slot. Returns whether any relay is still pending.
-    /// `answered` holds, per slot, the activity in which a prompt was last
-    /// seen answered (see `deliver`).
     async fn round(
         &self,
         sent: &mut [Option<Sent>; SLOT_COUNT],
-        answered: &mut [Option<Activity>; SLOT_COUNT],
+        watch: &mut [Watch; SLOT_COUNT],
     ) -> bool {
         let infos = self.manager.lock().unwrap().list();
         let mut pending = false;
@@ -203,8 +248,9 @@ impl Courier {
                     continue;
                 }
             };
+            let w = &mut watch[id as usize];
             if relays.is_empty() {
-                answered[id as usize] = None;
+                *w = Watch::default();
                 self.locks.set_held(id, None);
                 continue;
             }
@@ -216,22 +262,42 @@ impl Courier {
                 }
             }
             sent[id as usize] = None;
-            match self
-                .deliver(&info, &relays, &mut answered[id as usize])
-                .await
-            {
+            let held = match self.deliver(&info, &relays, w).await {
                 Ok(true) => {
                     sent[id as usize] = Some(Sent {
                         activity: info.activity.clone(),
                         at: Instant::now(),
-                    })
+                    });
+                    None
                 }
                 // Every relay had gone stale: nothing was typed.
-                Ok(false) => self.locks.set_held(id, None),
-                Err(reason) => self.locks.set_held(id, Some(reason)),
+                Ok(false) => None,
+                Err(reason) => Some(reason),
+            };
+            self.locks.set_held(id, held);
+            if let Some(reason) = held.filter(|r| w.held != Some(*r)) {
+                self.log_wait(id, &relays, reason);
             }
+            w.held = held;
         }
         pending
+    }
+
+    /// Logs why `relays` to `id` wait, and for a box that cannot be found,
+    /// what the screen shows instead.
+    fn log_wait(&self, id: SlotId, relays: &[Relay], reason: &str) {
+        let ids: Vec<i64> = relays.iter().map(|r| r.id).collect();
+        tracing::info!("relays {ids:?} to {} wait: {reason}", slot_name(id));
+        if reason == NO_BOX {
+            if let Some(slot) = self.manager.lock().unwrap().slot(id) {
+                let (snap, _) = slot.screen();
+                tracing::info!(
+                    "{} screen with no input box found:\n{}",
+                    slot_name(id),
+                    bottom_rows(&snap)
+                );
+            }
+        }
     }
 
     /// Types `relays` into the slot `info` describes if it is ready, and
@@ -245,25 +311,31 @@ impl Courier {
     ///
     /// A slot waiting at a prompt is ready once the prompt is answered: the
     /// screen shows the empty box and no working line on this look and on
-    /// the one before, in the same activity. `answered` carries that
-    /// activity between looks.
+    /// the one before, in the same activity. A slot that reads as working
+    /// is ready once the screen has shown that for `QUIET_FOR` in the same
+    /// activity. `watch` carries both between looks.
     async fn deliver(
         &self,
         info: &SlotInfo,
         relays: &[Relay],
-        answered: &mut Option<Activity>,
+        watch: &mut Watch,
     ) -> Result<bool, &'static str> {
         let id = info.id;
-        let at_prompt = match ready(&info.state, info.activity.as_ref()) {
-            Ok(()) => false,
-            Err(AT_PROMPT) => true,
+        let held = match ready(&info.state, info.activity.as_ref()) {
+            Ok(()) => None,
+            Err(why @ (AT_PROMPT | WORKING)) => Some(why),
             Err(why) => {
-                *answered = None;
+                watch.answered = None;
+                watch.quiet = None;
                 return Err(why);
             }
         };
+        let (at_prompt, working_hook) = (held == Some(AT_PROMPT), held == Some(WORKING));
         if !at_prompt {
-            *answered = None;
+            watch.answered = None;
+        }
+        if !working_hook {
+            watch.quiet = None;
         }
         let slot = self.manager.lock().unwrap().slot(id).ok_or(NOT_RUNNING)?;
         // The live screen, not a replay of the ring: the ring loses the box's
@@ -272,13 +344,37 @@ impl Courier {
         let (found, working) = (input_box(&snap), shows_working(&snap));
         if at_prompt {
             if found != InputBox::Empty || working {
-                *answered = None;
+                watch.answered = None;
                 return Err(AT_PROMPT);
             }
-            if *answered != info.activity {
+            if watch.answered != info.activity {
                 // Seen once; deliver if the next look agrees.
-                *answered = info.activity.clone();
+                watch.answered = info.activity.clone();
                 return Err(AT_PROMPT);
+            }
+        }
+        if working_hook {
+            let quiet = found == InputBox::Empty && !working;
+            let now = info.activity.clone().ok_or(WORKING)?;
+            match &watch.quiet {
+                _ if !quiet => {
+                    watch.quiet = None;
+                    return Err(WORKING);
+                }
+                Some((a, since)) if *a == now => {
+                    if since.elapsed() < QUIET_FOR {
+                        return Err(WORKING);
+                    }
+                    tracing::info!(
+                        "{} reads as working but its screen has been idle for {}s",
+                        slot_name(id),
+                        since.elapsed().as_secs()
+                    );
+                }
+                _ => {
+                    watch.quiet = Some((now, Instant::now()));
+                    return Err(WORKING);
+                }
             }
         }
         match found {
@@ -295,13 +391,15 @@ impl Courier {
         // A hook may have come in while the screen was read.
         let latest = self.manager.lock().unwrap().list().swap_remove(id as usize);
         match ready(&latest.state, latest.activity.as_ref()) {
-            Err(AT_PROMPT) if at_prompt && latest.activity == info.activity => {}
+            Err(why @ (AT_PROMPT | WORKING))
+                if held == Some(why) && latest.activity == info.activity => {}
             other => other?,
         }
         // From here a drop of a claimed relay is refused as delivered, and
         // one dropped before is left out.
         let relays = self.claim(id, relays)?;
-        *answered = None;
+        watch.answered = None;
+        watch.quiet = None;
         if relays.is_empty() {
             self.locks.set_held(id, None);
             return Ok(false);
@@ -472,6 +570,22 @@ mod tests {
             compose(&[relay(Sender::Overseer, "S has released x")], 1, "Demo"),
             "Overseer: S has released x"
         );
+    }
+
+    #[test]
+    fn bottom_rows_keeps_the_last_non_blank_rows_trimmed() {
+        let mut out = String::from("\x1b[2J\x1b[H");
+        for i in 0..20 {
+            out.push_str(&format!("row {i}   \r\n"));
+        }
+        out.push_str("\r\n  ? for shortcuts");
+        let (snap, _) = super::super::screen::screen_of(out.as_bytes(), 40, 30);
+        let rows = bottom_rows(&snap);
+        let lines: Vec<&str> = rows.lines().collect();
+        assert_eq!(lines.len(), LOGGED_ROWS);
+        assert_eq!(lines[0], "row 9");
+        assert_eq!(lines[LOGGED_ROWS - 2], "row 19");
+        assert_eq!(lines[LOGGED_ROWS - 1], "  ? for shortcuts");
     }
 
     #[test]
