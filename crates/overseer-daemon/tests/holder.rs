@@ -181,6 +181,39 @@ fn hello_then_replay_then_output() {
     output_until(&mut s, "after");
 }
 
+/// A daemon that reads slowly is well behind when the child exits, with a
+/// full queue of output still to go. It still gets the whole tail, and Exit
+/// after it.
+#[test]
+fn exit_comes_after_the_whole_tail() {
+    let mut h = Holder::start("seq 1 40000; exit 3");
+    let mut s = h.connect();
+    let mut seen = skip_greeting(&mut s).into_bytes();
+    let code = loop {
+        // About 3s for a full queue, well past the holder's 1s drain wait.
+        std::thread::sleep(Duration::from_millis(3));
+        match frame(&mut s) {
+            Frame::Output(b) => seen.extend(b),
+            Frame::Exit { code, .. } => break code,
+            other => panic!("expected Output or Exit, got {other:?}"),
+        }
+    };
+    assert_eq!(code, Some(3));
+    write_frame(&mut s, &Frame::ExitSeen).unwrap();
+    let text = String::from_utf8_lossy(&seen).replace('\r', "");
+    let want: String = (1..=40000).map(|n| format!("{n}\n")).collect();
+    assert!(
+        text == want,
+        "tail lost: got {} bytes of {}, ending {:?}",
+        text.len(),
+        want.len(),
+        &text[text.len().saturating_sub(40)..]
+    );
+    // Nothing follows Exit.
+    assert!(matches!(read_frame(&mut s), Ok(None) | Err(_)));
+    h.wait_exit(WAIT);
+}
+
 #[test]
 fn an_empty_ring_replays_one_empty_frame() {
     let h = Holder::start("sleep 30");

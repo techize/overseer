@@ -38,9 +38,13 @@ const _: () = assert!(RING_CAP / CHUNK + 4 < QUEUE);
 const STALL_LIMIT: Duration = Duration::from_secs(30);
 /// How often a send waiting for room tries again.
 const SEND_RETRY: Duration = Duration::from_millis(1);
-/// How long a connected daemon has to answer Exit with ExitSeen.
+/// How long a connected daemon has to answer Exit with ExitSeen, counted
+/// from the last frame it was written, so a daemon still working through
+/// its queue is not given up on.
 const EXIT_SEEN_WAIT: Duration = Duration::from_secs(5);
-/// How long to wait, after the child exits, for its last output.
+/// How long to wait, after the child exits, for its last output. While a
+/// connected daemon is still taking frames the wait goes on, up to
+/// [`STALL_LIMIT`].
 const OUTPUT_DRAIN_WAIT: Duration = Duration::from_secs(1);
 
 fn now_secs() -> i64 {
@@ -126,6 +130,8 @@ fn run(args: Vec<OsString>) -> anyhow::Result<std::convert::Infallible> {
             exit_seen: false,
         }),
         changed: Condvar::new(),
+        sending: Mutex::new(()),
+        written: Mutex::new(Instant::now()),
     });
 
     // The PTY drops this closure, and with it `drained_tx`, when the
@@ -138,11 +144,13 @@ fn run(args: Vec<OsString>) -> anyhow::Result<std::convert::Infallible> {
             let _keep = &drained_tx;
             // Push and pick the connection under one lock so a connection
             // sees each chunk either in its Replay or as Output, never both
-            // and never neither. The send waits outside the lock.
+            // and never neither. The send waits outside the lock. Once Exit
+            // is out, nothing more is sent: Exit is always the last frame.
+            let _order = lock(&out.sending);
             let target = {
                 let mut st = out.lock();
                 st.ring.push(chunk);
-                st.target()
+                st.exit.is_none().then(|| st.target()).flatten()
             };
             if let Some((id, tx)) = target {
                 for piece in chunk.chunks(CHUNK) {
@@ -193,7 +201,7 @@ fn run(args: Vec<OsString>) -> anyhow::Result<std::convert::Infallible> {
     }
 
     let code = wait_for_exit(&pty);
-    let _ = drained_rx.recv_timeout(OUTPUT_DRAIN_WAIT);
+    drain(&shared, &drained_rx);
     let at = pty.exited_at().unwrap_or_else(now_secs);
     let seen = report_exit(&shared, code, at);
     if !seen {
@@ -208,11 +216,41 @@ struct Shared {
     state: Mutex<State>,
     /// Signalled when ExitSeen arrives or the connection goes.
     changed: Condvar,
+    /// Held while queuing frames for the connection, taken before `state`:
+    /// Exit is queued only after every Output piece already on its way.
+    sending: Mutex<()>,
+    /// When the connection's writer last wrote a frame to the daemon.
+    written: Mutex<Instant>,
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 impl Shared {
     fn lock(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
+        lock(&self.state)
+    }
+
+    /// Whether a daemon is connected and has been written a frame within
+    /// `within`: it is still working through its queue.
+    fn taking_frames(&self, within: Duration) -> bool {
+        self.lock().conn.is_some() && lock(&self.written).elapsed() < within
+    }
+}
+
+/// Waits for the PTY's output to end after the child exited: up to
+/// [`OUTPUT_DRAIN_WAIT`], or longer while a connected daemon keeps taking
+/// frames (the PTY reader may be waiting for room in its queue), up to
+/// [`STALL_LIMIT`]. A grandchild that keeps the PTY open ends the wait.
+fn drain(shared: &Shared, drained: &Receiver<()>) {
+    let start = Instant::now();
+    loop {
+        match drained.recv_timeout(OUTPUT_DRAIN_WAIT) {
+            Err(mpsc::RecvTimeoutError::Timeout)
+                if start.elapsed() < STALL_LIMIT && shared.taking_frames(OUTPUT_DRAIN_WAIT) => {}
+            _ => return,
+        }
     }
 }
 
@@ -304,9 +342,11 @@ fn wait_for_exit(pty: &LocalPty) -> Option<i32> {
 /// whether it came; false when nothing was connected, the connection went,
 /// or the wait ran out.
 fn report_exit(shared: &Shared, code: Option<i32>, at: i64) -> bool {
-    // Set under the lock that picks the connection, so a connection made
-    // later gets Exit in its greeting instead.
+    // After any Output piece on its way (`sending`), and set under the lock
+    // that picks the connection, so a connection made later gets Exit in its
+    // greeting instead.
     let target = {
+        let _order = lock(&shared.sending);
         let mut st = shared.lock();
         st.exit = Some((code, at));
         st.target()
@@ -314,7 +354,7 @@ fn report_exit(shared: &Shared, code: Option<i32>, at: i64) -> bool {
     if let Some((id, tx)) = target {
         send_waiting(shared, id, &tx, Frame::Exit { code, at });
     }
-    let deadline = Instant::now() + EXIT_SEEN_WAIT;
+    let start = Instant::now();
     let mut st = shared.lock();
     loop {
         if st.exit_seen {
@@ -323,6 +363,8 @@ fn report_exit(shared: &Shared, code: Option<i32>, at: i64) -> bool {
         if st.conn.is_none() {
             return false;
         }
+        let last = (*lock(&shared.written)).max(start);
+        let deadline = (last + EXIT_SEEN_WAIT).min(start + STALL_LIMIT);
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return false;
@@ -390,7 +432,10 @@ fn attach(
     // The connection was dropped already if either thread fails to start.
     let spawned = std::thread::Builder::new()
         .name("holder-write".into())
-        .spawn(move || write_loop(rx, writer))
+        .spawn({
+            let shared = shared.clone();
+            move || write_loop(rx, writer, &shared)
+        })
         .and_then(|_| {
             let shared = shared.clone();
             let pty = pty.clone();
@@ -409,11 +454,12 @@ fn attach(
     Ok(())
 }
 
-fn write_loop(rx: Receiver<Frame>, mut stream: UnixStream) {
+fn write_loop(rx: Receiver<Frame>, mut stream: UnixStream, shared: &Shared) {
     for frame in rx {
         if write_frame(&mut stream, &frame).is_err() {
             break;
         }
+        *lock(&shared.written) = Instant::now();
     }
     let _ = stream.shutdown(Shutdown::Both);
 }
