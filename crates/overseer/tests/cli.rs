@@ -1448,3 +1448,83 @@ fn ctl_restart_kickstarts_this_homes_agent_when_it_is_loaded() {
         "no {kick:?} in:\n{log}"
     );
 }
+
+/// `overseer hold --end <pidfile>` ends the holder a pid file names and the
+/// session it keeps; with nothing to end it still succeeds.
+#[test]
+fn hold_end_ends_a_holder_by_its_pid_file() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let dir = tempfile::Builder::new()
+        .prefix("ovc")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let spec = overseer_daemon::pty::SpawnSpec {
+        slot: 3,
+        label: "demo".into(),
+        cwd: PathBuf::from("/tmp"),
+        argv: vec!["/bin/sleep".into(), "30".into()],
+        env: vec![("PATH".into(), "/usr/bin:/bin".into())],
+        cols: 80,
+        rows: 24,
+        run: "demo-run".into(),
+    };
+    let mut holder = StdCommand::new(env!("CARGO_BIN_EXE_overseer"))
+        .arg("hold")
+        .arg(dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = holder.stdin.take().unwrap();
+    stdin
+        .write_all(&serde_json::to_vec(&spec).unwrap())
+        .unwrap();
+    drop(stdin);
+    let pid_path = overseer_daemon::holder::pid_path(dir.path(), 3);
+    let start = Instant::now();
+    while !pid_path.exists() {
+        assert!(start.elapsed() < Duration::from_secs(5), "no pid file");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let p: overseer_daemon::holder::PidFile =
+        serde_json::from_slice(&std::fs::read(&pid_path).unwrap()).unwrap();
+    let hold_end = |path: &std::path::Path| {
+        Command::cargo_bin("overseer")
+            .unwrap()
+            .args(["hold", "--end"])
+            .arg(path)
+            .assert()
+    };
+    hold_end(&pid_path).success();
+    let start = Instant::now();
+    loop {
+        if holder.try_wait().unwrap().is_some() {
+            break;
+        }
+        if start.elapsed() > Duration::from_secs(5) {
+            // SAFETY: plain signals to this test's own holder and its child.
+            unsafe {
+                libc::kill(-(p.child as i32), libc::SIGKILL);
+                libc::kill(p.holder as i32, libc::SIGKILL);
+            }
+            let _ = holder.wait();
+            panic!("holder not ended");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // SAFETY: signal 0 only checks that the pid exists.
+    assert!(
+        unsafe { libc::kill(p.child as i32, 0) } != 0,
+        "child left running"
+    );
+
+    // Nothing left to end, or no pid file at all: still a success.
+    hold_end(&pid_path).success();
+    hold_end(&dir.path().join("missing.pid")).success();
+    // A pid file that cannot be read is an error.
+    let bad = dir.path().join("bad.pid");
+    std::fs::write(&bad, "not json").unwrap();
+    hold_end(&bad).failure();
+}

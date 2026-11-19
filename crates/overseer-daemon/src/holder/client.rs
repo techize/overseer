@@ -17,7 +17,7 @@ use overseer_proto::{slot_name, SlotId};
 use tokio::sync::watch;
 
 use super::frame::{read_frame, write_frame, Frame, HolderHello, HOLDER_PROTOCOL, SUPPORTED};
-use super::{exit_path, pid_path, socket_path, PidFile};
+use super::{exit_path, holder_alive, load_pid_file, pid_path, socket_path, PidFile};
 use crate::pty::{OnOutput, SpawnSpec};
 
 /// How long a new holder has to start listening, and a connected one to
@@ -38,6 +38,19 @@ fn now_secs() -> i64 {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
 }
+
+/// A holder's first frame was not a Hello this build can read: the holder
+/// is another build's.
+#[derive(Debug)]
+pub struct UnreadableHello(String);
+
+impl std::fmt::Display for UnreadableHello {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "holder hello not readable: {}", self.0)
+    }
+}
+
+impl std::error::Error for UnreadableHello {}
 
 /// A connection to a holder that has sent its Hello, before anything else
 /// is read from it.
@@ -60,10 +73,16 @@ impl Greeting {
         )
         .context("send hello to holder")?;
         stream.set_read_timeout(Some(HOLDER_START))?;
-        let hello = match read_frame(&mut stream).context("read holder hello")? {
-            Some(Frame::Hello(h)) => h,
-            Some(other) => bail!("holder sent {other:?} before its hello"),
-            None => bail!("holder closed the connection before its hello"),
+        let hello = match read_frame(&mut stream) {
+            Ok(Some(Frame::Hello(h))) => h,
+            Ok(Some(other)) => {
+                return Err(UnreadableHello(format!("{other:?} before its hello")).into())
+            }
+            Ok(None) => bail!("holder closed the connection before its hello"),
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                return Err(UnreadableHello(e.to_string()).into())
+            }
+            Err(e) => return Err(anyhow::Error::new(e).context("read holder hello")),
         };
         stream.set_read_timeout(None)?;
         Ok(Greeting { stream, hello })
@@ -203,7 +222,8 @@ impl Drop for HeldPty {
     }
 }
 
-/// Whether a process with this pid exists.
+/// Whether a process with this pid exists. For a holder's pid, use
+/// [`holder_alive`], which also checks what the process is.
 pub(crate) fn alive(pid: u32) -> bool {
     let Ok(pid) = i32::try_from(pid) else {
         return false;
@@ -215,7 +235,7 @@ pub(crate) fn alive(pid: u32) -> bool {
 }
 
 pub(crate) fn read_pid_file(path: &Path) -> Option<PidFile> {
-    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+    load_pid_file(path).ok().flatten()
 }
 
 /// Ends a holder that never got going: it and its child, if it had one.
@@ -235,7 +255,7 @@ pub(crate) fn abandon(holder: u32, state_dir: &Path, slot: SlotId) {
 /// Starts `<program> hold <state_dir>` for `spec` and connects to it. The
 /// caller starts reading with [`Greeting::serve`].
 ///
-/// Refuses when the slot's pid file names a live holder (after giving one
+/// Refuses when the slot's pid file names a live holder ([`holder_alive`]) (after giving one
 /// that is finishing up [`HOLDER_START`] to go), since a new holder would
 /// take its socket. A stale exit file is removed first, so an old exit is
 /// never read as the new child's.
@@ -251,10 +271,10 @@ pub fn start(spec: &SpawnSpec, program: &Path, state_dir: &Path) -> anyhow::Resu
     }
     if let Some(old) = read_pid_file(&pid_path(state_dir, slot)) {
         let deadline = Instant::now() + HOLDER_START;
-        while alive(old.holder) && Instant::now() < deadline {
+        while holder_alive(&old) && Instant::now() < deadline {
             std::thread::sleep(POLL);
         }
-        if alive(old.holder) {
+        if holder_alive(&old) {
             bail!("{name} already has a holder running (pid {})", old.holder);
         }
     }

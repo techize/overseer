@@ -5705,9 +5705,10 @@ mod restart {
         c.delivered_after_redraw(1).await;
     }
 
-    /// Stands in for a holder that is alive but never greets: two `sleep`
-    /// processes named by its pid file (each leading its own process
-    /// group) and a listener on its socket that accepts and says nothing.
+    /// Stands in for a holder that is alive but never greets: an idle test
+    /// holder (a holder by name, so its pid file is trusted) and a `sleep`
+    /// as its child, each leading its own process group, named by its pid
+    /// file, and a listener on its socket that accepts and says nothing.
     struct MuteHolder {
         holder: std::process::Child,
         child: std::process::Child,
@@ -5725,14 +5726,14 @@ mod restart {
                 .mode(0o700)
                 .create(overseer_daemon::holder::holders_dir(state_dir))
                 .unwrap();
-            let sleep_60 = || {
-                std::process::Command::new("/bin/sleep")
-                    .arg("60")
+            let run = |program: &str, arg: &str| {
+                std::process::Command::new(program)
+                    .arg(arg)
                     .process_group(0)
                     .spawn()
                     .unwrap()
             };
-            let (holder, child) = (sleep_60(), sleep_60());
+            let (holder, child) = (run(HOLDER, "idle"), run("/bin/sleep", "60"));
             let pid_file = pid_path(state_dir, slot);
             let pid = PidFile {
                 holder: holder.id(),
@@ -5839,5 +5840,192 @@ mod restart {
         assert_eq!(c.request(Request::StopSlot { id: 1 }).await, Response::Ok);
         c.exited_event(1).await;
         drop(mute);
+    }
+
+    /// What an attach to an older build's session answers.
+    const OLDER: &str = "this session runs on an older Overseer build; stop it to use the slot";
+
+    /// A process this test started; killed and reaped when dropped, so a
+    /// failing test leaves nothing behind.
+    struct Reap(std::process::Child);
+
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// The test holder as an older build would run it: it announces
+    /// protocol 99. Started by hand for `slot` in `state_dir`, running
+    /// `argv`.
+    fn start_old_holder(state_dir: &Path, slot: u8, argv: Vec<String>) -> Reap {
+        use std::io::Write;
+        let spec = overseer_daemon::pty::SpawnSpec {
+            slot,
+            label: "demo".into(),
+            cwd: PathBuf::from("/tmp"),
+            argv,
+            env: vec![("PATH".into(), "/usr/bin:/bin".into())],
+            cols: 80,
+            rows: 24,
+            run: "demo-old".into(),
+        };
+        let mut proc = std::process::Command::new(HOLDER)
+            .arg("hold")
+            .arg(state_dir)
+            .env("OVERSEER_TEST_HOLDER_VERSION", "99")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut stdin = proc.stdin.take().unwrap();
+        stdin
+            .write_all(&serde_json::to_vec(&spec).unwrap())
+            .unwrap();
+        drop(stdin);
+        Reap(proc)
+    }
+
+    /// An older build's session in S2: a claude stub started by a first
+    /// daemon, whose holder is then swapped for an older build's running
+    /// the fake, and a second daemon started over it.
+    struct OlderSession {
+        // Dropped in this order: the daemon, then the holder, then the
+        // guard that ends whatever is left.
+        d: Daemon,
+        old: Reap,
+        _down: Down,
+        pids: PidFile,
+        session_id: String,
+    }
+
+    async fn older_session() -> OlderSession {
+        let d0 = start_daemon().await;
+        let dir = dir_of(&d0).join("claude");
+        drop(d0);
+        let (bin, log) = stub_claude(&dir);
+        let d = start_daemon_with(temp_socket(), claude_env(&dir, true)).await;
+        let mut c = Client::connect(&d.socket).await;
+        c.start_cmd(2, vec![bin.to_string_lossy().into_owned()])
+            .await;
+        let first = wait_for_log(&log, 1).await;
+        let session_id = arg_after(&first[0], "--session-id").unwrap();
+        drop(c);
+
+        let down = stop_keeping(d).await;
+        // The session goes on under an older build's holder.
+        end_holders(&down.state_dir);
+        let old = start_old_holder(&down.state_dir, 2, fake(&[]));
+        let pid = pid_path(&down.state_dir, 2);
+        until("the old holder's pid file", WAIT, || pid.exists()).await;
+        let pids: PidFile = serde_json::from_slice(&std::fs::read(&pid).unwrap()).unwrap();
+        assert_eq!(pids.version, 99);
+        let d = start_daemon_with(down.socket.clone(), claude_env(&dir, true)).await;
+        OlderSession {
+            d,
+            old,
+            _down: down,
+            pids,
+            session_id,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_older_build_session_is_kept_and_can_be_stopped() {
+        let o = older_session().await;
+        let mut c = Client::connect(&o.d.socket).await;
+        let info = c.list().await.remove(2);
+        assert_eq!(running_pid(&info), o.pids.child, "{info:?}");
+        assert!(info.label.ends_with(" (older build)"), "{info:?}");
+        assert!(info.held, "{info:?}");
+        assert!(matches!(c.start(2).await, Response::Error { .. }));
+        assert_eq!(
+            c.request(Request::Attach { id: 2 }).await,
+            Response::Error {
+                message: OLDER.into()
+            }
+        );
+        assert_eq!(c.request(Request::StopSlot { id: 2 }).await, Response::Ok);
+        until("the child to end", Duration::from_secs(3), || {
+            !pid_alive(o.pids.child)
+        })
+        .await;
+        let info = c.list().await.remove(2);
+        assert!(
+            matches!(&info.state, SlotState::Resumable { session_id: s, .. } if *s == o.session_id),
+            "{info:?}"
+        );
+        assert_eq!(info.label, "t2", "{info:?}");
+    }
+
+    #[tokio::test]
+    async fn an_older_build_holder_that_dies_frees_its_slot() {
+        let mut o = older_session().await;
+        let mut c = Client::connect(&o.d.socket).await;
+        let mut w = Client::connect(&o.d.socket).await;
+        assert!(matches!(c.list().await[2].state, SlotState::Running { .. }));
+        // The holder dies on its own, with no Stop; reaped, as launchd
+        // would reap an orphan.
+        o.old.0.kill().unwrap();
+        o.old.0.wait().unwrap();
+        let info = tokio::time::timeout(WAIT * 3, w.exited_event(2))
+            .await
+            .expect("no SlotChanged when the holder died");
+        assert!(!info.held, "{info:?}");
+        c.start_cmd(2, fake(&[])).await;
+        assert_eq!(c.request(Request::StopSlot { id: 2 }).await, Response::Ok);
+        c.exited_event(2).await;
+    }
+
+    #[tokio::test]
+    async fn a_stale_pid_file_never_signals_another_process() {
+        use std::os::unix::fs::DirBuilderExt;
+        use std::os::unix::process::CommandExt;
+        let socket = temp_socket();
+        let state_dir = socket.parent().unwrap().join("state");
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(overseer_daemon::holder::holders_dir(&state_dir))
+            .unwrap();
+        // Some other process now has the pid the file names, and leads its
+        // own process group as a holder's child would.
+        let mut other = Reap(
+            std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .process_group(0)
+                .spawn()
+                .unwrap(),
+        );
+        let (pid, sock) = (pid_path(&state_dir, 1), socket_path(&state_dir, 1));
+        let stale = PidFile {
+            holder: other.0.id(),
+            child: other.0.id(),
+            version: overseer_daemon::holder::HOLDER_PROTOCOL,
+        };
+        std::fs::write(&pid, serde_json::to_vec(&stale).unwrap()).unwrap();
+        drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
+        let d = start_daemon_at(socket).await;
+        let mut c = Client::connect(&d.socket).await;
+        let info = c.list().await.remove(1);
+        assert!(!matches!(info.state, SlotState::Running { .. }), "{info:?}");
+        until("the stale files to go", WAIT, || {
+            !pid.exists() && !sock.exists()
+        })
+        .await;
+        assert!(
+            other.0.try_wait().unwrap().is_none(),
+            "the other process was signalled"
+        );
+        // The slot takes a new session at once.
+        c.start_cmd(1, fake(&[])).await;
+        assert_eq!(c.request(Request::StopSlot { id: 1 }).await, Response::Ok);
+        c.exited_event(1).await;
+        assert!(
+            other.0.try_wait().unwrap().is_none(),
+            "the other process was signalled"
+        );
     }
 }

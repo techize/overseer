@@ -7,9 +7,11 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use overseer_daemon::holder::{
-    exit_path, pid_path, read_frame, socket_path, write_frame, ExitFile, Frame, PidFile,
+    end_by_pid, exit_path, holder_alive, pid_path, read_frame, socket_path, write_frame, ExitFile,
+    Frame, PidFile, HOLDER_PROTOCOL,
 };
 use overseer_daemon::pty::SpawnSpec;
+use overseer_daemon::slot::{Attached, Slot};
 
 const HOLDER: &str = env!("CARGO_BIN_EXE_overseer-test-holder");
 const SLOT: u8 = 2;
@@ -370,4 +372,99 @@ fn the_pid_file_names_holder_and_child() {
         Frame::Hello(hello) => assert_eq!(hello.child_pid, p.child),
         other => panic!("expected Hello, got {other:?}"),
     }
+}
+
+/// A process this test started, killed and reaped when dropped.
+struct Reap(Child);
+
+impl Drop for Reap {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// `/bin/sleep 30`, leading its own process group as a holder's child does.
+fn other_process() -> Reap {
+    use std::os::unix::process::CommandExt;
+    Reap(
+        Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap(),
+    )
+}
+
+fn pid_alive(pid: u32) -> bool {
+    // SAFETY: signal 0 only checks that the pid exists.
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+#[test]
+fn holder_alive_knows_a_holder_from_another_process() {
+    let h = Holder::start("sleep 30");
+    assert!(holder_alive(&h.pid_file()));
+    let other = other_process();
+    let id = other.0.id();
+    let named = PidFile {
+        holder: id,
+        child: id,
+        version: HOLDER_PROTOCOL,
+    };
+    assert!(!holder_alive(&named), "a sleep taken for a holder");
+    let gone = PidFile {
+        holder: u32::MAX,
+        child: u32::MAX,
+        version: HOLDER_PROTOCOL,
+    };
+    assert!(!holder_alive(&gone));
+}
+
+#[test]
+fn end_by_pid_ends_the_child_and_then_the_holder() {
+    let mut h = Holder::start("sleep 30");
+    let p = h.pid_file();
+    end_by_pid(&p);
+    h.wait_for(|| !pid_alive(p.child), "the child to end");
+    h.wait_exit(WAIT);
+}
+
+#[test]
+fn end_by_pid_never_signals_another_process() {
+    let mut other = other_process();
+    let id = other.0.id();
+    end_by_pid(&PidFile {
+        holder: id,
+        child: id,
+        version: HOLDER_PROTOCOL,
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(other.0.try_wait().unwrap().is_none(), "signalled");
+}
+
+#[test]
+fn a_hello_that_cannot_be_read_is_unsupported() {
+    let state = tempfile::Builder::new()
+        .prefix("ovh")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let sock = state.path().join("S2.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let serve = std::thread::spawn(move || {
+        let (mut conn, _) = listener.accept().unwrap();
+        let payload = b"not a hello";
+        let mut buf = ((payload.len() + 1) as u32).to_be_bytes().to_vec();
+        buf.push(1);
+        buf.extend_from_slice(payload);
+        conn.write_all(&buf).unwrap();
+        // Held open until the daemon side is done with it.
+        let mut rest = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut conn, &mut rest);
+    });
+    let (tx, _rx) = tokio::sync::broadcast::channel(16);
+    let attached = Slot::attach_held(&sock, tx).unwrap();
+    assert!(matches!(attached, Attached::Unreadable));
+    drop(attached);
+    serve.join().unwrap();
 }

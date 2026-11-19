@@ -47,6 +47,8 @@ pub enum Attached {
     Slot(Slot),
     /// The holder speaks a protocol this daemon does not.
     Unsupported(HolderHello),
+    /// The holder's Hello could not be read at all: another build's.
+    Unreadable,
 }
 
 /// Where the slot's terminal lives.
@@ -268,7 +270,11 @@ impl Slot {
     /// returns. When the child exits the slot reads as exited; when the
     /// holder goes without saying so, as killed (`None`).
     pub fn attach_held(socket: &Path, out: broadcast::Sender<Bytes>) -> anyhow::Result<Attached> {
-        let greeting = Greeting::connect(socket)?;
+        let greeting = match Greeting::connect(socket) {
+            Ok(g) => g,
+            Err(e) if e.is::<client::UnreadableHello>() => return Ok(Attached::Unreadable),
+            Err(e) => return Err(e),
+        };
         if !greeting.supported() {
             return Ok(Attached::Unsupported(greeting.hello));
         }

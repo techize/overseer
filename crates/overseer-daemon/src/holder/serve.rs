@@ -19,7 +19,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context};
 
-use super::frame::{write_frame, Frame, HolderHello, HOLDER_PROTOCOL};
+use super::frame::{write_frame, Frame, HolderHello};
 use super::{exit_path, holders_dir, pid_path, socket_path, write_json_atomic, ExitFile, PidFile};
 use crate::pty::{LocalPty, SpawnSpec};
 use crate::ring::RingBuffer;
@@ -54,8 +54,9 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// The process entry point; see [`super::main`].
-pub fn main() -> ! {
+/// The process entry point; see [`super::main`]. `version` is the protocol
+/// announced in the pid file and the Hello.
+pub fn main(version: u32) -> ! {
     // SAFETY: setsid and the fd calls below take no pointers we own.
     if unsafe { libc::setsid() } < 0 {
         std::process::exit(1);
@@ -63,7 +64,7 @@ pub fn main() -> ! {
     // The holder outlives the daemon that started it, and with it the
     // daemon's pipes: write nothing to them.
     redirect_to_dev_null(&[1, 2]);
-    match run(std::env::args_os().skip(1).collect()) {
+    match run(std::env::args_os().skip(1).collect(), version) {
         Ok(never) => match never {},
         Err(_) => std::process::exit(1),
     }
@@ -96,7 +97,7 @@ fn state_dir_arg(mut args: Vec<OsString>) -> anyhow::Result<PathBuf> {
     }
 }
 
-fn run(args: Vec<OsString>) -> anyhow::Result<std::convert::Infallible> {
+fn run(args: Vec<OsString>, version: u32) -> anyhow::Result<std::convert::Infallible> {
     let state_dir = state_dir_arg(args)?;
     let dir = holders_dir(&state_dir);
     std::fs::DirBuilder::new()
@@ -170,7 +171,7 @@ fn run(args: Vec<OsString>) -> anyhow::Result<std::convert::Infallible> {
     let pid = PidFile {
         holder: std::process::id(),
         child: pty.pid(),
-        version: HOLDER_PROTOCOL,
+        version,
     };
     if let Err(e) = write_json_atomic(&pid_file, &pid) {
         pty.kill();
@@ -179,7 +180,7 @@ fn run(args: Vec<OsString>) -> anyhow::Result<std::convert::Infallible> {
     }
 
     let hello = HolderHello {
-        version: HOLDER_PROTOCOL,
+        version,
         slot: spec.slot,
         pid: std::process::id(),
         child_pid: pty.pid(),

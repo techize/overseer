@@ -60,6 +60,19 @@ enum Cmd {
     },
 }
 
+/// `overseer hold --end <pidfile>`: ends the session the pid file names,
+/// if its holder still runs. Nothing to end is a success; only a pid file
+/// that exists but cannot be read is an error.
+fn end_holder(path: &std::path::Path) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let pid_file = overseer_daemon::holder::load_pid_file(path)
+        .with_context(|| format!("read pid file {}", path.display()))?;
+    if let Some(p) = pid_file {
+        overseer_daemon::holder::end_by_pid(&p);
+    }
+    Ok(())
+}
+
 fn default_command() -> Vec<String> {
     match std::env::var("OVERSEER_DEFAULT_COMMAND") {
         Ok(v) if !v.trim().is_empty() => v.split_whitespace().map(String::from).collect(),
@@ -88,7 +101,10 @@ fn main() {
     let result = match command {
         // No logger and no stdio: the holder outlives the daemon's pipes.
         Cmd::Hold { end: None, .. } => overseer_daemon::holder::main(),
-        Cmd::Hold { end: Some(_), .. } => Err(anyhow::anyhow!("hold --end is not yet supported")),
+        Cmd::Hold {
+            end: Some(pid_file),
+            ..
+        } => end_holder(&pid_file),
         // No logger and no stderr: a hook must be silent and always exit 0.
         Cmd::Hook { event } => {
             hook::run(&event);
