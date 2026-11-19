@@ -1131,6 +1131,22 @@ fn handle_request(
             locks.force_release(&target, holder, unix_now())
         }
         Request::DropRelays { from, id, to } => locks.drop_relays(from, id, to, unix_now()),
+        Request::TakeStaleRelays { slot } => {
+            let running = valid_id(slot)
+                && matches!(
+                    manager.lock().unwrap().list()[slot as usize].state,
+                    SlotState::Running { .. }
+                );
+            if !running {
+                return Response::Text {
+                    text: String::new(),
+                };
+            }
+            match ctx.courier.take_stale(slot, unix_now()) {
+                Ok(text) => Response::Text { text },
+                Err(message) => err(message),
+            }
+        }
         Request::SendRelay { from, to, text } => {
             // An empty or exited slot has no session to type into; a
             // resumable one gets it once resumed.

@@ -832,6 +832,22 @@ pub(crate) fn claim_batch_on(
     Ok(kept)
 }
 
+/// Claims every pending relay to `to`, as `claim_batch_on` does, if the
+/// oldest was queued at `stale_by` or before; else claims nothing. For
+/// relays shown in a tool reply instead of typed in.
+pub(crate) fn claim_stale_on(
+    conn: &Connection,
+    to: SlotId,
+    stale_by: i64,
+    now: i64,
+) -> Result<Vec<Relay>> {
+    let pending = pending_relays_on(conn, to)?;
+    if !pending.iter().any(|r| r.at <= stale_by) {
+        return Ok(Vec::new());
+    }
+    claim_batch_on(conn, &pending, now)
+}
+
 /// Puts claimed relays back to pending after their paste failed.
 pub(crate) fn unclaim_on(conn: &Connection, ids: &[i64]) -> Result<()> {
     let mut stmt =
@@ -1780,6 +1796,27 @@ mod tests {
             assert_eq!(recheck_lock_notices_on(c, &to_3, 30)?, to_3);
             Ok(())
         })
+    }
+
+    #[test]
+    fn claim_stale_takes_all_pending_once_the_oldest_is_old_enough() {
+        with(|c| {
+            let old = queue_relay_on(c, &Sender::You, 2, "kickoff", None, 10)?;
+            let new = queue_relay_on(c, &Sender::You, 2, "and this", None, 100)?;
+            let other = queue_relay_on(c, &Sender::You, 3, "not yours", None, 10)?;
+            // Nothing queued by 9: nothing taken, all still pending.
+            assert!(claim_stale_on(c, 2, 9, 200)?.is_empty());
+            assert_eq!(relay_on(c, old)?.unwrap().state, RelayState::Pending);
+            let got = claim_stale_on(c, 2, 10, 200)?;
+            assert_eq!(got.iter().map(|r| r.id).collect::<Vec<_>>(), vec![old, new]);
+            for id in [old, new] {
+                assert_eq!(relay_on(c, id)?.unwrap().state, RelayState::Delivered);
+            }
+            assert_eq!(relay_on(c, other)?.unwrap().state, RelayState::Pending);
+            // Taken once only.
+            assert!(claim_stale_on(c, 2, 10, 300)?.is_empty());
+            Ok(())
+        });
     }
 
     #[test]

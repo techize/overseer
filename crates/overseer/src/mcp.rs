@@ -630,7 +630,7 @@ fn call_tool(params: &Value, slot: Option<SlotId>, call: &mut Call) -> Result<Va
         }
         return Ok(tool_result(NOT_IN_A_SLOT, true));
     };
-    Ok(match call(req) {
+    let reply = match call(req) {
         Err(reason) => tool_result(format!("Overseer is not reachable: {reason}"), true),
         Ok(Response::Error { message }) => tool_result(message, true),
         Ok(Response::Text { text }) => tool_result(text, false),
@@ -654,7 +654,22 @@ fn call_tool(params: &Value, slot: Option<SlotId>, call: &mut Call) -> Result<Va
         Ok(Response::ItemDetail(d)) => tool_result(detail_text(&d), false),
         Ok(Response::Ok) => tool_result("Done.", false),
         Ok(other) => tool_result(format!("Unexpected reply from Overseer: {other:?}"), true),
-    })
+    };
+    Ok(with_stale_relays(reply, slot, call))
+}
+
+/// `reply` with any relays to `slot` that have waited too long to be typed
+/// in added as a second text block (#58). Asking is best effort: a missing
+/// or failing answer leaves `reply` as it is.
+fn with_stale_relays(mut reply: Value, slot: SlotId, call: &mut Call) -> Value {
+    if let Ok(Response::Text { text }) = call(Request::TakeStaleRelays { slot }) {
+        if !text.is_empty() {
+            if let Some(content) = reply["content"].as_array_mut() {
+                content.push(json!({"type": "text", "text": text}));
+            }
+        }
+    }
+    reply
 }
 
 /// Answers one JSON-RPC message; `None` for notifications. `slot` is this
@@ -756,6 +771,11 @@ mod tests {
     ) -> (Option<Value>, Vec<Request>) {
         let mut seen = Vec::new();
         let out = handle(msg, slot, &mut |r| {
+            if matches!(r, Request::TakeStaleRelays { .. }) {
+                return Ok(Response::Text {
+                    text: String::new(),
+                });
+            }
             seen.push(r);
             reply.clone()
         });
@@ -1018,6 +1038,42 @@ mod tests {
         // 5 s PATH wait + 30 s Keychain + 60 s REST.
         assert!(within > Duration::from_secs(95), "{within:?}");
         assert!(within < BRAIN_CALL_WITHIN);
+    }
+
+    #[test]
+    fn stale_relays_follow_the_tool_reply_as_a_second_block() {
+        let msg = tool("get_board", json!({}));
+        let mut asked = Vec::new();
+        let out = handle(&msg, Some(3), &mut |r| {
+            asked.push(r.clone());
+            Ok(match r {
+                Request::TakeStaleRelays { .. } => Response::Text {
+                    text: "Overseer: DEMO-40 was moved to S3".into(),
+                },
+                _ => Response::Ok,
+            })
+        })
+        .unwrap();
+        assert_eq!(asked[1], Request::TakeStaleRelays { slot: 3 });
+        let content = out["result"]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["text"], "Done.");
+        assert_eq!(content[1]["text"], "Overseer: DEMO-40 was moved to S3");
+        assert_eq!(out["result"]["isError"], false);
+        // None waiting, or no answer: the reply is unchanged.
+        for stale in [
+            Ok(Response::Text {
+                text: String::new(),
+            }),
+            Err("timed out".to_string()),
+        ] {
+            let out = handle(&msg, Some(3), &mut |r| match r {
+                Request::TakeStaleRelays { .. } => stale.clone(),
+                _ => Ok(Response::Ok),
+            })
+            .unwrap();
+            assert_eq!(out["result"]["content"].as_array().unwrap().len(), 1);
+        }
     }
 
     #[test]

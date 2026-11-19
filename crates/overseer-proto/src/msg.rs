@@ -664,6 +664,14 @@ pub enum Request {
         #[serde(default)]
         to: Option<SlotId>,
     },
+    /// From `slot`'s own MCP server after each tool call: if a relay to
+    /// `slot` has been pending for `STALE_RELAY_SECS`, every pending relay
+    /// to it is marked delivered and their text answered as `Text`, to be
+    /// shown in the tool's reply. `Text` is empty when none is that old.
+    /// The fallback for a slot the courier cannot type into (#58).
+    TakeStaleRelays {
+        slot: SlotId,
+    },
     CheckBash(BashCheck),
     /// Queues a pathspec commit of `paths` in the 2ndBrain. `from` is
     /// `None` for you.
