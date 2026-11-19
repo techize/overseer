@@ -973,7 +973,7 @@ fn handle_frame(
             });
         }
         Frame::Request { seq, req } => {
-            let is_shutdown = matches!(req, Request::Shutdown);
+            let is_shutdown = matches!(req, Request::Shutdown | Request::StopAll);
             // Each of these can queue a relay or make one deliverable.
             let pokes = matches!(
                 req,
@@ -1325,10 +1325,12 @@ fn handle_request(
             None => err(format!("{} is empty", slot_name(id))),
         },
         Request::Shutdown => Response::Ok,
-        Request::StopAll => {
-            manager.lock().unwrap().end_all();
-            Response::Ok
-        }
+        // The daemon stops after answering (see `handle_frame`): it has
+        // been told to end its sessions, so it must not go on serving.
+        Request::StopAll => match manager.lock().unwrap().end_all() {
+            Ok(()) => Response::Ok,
+            Err(e) => err(e),
+        },
         // Coordinator requests.
         Request::GetBoard => Response::Board(BoardView {
             slots: manager.lock().unwrap().list(),

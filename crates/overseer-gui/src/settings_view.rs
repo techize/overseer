@@ -325,11 +325,18 @@ pub fn restart_confirm(slots: Option<&[SlotInfo]>) -> String {
     let Some(slots) = slots else {
         return RESTART_UNLISTED.to_string();
     };
+    let is_running = |s: &&SlotInfo| matches!(s.state, SlotState::Running { .. });
+    // A held session survives a restart; only the others end.
     let running: Vec<&SlotInfo> = slots
         .iter()
-        .filter(|s| matches!(s.state, SlotState::Running { .. }))
+        .filter(is_running)
+        .filter(|s| !s.held)
         .collect();
     let what = match running.len() {
+        0 if slots.iter().any(|s| is_running(&s)) => {
+            return "Restart the daemon? Running sessions are kept: they reattach to the new daemon."
+                .to_string()
+        }
         0 => return "Restart the daemon? No session is running.".to_string(),
         1 => "ends and comes back",
         _ => "end and come back",
@@ -339,6 +346,16 @@ pub fn restart_confirm(slots: Option<&[SlotInfo]>) -> String {
         running_sessions_count(running.len()),
         running_sessions_text(running.iter().map(|s| (s.id, s.label.as_str()))),
     )
+}
+
+/// Whether Restart the daemon asks first: only when a session it cannot
+/// see, or one without a holder, would end.
+pub fn restart_needs_confirm(slots: Option<&[SlotInfo]>) -> bool {
+    slots.is_none_or(|slots| {
+        slots
+            .iter()
+            .any(|s| matches!(s.state, SlotState::Running { .. }) && !s.held)
+    })
 }
 
 /// Whether the edits touch what the app itself reads (terminal and editor),
@@ -830,6 +847,11 @@ impl SettingsPanel {
 
     fn ask_restart(&mut self, cx: &mut Context<Self>) {
         self.confirm = Some(restart_confirm(self.slots.as_deref()));
+        if !restart_needs_confirm(self.slots.as_deref()) {
+            // Nothing would end: restart as the CLI does, without asking.
+            self.confirm_restart(cx);
+            return;
+        }
         cx.notify();
     }
 
@@ -1752,6 +1774,30 @@ mod tests {
             restart_confirm(Some(&[slot(1, "x", false)])),
             "Restart the daemon? No session is running."
         );
+    }
+
+    #[test]
+    fn held_sessions_do_not_ask_for_a_restart() {
+        let mut held = slot(1, "demo lane", true);
+        held.held = true;
+        let mut other = slot(3, "docs", true);
+        // All held: kept, and no question.
+        let all = vec![held.clone(), slot(2, "", false)];
+        assert!(!restart_needs_confirm(Some(&all)));
+        assert_eq!(
+            restart_confirm(Some(&all)),
+            "Restart the daemon? Running sessions are kept: they reattach to the new daemon."
+        );
+        assert!(!restart_needs_confirm(Some(&[])));
+        // One unheld: only it is named.
+        other.held = false;
+        let mixed = vec![held, other];
+        assert!(restart_needs_confirm(Some(&mixed)));
+        assert_eq!(
+            restart_confirm(Some(&mixed)),
+            "Restart the daemon? 1 running session ends and comes back as resumable: S3 docs."
+        );
+        assert!(restart_needs_confirm(None));
     }
 
     #[test]

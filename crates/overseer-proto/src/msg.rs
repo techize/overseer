@@ -599,8 +599,9 @@ pub enum Request {
     },
     Shutdown,
     /// Ends every session, held ones included, leaving their ledger rows
-    /// live so the next daemon offers them as resumable. For uninstall;
-    /// stop the daemon after it.
+    /// live so the next daemon offers them as resumable, then stops the
+    /// daemon as `Shutdown` does. Answers an error naming the sessions it
+    /// could not end (the daemon stops anyway and they keep running).
     StopAll,
     /// A Claude Code hook event, relayed by `overseer hook`.
     Hook(HookEvent),

@@ -982,10 +982,14 @@ impl SlotManager {
     /// pid. The exit file a holder leaves is removed once it has gone, since
     /// a restart reads one as an exit. Waits for that, so it is done when
     /// this returns. Locks and relays are kept. Leaves the daemon marked as
-    /// shutting down: stop it afterwards.
-    pub fn end_all(&mut self) {
+    /// shutting down: it must stop afterwards, as `StopAll` does. Errs,
+    /// naming the slots, when a session could not be ended (its holder
+    /// cannot be confirmed or is still there); that session keeps running
+    /// and its files stay.
+    pub fn end_all(&mut self) -> Result<(), String> {
         self.shutting_down.store(true, Ordering::SeqCst);
-        let mut waits: Vec<Ending> = Vec::new();
+        let mut waits: Vec<(SlotId, Ending)> = Vec::new();
+        let mut left: Vec<SlotId> = Vec::new();
         {
             let slots = self.slots.lock().unwrap();
             for entry in slots.iter().flatten() {
@@ -1007,7 +1011,7 @@ impl SlotManager {
                         .name(format!("end-{}", slot_name(id)))
                         .spawn(move || clear_exit_file(id, &pids, &pid_file, &exit));
                     match spawned {
-                        Ok(handle) => waits.push(handle),
+                        Ok(handle) => waits.push((id, handle)),
                         Err(e) => tracing::warn!("{} exit file not cleared: {e}", slot_name(id)),
                     }
                 }
@@ -1016,14 +1020,26 @@ impl SlotManager {
         for id in 0..SLOT_COUNT as SlotId {
             if self.unreachable(id).is_some() {
                 match self.stop_slot(id, true) {
-                    Ok(ending) => waits.extend(ending),
-                    Err(e) => tracing::warn!("{e}"),
+                    Ok(ending) => waits.extend(ending.map(|h| (id, h))),
+                    Err(e) => {
+                        tracing::warn!("{e}");
+                        left.push(id);
+                    }
                 }
             }
         }
-        for handle in waits {
-            let _ = handle.join();
+        for (id, handle) in waits {
+            if !handle.join().unwrap_or(false) {
+                left.push(id);
+            }
         }
+        if left.is_empty() {
+            return Ok(());
+        }
+        left.sort_unstable();
+        left.dedup();
+        let names: Vec<String> = left.into_iter().map(slot_name).collect();
+        Err(format!("could not end {}; still running", names.join(", ")))
     }
 
     /// Called on daemon shutdown. Held sessions keep running under their
@@ -1302,8 +1318,9 @@ fn end_in_background(
         .name(format!("end-{}", slot_name(id)))
         .spawn(move || {
             end_by_pid(&pids);
-            if let Some((pid_file, exit)) = exit_file {
-                clear_exit_file(id, &pids, &pid_file, &exit);
+            match exit_file {
+                Some((pid_file, exit)) => clear_exit_file(id, &pids, &pid_file, &exit),
+                None => holder_gone(&pids),
             }
         });
     match spawned {
@@ -1315,13 +1332,15 @@ fn end_in_background(
     }
 }
 
-/// The thread [`end_in_background`] starts.
-type Ending = std::thread::JoinHandle<()>;
+/// The thread [`end_in_background`] starts; it ends with whether the holder
+/// is gone.
+type Ending = std::thread::JoinHandle<bool>;
 
 /// Waits for the holder `pids` to go, then removes the exit file it wrote,
 /// so the session reads as live (resumable) after a restart rather than as
 /// exited. Leaves it when a new holder has taken the slot meanwhile.
-fn clear_exit_file(id: SlotId, pids: &PidFile, pid_file: &Path, exit: &Path) {
+/// Returns whether the holder is gone.
+fn clear_exit_file(id: SlotId, pids: &PidFile, pid_file: &Path, exit: &Path) -> bool {
     // The holder writes its exit file, then removes its pid file.
     let ours = || client::read_pid_file(pid_file).is_some_and(|p| p == *pids);
     let deadline = std::time::Instant::now() + HOLDER_GONE_WAIT;
@@ -1329,11 +1348,15 @@ fn clear_exit_file(id: SlotId, pids: &PidFile, pid_file: &Path, exit: &Path) {
         std::thread::sleep(Duration::from_millis(50));
     }
     match client::read_pid_file(pid_file) {
-        Some(p) if p != *pids => {}
+        Some(p) if p != *pids => true,
         Some(_) if !holder_gone(pids) => {
             tracing::warn!("{} holder still there; exit file kept", slot_name(id));
+            false
         }
-        _ => remove_file(exit),
+        _ => {
+            remove_file(exit);
+            true
+        }
     }
 }
 

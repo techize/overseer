@@ -352,7 +352,8 @@ make uninstall
 ```
 
 This runs `scripts/uninstall.sh`, which ends every running session (they come
-back as resumable if you install again), stops the daemon, removes the LaunchAgent, the `~/.local/bin/overseer` link and
+back as resumable if you install again; any it cannot end are named and
+`holders/` is kept), stops the daemon, removes the LaunchAgent, the `~/.local/bin/overseer` link and
 `~/Applications/Overseer.app`. It leaves the state dir
 `~/Library/Application Support/Overseer/` and the logs in place; delete those by
 hand if you want them gone. With `OVERSEER_HOME` set it removes that home's
@@ -369,9 +370,9 @@ install in place.
   it; any that would end (started before holders) come back as resumable, and
   you are asked first on a terminal. `overseer ctl restart --yes` restarts
   without asking.
-- `overseer ctl stop-all` ends every session, held ones included. They come
-  back as resumable under the next daemon. `make uninstall` runs it; stop the
-  daemon afterwards.
+- `overseer ctl stop-all` ends every session, held ones included, and stops the
+  daemon. The sessions come back as resumable under the next daemon. It fails,
+  naming them, if a session cannot be ended. `make uninstall` runs it.
 - `overseer ctl shutdown` stops the daemon; held sessions keep running under
   their holders. The daemon then stays down until the next `overseer ctl` or `overseer attach` command or app
   launch starts it again. launchd only restarts it by itself if it crashes.
@@ -396,8 +397,8 @@ unsaved edits the first `Esc` only warns).
   app at once, open terminals included.
 - Every other key is the daemon's and applies after it restarts; the view marks
   such a key `restart needed` until then. Restart the daemon in the view asks
-  first, naming the sessions a restart would end (those without a holder; each
-  comes back as resumable), then runs `overseer ctl restart --yes`.
+  first when sessions without a holder would end (it names them; each comes
+  back as resumable), and restarts without asking when none would, then runs `overseer ctl restart --yes`.
 - The Jira token and Bitbucket token rows send a token to the daemon, which
   stores it in the Keychain. They show only whether a token is found, never
   the token itself.

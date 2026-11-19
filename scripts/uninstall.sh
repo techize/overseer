@@ -17,8 +17,10 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 label=uk.co.techize.overseer
 
 # Sessions kept by a holder outlive the daemon, so end them first. With a
-# daemon running, it does that through its shutdown path, which keeps the
-# sessions resumable. Without one, each holder is ended from its pid file.
+# daemon running, stop-all ends them through its shutdown path (which keeps
+# them resumable) and stops it. Whatever it did not end, or all of them when no
+# daemon answers, is ended from the holders' pid files. An ended holder's exit
+# file is removed so its session comes back as resumable, not as exited.
 if [ -x "$app_bin" ]; then
     ov=$app_bin
 else
@@ -26,15 +28,26 @@ else
 fi
 state=${OVERSEER_HOME:-"$HOME/Library/Application Support/Overseer"}
 if [ -n "$ov" ]; then
-    left=0
-    if ! "$ov" ctl stop-all 2>/dev/null; then
-        for pidfile in "$state"/holders/*.pid; do
-            [ -e "$pidfile" ] || continue
-            "$ov" hold --end "$pidfile" || left=1
-        done
+    if ! stop_err=$("$ov" ctl stop-all 2>&1); then
+        echo "uninstall.sh: ctl stop-all did not finish (${stop_err:-no message}); ending sessions by pid file" >&2
     fi
-    if [ "$left" = 1 ]; then
-        echo "uninstall.sh: a session could not be ended; $state/holders is left in place" >&2
+    alive=""
+    for pidfile in "$state"/holders/*.pid; do
+        [ -e "$pidfile" ] || continue
+        slot=$(basename "$pidfile" .pid)
+        if ! "$ov" hold --end "$pidfile"; then
+            alive="$alive $slot"
+            continue
+        fi
+        pid=$(sed -n 's/.*"holder"[^0-9]*\([0-9][0-9]*\).*/\1/p' "$pidfile" 2>/dev/null || true)
+        if [ -e "$pidfile" ] && [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            alive="$alive $slot"
+        else
+            rm -f "${pidfile%.pid}.exit"
+        fi
+    done
+    if [ -n "$alive" ]; then
+        echo "uninstall.sh: still running:$alive. End them before installing again; $state/holders is left in place" >&2
     else
         rm -rf "$state/holders"
     fi

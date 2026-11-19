@@ -169,8 +169,8 @@ pub enum CtlCmd {
     /// Stop the daemon. Sessions kept by a holder keep running.
     Shutdown,
     /// End every session, kept ones included, so they come back as
-    /// resumable under the next daemon. Run before uninstalling; stop the
-    /// daemon afterwards.
+    /// resumable under the next daemon, and stop the daemon. Fails, naming
+    /// them, when a session cannot be ended. Used by uninstall.
     StopAll,
     /// Restart the daemon. Sessions kept by a holder survive it; others end
     /// and come back as resumable, and you are asked first when any would.

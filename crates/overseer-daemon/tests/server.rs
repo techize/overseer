@@ -5365,6 +5365,21 @@ mod restart {
         }
     }
 
+    /// Waits for a daemon that was sent `StopAll` (or `Shutdown`) to stop,
+    /// leaving whatever still runs.
+    async fn await_stopped(mut d: Daemon) -> Down {
+        timeout(WAIT, &mut d.task)
+            .await
+            .expect("the daemon did not stop")
+            .unwrap()
+            .unwrap();
+        d.keep = true;
+        Down {
+            socket: d.socket.clone(),
+            state_dir: d.state_dir.clone(),
+        }
+    }
+
     /// The test's own folder, beside the state dir.
     fn dir_of(d: &Daemon) -> PathBuf {
         d.state_dir.parent().unwrap().to_path_buf()
@@ -5607,7 +5622,7 @@ mod restart {
         }
         drop(c);
 
-        let down2 = stop_keeping(d).await;
+        let down2 = await_stopped(d).await;
         let d = start_daemon_with(down2.socket.clone(), claude_env(&dir, true)).await;
         let mut c = Client::connect(&d.socket).await;
         let slots = c.list().await;
@@ -5866,6 +5881,42 @@ mod restart {
         let info = c.list().await.remove(1);
         assert!(!matches!(info.state, SlotState::Running { .. }), "{info:?}");
         // Reaped, and its pid file gone, before the daemon guard looks.
+        drop(mute);
+    }
+
+    #[tokio::test]
+    async fn stop_all_stops_the_daemon_after_answering() {
+        let d = start_daemon().await;
+        let mut c = Client::connect(&d.socket).await;
+        assert_eq!(c.start(1).await, Response::Ok);
+        assert_eq!(c.request(Request::StopAll).await, Response::Ok);
+        let down = await_stopped(d).await;
+        assert!(tokio::net::UnixStream::connect(&down.socket).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn stop_all_that_cannot_end_a_session_says_so_and_leaves_its_files() {
+        let socket = temp_socket();
+        let state_dir = socket.parent().unwrap().join("state");
+        let mute = MuteHolder::new(&state_dir, 1);
+        let d = start_daemon_at(socket).await;
+        let closed = mute.closed.clone();
+        until("the attach to time out", WAIT * 3, || {
+            closed.load(Ordering::SeqCst) >= 1
+        })
+        .await;
+        let mut c = Client::connect(&d.socket).await;
+        // Killed but not reaped: alive to a signal check, not identifiable.
+        // SAFETY: a plain signal to this test's own process.
+        unsafe { libc::kill(mute.holder.id() as i32, libc::SIGKILL) };
+        sleep(Duration::from_millis(200)).await;
+        let Response::Error { message } = c.request(Request::StopAll).await else {
+            panic!("StopAll answered Ok for a session it could not end");
+        };
+        assert!(message.contains("S1"), "{message}");
+        assert!(mute.pid_file.exists(), "pid file removed");
+        let down = await_stopped(d).await;
+        assert!(pid_path(&down.state_dir, 1).exists());
         drop(mute);
     }
 
@@ -6223,7 +6274,7 @@ mod restart {
             ..
         } = o;
         drop(old);
-        let down = stop_keeping(d).await;
+        let down = await_stopped(d).await;
         let d = start_daemon_with(down.socket.clone(), claude_env(&claude_dir, true)).await;
         let mut c = Client::connect(&d.socket).await;
         let info = c.list().await.remove(2);

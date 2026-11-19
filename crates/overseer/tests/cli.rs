@@ -1320,9 +1320,13 @@ fn ctl_stop_all_with_no_daemon_fails_without_starting_one() {
 fn ctl_stop_all_ends_sessions_and_they_come_back_resumable() {
     let env = Env::new();
     start_claude(&env);
+    let pid = pid_after(&stdout_of(&mut env.ctl(&["version"])), "  pid ");
     env.ctl(&["stop-all"]).assert().success();
+    // It stopped the daemon: the next command starts a new one.
     let s1 = status_line(&env, 1);
-    assert!(!s1.starts_with("S1  running"), "{s1}");
+    assert!(s1.starts_with("S1  resumable"), "{s1}");
+    let now = pid_after(&stdout_of(&mut env.ctl(&["version"])), "  pid ");
+    assert_ne!(pid, now);
 }
 
 /// How a fake daemon on `<home>/overseer.sock` treats requests.
