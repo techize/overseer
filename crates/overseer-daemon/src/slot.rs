@@ -5,10 +5,10 @@ use std::ffi::OsString;
 use std::io;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use overseer_proto::{SlotId, SlotInfo, SlotState};
+use overseer_proto::{slot_name, SlotId, SlotInfo, SlotState};
 use overseer_term::{Snapshot, TermBridge, TermModes};
 use tokio::sync::broadcast;
 
@@ -28,6 +28,12 @@ pub enum CatchUp {
 }
 
 pub const RING_CAP: usize = 4 * 1024 * 1024;
+
+/// After [`Slot::nudge_redraw`], the redraw counts as over once output has
+/// come and then stopped for this long...
+pub const REDRAW_QUIET: Duration = Duration::from_secs(1);
+/// ...or once this long has passed since the nudge, output or not.
+pub const REDRAW_GIVE_UP: Duration = Duration::from_secs(10);
 
 fn now_secs() -> i64 {
     SystemTime::now()
@@ -73,6 +79,13 @@ impl Backend {
         }
     }
 
+    /// Leaves a held child to its holder; a local one has nowhere to go.
+    fn let_go(&self) {
+        if let Backend::Held(p) = self {
+            p.close();
+        }
+    }
+
     fn exit(&self) -> tokio::sync::watch::Receiver<Option<Option<i32>>> {
         match self {
             Backend::Local(p) => p.exit(),
@@ -89,14 +102,17 @@ impl Backend {
 }
 
 /// The output callback every backend gets: each chunk goes to the ring, the
-/// broadcast and the screen. Dropping it (when the stream ends) drops `out`,
-/// which closes the broadcast.
+/// broadcast and the screen, and its arrival is noted in `last_output`.
+/// Dropping it (when the stream ends) drops `out`, which closes the
+/// broadcast.
 fn feeder(
     ring: Arc<Mutex<RingBuffer>>,
     screen: Arc<Mutex<TermBridge>>,
     out: broadcast::Sender<Bytes>,
+    last_output: Arc<Mutex<Option<Instant>>>,
 ) -> OnOutput {
     Box::new(move |chunk| {
+        *last_output.lock().unwrap() = Some(Instant::now());
         // Push and broadcast under one lock so `attach` sees each chunk
         // either in its snapshot or on its receiver, never both and never
         // neither.
@@ -155,6 +171,10 @@ pub struct Slot {
     out: broadcast::WeakSender<Bytes>,
     /// Set as `OVERSEER_RUN` in the child's environment; unique per spawn.
     run: String,
+    /// When the last output chunk arrived.
+    last_output: Arc<Mutex<Option<Instant>>>,
+    /// When [`Slot::nudge_redraw`] asked for a redraw that is not over yet.
+    nudged: Mutex<Option<Instant>>,
 }
 
 /// A token no other spawn in any daemon run shares: the daemon's pid and a
@@ -199,9 +219,13 @@ impl Slot {
         let ring = Arc::new(Mutex::new(RingBuffer::new(RING_CAP)));
         let screen = Arc::new(Mutex::new(TermBridge::new(cols as usize, rows as usize, 0)));
         let out_weak = out.downgrade();
+        let last_output = Arc::new(Mutex::new(None));
         // The pty drops the feeder, and with it `out`, when the output
         // stream ends, which closes the broadcast.
-        let pty = LocalPty::spawn(&spec, feeder(ring.clone(), screen.clone(), out))?;
+        let pty = LocalPty::spawn(
+            &spec,
+            feeder(ring.clone(), screen.clone(), out, last_output.clone()),
+        )?;
 
         Ok(Slot {
             id,
@@ -216,6 +240,8 @@ impl Slot {
             screen,
             out: out_weak,
             run: spec.run,
+            last_output,
+            nudged: Mutex::new(None),
         })
     }
 
@@ -258,7 +284,13 @@ impl Slot {
             0,
         )));
         let out_weak = out.downgrade();
-        let pty = greeting.serve(feeder(ring.clone(), screen.clone(), out))?;
+        let last_output = Arc::new(Mutex::new(None));
+        let pty = greeting.serve(feeder(
+            ring.clone(),
+            screen.clone(),
+            out,
+            last_output.clone(),
+        ))?;
         Ok(Slot {
             id: hello.slot,
             label: hello.label,
@@ -272,6 +304,8 @@ impl Slot {
             screen,
             out: out_weak,
             run: hello.run,
+            last_output,
+            nudged: Mutex::new(None),
         })
     }
 
@@ -302,6 +336,51 @@ impl Slot {
     /// Kill the child. Does nothing harmful if it has already exited.
     pub fn kill(&self) {
         self.pty.kill();
+    }
+
+    /// Closes a held slot's connection and leaves its child running under
+    /// its holder, for the next daemon to attach. The slot then reads as
+    /// exited with no code. Does nothing to a local slot.
+    pub fn let_go(&self) {
+        self.pty.let_go();
+    }
+
+    /// Makes the program redraw its whole screen: resizes the terminal one
+    /// column narrower and back, which sends it SIGWINCH. Until that redraw
+    /// is over, [`Slot::redraw_pending`] is true. For a slot attached after
+    /// a restart, whose screen was rebuilt from a replay that can miss rows.
+    pub fn nudge_redraw(&self) {
+        let (cols, rows) = *self.size.lock().unwrap();
+        let other = if cols > 1 { cols - 1 } else { cols + 1 };
+        // Before the resize, so the redraw it brings counts as after it.
+        *self.nudged.lock().unwrap() = Some(Instant::now());
+        if let Err(e) = self
+            .resize(other, rows)
+            .and_then(|()| self.resize(cols, rows))
+        {
+            tracing::warn!("{} redraw not asked for: {e:#}", slot_name(self.id));
+        }
+    }
+
+    /// Whether the redraw [`Slot::nudge_redraw`] asked for is still to come:
+    /// true until output has arrived after the nudge and then
+    /// [`REDRAW_QUIET`] has passed with no more, or [`REDRAW_GIVE_UP`] has
+    /// passed since the nudge. Never true for a slot never nudged.
+    pub fn redraw_pending(&self) -> bool {
+        let mut nudged = self.nudged.lock().unwrap();
+        let Some(at) = *nudged else {
+            return false;
+        };
+        let quiet = self
+            .last_output
+            .lock()
+            .unwrap()
+            .is_some_and(|last| last > at && last.elapsed() >= REDRAW_QUIET);
+        if quiet || at.elapsed() >= REDRAW_GIVE_UP {
+            *nudged = None;
+            return false;
+        }
+        true
     }
 
     /// The live screen and its terminal modes. A synchronized update that

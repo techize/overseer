@@ -13,12 +13,13 @@ use tokio::sync::broadcast;
 
 use crate::activity::apply;
 use crate::env::BaseEnv;
+use crate::holder::{activity_path, exit_path, socket_path, ExitFile};
 use crate::launch::{
     claude_argv, claude_projects_dir, first_prompt, has_transcript, is_claude, write_slot_files,
     RoleDirs, Start,
 };
 use crate::ledger::{Ledger, SessionRow};
-use crate::slot::{spawn_spec, Slot};
+use crate::slot::{spawn_spec, Attached, Slot};
 
 pub const SLOT_COUNT: usize = 7;
 const DEFAULT_COLS: u16 = 80;
@@ -27,8 +28,6 @@ const DEFAULT_ROWS: u16 = 24;
 const OUTPUT_CHANNEL_CAP: usize = 1024;
 /// How long to wait for the output stream to end after the child exits.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
-/// How long shutdown waits for held children to report their exit.
-const HELD_KILL_WAIT: Duration = Duration::from_secs(2);
 
 /// N2: slot ids are validated here, in the daemon layer.
 pub fn valid_id(id: SlotId) -> bool {
@@ -151,10 +150,15 @@ impl SlotManager {
         }
     }
 
-    /// Turns the sessions the ledger still has as live (the daemon went down
-    /// under them) into `Resumable` slots. Anything that cannot be resumed
-    /// (not claude, no session id, unreadable command) shows as exited and is
-    /// marked exited in the ledger so it is not considered again.
+    /// Picks up the sessions the last daemon left. First the holders in
+    /// `<state>/holders`: a live one is attached again and its slot runs on;
+    /// an exit file is recorded in the ledger and the slot shows as exited
+    /// with its code; a socket nobody listens on is deleted. Then the
+    /// sessions the ledger still has as live with no holder (the daemon went
+    /// down under them) become `Resumable` slots. Anything that cannot be
+    /// resumed (not claude, no session id, unreadable command) shows as
+    /// exited and is marked exited in the ledger so it is not considered
+    /// again.
     pub fn restore(&mut self) {
         let Some(launch) = self.launch.clone() else {
             return;
@@ -163,10 +167,19 @@ impl SlotManager {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!("ledger not readable, nothing to resume: {e:#}");
-                return;
+                Vec::new()
             }
         };
+        for id in 0..SLOT_COUNT as SlotId {
+            let row = rows.iter().find(|r| r.slot == id);
+            self.restore_held(&launch, id, row);
+        }
         for row in rows.into_iter().filter(|r| valid_id(r.slot)) {
+            let filled = self.slots.lock().unwrap()[row.slot as usize].is_some()
+                || self.restored[row.slot as usize].is_some();
+            if filled {
+                continue;
+            }
             let resumable =
                 !row.session_id.is_empty() && !row.command.is_empty() && is_claude(&row.command);
             let state = if resumable {
@@ -202,6 +215,125 @@ impl SlotManager {
             };
             self.restored[row.slot as usize] = Some(Restored { info, session_id });
         }
+    }
+
+    /// The holder side of [`SlotManager::restore`] for slot `id`, whose
+    /// live ledger row is `row`, if any.
+    fn restore_held(&mut self, launch: &Launch, id: SlotId, row: Option<&SessionRow>) {
+        let state_dir = &launch.state_dir;
+        let saved = take_activity(state_dir, id);
+        // An exit file comes first: its holder is gone or about to go.
+        let exit = exit_path(state_dir, id);
+        if let Some(file) = read_json::<ExitFile>(&exit) {
+            tracing::info!(
+                "{} exited (code {:?}) while the daemon was down",
+                slot_name(id),
+                file.code
+            );
+            if let Err(e) = launch.ledger.record_exit(id, file.code, file.at) {
+                tracing::warn!("{} ledger exit not recorded: {e:#}", slot_name(id));
+            }
+            let info = SlotInfo {
+                id,
+                label: row.map(|r| r.label.clone()).unwrap_or_default(),
+                cwd: row.map(|r| r.cwd.clone()),
+                command: row.map(|r| r.command.clone()).filter(|c| !c.is_empty()),
+                state: SlotState::Exited {
+                    code: file.code,
+                    at: file.at,
+                },
+                cols: DEFAULT_COLS,
+                rows: DEFAULT_ROWS,
+                activity: None,
+                session_note: launch.ledger.session_note(id).ok().flatten(),
+                held: false,
+            };
+            self.restored[id as usize] = Some(Restored {
+                info,
+                session_id: String::new(),
+            });
+            remove_file(&exit);
+            return;
+        }
+        let socket = socket_path(state_dir, id);
+        if !socket.exists() {
+            return;
+        }
+        let (tx, monitor_rx) = broadcast::channel(OUTPUT_CHANNEL_CAP);
+        // For the trust watch, subscribed once the replay is in: a trust
+        // question in the replay was asked before the restart, and the
+        // saved activity already says whether it is still open. Dropped
+        // after, so the channel still closes when the stream ends.
+        let live = tx.clone();
+        let attached = Slot::attach_held(&socket, tx);
+        let trust_rx = live.subscribe();
+        drop(live);
+        let slot = match attached {
+            Ok(Attached::Slot(slot)) if slot.info().id == id => slot,
+            Ok(Attached::Slot(slot)) => {
+                tracing::warn!(
+                    "holder at {} keeps {}, not {}; left alone",
+                    socket.display(),
+                    slot_name(slot.info().id),
+                    slot_name(id)
+                );
+                slot.let_go();
+                return;
+            }
+            Ok(Attached::Unsupported(hello)) => {
+                tracing::warn!(
+                    "{} holder (pid {}) speaks protocol {}; left alone",
+                    slot_name(id),
+                    hello.pid,
+                    hello.version
+                );
+                return;
+            }
+            Err(e) if nobody_listens(&e) => {
+                tracing::info!("{} holder is gone; removing its socket", slot_name(id));
+                remove_file(&socket);
+                return;
+            }
+            Err(e) => {
+                tracing::warn!("{} holder not attached: {e:#}", slot_name(id));
+                return;
+            }
+        };
+        let slot = Arc::new(slot);
+        // The base command and session id from the ledger; with no row, the
+        // holder's own argv.
+        let command = row
+            .map(|r| r.command.clone())
+            .filter(|c| !c.is_empty())
+            .unwrap_or_else(|| slot.info().command.unwrap_or_default());
+        let session_id = row.map(|r| r.session_id.clone()).unwrap_or_default();
+        let mut entry = Entry::new(slot.clone(), session_id, command.clone());
+        entry.session_note = launch.ledger.session_note(id).ok().flatten();
+        entry.activity = saved;
+        if let SlotState::Running { pid, .. } = slot.info().state {
+            tracing::info!(
+                "{} attached again to its session (pid {pid})",
+                slot_name(id)
+            );
+        }
+        self.slots.lock().unwrap()[id as usize] = Some(entry);
+        slot.nudge_redraw();
+        if is_claude(&command) {
+            tokio::spawn(watch_trust(
+                slot.clone(),
+                trust_rx,
+                self.events.clone(),
+                self.slots.clone(),
+            ));
+        }
+        tokio::spawn(monitor_exit(
+            slot,
+            monitor_rx,
+            self.events.clone(),
+            self.slots.clone(),
+            Some(launch.ledger.clone()),
+            self.shutting_down.clone(),
+        ));
     }
 
     /// Generates claude's per-slot files under `state_dir` and records every
@@ -570,11 +702,13 @@ impl SlotManager {
         })
     }
 
-    /// N4: kill every child. Called on daemon shutdown. Held children are
-    /// killed through their holders, and waited for (up to
-    /// [`HELD_KILL_WAIT`]) so their holders can see the exit through and end.
+    /// Called on daemon shutdown. Held sessions keep running under their
+    /// holders for the next daemon: each one's activity is saved to its
+    /// activity file and its connection closed. N4: local children are
+    /// killed. Either way the ledger rows stay live.
     pub fn shutdown_all(&mut self) {
-        // Before any kill: the exit monitors must see it when the children die.
+        // Before any kill or close: the exit monitors must see it when the
+        // children die or their connections end.
         self.shutting_down.store(true, Ordering::SeqCst);
         let entries: Vec<Entry> = self
             .slots
@@ -584,17 +718,66 @@ impl SlotManager {
             .filter_map(Option::take)
             .collect();
         for entry in &entries {
-            entry.slot.kill();
-        }
-        let deadline = std::time::Instant::now() + HELD_KILL_WAIT;
-        for entry in entries.iter().filter(|e| e.slot.is_held()) {
-            while matches!(entry.slot.info().state, SlotState::Running { .. })
-                && std::time::Instant::now() < deadline
-            {
-                std::thread::sleep(Duration::from_millis(10));
+            if !entry.slot.is_held() {
+                entry.slot.kill();
+                continue;
             }
+            let running = matches!(entry.slot.info().state, SlotState::Running { .. });
+            if let (Some(launch), Some(activity), true) = (&self.launch, &entry.activity, running) {
+                let id = entry.slot.info().id;
+                let path = activity_path(&launch.state_dir, id);
+                if let Err(e) = crate::holder::write_json_atomic(&path, activity) {
+                    tracing::warn!("{} activity not saved: {e}", slot_name(id));
+                }
+            }
+            entry.slot.let_go();
         }
     }
+}
+
+/// The activity the last daemon saved for slot `id`, if any. The file is
+/// removed either way: it only ever describes the session it was saved for.
+fn take_activity(state_dir: &Path, id: SlotId) -> Option<Activity> {
+    let path = activity_path(state_dir, id);
+    let activity = read_json(&path);
+    remove_file(&path);
+    activity
+}
+
+fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            tracing::warn!("{} not readable: {e}", path.display());
+            return None;
+        }
+    };
+    serde_json::from_slice(&bytes)
+        .inspect_err(|e| tracing::warn!("{} not readable: {e}", path.display()))
+        .ok()
+}
+
+fn remove_file(path: &Path) {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            tracing::warn!("{} not removed: {e}", path.display());
+        }
+        _ => {}
+    }
+}
+
+/// Whether connecting to a holder's socket failed because nothing listens
+/// there any more.
+fn nobody_listens(e: &anyhow::Error) -> bool {
+    e.chain()
+        .filter_map(|c| c.downcast_ref::<std::io::Error>())
+        .any(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            )
+        })
 }
 
 /// Emits `SlotChanged` once the child has exited AND its output stream has

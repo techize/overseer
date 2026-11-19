@@ -42,7 +42,35 @@ impl Drop for Home {
     fn drop(&mut self) {
         self.ctl(&["shutdown"]);
         std::thread::sleep(Duration::from_millis(200));
+        end_holders(&self.0);
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Ends the held sessions a daemon left in `state_dir` and their process
+/// groups, by their pid files: a daemon shutdown keeps them running.
+fn end_holders(state_dir: &std::path::Path) {
+    let Ok(dir) = std::fs::read_dir(overseer_daemon::holder::holders_dir(state_dir)) else {
+        return;
+    };
+    for entry in dir.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "pid") {
+            continue;
+        }
+        let Some(p) = std::fs::read(&path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<overseer_daemon::holder::PidFile>(&b).ok())
+        else {
+            continue;
+        };
+        // SAFETY: plain signals to pids this test's holders wrote. The child
+        // leads its own session and process group.
+        unsafe {
+            libc::kill(-(p.child as i32), libc::SIGKILL);
+            libc::kill(p.child as i32, libc::SIGKILL);
+            libc::kill(p.holder as i32, libc::SIGKILL);
+        }
     }
 }
 

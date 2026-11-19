@@ -81,6 +81,7 @@ impl Greeting {
     pub fn serve(self, mut on_output: OnOutput) -> anyhow::Result<HeldPty> {
         let Greeting { stream, hello } = self;
         let writer = Arc::new(Mutex::new(stream.try_clone()?));
+        let closer = stream.try_clone()?;
         // A burst arrives as many small frames: read them through a buffer.
         let mut reader = BufReader::with_capacity(CHUNK, stream);
         // The replay is the ring cut into Replay frames, closed by an empty
@@ -132,6 +133,7 @@ impl Greeting {
 
         Ok(HeldPty {
             writer,
+            closer,
             exit_rx,
             exited_at,
         })
@@ -142,6 +144,8 @@ impl Greeting {
 pub struct HeldPty {
     /// Shared with the reader thread, which answers Exit with ExitSeen.
     writer: Arc<Mutex<UnixStream>>,
+    /// The same socket, for closing it without waiting on `writer`.
+    closer: UnixStream,
     exit_rx: watch::Receiver<ExitValue>,
     exited_at: Arc<Mutex<Option<i64>>>,
 }
@@ -173,6 +177,12 @@ impl HeldPty {
         }
     }
 
+    /// Closes the connection and leaves the child to its holder, which
+    /// keeps it running for the next daemon.
+    pub fn close(&self) {
+        let _ = self.closer.shutdown(Shutdown::Both);
+    }
+
     /// When the child exited, in Unix seconds, once it has. Set before
     /// [`HeldPty::exit`] reports the exit.
     pub fn exited_at(&self) -> Option<i64> {
@@ -189,7 +199,7 @@ impl HeldPty {
 impl Drop for HeldPty {
     fn drop(&mut self) {
         // Ends the reader thread too; the holder keeps the child.
-        let _ = self.writer.lock().unwrap().shutdown(Shutdown::Both);
+        self.close();
     }
 }
 

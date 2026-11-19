@@ -39,6 +39,9 @@ struct Daemon {
     socket: PathBuf,
     state_dir: PathBuf,
     task: JoinHandle<anyhow::Result<()>>,
+    /// Leaves the held sessions running on drop, for a restart test that
+    /// starts a second daemon on the same state dir.
+    keep: bool,
 }
 
 async fn start_daemon() -> Daemon {
@@ -99,6 +102,7 @@ async fn start_daemon_full(
                 socket,
                 state_dir,
                 task,
+                keep: false,
             };
         }
         sleep(Duration::from_millis(20)).await;
@@ -110,7 +114,9 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         self.task.abort();
         let _ = std::fs::remove_file(&self.socket);
-        end_holders(&self.state_dir);
+        if !self.keep {
+            end_holders(&self.state_dir);
+        }
     }
 }
 
@@ -374,6 +380,7 @@ async fn start_daemon_with_security(email: &str, security: String) -> Daemon {
                 socket,
                 state_dir,
                 task,
+                keep: false,
             };
         }
         sleep(Duration::from_millis(20)).await;
@@ -4593,6 +4600,7 @@ impl PlanRig {
                     socket,
                     state_dir,
                     task,
+                    keep: false,
                 };
             }
             sleep(Duration::from_millis(20)).await;
@@ -5301,4 +5309,363 @@ async fn sessions_start_without_the_api_tokens() {
             .any(|l| l.starts_with("ATLASSIAN_API_TOKEN=") || l.starts_with("BITBUCKET_API_TOKEN=")),
         "{lines:?}"
     );
+}
+
+/// Held sessions across a daemon restart (#62): the first daemon stops
+/// through its shutdown path and a second one starts on the same state dir
+/// and socket.
+mod restart {
+    use super::*;
+    use std::path::Path;
+    use std::time::Instant;
+
+    use overseer_daemon::holder::{exit_path, pid_path, socket_path, PidFile};
+
+    /// Past the daemon's own give-up time for a redraw.
+    const REDRAW_WAIT: Duration = Duration::from_secs(30);
+
+    /// The sessions a stopped daemon left running; ends them when dropped,
+    /// so a failing test leaves nothing behind.
+    struct Down {
+        socket: PathBuf,
+        state_dir: PathBuf,
+    }
+
+    impl Drop for Down {
+        fn drop(&mut self) {
+            end_holders(&self.state_dir);
+        }
+    }
+
+    /// Stops `d` with the shutdown request, as launchd does on a restart,
+    /// leaving its held sessions running.
+    async fn stop_keeping(mut d: Daemon) -> Down {
+        let mut c = Client::connect(&d.socket).await;
+        assert_eq!(c.request(Request::Shutdown).await, Response::Ok);
+        timeout(WAIT, &mut d.task)
+            .await
+            .expect("run returned")
+            .unwrap()
+            .unwrap();
+        d.keep = true;
+        Down {
+            socket: d.socket.clone(),
+            state_dir: d.state_dir.clone(),
+        }
+    }
+
+    /// The test's own folder, beside the state dir.
+    fn dir_of(d: &Daemon) -> PathBuf {
+        d.state_dir.parent().unwrap().to_path_buf()
+    }
+
+    async fn until(what: &str, within: Duration, mut done: impl FnMut() -> bool) {
+        let start = Instant::now();
+        while !done() {
+            assert!(start.elapsed() < within, "timed out waiting for {what}");
+            sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    fn pid_alive(pid: u32) -> bool {
+        // SAFETY: signal 0 only checks that the pid exists.
+        unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+
+    /// `fake-claude.sh` with `args`.
+    fn fake(args: &[&str]) -> Vec<String> {
+        std::iter::once(SCRIPT)
+            .chain(args.iter().copied())
+            .map(String::from)
+            .collect()
+    }
+
+    /// The fake in its box mode: it draws Claude Code's input box at start
+    /// and on every resize, logging each draw to `<dir>/draws`.
+    fn boxed(dir: &Path) -> Vec<String> {
+        fake(&["box", &dir.to_string_lossy()])
+    }
+
+    fn draws(dir: &Path) -> usize {
+        std::fs::read_to_string(dir.join("draws"))
+            .map(|s| s.lines().count())
+            .unwrap_or(0)
+    }
+
+    impl Client {
+        async fn start_cmd(&mut self, id: u8, command: Vec<String>) {
+            let start = Request::StartSlot {
+                id,
+                label: format!("t{id}"),
+                cwd: PathBuf::from("/tmp"),
+                command: Some(command),
+                prompt: None,
+            };
+            assert_eq!(self.request(start).await, Response::Ok);
+        }
+
+        async fn type_line(&mut self, id: u8, line: &str) {
+            self.send(Frame::Input {
+                id,
+                data: Bytes::from(format!("{line}\r")),
+            })
+            .await;
+        }
+
+        /// Attaches to `id` and returns the snapshot.
+        async fn snapshot(&mut self, id: u8) -> Vec<u8> {
+            assert_eq!(self.request(Request::Attach { id }).await, Response::Ok);
+            loop {
+                match self.recv().await.expect("connection closed") {
+                    Frame::Output { id: i, data } if i == id => return data.to_vec(),
+                    Frame::Event(_) => {}
+                    other => panic!("expected snapshot, got {other:?}"),
+                }
+            }
+        }
+
+        /// Waits until every relay to `to` is delivered. Longer than
+        /// `all_delivered`: the redraw a restart asks for, and the quiet
+        /// after it, take a while on a loaded machine.
+        async fn delivered_after_redraw(&mut self, to: u8) {
+            let start = Instant::now();
+            loop {
+                let v = self.locks().await;
+                let mine = || v.relays.iter().filter(|r| r.to == to);
+                if mine().all(|r| r.state == RelayState::Delivered) {
+                    return;
+                }
+                assert!(start.elapsed() < REDRAW_WAIT, "never delivered: {v:?}");
+                sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        async fn relay_state(&mut self, to: u8) -> (RelayState, Option<String>) {
+            let v = self.locks().await;
+            let r = v.relays.iter().find(|r| r.to == to).expect("relay listed");
+            (r.state, r.held.clone())
+        }
+    }
+
+    fn running_pid(info: &SlotInfo) -> u32 {
+        match info.state {
+            SlotState::Running { pid, .. } => pid,
+            ref other => panic!("S{} not running: {other:?}", info.id),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_held_session_survives_a_restart() {
+        let d = start_daemon().await;
+        let mut c = Client::connect(&d.socket).await;
+        assert_eq!(c.start(1).await, Response::Ok);
+        assert_eq!(c.request(Request::Attach { id: 1 }).await, Response::Ok);
+        c.type_line(1, "before").await;
+        c.output_until(1, "ECHO:before").await;
+        let pid = running_pid(&c.list().await[1]);
+        drop(c);
+
+        let down = stop_keeping(d).await;
+        let d = start_daemon_at(down.socket.clone()).await;
+        let mut c = Client::connect(&d.socket).await;
+        let info = c.list().await.remove(1);
+        assert_eq!(running_pid(&info), pid, "{info:?}");
+        assert!(info.held);
+        let snap = String::from_utf8_lossy(&c.snapshot(1).await).into_owned();
+        assert!(snap.contains("ECHO:before"), "{snap:?}");
+        c.type_line(1, "after").await;
+        c.output_until(1, "ECHO:after").await;
+    }
+
+    #[tokio::test]
+    async fn output_while_down_is_shown_after_restart() {
+        let d = start_daemon().await;
+        let go = dir_of(&d).join("go");
+        let mut c = Client::connect(&d.socket).await;
+        assert_eq!(c.start(1).await, Response::Ok);
+        c.type_line(1, &format!("later {}", go.display())).await;
+        sleep(Duration::from_millis(200)).await;
+        drop(c);
+
+        let down = stop_keeping(d).await;
+        std::fs::write(&go, "").unwrap();
+        let done = go.with_extension("done");
+        until("the marker", WAIT, || done.exists()).await;
+        let d = start_daemon_at(down.socket.clone()).await;
+        let mut c = Client::connect(&d.socket).await;
+        let snap = String::from_utf8_lossy(&c.snapshot(1).await).into_owned();
+        assert!(snap.contains("DOWN-MARK"), "{snap:?}");
+    }
+
+    #[tokio::test]
+    async fn exit_while_down_shows_the_code() {
+        let d = start_daemon().await;
+        let go = dir_of(&d).join("go");
+        let mut c = Client::connect(&d.socket).await;
+        assert_eq!(c.start(1).await, Response::Ok);
+        c.type_line(1, &format!("exitwhen {} 7", go.display()))
+            .await;
+        sleep(Duration::from_millis(200)).await;
+        drop(c);
+
+        let down = stop_keeping(d).await;
+        std::fs::write(&go, "").unwrap();
+        let (exit, pid) = (exit_path(&down.state_dir, 1), pid_path(&down.state_dir, 1));
+        until("the holder to end", WAIT, || exit.exists() && !pid.exists()).await;
+        let d = start_daemon_at(down.socket.clone()).await;
+        let mut c = Client::connect(&d.socket).await;
+        let info = c.list().await.remove(1);
+        assert!(
+            matches!(info.state, SlotState::Exited { code: Some(7), .. }),
+            "{info:?}"
+        );
+        assert!(!exit.exists(), "exit file left behind");
+        assert!(live_slots(&d).is_empty(), "exit not recorded");
+        assert_eq!(c.start(1).await, Response::Ok);
+        assert!(matches!(c.list().await[1].state, SlotState::Running { .. }));
+    }
+
+    #[tokio::test]
+    async fn killed_holder_falls_back_to_resumable() {
+        let d0 = start_daemon().await;
+        let dir = dir_of(&d0).join("claude");
+        drop(d0);
+        let (bin, log) = stub_claude(&dir);
+        let d = start_daemon_with(temp_socket(), claude_env(&dir, true)).await;
+        let mut c = Client::connect(&d.socket).await;
+        c.start_cmd(1, vec![bin.to_string_lossy().into_owned()])
+            .await;
+        let first = wait_for_log(&log, 1).await;
+        let session_id = arg_after(&first[0], "--session-id").unwrap();
+        drop(c);
+
+        let down = stop_keeping(d).await;
+        let p: PidFile =
+            serde_json::from_slice(&std::fs::read(pid_path(&down.state_dir, 1)).unwrap()).unwrap();
+        // SAFETY: a plain signal to this test's own holder.
+        unsafe { libc::kill(p.holder as i32, libc::SIGKILL) };
+        until("the holder to go", WAIT, || !pid_alive(p.holder)).await;
+        let d = start_daemon_with(down.socket.clone(), claude_env(&dir, true)).await;
+        let mut c = Client::connect(&d.socket).await;
+        let info = c.list().await.remove(1);
+        assert!(
+            matches!(&info.state, SlotState::Resumable { session_id: s, .. } if *s == session_id),
+            "{info:?}"
+        );
+        assert!(
+            !socket_path(&down.state_dir, 1).exists(),
+            "dead socket kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn activity_survives_a_restart() {
+        let d = start_daemon().await;
+        let dir = dir_of(&d);
+        let mut c = Client::connect(&d.socket).await;
+        c.start_cmd(1, boxed(&dir)).await;
+        until("the first draw", WAIT, || draws(&dir) >= 1).await;
+        c.hook(hook(1, HookKind::SessionStart)).await;
+        assert_eq!(activity_of(&c.list().await[1]).kind, ActivityKind::Idle);
+        drop(c);
+
+        let down = stop_keeping(d).await;
+        let d = start_daemon_at(down.socket.clone()).await;
+        let mut c = Client::connect(&d.socket).await;
+        assert_eq!(activity_of(&c.list().await[1]).kind, ActivityKind::Idle);
+        assert_eq!(c.request(Request::Attach { id: 1 }).await, Response::Ok);
+        assert_eq!(c.relay(None, 1, "hello").await, queued_for(1));
+        c.delivered_after_redraw(1).await;
+        c.output_until(1, &format!("ECHO:\x1b[200~{HELLO}")).await;
+    }
+
+    #[tokio::test]
+    async fn no_relay_before_the_redraw() {
+        let d = start_daemon().await;
+        let dir = dir_of(&d);
+        let mut c = Client::connect(&d.socket).await;
+        c.start_cmd(1, boxed(&dir)).await;
+        until("the first draw", WAIT, || draws(&dir) >= 1).await;
+        c.hook(hook(1, HookKind::SessionStart)).await;
+        drop(c);
+
+        let down = stop_keeping(d).await;
+        let started = Instant::now();
+        let d = start_daemon_at(down.socket.clone()).await;
+        let mut c = Client::connect(&d.socket).await;
+        assert_eq!(activity_of(&c.list().await[1]).kind, ActivityKind::Idle);
+        assert_eq!(c.relay(None, 1, "hello").await, queued_for(1));
+        c.held_for(1, "screen is being redrawn").await;
+        let half = Duration::from_millis(500);
+        sleep(half.saturating_sub(started.elapsed())).await;
+        assert_eq!(
+            c.relay_state(1).await,
+            (RelayState::Pending, Some("screen is being redrawn".into()))
+        );
+        // The gate opens once the redraw is over.
+        c.delivered_after_redraw(1).await;
+    }
+
+    #[tokio::test]
+    async fn a_burst_bigger_than_the_ring_still_converges() {
+        let d = start_daemon().await;
+        let dir = dir_of(&d);
+        let go = dir.join("go");
+        let mut c = Client::connect(&d.socket).await;
+        c.start_cmd(1, boxed(&dir)).await;
+        until("the first draw", WAIT, || draws(&dir) >= 1).await;
+        c.hook(hook(1, HookKind::SessionStart)).await;
+        c.type_line(1, &format!("burstwhen {}", go.display())).await;
+        sleep(Duration::from_millis(200)).await;
+        drop(c);
+
+        let down = stop_keeping(d).await;
+        let before = draws(&dir);
+        std::fs::write(&go, "").unwrap();
+        let done = go.with_extension("done");
+        until("the burst", WAIT * 6, || done.exists()).await;
+        let d = start_daemon_at(down.socket.clone()).await;
+        let mut c = Client::connect(&d.socket).await;
+        // The redraw the restart asks for, and its echoes, have all landed.
+        until("the redraw", WAIT, || draws(&dir) > before).await;
+        let mut last = (draws(&dir), Instant::now());
+        until("the redraws to stop", WAIT, || {
+            let n = draws(&dir);
+            if n != last.0 {
+                last = (n, Instant::now());
+            }
+            last.1.elapsed() > Duration::from_millis(500)
+        })
+        .await;
+
+        let info = c.list().await.remove(1);
+        let (cols, rows) = (info.cols as usize, info.rows as usize);
+        let snap = c.snapshot(1).await;
+        let mut term = overseer_term::TermBridge::new(cols, rows, 0);
+        term.feed(&snap);
+        let screen = term.snapshot();
+        let row = |r: usize| -> String {
+            screen.cells[r * cols..(r + 1) * cols]
+                .iter()
+                .map(|c| c.ch)
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        };
+        let rule = "\u{2500}".repeat(cols);
+        let want = [
+            "DRAWN".to_string(),
+            String::new(),
+            rule.clone(),
+            "\u{276f}".to_string(),
+            rule,
+            "  ? for shortcuts".to_string(),
+        ];
+        let got: Vec<String> = (0..rows).map(row).collect();
+        assert_eq!(got[..want.len()], want[..], "{got:#?}");
+        assert!(got[want.len()..].iter().all(String::is_empty), "{got:#?}");
+        // The courier reads the daemon's own screen: it finds the box.
+        assert_eq!(c.relay(None, 1, "hello").await, queued_for(1));
+        c.delivered_after_redraw(1).await;
+    }
 }

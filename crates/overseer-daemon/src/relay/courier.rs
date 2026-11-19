@@ -62,6 +62,9 @@ const WORKING: &str = "session is working";
 pub(crate) const AT_PROMPT: &str = "waiting at a prompt";
 const TYPED: &str = "input box has text";
 const NO_BOX: &str = "input box not found";
+/// A slot attached after a restart, before the redraw its rebuilt screen
+/// needs has arrived: the screen cannot be read yet.
+const REDRAWING: &str = "screen is being redrawn";
 /// Inside the cooldown after a delivery.
 const JUST_SENT: &str = "just delivered, waiting for the session";
 /// Without bracketed paste every newline is an Enter, and a later one could
@@ -71,10 +74,17 @@ const NO_BRACKETS: &str = "bracketed paste is off";
 const CLAIM_FAILED: &str = "relays could not be claimed";
 
 /// Whether a slot in `state` doing `activity` may be typed into now, else
-/// why not.
-pub fn ready(state: &SlotState, activity: Option<&Activity>) -> Result<(), &'static str> {
+/// why not. `redraw_pending` is the slot's [`crate::slot::Slot::redraw_pending`].
+pub fn ready(
+    state: &SlotState,
+    activity: Option<&Activity>,
+    redraw_pending: bool,
+) -> Result<(), &'static str> {
     if !matches!(state, SlotState::Running { .. }) {
         return Err(NOT_RUNNING);
+    }
+    if redraw_pending {
+        return Err(REDRAWING);
     }
     let a = activity.ok_or("no activity reported yet")?;
     match a.kind {
@@ -352,7 +362,9 @@ impl Courier {
         watch: &mut Watch,
     ) -> Result<bool, &'static str> {
         let id = info.id;
-        let held = match ready(&info.state, info.activity.as_ref()) {
+        let slot = self.manager.lock().unwrap().slot(id);
+        let redrawing = slot.as_ref().is_some_and(|s| s.redraw_pending());
+        let held = match ready(&info.state, info.activity.as_ref(), redrawing) {
             Ok(()) => None,
             Err(why @ (AT_PROMPT | WORKING)) => Some(why),
             Err(why) => {
@@ -368,7 +380,7 @@ impl Courier {
         if !working_hook {
             watch.quiet = None;
         }
-        let slot = self.manager.lock().unwrap().slot(id).ok_or(NOT_RUNNING)?;
+        let slot = slot.ok_or(NOT_RUNNING)?;
         // The live screen, not a replay of the ring: the ring loses the box's
         // rules once it wraps, as they are drawn only once (#21).
         let (snap, modes) = slot.screen();
@@ -421,7 +433,11 @@ impl Courier {
         }
         // A hook may have come in while the screen was read.
         let latest = self.manager.lock().unwrap().list().swap_remove(id as usize);
-        match ready(&latest.state, latest.activity.as_ref()) {
+        match ready(
+            &latest.state,
+            latest.activity.as_ref(),
+            slot.redraw_pending(),
+        ) {
             Err(why @ (AT_PROMPT | WORKING))
                 if held == Some(why) && latest.activity == info.activity => {}
             other => other?,
@@ -516,9 +532,25 @@ mod tests {
         ];
         for (kind, wait, want) in cases {
             let a = act(kind, wait);
-            assert_eq!(ready(&RUNNING, Some(&a)), want, "{kind:?} {wait}");
+            assert_eq!(ready(&RUNNING, Some(&a), false), want, "{kind:?} {wait}");
         }
-        assert_eq!(ready(&RUNNING, None), Err("no activity reported yet"));
+        assert_eq!(
+            ready(&RUNNING, None, false),
+            Err("no activity reported yet")
+        );
+    }
+
+    #[test]
+    fn a_slot_being_redrawn_is_never_ready() {
+        for kind in [
+            ActivityKind::Idle,
+            ActivityKind::NeedsYou,
+            ActivityKind::Working,
+        ] {
+            let a = act(kind, true);
+            assert_eq!(ready(&RUNNING, Some(&a), true), Err(REDRAWING));
+        }
+        assert_eq!(ready(&RUNNING, None, true), Err(REDRAWING));
     }
 
     #[test]
@@ -532,8 +564,8 @@ mod tests {
                 at: 1,
             },
         ] {
-            assert_eq!(ready(&state, Some(&idle)), Err("slot is not running"));
-            assert_eq!(ready(&state, None), Err("slot is not running"));
+            assert_eq!(ready(&state, Some(&idle), true), Err("slot is not running"));
+            assert_eq!(ready(&state, None, false), Err("slot is not running"));
         }
     }
 

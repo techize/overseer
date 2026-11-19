@@ -232,7 +232,35 @@ impl Drop for Env {
             .args(["ctl", "shutdown"])
             .output();
         std::thread::sleep(Duration::from_millis(200));
+        end_holders(&self.home);
         let _ = std::fs::remove_dir_all(&self.home);
+    }
+}
+
+/// Ends the held sessions a daemon left in `state_dir` and their process
+/// groups, by their pid files: a daemon shutdown keeps them running.
+fn end_holders(state_dir: &std::path::Path) {
+    let Ok(dir) = std::fs::read_dir(overseer_daemon::holder::holders_dir(state_dir)) else {
+        return;
+    };
+    for entry in dir.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "pid") {
+            continue;
+        }
+        let Some(p) = std::fs::read(&path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<overseer_daemon::holder::PidFile>(&b).ok())
+        else {
+            continue;
+        };
+        // SAFETY: plain signals to pids this test's holders wrote. The child
+        // leads its own session and process group.
+        unsafe {
+            libc::kill(-(p.child as i32), libc::SIGKILL);
+            libc::kill(p.child as i32, libc::SIGKILL);
+            libc::kill(p.holder as i32, libc::SIGKILL);
+        }
     }
 }
 
@@ -1180,9 +1208,9 @@ fn install_agent_keeps_a_daemon_with_running_sessions() {
 }
 
 #[test]
-fn install_agent_yes_restarts_and_the_session_is_resumable() {
+fn install_agent_yes_restarts_and_the_session_survives() {
     let env = Env::new();
-    start_claude(&env);
+    let pid = start_claude(&env);
     let out = stdout_of(&mut env.agent_claude(&["install-agent", "--yes"]));
     assert!(out.contains(WARNING_START), "{out}");
     assert!(
@@ -1190,9 +1218,10 @@ fn install_agent_yes_restarts_and_the_session_is_resumable() {
         "{out}"
     );
     // The stub's bootstrap starts nothing and its kickstart fails, so this
-    // autostart spawns the daemon, which finds S1 in the ledger.
+    // autostart spawns the daemon, which attaches to S1's holder again.
     let s1 = status_line(&env, 1);
-    assert!(s1.starts_with("S1  resumable"), "{s1}");
+    assert!(s1.starts_with("S1  running  pid "), "{s1}");
+    assert_eq!(pid_after(&s1, "pid "), pid);
 }
 
 #[test]
@@ -1247,7 +1276,7 @@ fn install_agent_with_no_daemon_starts_it() {
 #[test]
 fn ctl_restart_yes_brings_the_daemon_back() {
     let env = Env::new();
-    start_claude(&env);
+    let pid = start_claude(&env);
     let before = pid_after(&stdout_of(&mut env.ctl(&["version"])), "  pid ");
     let out = stdout_of(&mut env.ctl(&["restart", "--yes"]));
     let warned = out.find(WARNING_START).unwrap_or_else(|| panic!("{out}"));
@@ -1257,8 +1286,10 @@ fn ctl_restart_yes_brings_the_daemon_back() {
     assert!(warned < restarted, "{out}");
     let after = pid_after(&stdout_of(&mut env.ctl(&["version"])), "  pid ");
     assert_ne!(before, after);
+    // The session kept running under its holder.
     let s1 = status_line(&env, 1);
-    assert!(s1.starts_with("S1  resumable"), "{s1}");
+    assert!(s1.starts_with("S1  running  pid "), "{s1}");
+    assert_eq!(pid_after(&s1, "pid "), pid);
 }
 
 #[test]
