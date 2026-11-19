@@ -1549,6 +1549,71 @@ fn hold_end_ends_a_holder_by_its_pid_file() {
     hold_end(&bad).failure();
 }
 
+/// `overseer hold --end` returns only once the holder has gone, even when
+/// it takes the final SIGTERM to the holder: its child ignores SIGTERM.
+#[test]
+fn hold_end_waits_for_the_holder_to_go() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let dir = tempfile::Builder::new()
+        .prefix("ovc")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let spec = overseer_daemon::pty::SpawnSpec {
+        slot: 4,
+        label: "demo".into(),
+        cwd: PathBuf::from("/tmp"),
+        argv: vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "trap '' TERM; while :; do sleep 1; done".into(),
+        ],
+        env: vec![("PATH".into(), "/usr/bin:/bin".into())],
+        cols: 80,
+        rows: 24,
+        run: "demo-run".into(),
+    };
+    let mut holder = StdCommand::new(env!("CARGO_BIN_EXE_overseer"))
+        .arg("hold")
+        .arg(dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = holder.stdin.take().unwrap();
+    stdin
+        .write_all(&serde_json::to_vec(&spec).unwrap())
+        .unwrap();
+    drop(stdin);
+    let pid_path = overseer_daemon::holder::pid_path(dir.path(), 4);
+    let start = Instant::now();
+    while !pid_path.exists() {
+        assert!(start.elapsed() < Duration::from_secs(5), "no pid file");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let p: overseer_daemon::holder::PidFile =
+        serde_json::from_slice(&std::fs::read(&pid_path).unwrap()).unwrap();
+    // The holder is this test's child: reaped here as soon as it exits, as
+    // launchd reaps a real one, so a check after `hold --end` sees it gone.
+    let reaper = std::thread::spawn(move || holder.wait().unwrap());
+    Command::cargo_bin("overseer")
+        .unwrap()
+        .args(["hold", "--end"])
+        .arg(&pid_path)
+        .assert()
+        .success();
+    // SAFETY: signal 0 only checks that the pid exists.
+    let left = unsafe { libc::kill(p.holder as i32, 0) } == 0;
+    // SAFETY: plain signals to this test's own holder and its child.
+    unsafe {
+        libc::kill(-(p.child as i32), libc::SIGKILL);
+        libc::kill(p.holder as i32, libc::SIGKILL);
+    }
+    reaper.join().unwrap();
+    assert!(!left, "hold --end returned while the holder still ran");
+}
+
 /// The activity of slot `n`, asked of the daemon on this home's socket.
 fn activity_kind(env: &Env, n: usize) -> Option<overseer_proto::ActivityKind> {
     let rt = tokio::runtime::Runtime::new().unwrap();

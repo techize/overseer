@@ -60,15 +60,24 @@ enum Cmd {
     },
 }
 
+/// How long `hold --end` waits for a holder to go after its final SIGTERM.
+const HOLDER_GONE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// `overseer hold --end <pidfile>`: ends the session the pid file names,
-/// if its holder still runs. Nothing to end is a success; only a pid file
-/// that exists but cannot be read is an error.
+/// if its holder still runs, and waits up to [`HOLDER_GONE_WAIT`] for the
+/// holder to go. Nothing to end is a success; only a pid file that exists
+/// but cannot be read is an error.
 fn end_holder(path: &std::path::Path) -> anyhow::Result<()> {
     use anyhow::Context;
-    let pid_file = overseer_daemon::holder::load_pid_file(path)
-        .with_context(|| format!("read pid file {}", path.display()))?;
+    use overseer_daemon::holder::{end_by_pid, holder_gone, load_pid_file};
+    let pid_file =
+        load_pid_file(path).with_context(|| format!("read pid file {}", path.display()))?;
     if let Some(p) = pid_file {
-        overseer_daemon::holder::end_by_pid(&p);
+        end_by_pid(&p);
+        let deadline = std::time::Instant::now() + HOLDER_GONE_WAIT;
+        while !holder_gone(&p) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
     Ok(())
 }

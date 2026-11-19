@@ -11,8 +11,8 @@
 #   later <path>         1s after <path> appears, print a marker, then
 #                        create <path>.done
 #   exitwhen <path> <n>  once <path> appears, exit <n>
-#   burstwhen <path>     once <path> appears, print 8 MiB, then create
-#                        <path>.done
+#   burstwhen <path>     create <path>.seen; once <path> appears, print
+#                        8 MiB, then create <path>.done
 draw() {
     cols=$(stty size < /dev/tty | cut -d' ' -f2)
     rule=$(awk -v n="$cols" 'BEGIN { for (i = 0; i < n; i++) printf "\342\224\200" }')
@@ -81,6 +81,7 @@ while :; do
             ;;
         "burstwhen "*)
             path=${line#burstwhen }
+            : > "$path.seen"
             wait_for "$path"
             awk 'BEGIN {
                 s = sprintf("%1023s", "");

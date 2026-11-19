@@ -57,12 +57,42 @@ impl Setup {
     }
 }
 
-fn sleeper() -> Child {
-    Command::new("sleep")
-        .arg("60")
-        .stdout(Stdio::null())
-        .spawn()
-        .unwrap()
+/// A `sleep 60` this test started; killed and reaped when dropped, so a
+/// failing test leaves nothing behind.
+struct Sleeper(Child);
+
+impl Sleeper {
+    fn id(&self) -> u32 {
+        self.0.id()
+    }
+}
+
+impl Drop for Sleeper {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn sleeper() -> Sleeper {
+    Sleeper(
+        Command::new("sleep")
+            .arg("60")
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap(),
+    )
+}
+
+/// The pid of a `sleep <secs>` that is not this test's child, so it is
+/// reaped as soon as it exits, as a real holder is by launchd.
+fn orphan_sleep(secs: &str) -> u32 {
+    let out = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!("sleep {secs} >/dev/null 2>&1 & echo $!"))
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
 }
 
 #[test]
@@ -92,7 +122,7 @@ exit 0"#,
 fn a_holder_still_running_keeps_holders_but_not_the_exit_files_of_the_ended() {
     let s = Setup::new();
     s.write_exec("launchctl", "exit 0");
-    let mut live = sleeper();
+    let live = sleeper();
     // S1 ends; S2's `hold --end` leaves it running.
     s.write_exec(
         "overseer",
@@ -106,8 +136,7 @@ exit 0"#,
     s.holder(2, live.id());
     let out = s.run();
     let err = String::from_utf8_lossy(&out.stderr).into_owned();
-    let _ = live.kill();
-    let _ = live.wait();
+    drop(live);
     assert!(err.contains("still running: S2"), "{err}");
     assert!(s.holders().join("S2.pid").exists());
     assert!(s.holders().join("S2.exit").exists());
@@ -133,4 +162,24 @@ exit 0"#,
     let out = s.run();
     assert!(out.status.success(), "{out:?}");
     assert!(!s.holders().exists());
+}
+
+#[test]
+fn a_holder_that_goes_a_moment_after_hold_end_is_not_still_running() {
+    let s = Setup::new();
+    s.write_exec("launchctl", "exit 0");
+    // `hold --end` leaves the pid file; the holder goes a moment later.
+    s.write_exec(
+        "overseer",
+        r#"case "$1 $2" in
+"ctl stop-all") echo "no daemon is running" >&2; exit 1 ;;
+"hold --end") exit 0 ;;
+esac
+exit 0"#,
+    );
+    s.holder(1, orphan_sleep("0.5"));
+    let out = s.run();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!err.contains("still running"), "{err}");
+    assert!(!s.holders().exists(), "{err}");
 }

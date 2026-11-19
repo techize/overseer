@@ -62,7 +62,7 @@ The spec makes this the first task: does a resize one column narrower and back m
 
 - [ ] **Step 2: Run it**
 
-Run: `cargo run -p overseer-daemon --example redraw_check -- /Users/jonathan/overseer/.claude/worktrees/share-ready`
+Run: `cargo run -p overseer-daemon --example redraw_check -- <path-to-a-trusted-folder>`
 Expected: `PASS`. Record the result and the Claude Code version (`claude --version`) in the commit message. On `FAIL`, stop and report: Task 6 then needs the fallback (the holder keeps a screen and sends a repaint on connect), and the plan has to be amended before going on.
 
 - [ ] **Step 3: Commit**

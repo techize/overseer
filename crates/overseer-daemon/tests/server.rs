@@ -5728,7 +5728,8 @@ mod restart {
         until("the first draw", WAIT, || draws(&dir) >= 1).await;
         c.hook(hook(1, HookKind::SessionStart)).await;
         c.type_line(1, &format!("burstwhen {}", go.display())).await;
-        sleep(Duration::from_millis(200)).await;
+        let seen = go.with_extension("seen");
+        until("the fake to read the burst line", WAIT, || seen.exists()).await;
         drop(c);
 
         let down = stop_keeping(d).await;
@@ -5738,44 +5739,48 @@ mod restart {
         until("the burst", WAIT * 6, || done.exists()).await;
         let d = start_daemon_at(down.socket.clone()).await;
         let mut c = Client::connect(&d.socket).await;
-        // The redraw the restart asks for, and its echoes, have all landed.
+        // The redraw the restart asks for lands; the screen then converges
+        // on the box, however many echoes of the redraw follow.
         until("the redraw", WAIT, || draws(&dir) > before).await;
-        let mut last = (draws(&dir), Instant::now());
-        until("the redraws to stop", WAIT, || {
-            let n = draws(&dir);
-            if n != last.0 {
-                last = (n, Instant::now());
+        let started = Instant::now();
+        loop {
+            // A fresh client each time: a snapshot is the first output
+            // after an attach, never live output from an earlier one.
+            let mut v = Client::connect(&d.socket).await;
+            let info = v.list().await.remove(1);
+            let (cols, rows) = (info.cols as usize, info.rows as usize);
+            let snap = v.snapshot(1).await;
+            let mut term = overseer_term::TermBridge::new(cols, rows, 0);
+            term.feed(&snap);
+            let screen = term.snapshot();
+            let row = |r: usize| -> String {
+                screen.cells[r * cols..(r + 1) * cols]
+                    .iter()
+                    .map(|c| c.ch)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            };
+            let rule = "\u{2500}".repeat(cols);
+            let want = [
+                "DRAWN".to_string(),
+                String::new(),
+                rule.clone(),
+                "\u{276f}".to_string(),
+                rule,
+                "  ? for shortcuts".to_string(),
+            ];
+            let got: Vec<String> = (0..rows).map(row).collect();
+            let rest_empty = got[want.len()..].iter().all(String::is_empty);
+            if got[..want.len()] == want[..] && rest_empty {
+                break;
             }
-            last.1.elapsed() > Duration::from_millis(500)
-        })
-        .await;
-
-        let info = c.list().await.remove(1);
-        let (cols, rows) = (info.cols as usize, info.rows as usize);
-        let snap = c.snapshot(1).await;
-        let mut term = overseer_term::TermBridge::new(cols, rows, 0);
-        term.feed(&snap);
-        let screen = term.snapshot();
-        let row = |r: usize| -> String {
-            screen.cells[r * cols..(r + 1) * cols]
-                .iter()
-                .map(|c| c.ch)
-                .collect::<String>()
-                .trim_end()
-                .to_string()
-        };
-        let rule = "\u{2500}".repeat(cols);
-        let want = [
-            "DRAWN".to_string(),
-            String::new(),
-            rule.clone(),
-            "\u{276f}".to_string(),
-            rule,
-            "  ? for shortcuts".to_string(),
-        ];
-        let got: Vec<String> = (0..rows).map(row).collect();
-        assert_eq!(got[..want.len()], want[..], "{got:#?}");
-        assert!(got[want.len()..].iter().all(String::is_empty), "{got:#?}");
+            if started.elapsed() > REDRAW_WAIT {
+                assert_eq!(got[..want.len()], want[..], "{got:#?}");
+                assert!(rest_empty, "{got:#?}");
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
         // The courier reads the daemon's own screen: it finds the box.
         assert_eq!(c.relay(None, 1, "hello").await, queued_for(1));
         c.delivered_after_redraw(1).await;
