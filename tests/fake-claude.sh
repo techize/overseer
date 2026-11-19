@@ -20,7 +20,13 @@ draw() {
     echo drawn >> "$draws"
 }
 
+# One drawer at a time: a resize stops the echoes of the one before, so two
+# draws never interleave their output.
 redraw() {
+    if [ -n "${echoes:-}" ]; then
+        kill "$echoes" 2>/dev/null
+        wait "$echoes" 2>/dev/null
+    fi
     draw
     (
         i=0
@@ -30,6 +36,7 @@ redraw() {
             i=$((i + 1))
         done
     ) &
+    echoes=$!
 }
 
 wait_for() {
