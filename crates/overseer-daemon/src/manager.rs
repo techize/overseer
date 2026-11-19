@@ -119,6 +119,40 @@ struct Unreachable {
     pids: PidFile,
     /// Set by Stop, under the slots lock, so a later retry leaves it alone.
     given_up: Arc<AtomicBool>,
+    /// When the session was seen to end, shared with the retry thread so
+    /// its exit is recorded once, whoever notices first.
+    ended: Ended,
+}
+
+type Ended = Arc<Mutex<Option<i64>>>;
+
+/// How often the retry thread, done retrying, checks the holder is alive.
+const HOLDER_WATCH: Duration = Duration::from_secs(1);
+
+/// Marks an unreachable session ended, recording its exit in the ledger
+/// the first time. Returns when it ended and whether this call ended it.
+fn end_once(ended: &Ended, ledger: Option<&Ledger>, id: SlotId) -> (i64, bool) {
+    let mut at = ended.lock().unwrap();
+    if let Some(at) = *at {
+        return (at, false);
+    }
+    let now = unix_now();
+    *at = Some(now);
+    if let Some(ledger) = ledger {
+        if let Err(e) = ledger.record_exit(id, None, now) {
+            tracing::warn!("{} ledger exit not recorded: {e:#}", slot_name(id));
+        }
+    }
+    (now, true)
+}
+
+/// A placeholder's card once its session has ended.
+fn ended_info(info: &SlotInfo, at: i64) -> SlotInfo {
+    SlotInfo {
+        state: SlotState::Exited { code: None, at },
+        held: false,
+        ..info.clone()
+    }
 }
 
 /// Further tries at attaching a holder that is alive, after the first one
@@ -338,6 +372,7 @@ impl SlotManager {
             pids.holder
         );
         let given_up = Arc::new(AtomicBool::new(false));
+        let ended: Ended = Arc::default();
         let info = SlotInfo {
             id,
             label: row.map(|r| r.label.clone()).unwrap_or_default(),
@@ -353,15 +388,22 @@ impl SlotManager {
             session_note: session.note.clone(),
             held: true,
         };
+        let watch = Watch {
+            holder: pids.holder,
+            given_up: given_up.clone(),
+            ended: ended.clone(),
+            info: info.clone(),
+        };
         self.restored[id as usize] = Some(Restored {
             info,
             session_id: String::new(),
             unreachable: Some(Unreachable {
                 pids,
-                given_up: given_up.clone(),
+                given_up,
+                ended,
             }),
         });
-        retry_attach(ctx, socket, id, session, given_up);
+        retry_attach(ctx, socket, id, session, watch);
     }
 
     /// Generates claude's per-slot files under `state_dir` and records every
@@ -675,20 +717,11 @@ impl SlotManager {
             if slots[id as usize].is_none() {
                 r.given_up.store(true, Ordering::SeqCst);
                 end_by_pid(id, &r.pids);
+                let (at, _) = end_once(&r.ended, self.launch.as_ref().map(|l| &*l.ledger), id);
                 drop(slots);
-                let now = unix_now();
-                if let Some(launch) = &self.launch {
-                    if let Err(e) = launch.ledger.record_exit(id, None, now) {
-                        tracing::warn!("{} ledger exit not recorded: {e:#}", slot_name(id));
-                    }
-                }
                 let restored = self.restored[id as usize].as_mut().unwrap();
                 restored.unreachable = None;
-                restored.info.state = SlotState::Exited {
-                    code: None,
-                    at: now,
-                };
-                restored.info.held = false;
+                restored.info = ended_info(&restored.info, at);
                 let _ = self.events.send(Event::SlotChanged(restored.info.clone()));
                 return Ok(());
             }
@@ -713,14 +746,9 @@ impl SlotManager {
                         info,
                         unreachable: Some(u),
                         ..
-                    }) if !client::alive(u.pids.holder) => SlotInfo {
-                        state: SlotState::Exited {
-                            code: None,
-                            at: unix_now(),
-                        },
-                        held: false,
-                        ..info.clone()
-                    },
+                    }) if self.unreachable(id).is_none() => {
+                        ended_info(info, u.ended.lock().unwrap().unwrap_or_else(unix_now))
+                    }
                     Some(r) => r.info.clone(),
                     None => Self::empty_info(id),
                 },
@@ -728,9 +756,27 @@ impl SlotManager {
             .collect()
     }
 
-    /// The slot's holder, if it is alive but not attached.
+    /// The slot's holder, if it is alive but not attached. A holder found
+    /// dead ends its session here, if the retry thread has not already:
+    /// its exit is recorded once and its card changes to exited, so the
+    /// slot can take a new session.
     fn unreachable(&self, id: SlotId) -> Option<&Unreachable> {
-        self.restored[id as usize].as_ref()?.unreachable.as_ref()
+        let restored = self.restored[id as usize].as_ref()?;
+        let u = restored.unreachable.as_ref()?;
+        if u.ended.lock().unwrap().is_some() {
+            return None;
+        }
+        if client::alive(u.pids.holder) {
+            return Some(u);
+        }
+        let (at, now) = end_once(&u.ended, self.launch.as_ref().map(|l| &*l.ledger), id);
+        if now {
+            tracing::info!("{} unreachable holder is gone", slot_name(id));
+            let _ = self
+                .events
+                .send(Event::SlotChanged(ended_info(&restored.info, at)));
+        }
+        None
     }
 
     fn empty_info(id: SlotId) -> SlotInfo {
@@ -923,25 +969,33 @@ fn install(
     info
 }
 
-/// Tries again, in the background, to attach a holder that is alive but
-/// was not attached at start. Gives up after [`ATTACH_RETRIES`], when the
-/// holder goes, when Stop ends it, or on shutdown.
-fn retry_attach(
-    ctx: Reattach,
-    socket: PathBuf,
-    id: SlotId,
-    session: Session,
+/// What the retry thread needs to notice an unreachable holder's death.
+struct Watch {
+    holder: u32,
     given_up: Arc<AtomicBool>,
-) {
+    ended: Ended,
+    /// The placeholder's card.
+    info: SlotInfo,
+}
+
+/// Tries again, in the background, to attach a holder that is alive but
+/// was not attached at start, up to [`ATTACH_RETRIES`] times. Unless it
+/// attaches, it then watches the holder: when the holder dies, the
+/// session's exit is recorded and its card changes to exited. Stops early
+/// when Stop ends the session or on shutdown.
+fn retry_attach(ctx: Reattach, socket: PathBuf, id: SlotId, session: Session, watch: Watch) {
     let spawned = std::thread::Builder::new()
         .name(format!("reattach-{}", slot_name(id)))
         .spawn(move || {
-            let stopped =
-                || given_up.load(Ordering::SeqCst) || ctx.shutting_down.load(Ordering::SeqCst);
+            let stopped = || {
+                watch.given_up.load(Ordering::SeqCst)
+                    || ctx.shutting_down.load(Ordering::SeqCst)
+                    || watch.ended.lock().unwrap().is_some()
+            };
             for _ in 0..ATTACH_RETRIES {
                 std::thread::sleep(ATTACH_RETRY_PAUSE);
-                if stopped() {
-                    return;
+                if stopped() || !client::alive(watch.holder) {
+                    break;
                 }
                 match try_attach(&socket, id) {
                     Attempt::Got(slot, monitor_rx, trust_rx) => {
@@ -958,13 +1012,33 @@ fn retry_attach(
                     Attempt::Failed(why) => {
                         tracing::warn!("{} holder still not attached: {why}", slot_name(id));
                     }
-                    Attempt::Gone | Attempt::Unsupported(_) => return,
+                    Attempt::Gone => break,
+                    Attempt::Unsupported(_) => return,
                 }
             }
-            tracing::warn!(
-                "{} holder not attached after {ATTACH_RETRIES} more tries; Stop ends it",
-                slot_name(id)
-            );
+            if !stopped() && client::alive(watch.holder) {
+                tracing::warn!(
+                    "{} holder not attached after {ATTACH_RETRIES} more tries; Stop ends it",
+                    slot_name(id)
+                );
+            }
+            while !stopped() {
+                if !client::alive(watch.holder) {
+                    // Under the slots lock, as Stop ends it, and only while
+                    // no session has taken the slot.
+                    let slots = ctx.slots.lock().unwrap();
+                    if slots[id as usize].is_none() && !stopped() {
+                        let (at, now) = end_once(&watch.ended, Some(&ctx.ledger), id);
+                        if now {
+                            tracing::info!("{} unreachable holder is gone", slot_name(id));
+                            let info = ended_info(&watch.info, at);
+                            let _ = ctx.events.send(Event::SlotChanged(info));
+                        }
+                    }
+                    return;
+                }
+                std::thread::sleep(HOLDER_WATCH);
+            }
         });
     if let Err(e) = spawned {
         tracing::warn!("{} attach not retried: {e}", slot_name(id));

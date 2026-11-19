@@ -5771,4 +5771,37 @@ mod restart {
         // Reaped, and its pid file gone, before the daemon guard looks.
         drop(mute);
     }
+
+    #[tokio::test]
+    async fn an_unreachable_holder_that_dies_frees_its_slot() {
+        let socket = temp_socket();
+        let state_dir = socket.parent().unwrap().join("state");
+        let mut mute = MuteHolder::new(&state_dir, 1);
+        let d = start_daemon_at(socket).await;
+        let closed = mute.closed.clone();
+        until("the attach to time out", WAIT * 3, || {
+            closed.load(Ordering::SeqCst) >= 1
+        })
+        .await;
+        let mut c = Client::connect(&d.socket).await;
+        let mut w = Client::connect(&d.socket).await;
+        let info = c.list().await.remove(1);
+        assert!(matches!(info.state, SlotState::Running { .. }), "{info:?}");
+        // The holder dies on its own, with no Stop.
+        mute.holder.kill().unwrap();
+        mute.holder.wait().unwrap();
+        let info = tokio::time::timeout(WAIT * 3, w.exited_event(1))
+            .await
+            .expect("no SlotChanged when the holder died");
+        assert!(!info.held, "{info:?}");
+        let listed = c.list().await.remove(1);
+        assert_eq!(listed.state, info.state, "a stable exit time");
+        // The slot takes a new session.
+        c.start_cmd(1, fake(&[])).await;
+        let info = c.list().await.remove(1);
+        assert!(matches!(info.state, SlotState::Running { .. }), "{info:?}");
+        assert_eq!(c.request(Request::StopSlot { id: 1 }).await, Response::Ok);
+        c.exited_event(1).await;
+        drop(mute);
+    }
 }
