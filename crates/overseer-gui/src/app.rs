@@ -1802,8 +1802,8 @@ impl OverseerApp {
         cx.notify();
     }
 
-    /// `p` on the board, and a clicked plan notice: the plan approval view
-    /// for the plan waiting for Jonathan.
+    /// `p` on the board, a click on its plan line and a clicked plan notice:
+    /// the plan approval view for the plan waiting for Jonathan.
     pub(crate) fn open_plan(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.modal_open() {
             return;
