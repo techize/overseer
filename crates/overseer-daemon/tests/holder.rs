@@ -137,13 +137,23 @@ fn output_until(s: &mut UnixStream, needle: &str) -> String {
     }
 }
 
-/// Reads past Hello and Replay; returns the replayed bytes as text.
+/// Reads Replay frames up to the empty one that closes the replay; returns
+/// the replayed bytes.
+fn replay(s: &mut UnixStream) -> Vec<u8> {
+    let mut seen = Vec::new();
+    loop {
+        match frame(s) {
+            Frame::Replay(b) if b.is_empty() => return seen,
+            Frame::Replay(b) => seen.extend(b),
+            other => panic!("expected Replay, got {other:?}"),
+        }
+    }
+}
+
+/// Reads past Hello and the replay; returns the replayed bytes as text.
 fn skip_greeting(s: &mut UnixStream) -> String {
     assert!(matches!(frame(s), Frame::Hello(_)));
-    match frame(s) {
-        Frame::Replay(b) => String::from_utf8_lossy(&b).into_owned(),
-        other => panic!("expected Replay, got {other:?}"),
-    }
+    String::from_utf8_lossy(&replay(s)).into_owned()
 }
 
 fn until_exit(s: &mut UnixStream) -> Option<i32> {
@@ -167,11 +177,48 @@ fn hello_then_replay_then_output() {
         }
         other => panic!("expected Hello, got {other:?}"),
     }
-    match frame(&mut s) {
-        Frame::Replay(b) => assert!(String::from_utf8_lossy(&b).contains("before")),
-        other => panic!("expected Replay, got {other:?}"),
-    }
+    assert!(String::from_utf8_lossy(&replay(&mut s)).contains("before"));
     output_until(&mut s, "after");
+}
+
+#[test]
+fn an_empty_ring_replays_one_empty_frame() {
+    let h = Holder::start("sleep 30");
+    let mut s = h.connect();
+    assert!(matches!(frame(&mut s), Frame::Hello(_)));
+    assert_eq!(frame(&mut s), Frame::Replay(Vec::new()));
+}
+
+#[test]
+fn a_slow_reader_gets_every_byte_of_a_burst() {
+    let h = Holder::start("sleep 0.5; seq 1 200000; echo BURST-END; read l; seq 1 300000; exit 3");
+    let mut s = h.connect();
+    let mut seen = skip_greeting(&mut s).into_bytes();
+    // Not reading for a while lets the queue fill, so the holder must wait.
+    std::thread::sleep(Duration::from_millis(1500));
+    let mut frames = 0u32;
+    // Only the tail can hold the end marker; scanning it all would be slow.
+    while !seen.ends_with(b"BURST-END\r\n") {
+        match frame(&mut s) {
+            Frame::Output(b) => seen.extend(b),
+            other => panic!("expected Output, got {other:?}"),
+        }
+        frames += 1;
+        if frames.is_multiple_of(2000) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    let text = String::from_utf8_lossy(&seen).replace('\r', "");
+    let mut want: String = (1..=200000).map(|n| format!("{n}\n")).collect();
+    want.push_str("BURST-END\n");
+    assert!(text == want, "burst lost or reordered bytes");
+
+    // A second burst with nobody reading must not block the child.
+    write_frame(&mut s, &Frame::Input(b"go\n".to_vec())).unwrap();
+    drop(s);
+    h.wait_for(|| h.exit_path().exists(), "exit file");
+    let exit: ExitFile = serde_json::from_slice(&std::fs::read(h.exit_path()).unwrap()).unwrap();
+    assert_eq!(exit.code, Some(3));
 }
 
 #[test]

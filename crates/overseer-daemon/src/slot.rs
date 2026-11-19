@@ -12,7 +12,9 @@ use overseer_proto::{SlotId, SlotInfo, SlotState};
 use overseer_term::{Snapshot, TermBridge, TermModes};
 use tokio::sync::broadcast;
 
-use crate::pty::{session_env, LocalPty, SpawnSpec};
+use crate::holder::client::{self, Greeting, HeldPty};
+use crate::holder::HolderHello;
+use crate::pty::{session_env, LocalPty, OnOutput, SpawnSpec};
 use crate::ring::RingBuffer;
 
 /// Ring capacity used by the daemon.
@@ -34,6 +36,107 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// What [`Slot::attach_held`] found at a holder's socket.
+pub enum Attached {
+    Slot(Slot),
+    /// The holder speaks a protocol this daemon does not.
+    Unsupported(HolderHello),
+}
+
+/// Where the slot's terminal lives.
+enum Backend {
+    /// A child of the daemon itself.
+    Local(LocalPty),
+    /// A child a holder process keeps.
+    Held(HeldPty),
+}
+
+impl Backend {
+    fn write(&self, data: &[u8]) -> io::Result<()> {
+        match self {
+            Backend::Local(p) => p.write(data),
+            Backend::Held(p) => p.write(data),
+        }
+    }
+
+    fn resize(&self, cols: u16, rows: u16) -> anyhow::Result<()> {
+        match self {
+            Backend::Local(p) => p.resize(cols, rows),
+            Backend::Held(p) => p.resize(cols, rows),
+        }
+    }
+
+    fn kill(&self) {
+        match self {
+            Backend::Local(p) => p.kill(),
+            Backend::Held(p) => p.kill(),
+        }
+    }
+
+    fn exit(&self) -> tokio::sync::watch::Receiver<Option<Option<i32>>> {
+        match self {
+            Backend::Local(p) => p.exit(),
+            Backend::Held(p) => p.exit(),
+        }
+    }
+
+    fn exited_at(&self) -> Option<i64> {
+        match self {
+            Backend::Local(p) => p.exited_at(),
+            Backend::Held(p) => p.exited_at(),
+        }
+    }
+}
+
+/// The output callback every backend gets: each chunk goes to the ring, the
+/// broadcast and the screen. Dropping it (when the stream ends) drops `out`,
+/// which closes the broadcast.
+fn feeder(
+    ring: Arc<Mutex<RingBuffer>>,
+    screen: Arc<Mutex<TermBridge>>,
+    out: broadcast::Sender<Bytes>,
+) -> OnOutput {
+    Box::new(move |chunk| {
+        // Push and broadcast under one lock so `attach` sees each chunk
+        // either in its snapshot or on its receiver, never both and never
+        // neither.
+        {
+            let mut ring = ring.lock().unwrap();
+            ring.push(chunk);
+            let _ = out.send(Bytes::copy_from_slice(chunk));
+        }
+        // Replies to terminal queries are the attached clients' to send;
+        // this screen only watches.
+        let mut screen = screen.lock().unwrap();
+        screen.feed(chunk);
+        screen.take_pty_writes();
+    })
+}
+
+/// The spec for starting `command` in slot `id` with `env` (already
+/// scrubbed), under a fresh `OVERSEER_RUN`; see [`session_env`].
+pub fn spawn_spec(
+    id: SlotId,
+    label: String,
+    cwd: &Path,
+    command: &[String],
+    cols: u16,
+    rows: u16,
+    env: &[(OsString, OsString)],
+) -> SpawnSpec {
+    let run = next_run();
+    SpawnSpec {
+        slot: id,
+        label,
+        cwd: cwd.to_path_buf(),
+        argv: command.to_vec(),
+        env: session_env(env, id, &run),
+        cols,
+        rows,
+        run,
+    }
+}
+
 pub struct Slot {
     id: SlotId,
     label: String,
@@ -42,7 +145,7 @@ pub struct Slot {
     pid: u32,
     since: i64,
     size: Mutex<(u16, u16)>,
-    pty: LocalPty,
+    pty: Backend,
     ring: Arc<Mutex<RingBuffer>>,
     /// The screen as a terminal following the whole output would show it,
     /// fed every chunk. Claude Code redraws only the cells that change, so a
@@ -92,57 +195,89 @@ impl Slot {
         out: broadcast::Sender<Bytes>,
         env: &[(OsString, OsString)],
     ) -> anyhow::Result<Slot> {
+        let spec = spawn_spec(id, label, cwd, command, cols, rows, env);
         let ring = Arc::new(Mutex::new(RingBuffer::new(RING_CAP)));
-        let out_weak = out.downgrade();
-        let reader_ring = ring.clone();
         let screen = Arc::new(Mutex::new(TermBridge::new(cols as usize, rows as usize, 0)));
-        let reader_screen = screen.clone();
-        let run = next_run();
-        let spec = SpawnSpec {
-            slot: id,
-            label: label.clone(),
-            cwd: cwd.to_path_buf(),
-            argv: command.to_vec(),
-            env: session_env(env, id, &run),
-            cols,
-            rows,
-            run: run.clone(),
-        };
-        // The pty drops this closure, and with it `out`, when the output
+        let out_weak = out.downgrade();
+        // The pty drops the feeder, and with it `out`, when the output
         // stream ends, which closes the broadcast.
-        let pty = LocalPty::spawn(
-            &spec,
-            Box::new(move |chunk| {
-                // Push and broadcast under one lock so `attach` sees each
-                // chunk either in its snapshot or on its receiver, never both
-                // and never neither.
-                {
-                    let mut ring = reader_ring.lock().unwrap();
-                    ring.push(chunk);
-                    let _ = out.send(Bytes::copy_from_slice(chunk));
-                }
-                // Replies to terminal queries are the attached clients' to
-                // send; this screen only watches.
-                let mut screen = reader_screen.lock().unwrap();
-                screen.feed(chunk);
-                screen.take_pty_writes();
-            }),
-        )?;
+        let pty = LocalPty::spawn(&spec, feeder(ring.clone(), screen.clone(), out))?;
 
         Ok(Slot {
             id,
-            label,
-            cwd: cwd.to_path_buf(),
-            command: command.to_vec(),
+            label: spec.label,
+            cwd: spec.cwd,
+            command: spec.argv,
             pid: pty.pid(),
             since: now_secs(),
             size: Mutex::new((cols, rows)),
-            pty,
+            pty: Backend::Local(pty),
             ring,
             screen,
             out: out_weak,
-            run,
+            run: spec.run,
         })
+    }
+
+    /// Starts `spec` under a holder, `<program> hold <state_dir>`, and
+    /// attaches to it as [`Slot::attach_held`] does. Fails if the holder is
+    /// not listening within [`client::HOLDER_START`], exits first, or the
+    /// slot already has a live holder.
+    pub fn spawn_held(
+        spec: SpawnSpec,
+        program: &Path,
+        state_dir: &Path,
+        out: broadcast::Sender<Bytes>,
+    ) -> anyhow::Result<Slot> {
+        let greeting = client::start(&spec, program, state_dir)?;
+        let holder = greeting.hello.pid;
+        Slot::from_greeting(greeting, out).inspect_err(|_| {
+            client::abandon(holder, state_dir, spec.slot);
+        })
+    }
+
+    /// Attaches to the holder listening at `socket`. Its replay and then its
+    /// live output feed the ring, screen and `out` exactly as a local child's
+    /// output does; the whole replay is in the ring and screen before this
+    /// returns. When the child exits the slot reads as exited; when the
+    /// holder goes without saying so, as killed (`None`).
+    pub fn attach_held(socket: &Path, out: broadcast::Sender<Bytes>) -> anyhow::Result<Attached> {
+        let greeting = Greeting::connect(socket)?;
+        if !greeting.supported() {
+            return Ok(Attached::Unsupported(greeting.hello));
+        }
+        Slot::from_greeting(greeting, out).map(Attached::Slot)
+    }
+
+    fn from_greeting(greeting: Greeting, out: broadcast::Sender<Bytes>) -> anyhow::Result<Slot> {
+        let hello = greeting.hello.clone();
+        let ring = Arc::new(Mutex::new(RingBuffer::new(RING_CAP)));
+        let screen = Arc::new(Mutex::new(TermBridge::new(
+            hello.cols as usize,
+            hello.rows as usize,
+            0,
+        )));
+        let out_weak = out.downgrade();
+        let pty = greeting.serve(feeder(ring.clone(), screen.clone(), out))?;
+        Ok(Slot {
+            id: hello.slot,
+            label: hello.label,
+            cwd: hello.cwd,
+            command: hello.argv,
+            pid: hello.child_pid,
+            since: hello.since,
+            size: Mutex::new((hello.cols, hello.rows)),
+            pty: Backend::Held(pty),
+            ring,
+            screen,
+            out: out_weak,
+            run: hello.run,
+        })
+    }
+
+    /// Whether a holder process keeps this slot's terminal.
+    pub fn is_held(&self) -> bool {
+        matches!(self.pty, Backend::Held(_))
     }
 
     /// This spawn's `OVERSEER_RUN`.
@@ -260,6 +395,7 @@ impl Slot {
             rows,
             activity: None,
             session_note: None,
+            held: self.is_held(),
         }
     }
 

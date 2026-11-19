@@ -78,6 +78,7 @@ async fn setup(name: &str) -> Setup {
         state_dir: dir.join("state"),
         files: overseer_daemon::SettingsFiles::in_dir(&dir),
         hook_program: std::path::PathBuf::from("/bin/true"),
+        holder_program: None,
         // No real beads or Jira.
         patterns: overseer_daemon::locks::targets::default_patterns(),
         settings: overseer_daemon::Config {

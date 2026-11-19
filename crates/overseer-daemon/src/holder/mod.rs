@@ -1,8 +1,10 @@
 //! The session holder: a small process that owns one Claude PTY so the
 //! session survives a daemon restart. It serves the terminal to the daemon
 //! over a Unix socket in `<state>/holders/`, speaking the frames in
-//! [`frame`]; [`serve`] is the process itself.
+//! [`frame`]; [`serve`] is the process itself, and [`client`] the daemon's
+//! end.
 
+pub mod client;
 pub mod frame;
 pub mod serve;
 

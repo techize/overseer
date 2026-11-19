@@ -18,7 +18,7 @@ use crate::launch::{
     RoleDirs, Start,
 };
 use crate::ledger::{Ledger, SessionRow};
-use crate::slot::Slot;
+use crate::slot::{spawn_spec, Slot};
 
 pub const SLOT_COUNT: usize = 7;
 const DEFAULT_COLS: u16 = 80;
@@ -27,6 +27,8 @@ const DEFAULT_ROWS: u16 = 24;
 const OUTPUT_CHANNEL_CAP: usize = 1024;
 /// How long to wait for the output stream to end after the child exits.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long shutdown waits for held children to report their exit.
+const HELD_KILL_WAIT: Duration = Duration::from_secs(2);
 
 /// N2: slot ids are validated here, in the daemon layer.
 pub fn valid_id(id: SlotId) -> bool {
@@ -96,6 +98,9 @@ pub struct SlotManager {
     /// `session_note` from the config: a fresh start fixes the slot's note
     /// from it in the ledger; a resume keeps the one it had.
     session_note: Option<String>,
+    /// The program run as `<program> hold <state_dir>` to keep each
+    /// session's terminal; `None` runs sessions in the daemon itself.
+    holder: Option<PathBuf>,
 }
 
 /// A slot as the ledger left it: no process, but remembered.
@@ -142,6 +147,7 @@ impl SlotManager {
             shutting_down: Default::default(),
             restored: Default::default(),
             session_note: None,
+            holder: None,
         }
     }
 
@@ -187,6 +193,7 @@ impl SlotManager {
                 rows: DEFAULT_ROWS,
                 activity: None,
                 session_note: launch.ledger.session_note(row.slot).ok().flatten(),
+                held: false,
             };
             let session_id = if resumable {
                 row.session_id
@@ -219,6 +226,14 @@ impl SlotManager {
     /// see `brain::paths::fill_template`).
     pub fn with_session_note(mut self, template: String) -> Self {
         self.session_note = Some(template);
+        self
+    }
+
+    /// Runs every session started from now on under a holder process,
+    /// `<program> hold <state_dir>`. Needs [`SlotManager::with_launch`] for
+    /// the state dir; without it sessions run in the daemon.
+    pub fn with_holder(mut self, program: PathBuf) -> Self {
+        self.holder = Some(program);
         self
     }
 
@@ -349,11 +364,17 @@ impl SlotManager {
         let (tx, monitor_rx) = broadcast::channel(OUTPUT_CHANNEL_CAP);
         // Only claude asks the folder-trust question.
         let trust_rx = (!session_id.is_empty()).then(|| tx.subscribe());
-        let slot = Slot::spawn_in(id, label, cwd, &argv, DEFAULT_COLS, DEFAULT_ROWS, tx, &env)
-            .map_err(|e| {
-                tracing::warn!("{} failed to start {:?}: {e:#}", slot_name(id), argv);
-                format!("{e:#}")
-            })?;
+        let spawned = match (&self.holder, &self.launch) {
+            (Some(program), Some(launch)) => {
+                let spec = spawn_spec(id, label, cwd, &argv, DEFAULT_COLS, DEFAULT_ROWS, &env);
+                Slot::spawn_held(spec, program, &launch.state_dir, tx)
+            }
+            _ => Slot::spawn_in(id, label, cwd, &argv, DEFAULT_COLS, DEFAULT_ROWS, tx, &env),
+        };
+        let slot = spawned.map_err(|e| {
+            tracing::warn!("{} failed to start {:?}: {e:#}", slot_name(id), argv);
+            format!("{e:#}")
+        })?;
         let slot = Arc::new(slot);
         if let SlotState::Running { pid, .. } = slot.info().state {
             tracing::info!(
@@ -518,6 +539,7 @@ impl SlotManager {
             rows: DEFAULT_ROWS,
             activity: None,
             session_note: None,
+            held: false,
         }
     }
 
@@ -548,18 +570,29 @@ impl SlotManager {
         })
     }
 
-    /// N4: kill every child. Called on daemon shutdown.
+    /// N4: kill every child. Called on daemon shutdown. Held children are
+    /// killed through their holders, and waited for (up to
+    /// [`HELD_KILL_WAIT`]) so their holders can see the exit through and end.
     pub fn shutdown_all(&mut self) {
         // Before any kill: the exit monitors must see it when the children die.
         self.shutting_down.store(true, Ordering::SeqCst);
-        for entry in self
+        let entries: Vec<Entry> = self
             .slots
             .lock()
             .unwrap()
             .iter_mut()
             .filter_map(Option::take)
-        {
+            .collect();
+        for entry in &entries {
             entry.slot.kill();
+        }
+        let deadline = std::time::Instant::now() + HELD_KILL_WAIT;
+        for entry in entries.iter().filter(|e| e.slot.is_held()) {
+            while matches!(entry.slot.info().state, SlotState::Running { .. })
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
     }
 }

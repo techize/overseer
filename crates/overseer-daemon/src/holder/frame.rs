@@ -48,6 +48,8 @@ pub enum Frame {
     DaemonHello {
         version: u32,
     },
+    /// Part of the ring as the holder had it on connect. The greeting's
+    /// Replay frames end with an empty one.
     Replay(Vec<u8>),
     Output(Vec<u8>),
     Input(Vec<u8>),

@@ -65,6 +65,7 @@ fn silent_and_fast_with_a_daemon() {
         state_dir: home.join("state"),
         files: overseer_daemon::SettingsFiles::in_dir(&home),
         hook_program: std::path::PathBuf::from("/bin/true"),
+        holder_program: None,
         // No real beads or Jira.
         patterns: overseer_daemon::locks::targets::default_patterns(),
         settings: overseer_daemon::Config {

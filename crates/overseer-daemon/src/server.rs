@@ -50,6 +50,10 @@ pub struct DaemonConfig {
     pub state_dir: PathBuf,
     /// The binary the generated hooks call (`<hook_program> hook <Event>`).
     pub hook_program: PathBuf,
+    /// The binary run as `<holder_program> hold <state_dir>` to keep each
+    /// session's terminal in its own process. `None` runs sessions in the
+    /// daemon, which then ends them when it stops.
+    pub holder_program: Option<PathBuf>,
     /// Settings from `config.toml`.
     pub settings: crate::config::Config,
     /// Write target patterns, from `targets.toml` and the defaults.
@@ -287,6 +291,7 @@ pub async fn run(mut cfg: DaemonConfig) -> anyhow::Result<()> {
     let exit_events = events.subscribe();
     let courier_events = events.subscribe();
     let state_dir = cfg.state_dir.clone();
+    let holder_program = cfg.holder_program;
     let mut mgr = SlotManager::new(cfg.default_command, events)
         .with_env(env.clone())
         .with_session_note(cfg.settings.session_note.clone())
@@ -302,6 +307,9 @@ pub async fn run(mut cfg: DaemonConfig) -> anyhow::Result<()> {
                 user: cfg.settings.user().to_string(),
             },
         );
+    if let Some(program) = holder_program {
+        mgr = mgr.with_holder(program);
+    }
     mgr.restore();
     // A session that did not survive the restart, or whose exit was never
     // seen, has ended: only a resumable one keeps its waits and relays.

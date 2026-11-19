@@ -20,12 +20,17 @@ use tokio::time::{sleep, timeout};
 
 const SCRIPT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fake-claude.sh");
 const WAIT: Duration = Duration::from_secs(5);
+/// Every daemon the harness starts runs its sessions through this holder.
+const HOLDER: &str = env!("CARGO_BIN_EXE_overseer-test-holder");
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
 fn temp_socket() -> PathBuf {
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
     let dir = std::env::temp_dir().join(format!("ovs-{}-{n}", std::process::id()));
+    // A run before this one, under the same pid, may have left the dir,
+    // holder pid files and all.
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir.join("s.sock")
 }
@@ -83,6 +88,7 @@ async fn start_daemon_full(
         state_dir: state_dir.clone(),
         files: overseer_daemon::SettingsFiles::in_dir(&state_dir),
         hook_program: PathBuf::from("/bin/true"),
+        holder_program: Some(HOLDER.into()),
         settings,
         patterns,
     };
@@ -104,6 +110,52 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         self.task.abort();
         let _ = std::fs::remove_file(&self.socket);
+        end_holders(&self.state_dir);
+    }
+}
+
+/// Ends every holder still running in `state_dir`, and its child's process
+/// group, so no test leaves processes behind, even when it fails. Aborting
+/// the daemon task skips its shutdown, which would otherwise end them.
+fn end_holders(state_dir: &std::path::Path) {
+    let Ok(dir) = std::fs::read_dir(overseer_daemon::holder::holders_dir(state_dir)) else {
+        return;
+    };
+    let mut holders = Vec::new();
+    for entry in dir.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "pid") {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let Ok(p) = serde_json::from_slice::<overseer_daemon::holder::PidFile>(&bytes) else {
+            continue;
+        };
+        // SAFETY: plain signals to pids this test's holders wrote. The child
+        // leads its own session and process group.
+        unsafe {
+            libc::kill(-(p.child as i32), libc::SIGKILL);
+            libc::kill(p.child as i32, libc::SIGKILL);
+            libc::kill(p.holder as i32, libc::SIGKILL);
+        }
+        holders.push((p.holder as i32, path));
+    }
+    // The daemon's reaper threads collect them; wait until they are gone.
+    let start = std::time::Instant::now();
+    while start.elapsed() < WAIT
+        && holders
+            .iter()
+            // SAFETY: signal 0 only checks that the pid exists.
+            .any(|(pid, _)| unsafe { libc::kill(*pid, 0) } == 0)
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // A killed holder leaves its pid file, which a later start in this
+    // state dir would read as a holder that might still run.
+    for (_, path) in holders {
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -235,6 +287,17 @@ async fn start_list_stop() {
 }
 
 #[tokio::test]
+async fn held_slot_reports_held() {
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    assert_eq!(c.start(1).await, Response::Ok);
+    let slots = c.list().await;
+    assert!(slots[1].held, "{:?}", slots[1]);
+    assert!(matches!(slots[1].state, SlotState::Running { .. }));
+    assert!(!slots[0].held);
+}
+
+#[tokio::test]
 async fn an_unknown_request_is_answered_and_the_connection_stays_open() {
     let d = start_daemon().await;
     let mut c = Client::connect(&d.socket).await;
@@ -297,6 +360,7 @@ async fn start_daemon_with_security(email: &str, security: String) -> Daemon {
         state_dir: state_dir.clone(),
         files,
         hook_program: PathBuf::from("/bin/true"),
+        holder_program: Some(HOLDER.into()),
         settings: overseer_daemon::Config {
             jira_email: email.into(),
             ..offline_settings()
@@ -677,6 +741,7 @@ async fn second_daemon_refused() {
         state_dir: d.state_dir.clone(),
         files: overseer_daemon::SettingsFiles::in_dir(&d.state_dir),
         hook_program: PathBuf::from("/bin/true"),
+        holder_program: Some(HOLDER.into()),
         settings: offline_settings(),
         patterns: default_patterns(),
     })
@@ -4517,6 +4582,7 @@ impl PlanRig {
             state_dir: state_dir.clone(),
             files: overseer_daemon::SettingsFiles::in_dir(&state_dir),
             hook_program: PathBuf::from("/bin/true"),
+            holder_program: Some(HOLDER.into()),
             settings,
             patterns: default_patterns(),
         };

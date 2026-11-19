@@ -138,6 +138,7 @@ fn main() {
                     env: overseer_daemon::EnvSource::LoginShell,
                     state_dir: overseer_proto::paths::state_dir(),
                     hook_program: std::env::current_exe()?,
+                    holder_program: Some(std::env::current_exe()?),
                     settings,
                     patterns,
                     files,

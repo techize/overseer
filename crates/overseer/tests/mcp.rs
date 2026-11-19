@@ -47,6 +47,7 @@ impl TempDaemon {
             state_dir: home.join("state"),
             files: overseer_daemon::SettingsFiles::in_dir(&home),
             hook_program: std::path::PathBuf::from("/bin/true"),
+            holder_program: None,
             patterns: overseer_daemon::locks::targets::default_patterns(),
             settings,
         }));

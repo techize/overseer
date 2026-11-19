@@ -73,6 +73,10 @@ pub struct SlotInfo {
     /// ledger has one.
     #[serde(default)]
     pub session_note: Option<String>,
+    /// True when a holder process keeps the slot's terminal, so the session
+    /// can outlive the daemon.
+    #[serde(default)]
+    pub held: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1358,6 +1362,7 @@ mod tests {
             rows: 24,
             activity: None,
             session_note: None,
+            held: false,
         };
         let running = info(SlotState::Running { pid: 1, since: 40 });
         assert_eq!(c.session_start(&running), Some(40));

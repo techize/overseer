@@ -13,7 +13,7 @@ use std::net::Shutdown;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -27,11 +27,17 @@ use crate::slot::RING_CAP;
 
 /// Replay and Output payloads are cut to this size, well under `MAX_FRAME`.
 const CHUNK: usize = 64 * 1024;
-/// Frames queued for one connection. A full queue means the daemon is not
-/// reading, and the connection is dropped; the daemon reconnects and gets a
-/// fresh Replay. Large enough for a greeting with a full ring
-/// (`RING_CAP / CHUNK` Replay frames plus a few).
+/// Frames queued for one connection. When it is full the PTY reader waits
+/// for room, so a daemon that reads slowly slows the child, as a local PTY
+/// would. Large enough for a greeting with a full ring (`RING_CAP / CHUNK`
+/// Replay frames, the closing empty one, and a few more).
 const QUEUE: usize = 1024;
+const _: () = assert!(RING_CAP / CHUNK + 4 < QUEUE);
+/// A connection whose queue has had no room for this long is dropped, so a
+/// hung daemon cannot freeze the child forever.
+const STALL_LIMIT: Duration = Duration::from_secs(30);
+/// How often a send waiting for room tries again.
+const SEND_RETRY: Duration = Duration::from_millis(1);
 /// How long a connected daemon has to answer Exit with ExitSeen.
 const EXIT_SEEN_WAIT: Duration = Duration::from_secs(5);
 /// How long to wait, after the child exits, for its last output.
@@ -130,12 +136,20 @@ fn run(args: Vec<OsString>) -> anyhow::Result<std::convert::Infallible> {
         &spec,
         Box::new(move |chunk| {
             let _keep = &drained_tx;
-            // Push and queue under one lock so a connection sees each chunk
-            // either in its Replay or as Output, never both and never neither.
-            let mut st = out.lock();
-            st.ring.push(chunk);
-            for piece in chunk.chunks(CHUNK) {
-                st.send(Frame::Output(piece.to_vec()));
+            // Push and pick the connection under one lock so a connection
+            // sees each chunk either in its Replay or as Output, never both
+            // and never neither. The send waits outside the lock.
+            let target = {
+                let mut st = out.lock();
+                st.ring.push(chunk);
+                st.target()
+            };
+            if let Some((id, tx)) = target {
+                for piece in chunk.chunks(CHUNK) {
+                    if !send_waiting(&out, id, &tx, Frame::Output(piece.to_vec())) {
+                        break;
+                    }
+                }
             }
         }),
     )
@@ -219,14 +233,9 @@ struct Conn {
 }
 
 impl State {
-    /// Queues `frame` for the current connection, if any. A connection
-    /// that cannot keep up is dropped.
-    fn send(&mut self, frame: Frame) {
-        if let Some(conn) = &self.conn {
-            if conn.tx.try_send(frame).is_err() {
-                self.drop_conn();
-            }
-        }
+    /// The current connection's id and queue, if any.
+    fn target(&self) -> Option<(u64, SyncSender<Frame>)> {
+        self.conn.as_ref().map(|c| (c.id, c.tx.clone()))
     }
 
     fn drop_conn(&mut self) {
@@ -237,6 +246,34 @@ impl State {
 
     fn is_current(&self, id: u64) -> bool {
         self.conn.as_ref().is_some_and(|c| c.id == id)
+    }
+}
+
+/// Queues `frame` for connection `id`, waiting while its queue is full.
+/// Returns false, at once, when that connection has been replaced or has
+/// closed; a connection whose queue makes no room for [`STALL_LIMIT`] is
+/// dropped. Never called with the State lock held.
+fn send_waiting(shared: &Shared, id: u64, tx: &SyncSender<Frame>, frame: Frame) -> bool {
+    let mut frame = frame;
+    let since = Instant::now();
+    loop {
+        match tx.try_send(frame) {
+            Ok(()) => return true,
+            Err(TrySendError::Disconnected(_)) => return false,
+            Err(TrySendError::Full(back)) => frame = back,
+        }
+        {
+            let mut st = shared.lock();
+            if !st.is_current(id) {
+                return false;
+            }
+            if since.elapsed() >= STALL_LIMIT {
+                st.drop_conn();
+                shared.changed.notify_all();
+                return false;
+            }
+        }
+        std::thread::sleep(SEND_RETRY);
     }
 }
 
@@ -267,10 +304,18 @@ fn wait_for_exit(pty: &LocalPty) -> Option<i32> {
 /// whether it came; false when nothing was connected, the connection went,
 /// or the wait ran out.
 fn report_exit(shared: &Shared, code: Option<i32>, at: i64) -> bool {
+    // Set under the lock that picks the connection, so a connection made
+    // later gets Exit in its greeting instead.
+    let target = {
+        let mut st = shared.lock();
+        st.exit = Some((code, at));
+        st.target()
+    };
+    if let Some((id, tx)) = target {
+        send_waiting(shared, id, &tx, Frame::Exit { code, at });
+    }
     let deadline = Instant::now() + EXIT_SEEN_WAIT;
     let mut st = shared.lock();
-    st.exit = Some((code, at));
-    st.send(Frame::Exit { code, at });
     loop {
         if st.exit_seen {
             return true;
@@ -308,7 +353,8 @@ fn accept_loop(
 }
 
 /// Makes `stream` the current connection, replacing any other, and greets
-/// it with Hello, the ring as Replay, and Exit if the child already ended.
+/// it with Hello, the ring as Replay frames closed by an empty one, and
+/// Exit if the child already ended.
 fn attach(
     shared: &Arc<Shared>,
     pty: &Arc<LocalPty>,
@@ -331,12 +377,10 @@ fn attach(
             ..hello.clone()
         }));
         let snapshot = st.ring.snapshot();
-        if snapshot.is_empty() {
-            let _ = tx.try_send(Frame::Replay(Vec::new()));
-        }
         for piece in snapshot.chunks(CHUNK) {
             let _ = tx.try_send(Frame::Replay(piece.to_vec()));
         }
+        let _ = tx.try_send(Frame::Replay(Vec::new()));
         if let Some((code, at)) = st.exit {
             let _ = tx.try_send(Frame::Exit { code, at });
         }

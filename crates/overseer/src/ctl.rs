@@ -1648,6 +1648,7 @@ mod tests {
             rows: 24,
             activity: None,
             session_note: None,
+            held: false,
         };
         assert_eq!(format_slot(&s), "S3  resumable  eks");
     }
@@ -1674,6 +1675,7 @@ mod tests {
                 idle_wait: false,
             }),
             session_note: None,
+            held: false,
         }
     }
 
