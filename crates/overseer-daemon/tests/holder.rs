@@ -61,7 +61,12 @@ impl Holder {
             .unwrap();
         drop(stdin);
         let h = Holder { proc, state };
-        h.wait_for(|| h.pid_path().exists(), "pid file");
+        // A short command can end before this sees the pid file; the exit
+        // file then stands in for it.
+        h.wait_for(
+            || h.pid_path().exists() || h.exit_path().exists(),
+            "pid file",
+        );
         h
     }
 
@@ -193,9 +198,12 @@ fn hello_then_replay_then_output() {
 /// after it.
 #[test]
 fn exit_comes_after_the_whole_tail() {
-    let mut h = Holder::start("seq 1 40000; exit 3");
+    // The child waits for a line, so it cannot finish before the test
+    // connects on a slow machine.
+    let mut h = Holder::start("read l; seq 1 40000; exit 3");
     let mut s = h.connect();
     let mut seen = skip_greeting(&mut s).into_bytes();
+    write_frame(&mut s, &Frame::Input(b"go\n".to_vec())).unwrap();
     let code = loop {
         // About 3s for a full queue, well past the holder's 1s drain wait.
         std::thread::sleep(Duration::from_millis(3));
@@ -208,6 +216,8 @@ fn exit_comes_after_the_whole_tail() {
     assert_eq!(code, Some(3));
     write_frame(&mut s, &Frame::ExitSeen).unwrap();
     let text = String::from_utf8_lossy(&seen).replace('\r', "");
+    // The terminal echoes the line typed above.
+    let text = text.strip_prefix("go\n").unwrap_or(&text).to_string();
     let want: String = (1..=40000).map(|n| format!("{n}\n")).collect();
     assert!(
         text == want,
@@ -321,7 +331,7 @@ fn exit_with_no_daemon_writes_the_exit_file() {
 
 #[test]
 fn exit_when_connected_is_sent() {
-    let mut h = Holder::start("sleep 0.5; exit 0");
+    let mut h = Holder::start("sleep 2; exit 0");
     let mut s = h.connect();
     skip_greeting(&mut s);
     assert_eq!(until_exit(&mut s), Some(0));
@@ -334,7 +344,7 @@ fn exit_when_connected_is_sent() {
 
 #[test]
 fn a_lost_connection_while_exiting_writes_the_exit_file() {
-    let mut h = Holder::start("sleep 0.5; exit 4");
+    let mut h = Holder::start("sleep 2; exit 4");
     let mut s = h.connect();
     skip_greeting(&mut s);
     assert_eq!(until_exit(&mut s), Some(4));
