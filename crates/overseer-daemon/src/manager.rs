@@ -54,6 +54,10 @@ struct Entry {
     command: Vec<String>,
     /// The ledger's session note for the slot, relative to the vault.
     session_note: Option<String>,
+    /// For a held slot, `holders/S<n>.activity`: every change of `activity`
+    /// is written there at once, so the next daemon starts with it even
+    /// after a crash or SIGKILL.
+    activity_file: Option<PathBuf>,
 }
 
 impl Entry {
@@ -64,6 +68,34 @@ impl Entry {
             session_id,
             command,
             session_note: None,
+            activity_file: None,
+        }
+    }
+
+    /// Sets the activity, writing it to the activity file if there is one
+    /// (removing the file for `None`). Returns whether it changed.
+    fn set_activity(&mut self, next: Option<Activity>) -> bool {
+        if next == self.activity {
+            return false;
+        }
+        self.activity = next;
+        self.save_activity();
+        true
+    }
+
+    /// Writes the activity to the activity file, if there is one.
+    fn save_activity(&self) {
+        let Some(path) = &self.activity_file else {
+            return;
+        };
+        let id = self.slot.info().id;
+        match &self.activity {
+            Some(activity) => {
+                if let Err(e) = crate::holder::write_json_atomic(path, activity) {
+                    tracing::warn!("{} activity not saved: {e}", slot_name(id));
+                }
+            }
+            None => remove_file(path),
         }
     }
 
@@ -338,6 +370,7 @@ impl SlotManager {
         };
         let ctx = Reattach {
             slots: self.slots.clone(),
+            state_dir: state_dir.clone(),
             events: self.events.clone(),
             ledger: launch.ledger.clone(),
             shutting_down: self.shutting_down.clone(),
@@ -694,6 +727,11 @@ impl SlotManager {
         // kill is a no-op then, but keeps the invariant in one place).
         let mut entry = Entry::new(slot.clone(), entry_session_id, command.clone());
         entry.session_note = note.clone().filter(|_| self.launch.is_some());
+        if let (Some(launch), true) = (&self.launch, slot.is_held()) {
+            entry.activity_file = Some(activity_path(&launch.state_dir, id));
+            // Whatever a session before this one saved is not this one's.
+            entry.save_activity();
+        }
         let started = entry.info();
         if let Some(old) = slots[id as usize].replace(entry) {
             old.slot.kill();
@@ -787,8 +825,7 @@ impl SlotManager {
             }
         }
         let next = apply(entry.activity.as_ref(), ev, unix_now());
-        if next != entry.activity {
-            entry.activity = next;
+        if entry.set_activity(next) {
             let _ = self.events.send(Event::SlotChanged(entry.info()));
         }
     }
@@ -1109,6 +1146,7 @@ fn forget_stale_pid_file(state_dir: &Path, id: SlotId) {
 #[derive(Clone)]
 struct Reattach {
     slots: Slots,
+    state_dir: PathBuf,
     events: broadcast::Sender<Event>,
     ledger: Arc<Ledger>,
     shutting_down: Arc<AtomicBool>,
@@ -1184,6 +1222,9 @@ fn install(
     let mut entry = Entry::new(slot.clone(), session.session_id, command.clone());
     entry.session_note = session.note;
     entry.activity = session.activity;
+    entry.activity_file = Some(activity_path(&ctx.state_dir, id));
+    // Restore took the file: put it back for the next daemon.
+    entry.save_activity();
     if let SlotState::Running { pid, .. } = slot.info().state {
         tracing::info!(
             "{} attached again to its session (pid {pid})",
@@ -1464,7 +1505,7 @@ async fn watch_trust(
             "{} is waiting on Claude's folder-trust question",
             slot_name(e.slot.info().id)
         );
-        e.activity = Some(crate::trust::activity(unix_now()));
+        e.set_activity(Some(crate::trust::activity(unix_now())));
         let _ = events.send(Event::SlotChanged(e.info()));
     }
 }
@@ -1502,7 +1543,7 @@ async fn monitor_exit(
         .as_mut()
         .filter(|e| Arc::ptr_eq(&e.slot, &slot))
         .map(|e| {
-            e.activity = None;
+            e.set_activity(None);
             e.info()
         });
     if let Some(info) = current {

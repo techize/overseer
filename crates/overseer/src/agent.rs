@@ -274,10 +274,24 @@ fn shutdown_running_daemon() -> anyhow::Result<()> {
         let Ok(client) = Client::connect(socket_path()).await else {
             return Ok(());
         };
+        // The daemon lets go of its socket as soon as it starts to stop, so
+        // the wait is for its process too, when it says which it is: a new
+        // daemon must not start while the old one still lets go of its
+        // sessions.
+        let pid = match tokio::time::timeout(QUERY_WAIT, client.request(Request::DaemonInfo)).await
+        {
+            Ok(Ok(Response::DaemonInfo(info))) => Some(info.pid),
+            _ => None,
+        };
+        // A fresh connection: an old daemon hangs up on DaemonInfo.
+        drop(client);
+        let client = Client::connect(socket_path()).await.ok();
         println!("stopping the running daemon");
-        let _ = client.request(Request::Shutdown).await;
+        if let Some(client) = client {
+            let _ = client.request(Request::Shutdown).await;
+        }
         let deadline = Instant::now() + BOOTOUT_WAIT;
-        while Client::connect(socket_path()).await.is_ok() {
+        while Client::connect(socket_path()).await.is_ok() || pid.is_some_and(process_alive) {
             if Instant::now() >= deadline {
                 bail!("the running daemon did not stop");
             }
@@ -285,6 +299,17 @@ fn shutdown_running_daemon() -> anyhow::Result<()> {
         }
         Ok(())
     })
+}
+
+/// Whether a process with this pid exists.
+fn process_alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: signal 0 sends nothing; it only checks the pid.
+    pid > 0
+        && (unsafe { libc::kill(pid, 0) } == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
 }
 
 /// The daemon answering on the socket: its build and its running sessions.

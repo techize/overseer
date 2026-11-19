@@ -226,7 +226,35 @@ fn notice_once(ledger: &Ledger, slot: SlotId, text: &str) {
     }
 }
 
-pub async fn run(mut cfg: DaemonConfig) -> anyhow::Result<()> {
+/// Runs the daemon until a `Shutdown` or `StopAll` request. Signals are
+/// left alone: an embedding process (the tests) keeps its own. The daemon
+/// proper runs [`run_until`] with [`stop_signal`].
+pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
+    run_until(cfg, std::future::pending()).await
+}
+
+/// SIGTERM or SIGINT: launchd stopping the job (`bootout`, `kickstart -k`)
+/// or Ctrl-C on a foreground daemon. The handlers are in place once this
+/// returns, so a signal sent from then on is never the default kill.
+/// Needs a tokio runtime.
+pub fn stop_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = signal(SignalKind::terminate())?;
+    let mut int = signal(SignalKind::interrupt())?;
+    Ok(async move {
+        tokio::select! {
+            _ = term.recv() => tracing::info!("SIGTERM: shutting down"),
+            _ = int.recv() => tracing::info!("SIGINT: shutting down"),
+        }
+    })
+}
+
+/// [`run`], also stopping, by the same path as a `Shutdown` request, when
+/// `stop` resolves.
+pub async fn run_until(
+    mut cfg: DaemonConfig,
+    stop: impl std::future::Future<Output = ()>,
+) -> anyhow::Result<()> {
     let listener = bind(&cfg.socket).await?;
     // Before anything reads the settings: a refused folder turns the notes
     // writer and the sprint sync off.
@@ -391,6 +419,7 @@ pub async fn run(mut cfg: DaemonConfig) -> anyhow::Result<()> {
     });
     let shutdown = Arc::new(Notify::new());
     let mut conns = JoinSet::new();
+    tokio::pin!(stop);
 
     loop {
         tokio::select! {
@@ -417,17 +446,23 @@ pub async fn run(mut cfg: DaemonConfig) -> anyhow::Result<()> {
                 Err(e) => tracing::warn!("accept failed: {e}"),
             },
             _ = shutdown.notified() => break,
+            _ = &mut stop => break,
             Some(_) = conns.join_next(), if !conns.is_empty() => {}
         }
     }
 
+    // First stop taking connections: a hook sent from now on finds no
+    // daemon and spools its event for the next one, rather than queueing
+    // on a listener nobody will accept from again. Connections already
+    // accepted run on until `conns` is dropped.
+    drop(listener);
+    let _ = std::fs::remove_file(&cfg.socket);
     store.shutdown();
-    // The sessions are killed next; they keep their locks for the restart.
+    // The sessions are let go next; they keep their locks for the restart.
     locks.shutdown();
     manager.lock().unwrap().shutdown_all();
     // A label change just before a restart should still reach the bead.
     store.drain_labels(crate::work::store::LABEL_DRAIN).await;
-    let _ = std::fs::remove_file(&cfg.socket);
     tokio::time::sleep(SHUTDOWN_GRACE).await;
     // Dropping `conns` aborts every connection task, closing the sockets.
     drop(conns);

@@ -5348,8 +5348,9 @@ mod restart {
         }
     }
 
-    /// Stops `d` with the shutdown request, as launchd does on a restart,
-    /// leaving its held sessions running.
+    /// Stops `d` with the shutdown request, leaving its held sessions
+    /// running. launchd's SIGTERM takes the same path in the daemon; the
+    /// CLI tests send that signal to a daemon process.
     async fn stop_keeping(mut d: Daemon) -> Down {
         let mut c = Client::connect(&d.socket).await;
         assert_eq!(c.request(Request::Shutdown).await, Response::Ok);
@@ -6312,5 +6313,66 @@ mod restart {
             !pid_alive(o.pids.child)
         })
         .await;
+    }
+
+    /// Once a daemon starts to stop, a hook finds no daemon (and spools its
+    /// event) rather than connecting to one that will never answer: the
+    /// socket is gone before the daemon lets go of its sessions. The
+    /// activity file's temporary name is made a FIFO, so shutdown blocks in
+    /// saving S1's activity until the test reads it: a window as long as
+    /// the test needs to look into.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hook_during_shutdown_finds_no_daemon() {
+        let d = start_daemon().await;
+        let mut c = Client::connect(&d.socket).await;
+        assert_eq!(c.start(1).await, Response::Ok);
+        c.hook(hook(1, HookKind::SessionStart)).await;
+        assert_eq!(activity_of(&c.list().await[1]).kind, ActivityKind::Idle);
+        let saved = overseer_daemon::holder::activity_path(&d.state_dir, 1);
+        let mut fifo = saved.into_os_string();
+        fifo.push(".tmp");
+        let fifo = PathBuf::from(fifo);
+        let name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+
+        assert_eq!(c.request(Request::Shutdown).await, Response::Ok);
+        let daemon_socket = d.socket.clone();
+        let reachable = tokio::task::spawn_blocking(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            let reachable = std::os::unix::net::UnixStream::connect(&daemon_socket).is_ok();
+            // Lets the shutdown go on.
+            let _ = std::fs::read(&fifo);
+            reachable
+        })
+        .await
+        .unwrap();
+        drop(c);
+        let _down = await_stopped(d).await;
+        assert!(
+            !reachable,
+            "a hook could still connect while the daemon let go of its sessions"
+        );
+    }
+
+    /// The activity file is written as the activity changes, not only at
+    /// shutdown, so a daemon that is killed outright keeps it too.
+    #[tokio::test]
+    async fn activity_is_saved_as_it_changes() {
+        let d = start_daemon().await;
+        let mut c = Client::connect(&d.socket).await;
+        assert_eq!(c.start(1).await, Response::Ok);
+        let path = overseer_daemon::holder::activity_path(&d.state_dir, 1);
+        assert!(!path.exists(), "activity saved before any was reported");
+        c.hook(hook(1, HookKind::SessionStart)).await;
+        assert_eq!(activity_of(&c.list().await[1]).kind, ActivityKind::Idle);
+        let saved: overseer_proto::Activity =
+            serde_json::from_slice(&std::fs::read(&path).expect("activity not saved")).unwrap();
+        assert_eq!(saved.kind, ActivityKind::Idle);
+        c.hook(hook(1, HookKind::UserPromptSubmit)).await;
+        assert_eq!(activity_of(&c.list().await[1]).kind, ActivityKind::Working);
+        let saved: overseer_proto::Activity =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved.kind, ActivityKind::Working);
     }
 }

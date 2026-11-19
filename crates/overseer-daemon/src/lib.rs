@@ -23,5 +23,5 @@ pub mod work;
 
 pub use config::Config;
 pub use env::EnvSource;
-pub use server::{run, AlreadyRunning, DaemonConfig};
+pub use server::{run, run_until, stop_signal, AlreadyRunning, DaemonConfig};
 pub use settings::SettingsFiles;

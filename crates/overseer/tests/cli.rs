@@ -1548,3 +1548,75 @@ fn hold_end_ends_a_holder_by_its_pid_file() {
     std::fs::write(&bad, "not json").unwrap();
     hold_end(&bad).failure();
 }
+
+/// The activity of slot `n`, asked of the daemon on this home's socket.
+fn activity_kind(env: &Env, n: usize) -> Option<overseer_proto::ActivityKind> {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let client = overseer_proto::Client::connect(env.home.join("overseer.sock"))
+            .await
+            .unwrap();
+        match client
+            .request(overseer_proto::Request::ListSlots)
+            .await
+            .unwrap()
+        {
+            overseer_proto::Response::Slots(slots) => slots[n].activity.as_ref().map(|a| a.kind),
+            other => panic!("{other:?}"),
+        }
+    })
+}
+
+/// `overseer hook <event>` from inside slot `n`, as Claude runs it.
+fn send_hook(env: &Env, n: u8, event: &str) {
+    use std::io::Write;
+    let mut hook = StdCommand::new(assert_cmd::cargo::cargo_bin("overseer"))
+        .env("OVERSEER_HOME", &env.home)
+        .env("OVERSEER_SLOT", format!("S{n}"))
+        .env("OVERSEER_LAUNCHCTL", env.launchctl_stub())
+        .env_remove("OVERSEER_RUN")
+        .args(["hook", event])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let body = format!("{{\"session_id\":\"demo-session\",\"hook_event_name\":\"{event}\"}}");
+    hook.stdin
+        .take()
+        .unwrap()
+        .write_all(body.as_bytes())
+        .unwrap();
+    assert!(hook.wait().unwrap().success());
+}
+
+/// launchd stops the daemon with SIGTERM (`make install`'s bootout,
+/// `ctl restart`'s `kickstart -k`): it takes the shutdown path, so the next
+/// daemon finds the session still running, with its activity.
+#[test]
+fn a_sigterm_keeps_held_sessions_and_their_activity() {
+    let env = Env::new();
+    let stub = env.claude_stub();
+    let stub = stub.to_str().unwrap();
+    let mut first = spawn_daemon(&env, &[("OVERSEER_DEFAULT_COMMAND", stub)]);
+    let pid = start_claude(&env);
+    send_hook(&env, 1, "SessionStart");
+    let idle = Some(overseer_proto::ActivityKind::Idle);
+    let up = Instant::now();
+    while activity_kind(&env, 1) != idle {
+        assert!(up.elapsed() < Duration::from_secs(5), "no activity");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // SAFETY: a plain signal to this test's own daemon.
+    unsafe { libc::kill(first.id() as i32, libc::SIGTERM) };
+    let status = wait_exit(&mut first, Duration::from_secs(10));
+    // Like a Shutdown request: a clean exit launchd does not respawn.
+    assert_eq!(status.code(), Some(0), "{status:?}");
+
+    let mut second = spawn_daemon(&env, &[("OVERSEER_DEFAULT_COMMAND", stub)]);
+    let s1 = status_line(&env, 1);
+    assert!(s1.starts_with("S1  running  pid "), "{s1}");
+    assert_eq!(pid_after(&s1, "pid "), pid);
+    assert_eq!(activity_kind(&env, 1), idle);
+    env.ctl(&["shutdown"]).assert().success();
+    wait_exit(&mut second, Duration::from_secs(10));
+}

@@ -148,17 +148,24 @@ fn main() {
                 security: overseer_daemon::work::store::SECURITY.to_owned(),
             };
             let result = runtime().and_then(|rt| {
-                rt.block_on(overseer_daemon::run(DaemonConfig {
-                    socket,
-                    default_command: default_command(),
-                    env: overseer_daemon::EnvSource::LoginShell,
-                    state_dir: overseer_proto::paths::state_dir(),
-                    hook_program: std::env::current_exe()?,
-                    holder_program: Some(std::env::current_exe()?),
-                    settings,
-                    patterns,
-                    files,
-                }))
+                // launchd stops the job with SIGTERM (bootout, kickstart -k):
+                // it takes the same path as a Shutdown request, so held
+                // sessions are let go and their activity saved.
+                let stop = rt.block_on(async { overseer_daemon::stop_signal() })?;
+                rt.block_on(overseer_daemon::run_until(
+                    DaemonConfig {
+                        socket,
+                        default_command: default_command(),
+                        env: overseer_daemon::EnvSource::LoginShell,
+                        state_dir: overseer_proto::paths::state_dir(),
+                        hook_program: std::env::current_exe()?,
+                        holder_program: Some(std::env::current_exe()?),
+                        settings,
+                        patterns,
+                        files,
+                    },
+                    stop,
+                ))
             });
             match &result {
                 Ok(()) => tracing::info!("daemon stopped"),
