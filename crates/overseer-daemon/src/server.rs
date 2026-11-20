@@ -343,6 +343,12 @@ pub async fn run_until(
     // seen, has ended: only a resumable one keeps its waits and relays.
     let ended = sessionless(&mgr.list());
     locks.reconcile_exits(&ended, unix_now());
+    // Items and status requests too, for a session that ended while the
+    // daemon was down (Exited). An Empty slot may own items assigned ahead
+    // of its start, so it keeps them.
+    for slot in exited(&mgr.list()) {
+        session_over_rest(&coord, &store, slot, unix_now());
+    }
     let manager: Manager = Arc::new(Mutex::new(mgr));
     // Hooks that found no daemon were spooled. They come after the restore,
     // so what happened while down wins over the saved activity; an event of
@@ -402,6 +408,8 @@ pub async fn run_until(
     let exits = tokio::spawn(watch_exits(
         exit_events,
         locks.clone(),
+        coord.clone(),
+        store.clone(),
         manager.clone(),
         courier.clone(),
     ));
@@ -481,6 +489,17 @@ fn sessionless(infos: &[overseer_proto::SlotInfo]) -> Vec<SlotId> {
         .collect()
 }
 
+/// The slots whose session exited and has not been replaced. Unlike
+/// `sessionless`, an Empty slot is left out: it may own items assigned
+/// ahead of its start.
+fn exited(infos: &[overseer_proto::SlotInfo]) -> Vec<SlotId> {
+    infos
+        .iter()
+        .filter(|i| matches!(i.state, SlotState::Exited { .. }))
+        .map(|i| i.id)
+        .collect()
+}
+
 /// Who owns what in the vault and which slots are running or busy, from
 /// the slots, the work store and the session notes in the ledger.
 fn brain_context(
@@ -527,11 +546,39 @@ fn brain_context(
     }
 }
 
-/// Ends the locks of each slot whose session exits. After a lag, which
-/// may have lost exit events, every slot with no session is reconciled.
+/// The rest of a session's end, after its locks: the slot's items are
+/// released and a status request it never answered goes. Callers skip it
+/// once the daemon is stopping, so a session that outlives it keeps them.
+fn session_over_rest(coord: &CoordService, store: &Arc<WorkStore>, slot: SlotId, now: i64) {
+    coord.session_ended(slot);
+    store.release_slot(slot, now);
+}
+
+/// A slot's session ended (it exited, or a resumable one was declined):
+/// its locks, items and status request go. Nothing once the daemon is
+/// stopping.
+fn session_over(
+    locks: &LockService,
+    coord: &CoordService,
+    store: &Arc<WorkStore>,
+    slot: SlotId,
+    now: i64,
+) {
+    if locks.is_stopping() {
+        return;
+    }
+    locks.on_session_ended(slot, now);
+    session_over_rest(coord, store, slot, now);
+}
+
+/// Ends the locks, items and status request of each slot whose session
+/// exits. After a lag, which may have lost exit events, every slot with no
+/// session is reconciled.
 async fn watch_exits(
     mut events: broadcast::Receiver<Event>,
     locks: Arc<LockService>,
+    coord: Arc<CoordService>,
+    store: Arc<WorkStore>,
     manager: Manager,
     courier: Arc<Courier>,
 ) {
@@ -544,7 +591,7 @@ async fn watch_exits(
                 if !ended.contains(&info.id) {
                     continue;
                 }
-                locks.on_session_ended(info.id, unix_now());
+                session_over(&locks, &coord, &store, info.id, unix_now());
                 // A handoff may have queued a relay.
                 courier.poke();
             }
@@ -553,6 +600,11 @@ async fn watch_exits(
                 tracing::warn!("lock exit watcher lagged by {n} events; reconciling");
                 let ended = sessionless(&manager.lock().unwrap().list());
                 locks.reconcile_exits(&ended, unix_now());
+                if !locks.is_stopping() {
+                    for slot in exited(&manager.lock().unwrap().list()) {
+                        session_over_rest(&coord, &store, slot, unix_now());
+                    }
+                }
                 courier.poke();
             }
             Err(broadcast::error::RecvError::Closed) => return,
@@ -1304,6 +1356,7 @@ fn handle_request(
                 valid_id(id) && matches!(m.list()[id as usize].state, SlotState::Running { .. });
             if !running {
                 locks.on_session_ended(id, unix_now());
+                ctx.coord.session_ended(id);
             }
             match m.start(id, label, &cwd, command, prompt) {
                 // CURRENT_SESSION.md was cleared before this (`handle_conn`).
@@ -1320,7 +1373,7 @@ fn handle_request(
             match m.stop(id) {
                 Ok(()) => {
                     if declined {
-                        locks.on_session_ended(id, unix_now());
+                        session_over(locks, ctx.coord, store, id, unix_now());
                     }
                     Response::Ok
                 }

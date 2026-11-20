@@ -4528,6 +4528,30 @@ async fn second_status_request_sends_one_relay() {
 }
 
 #[tokio::test]
+async fn a_status_request_goes_when_the_session_ends() {
+    let s3 = box_stub("status-gone-s3");
+    let d = start_daemon_with(temp_socket(), s3.env()).await;
+    let mut c = Client::connect(&d.socket).await;
+    c.start_stub(3, &s3).await;
+    assert!(matches!(
+        c.ask_status(Some(0), 3).await,
+        Response::Text { .. }
+    ));
+    assert_eq!(c.coord().await.status_asked.len(), 1);
+    assert_eq!(c.request(Request::StopSlot { id: 3 }).await, Response::Ok);
+    c.exited_event(3).await;
+    let mut cleared = false;
+    for _ in 0..40 {
+        if c.coord().await.status_asked.is_empty() {
+            cleared = true;
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    assert!(cleared, "status asked still shown after S3 exited");
+}
+
+#[tokio::test]
 async fn status_of_a_stopped_slot_is_refused() {
     let d = start_daemon().await;
     let mut c = Client::connect(&d.socket).await;
@@ -5225,6 +5249,17 @@ async fn manual_kickoff_names_the_worktree_only_under_the_root() {
     // StopSlot answers before the process has gone; a start before the exit
     // event can find the slot still running.
     c.exited_event(3).await;
+    // The ended session released its item; the next one is assigned afresh.
+    let mut released = false;
+    for _ in 0..40 {
+        if item(&c.work().await, "DEMO-12").owner.is_none() {
+            released = true;
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    assert!(released, "DEMO-12 still owned after S3 exited");
+    assert_eq!(c.assign("DEMO-12", 3, false, false).await, Response::Ok);
     assert_eq!(c.request(start(wt.clone())).await, Response::Ok);
     let text = kickoff_text_of(&mut c, 3).await;
     assert!(

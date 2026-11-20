@@ -471,6 +471,10 @@ trimming):
   new key is absent, and the review names are added to In progress.
 - Click a session card, or press Cmd+0 to Cmd+6, to open that session over the
   board. Cmd+Esc, the x button, or a click outside the panel closes it.
+- When a slot's session ends (it exits, is stopped, or you decline to resume
+  it), Overseer releases every item it owned and logs it, and drops a status
+  request it never answered. The next plan or ticket click finds those items
+  free. A resumable slot keeps its items until you resume or decline it.
 - A worker session's panel has an Owns box listing the items it owns. Each row
   shows the key and status, then the title on up to two lines. Click the row
   (not Release) to open the item's detail in place of the panel boxes, with
