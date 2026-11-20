@@ -83,7 +83,7 @@ fn tools() -> Value {
         },
         {
             "name": "notify_session",
-            "description": "Send a message to another Overseer session. Workers may only answer a message they were sent.",
+            "description": "Send a message to another Overseer session. Workers may message S0 at any time, with one message waiting to be typed in at a time, and cannot message other workers.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

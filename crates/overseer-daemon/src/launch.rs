@@ -40,6 +40,7 @@ const PREVIOUS_WORKER: &[u64] = &[
     0xe8deae3b8fe65917,
     0x751ce33e657e6c1f, // phase 5
     0xaba64201957d69d7, // before the user's name was a placeholder
+    0x906c2b3901ce9b53, // before workers could message S0
 ];
 const PREVIOUS_KICKOFF: &[u64] = &[
     0x05db44420ef92039, // phase 5
@@ -1177,6 +1178,31 @@ mod tests {
             );
             assert!(!roles.join(format!("{name}.new")).exists());
         }
+    }
+
+    const BEFORE_S0_NOTES_WORKER: &str =
+        include_str!("../tests/fixtures/roles-before-s0-notes/worker.md");
+
+    #[test]
+    fn worker_role_from_before_s0_notes_upgrades() {
+        assert_eq!(text_hash(BEFORE_S0_NOTES_WORKER), 0x906c2b3901ce9b53);
+        assert!(PREVIOUS_WORKER.contains(&text_hash(BEFORE_S0_NOTES_WORKER)));
+        let dir = temp("befores0notes");
+        let roles = dir.join("roles");
+        std::fs::create_dir_all(&roles).unwrap();
+        std::fs::write(roles.join("worker.md"), BEFORE_S0_NOTES_WORKER).unwrap();
+        let path = ensure_template(&roles, "worker.md", WORKER_ROLE, PREVIOUS_WORKER).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap().trim_end(),
+            WORKER_ROLE.trim_end()
+        );
+        assert!(!roles.join("worker.md.new").exists());
+    }
+
+    #[test]
+    fn worker_role_says_workers_may_message_s0() {
+        assert!(WORKER_ROLE.contains("You may message S0 at any time"));
+        assert!(WORKER_ROLE.contains("cannot start a conversation with another worker"));
     }
 
     const BEFORE_DETAIL_COORDINATOR: &str =
