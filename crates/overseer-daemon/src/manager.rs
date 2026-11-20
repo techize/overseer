@@ -1165,6 +1165,12 @@ impl SlotManager {
             .collect();
         for entry in &entries {
             if !entry.slot.is_held() {
+                if matches!(entry.slot.info().state, SlotState::Running { .. }) {
+                    tracing::info!(
+                        "{} ended at shutdown (not held, so it cannot outlive the daemon)",
+                        slot_name(entry.slot.info().id)
+                    );
+                }
                 entry.slot.kill();
                 continue;
             }
@@ -1716,9 +1722,6 @@ async fn monitor_exit(
     // identity and send under the same lock `start` uses to replace and
     // announce.
     let info = slot.info();
-    if let SlotState::Exited { code, .. } = &info.state {
-        tracing::info!("{} exited (code {code:?})", slot_name(info.id));
-    }
     let mut slots = slots.lock().unwrap();
     // The entry's info, not the slot's: it carries the base command.
     let current = slots[info.id as usize]
@@ -1729,6 +1732,12 @@ async fn monitor_exit(
             e.info()
         });
     if let Some(info) = current {
+        // Only the slot's own exit is logged: a slot that shutdown or a
+        // reattach let go of, or killed, is no longer in its entry, and
+        // shutdown logs that itself.
+        if let SlotState::Exited { code, .. } = &info.state {
+            tracing::info!("{} exited (code {code:?})", slot_name(info.id));
+        }
         // A daemon shutdown kills the children too, but those sessions must
         // stay live in the ledger so they can be resumed. Synchronous for the
         // same reason as the start write.

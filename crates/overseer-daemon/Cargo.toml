@@ -30,4 +30,6 @@ base64 = "0.22"
 
 [dev-dependencies]
 tempfile = "3"
+# The same features as the overseer crate's, so both share one build.
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "env-filter", "std"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
