@@ -322,18 +322,21 @@ unset, the daemon reads the default config file, `~/.config/overseer/config.toml
 and Settings writes to it, so that is your real config. Set `OVERSEER_CONFIG`
 (and `OVERSEER_TARGETS`) as well for a fully isolated home.
 
-## Upgrade
+## Upgrading
 
 ```
 git pull && make install
 ```
 
-Restarting the daemon ends every running session. Each comes back on the board
-as resumable, and `r` on its card resumes it. So when sessions are running,
-`make install` says which ones would end and asks before it restarts the
-daemon; without a terminal it keeps the daemon. With no session running it
-restarts without asking, and when the build has not changed it restarts
-nothing.
+Running sessions are kept. Each session runs under its own small holder
+process, so restarting the daemon does not end it: the new daemon reattaches
+and the session goes on. The one exception is the first upgrade to a build with
+holders: sessions started before it have no holder, so they end this one last
+time. Each comes back on the board as resumable, and `r` on its card resumes
+it. When such sessions are running, `make install` says which ones would end
+and asks before it restarts the daemon; without a terminal it keeps the daemon.
+With only held sessions or none running it restarts without asking, and when
+the build has not changed it restarts nothing.
 
 - `make install YES=1` restarts without asking, even with sessions running.
 - `make install NO_RESTART=1` always keeps the running daemon.
@@ -348,8 +351,9 @@ running daemon's, and says when they differ.
 make uninstall
 ```
 
-This runs `scripts/uninstall.sh`, which stops the daemon (ending any sessions),
-removes the LaunchAgent, the `~/.local/bin/overseer` link and
+This runs `scripts/uninstall.sh`, which ends every running session (they come
+back as resumable if you install again; any it cannot end are named and
+`holders/` is kept), stops the daemon, removes the LaunchAgent, the `~/.local/bin/overseer` link and
 `~/Applications/Overseer.app`. It leaves the state dir
 `~/Library/Application Support/Overseer/` and the logs in place; delete those by
 hand if you want them gone. With `OVERSEER_HOME` set it removes that home's
@@ -362,11 +366,15 @@ install in place.
   command (or opening the app) starts the daemon if it is not running.
 - `overseer ctl version` shows the app's version and build and the running
   daemon's, without starting one.
-- `overseer ctl restart` restarts the daemon. Running sessions end and come
-  back as resumable; with any running you are asked first on a terminal, and
-  `overseer ctl restart --yes` restarts without asking.
-- `overseer ctl shutdown` stops the daemon and every session. The daemon then
-  stays down until the next `overseer ctl` or `overseer attach` command or app
+- `overseer ctl restart` restarts the daemon. Sessions kept by a holder survive
+  it; any that would end (started before holders) come back as resumable, and
+  you are asked first on a terminal. `overseer ctl restart --yes` restarts
+  without asking.
+- `overseer ctl stop-all` ends every session, held ones included, and stops the
+  daemon. The sessions come back as resumable under the next daemon. It fails,
+  naming them, if a session cannot be ended. `make uninstall` runs it.
+- `overseer ctl shutdown` stops the daemon; held sessions keep running under
+  their holders. The daemon then stays down until the next `overseer ctl` or `overseer attach` command or app
   launch starts it again. launchd only restarts it by itself if it crashes.
 - Logs live in `~/Library/Logs/Overseer/` (`$OVERSEER_HOME/logs` for an isolated
   home): `daemon.log` (the daemon's own log), `daemon.out.log` and
@@ -389,8 +397,8 @@ unsaved edits the first `Esc` only warns).
   app at once, open terminals included.
 - Every other key is the daemon's and applies after it restarts; the view marks
   such a key `restart needed` until then. Restart the daemon in the view asks
-  first, naming the sessions a restart would end (each comes back as
-  resumable), then runs `overseer ctl restart --yes`.
+  first when sessions without a holder would end (it names them; each comes
+  back as resumable), and restarts without asking when none would, then runs `overseer ctl restart --yes`.
 - The Jira token and Bitbucket token rows send a token to the daemon, which
   stores it in the Keychain. They show only whether a token is found, never
   the token itself.

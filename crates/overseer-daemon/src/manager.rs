@@ -13,12 +13,16 @@ use tokio::sync::broadcast;
 
 use crate::activity::apply;
 use crate::env::BaseEnv;
+use crate::holder::{
+    activity_path, client, end_by_pid, exit_path, holder_gone, holder_state, pid_path, socket_path,
+    ExitFile, HolderHello, HolderState, PidFile,
+};
 use crate::launch::{
     claude_argv, claude_projects_dir, first_prompt, has_transcript, is_claude, write_slot_files,
     RoleDirs, Start,
 };
 use crate::ledger::{Ledger, SessionRow};
-use crate::slot::Slot;
+use crate::slot::{spawn_spec, Attached, Slot};
 
 pub const SLOT_COUNT: usize = 7;
 const DEFAULT_COLS: u16 = 80;
@@ -50,6 +54,10 @@ struct Entry {
     command: Vec<String>,
     /// The ledger's session note for the slot, relative to the vault.
     session_note: Option<String>,
+    /// For a held slot, `holders/S<n>.activity`: every change of `activity`
+    /// is written there at once, so the next daemon starts with it even
+    /// after a crash or SIGKILL.
+    activity_file: Option<PathBuf>,
 }
 
 impl Entry {
@@ -60,6 +68,34 @@ impl Entry {
             session_id,
             command,
             session_note: None,
+            activity_file: None,
+        }
+    }
+
+    /// Sets the activity, writing it to the activity file if there is one
+    /// (removing the file for `None`). Returns whether it changed.
+    fn set_activity(&mut self, next: Option<Activity>) -> bool {
+        if next == self.activity {
+            return false;
+        }
+        self.activity = next;
+        self.save_activity();
+        true
+    }
+
+    /// Writes the activity to the activity file, if there is one.
+    fn save_activity(&self) {
+        let Some(path) = &self.activity_file else {
+            return;
+        };
+        let id = self.slot.info().id;
+        match &self.activity {
+            Some(activity) => {
+                if let Err(e) = crate::holder::write_json_atomic(path, activity) {
+                    tracing::warn!("{} activity not saved: {e}", slot_name(id));
+                }
+            }
+            None => remove_file(path),
         }
     }
 
@@ -96,6 +132,9 @@ pub struct SlotManager {
     /// `session_note` from the config: a fresh start fixes the slot's note
     /// from it in the ledger; a resume keeps the one it had.
     session_note: Option<String>,
+    /// The program run as `<program> hold <state_dir>` to keep each
+    /// session's terminal; `None` runs sessions in the daemon itself.
+    holder: Option<PathBuf>,
 }
 
 /// A slot as the ledger left it: no process, but remembered.
@@ -103,7 +142,74 @@ struct Restored {
     info: SlotInfo,
     /// The session to continue, empty when the slot is not resumable.
     session_id: String,
+    /// Set when the slot's holder is alive but could not be attached.
+    unreachable: Option<Unreachable>,
 }
+
+/// A session whose holder is alive but that this daemon could not attach
+/// to, or whose holder is an older build's. Its card shows it running;
+/// Stop ends it by pid.
+struct Unreachable {
+    pids: PidFile,
+    /// Set when the holder is an older build's: Stop then offers its
+    /// session for resume rather than ending it.
+    older: Option<Older>,
+    /// Set by Stop, under the slots lock, so a later retry leaves it alone.
+    given_up: Arc<AtomicBool>,
+    /// When the session was seen to end, shared with the retry thread so
+    /// its exit is recorded once, whoever notices first.
+    ended: Ended,
+}
+
+/// What an older build's session goes back to when Stop ends it.
+#[derive(Clone)]
+struct Older {
+    /// The label without the older-build note.
+    label: String,
+    /// The session to offer for resume, from the ledger.
+    session_id: Option<String>,
+    /// When the session started, from the ledger.
+    started: i64,
+}
+
+type Ended = Arc<Mutex<Option<i64>>>;
+
+/// How often the retry thread, done retrying, checks the holder is alive.
+const HOLDER_WATCH: Duration = Duration::from_secs(1);
+
+/// Marks an unreachable session ended, recording its exit in the ledger
+/// the first time. Returns when it ended and whether this call ended it.
+fn end_once(ended: &Ended, ledger: Option<&Ledger>, id: SlotId) -> (i64, bool) {
+    let mut at = ended.lock().unwrap();
+    if let Some(at) = *at {
+        return (at, false);
+    }
+    let now = unix_now();
+    *at = Some(now);
+    if let Some(ledger) = ledger {
+        if let Err(e) = ledger.record_exit(id, None, now) {
+            tracing::warn!("{} ledger exit not recorded: {e:#}", slot_name(id));
+        }
+    }
+    (now, true)
+}
+
+/// A placeholder's card once its session has ended.
+fn ended_info(info: &SlotInfo, at: i64) -> SlotInfo {
+    SlotInfo {
+        state: SlotState::Exited { code: None, at },
+        held: false,
+        ..info.clone()
+    }
+}
+
+/// Further tries at attaching a holder that is alive, after the first one
+/// at start failed.
+const ATTACH_RETRIES: u32 = 3;
+const ATTACH_RETRY_PAUSE: Duration = Duration::from_secs(2);
+/// Before the first try at attaching a holder whose connection was lost:
+/// short, since the holder is known to be alive.
+const LOST_FIRST_PAUSE: Duration = Duration::from_millis(200);
 
 #[derive(Clone)]
 struct Launch {
@@ -142,13 +248,19 @@ impl SlotManager {
             shutting_down: Default::default(),
             restored: Default::default(),
             session_note: None,
+            holder: None,
         }
     }
 
-    /// Turns the sessions the ledger still has as live (the daemon went down
-    /// under them) into `Resumable` slots. Anything that cannot be resumed
-    /// (not claude, no session id, unreadable command) shows as exited and is
-    /// marked exited in the ledger so it is not considered again.
+    /// Picks up the sessions the last daemon left. First the holders in
+    /// `<state>/holders`: a live one is attached again and its slot runs on;
+    /// an exit file is recorded in the ledger and the slot shows as exited
+    /// with its code; a socket nobody listens on is deleted. Then the
+    /// sessions the ledger still has as live with no holder (the daemon went
+    /// down under them) become `Resumable` slots. Anything that cannot be
+    /// resumed (not claude, no session id, unreadable command) shows as
+    /// exited and is marked exited in the ledger so it is not considered
+    /// again.
     pub fn restore(&mut self) {
         let Some(launch) = self.launch.clone() else {
             return;
@@ -157,10 +269,19 @@ impl SlotManager {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!("ledger not readable, nothing to resume: {e:#}");
-                return;
+                Vec::new()
             }
         };
+        for id in 0..SLOT_COUNT as SlotId {
+            let row = rows.iter().find(|r| r.slot == id);
+            self.restore_held(&launch, id, row);
+        }
         for row in rows.into_iter().filter(|r| valid_id(r.slot)) {
+            let filled = self.slots.lock().unwrap()[row.slot as usize].is_some()
+                || self.restored[row.slot as usize].is_some();
+            if filled {
+                continue;
+            }
             let resumable =
                 !row.session_id.is_empty() && !row.command.is_empty() && is_claude(&row.command);
             let state = if resumable {
@@ -187,14 +308,236 @@ impl SlotManager {
                 rows: DEFAULT_ROWS,
                 activity: None,
                 session_note: launch.ledger.session_note(row.slot).ok().flatten(),
+                held: false,
             };
             let session_id = if resumable {
                 row.session_id
             } else {
                 String::new()
             };
-            self.restored[row.slot as usize] = Some(Restored { info, session_id });
+            self.restored[row.slot as usize] = Some(Restored {
+                info,
+                session_id,
+                unreachable: None,
+            });
         }
+    }
+
+    /// The holder side of [`SlotManager::restore`] for slot `id`, whose
+    /// live ledger row is `row`, if any.
+    fn restore_held(&mut self, launch: &Launch, id: SlotId, row: Option<&SessionRow>) {
+        let state_dir = &launch.state_dir;
+        let saved = take_activity(state_dir, id);
+        // An exit file comes first: its holder is gone or about to go.
+        let exit = exit_path(state_dir, id);
+        if let Some(file) = read_json::<ExitFile>(&exit) {
+            tracing::info!(
+                "{} exited (code {:?}) while the daemon was down",
+                slot_name(id),
+                file.code
+            );
+            if let Err(e) = launch.ledger.record_exit(id, file.code, file.at) {
+                tracing::warn!("{} ledger exit not recorded: {e:#}", slot_name(id));
+            }
+            let info = SlotInfo {
+                id,
+                label: row.map(|r| r.label.clone()).unwrap_or_default(),
+                cwd: row.map(|r| r.cwd.clone()),
+                command: row.map(|r| r.command.clone()).filter(|c| !c.is_empty()),
+                state: SlotState::Exited {
+                    code: file.code,
+                    at: file.at,
+                },
+                cols: DEFAULT_COLS,
+                rows: DEFAULT_ROWS,
+                activity: None,
+                session_note: launch.ledger.session_note(id).ok().flatten(),
+                held: false,
+            };
+            self.restored[id as usize] = Some(Restored {
+                info,
+                session_id: String::new(),
+                unreachable: None,
+            });
+            remove_file(&exit);
+            return;
+        }
+        let socket = socket_path(state_dir, id);
+        if !socket.exists() {
+            forget_stale_pid_file(state_dir, id);
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!("{} holder not attached: no runtime", slot_name(id));
+            return;
+        };
+        let ctx = Reattach {
+            slots: self.slots.clone(),
+            state_dir: state_dir.clone(),
+            events: self.events.clone(),
+            ledger: launch.ledger.clone(),
+            shutting_down: self.shutting_down.clone(),
+            runtime,
+        };
+        let session = Session {
+            command: row.map(|r| r.command.clone()).filter(|c| !c.is_empty()),
+            session_id: row.map(|r| r.session_id.clone()).unwrap_or_default(),
+            note: launch.ledger.session_note(id).ok().flatten(),
+            activity: saved,
+        };
+        let why = match try_attach(&socket, id) {
+            Attempt::Got(slot, monitor_rx, trust_rx) => {
+                let mut slots = self.slots.lock().unwrap();
+                install(&ctx, &mut slots, id, slot, monitor_rx, trust_rx, session);
+                return;
+            }
+            // Nothing listens, but the pid file decides: a live holder is
+            // never taken for gone.
+            Attempt::Gone => "nothing listens on its socket".to_string(),
+            Attempt::Unsupported(hello) => {
+                self.keep_older(ctx, state_dir, id, row, session, hello.as_ref());
+                return;
+            }
+            Attempt::Failed(why) => why,
+        };
+        // A holder that is still alive keeps its session: never offer a
+        // resume over it, which its live pid file would refuse anyway.
+        let pids = client::read_pid_file(&pid_path(state_dir, id)).filter(|p| !holder_gone(p));
+        let Some(pids) = pids else {
+            tracing::info!(
+                "{} holder is gone ({why}); removing its socket",
+                slot_name(id)
+            );
+            remove_file(&socket);
+            forget_stale_pid_file(state_dir, id);
+            return;
+        };
+        tracing::warn!(
+            "{} holder (pid {}) is alive but not attached ({why}); trying again",
+            slot_name(id),
+            pids.holder
+        );
+        let since = row.map_or_else(unix_now, |r| r.started);
+        let label = row.map(|r| r.label.clone()).unwrap_or_default();
+        let child = pids.child;
+        let watch = self.keep_placeholder(id, row, &session, pids, child, since, label, None);
+        retry_attach(ctx, socket, id, session, watch, ATTACH_RETRIES);
+    }
+
+    /// Keeps a card for a session whose holder is an older build's
+    /// (`hello` is `None` when its Hello could not be read at all): it shows
+    /// as running, with the older-build note on its label, until Stop ends
+    /// it by pid or the holder dies.
+    fn keep_older(
+        &mut self,
+        ctx: Reattach,
+        state_dir: &Path,
+        id: SlotId,
+        row: Option<&SessionRow>,
+        session: Session,
+        hello: Option<&HolderHello>,
+    ) {
+        let from_hello = hello.map(|h| PidFile {
+            holder: h.pid,
+            child: h.child_pid,
+            version: h.version,
+            holder_start: None,
+            child_start: None,
+        });
+        // Each source on its own: a stale pid file must not hide the Hello.
+        let pids = client::read_pid_file(&pid_path(state_dir, id))
+            .filter(|p| !holder_gone(p))
+            .or(from_hello.filter(|p| !holder_gone(p)));
+        let Some(pids) = pids else {
+            // It answered, so something listens there: leave it alone, but
+            // never signal what cannot be shown to be a holder.
+            tracing::warn!(
+                "{} holder of another build answered, but no live holder is named for it; left alone",
+                slot_name(id)
+            );
+            return;
+        };
+        tracing::warn!(
+            "{} holder (pid {}) is an older build's (protocol {}); Stop ends it",
+            slot_name(id),
+            pids.holder,
+            hello.map_or_else(|| "unreadable".to_string(), |h| h.version.to_string())
+        );
+        let label = row
+            .map(|r| r.label.clone())
+            .or_else(|| hello.map(|h| h.label.clone()))
+            .unwrap_or_default();
+        let since = row
+            .map(|r| r.started)
+            .or_else(|| hello.map(|h| h.since))
+            .unwrap_or_else(unix_now);
+        let resumable = row
+            .filter(|r| !r.session_id.is_empty() && !r.command.is_empty() && is_claude(&r.command));
+        let older = Older {
+            label: label.clone(),
+            session_id: resumable.map(|r| r.session_id.clone()),
+            started: since,
+        };
+        let child = hello.map_or(pids.child, |h| h.child_pid);
+        let watch = self.keep_placeholder(
+            id,
+            row,
+            &session,
+            pids,
+            child,
+            since,
+            format!("{label} (older build)"),
+            Some(older),
+        );
+        let socket = socket_path(state_dir, id);
+        retry_attach(ctx, socket, id, session, watch, 0);
+    }
+
+    /// Puts a running card in slot `id` for a live holder this daemon does
+    /// not attach. Returns what the watching thread needs.
+    #[allow(clippy::too_many_arguments)]
+    fn keep_placeholder(
+        &mut self,
+        id: SlotId,
+        row: Option<&SessionRow>,
+        session: &Session,
+        pids: PidFile,
+        child: u32,
+        since: i64,
+        label: String,
+        older: Option<Older>,
+    ) -> Watch {
+        let given_up = Arc::new(AtomicBool::new(false));
+        let ended: Ended = Arc::default();
+        let info = SlotInfo {
+            id,
+            label,
+            cwd: row.map(|r| r.cwd.clone()),
+            command: session.command.clone(),
+            state: SlotState::Running { pid: child, since },
+            cols: DEFAULT_COLS,
+            rows: DEFAULT_ROWS,
+            activity: None,
+            session_note: session.note.clone(),
+            held: true,
+        };
+        let watch = Watch {
+            pids: pids.clone(),
+            given_up: given_up.clone(),
+            ended: ended.clone(),
+            info: info.clone(),
+        };
+        self.restored[id as usize] = Some(Restored {
+            info,
+            session_id: String::new(),
+            unreachable: Some(Unreachable {
+                pids,
+                older,
+                given_up,
+                ended,
+            }),
+        });
+        watch
     }
 
     /// Generates claude's per-slot files under `state_dir` and records every
@@ -219,6 +562,14 @@ impl SlotManager {
     /// see `brain::paths::fill_template`).
     pub fn with_session_note(mut self, template: String) -> Self {
         self.session_note = Some(template);
+        self
+    }
+
+    /// Runs every session started from now on under a holder process,
+    /// `<program> hold <state_dir>`. Needs [`SlotManager::with_launch`] for
+    /// the state dir; without it sessions run in the daemon.
+    pub fn with_holder(mut self, program: PathBuf) -> Self {
+        self.holder = Some(program);
         self
     }
 
@@ -292,6 +643,11 @@ impl SlotManager {
                 return Err(format!("{} is already running", slot_name(id)));
             }
         }
+        if slots[id as usize].is_none() {
+            if let Some(u) = self.unreachable(id) {
+                return Err(u.refusal(id));
+            }
+        }
         let command = command.unwrap_or_else(|| self.default_command.clone());
         // One clock reading and one note for the role, the row and the
         // ledger: a fresh start fixes the note from `start_time`, a resume keeps
@@ -349,11 +705,17 @@ impl SlotManager {
         let (tx, monitor_rx) = broadcast::channel(OUTPUT_CHANNEL_CAP);
         // Only claude asks the folder-trust question.
         let trust_rx = (!session_id.is_empty()).then(|| tx.subscribe());
-        let slot = Slot::spawn_in(id, label, cwd, &argv, DEFAULT_COLS, DEFAULT_ROWS, tx, &env)
-            .map_err(|e| {
-                tracing::warn!("{} failed to start {:?}: {e:#}", slot_name(id), argv);
-                format!("{e:#}")
-            })?;
+        let spawned = match (&self.holder, &self.launch) {
+            (Some(program), Some(launch)) => {
+                let spec = spawn_spec(id, label, cwd, &argv, DEFAULT_COLS, DEFAULT_ROWS, &env);
+                Slot::spawn_held(spec, program, &launch.state_dir, tx)
+            }
+            _ => Slot::spawn_in(id, label, cwd, &argv, DEFAULT_COLS, DEFAULT_ROWS, tx, &env),
+        };
+        let slot = spawned.map_err(|e| {
+            tracing::warn!("{} failed to start {:?}: {e:#}", slot_name(id), argv);
+            format!("{e:#}")
+        })?;
         let slot = Arc::new(slot);
         if let SlotState::Running { pid, .. } = slot.info().state {
             tracing::info!(
@@ -367,6 +729,11 @@ impl SlotManager {
         // kill is a no-op then, but keeps the invariant in one place).
         let mut entry = Entry::new(slot.clone(), entry_session_id, command.clone());
         entry.session_note = note.clone().filter(|_| self.launch.is_some());
+        if let (Some(launch), true) = (&self.launch, slot.is_held()) {
+            entry.activity_file = Some(activity_path(&launch.state_dir, id));
+            // Whatever a session before this one saved is not this one's.
+            entry.save_activity();
+        }
         let started = entry.info();
         if let Some(old) = slots[id as usize].replace(entry) {
             old.slot.kill();
@@ -407,6 +774,17 @@ impl SlotManager {
                 self.events.clone(),
                 self.slots.clone(),
             ));
+        }
+        if let (Some(launch), true) = (&self.launch, slot.is_held()) {
+            let ctx = Reattach {
+                slots: self.slots.clone(),
+                state_dir: launch.state_dir.clone(),
+                events: self.events.clone(),
+                ledger: launch.ledger.clone(),
+                shutting_down: self.shutting_down.clone(),
+                runtime: tokio::runtime::Handle::current(),
+            };
+            tokio::spawn(watch_lost(slot.clone(), ctx));
         }
         tokio::spawn(monitor_exit(
             slot,
@@ -460,13 +838,20 @@ impl SlotManager {
             }
         }
         let next = apply(entry.activity.as_ref(), ev, unix_now());
-        if next != entry.activity {
-            entry.activity = next;
+        if entry.set_activity(next) {
             let _ = self.events.send(Event::SlotChanged(entry.info()));
         }
     }
 
     pub fn stop(&mut self, id: SlotId) -> Result<(), String> {
+        self.stop_slot(id, false).map(drop)
+    }
+
+    /// [`SlotManager::stop`]; with `keep_live` a session this daemon could
+    /// not attach is ended without its ledger row being closed and with the
+    /// exit file its holder leaves removed, so the next daemon offers it as
+    /// resumable. Returns the thread that finishes a by-pid end, if any.
+    fn stop_slot(&mut self, id: SlotId, keep_live: bool) -> Result<Option<Ending>, String> {
         if !valid_id(id) {
             return Err(invalid_id(id));
         }
@@ -483,15 +868,104 @@ impl SlotManager {
                 }
             }
             let _ = self.events.send(Event::SlotChanged(Self::empty_info(id)));
-            return Ok(());
+            return Ok(None);
+        }
+        if let Some(r) = self.unreachable(id) {
+            let slots = self.slots.lock().unwrap();
+            // Unless a retry has attached it meanwhile, end it by pid.
+            if slots[id as usize].is_none() {
+                if holder_state(&r.pids) == HolderState::Unknown {
+                    return Err(format!(
+                        "{} cannot confirm that pid {} is still its holder; left it running",
+                        slot_name(id),
+                        r.pids.holder
+                    ));
+                }
+                r.given_up.store(true, Ordering::SeqCst);
+                let older = r.older.clone();
+                // A resumed older session must not read as exited after a
+                // restart: the exit file its holder leaves is removed.
+                let resumed = keep_live || older.as_ref().is_some_and(|o| o.session_id.is_some());
+                let exit_file = resumed
+                    .then(|| {
+                        self.launch
+                            .as_ref()
+                            .map(|l| (pid_path(&l.state_dir, id), exit_path(&l.state_dir, id)))
+                    })
+                    .flatten();
+                let ending = end_in_background(id, r.pids.clone(), exit_file);
+
+                // An older build's session is offered for resume, so its
+                // ledger row stays live; any other session has ended.
+                let resume = older
+                    .as_ref()
+                    .and_then(|o| Some((o.session_id.clone()?, o.started)));
+                let ledger = self.launch.as_ref().filter(|_| !keep_live);
+                let ended = resume
+                    .is_none()
+                    .then(|| end_once(&r.ended, ledger.map(|l| &*l.ledger), id).0);
+                drop(slots);
+                let restored = self.restored[id as usize].as_mut().unwrap();
+                restored.unreachable = None;
+                if let Some(o) = older {
+                    restored.info.label = o.label;
+                }
+                restored.info = match (resume, ended) {
+                    (Some((session_id, at)), _) => {
+                        restored.session_id = session_id.clone();
+                        SlotInfo {
+                            state: SlotState::Resumable { session_id, at },
+                            held: false,
+                            ..restored.info.clone()
+                        }
+                    }
+                    (None, at) => ended_info(&restored.info, at.unwrap_or_else(unix_now)),
+                };
+                let _ = self.events.send(Event::SlotChanged(restored.info.clone()));
+                return Ok(ending);
+            }
         }
         match &self.slots.lock().unwrap()[id as usize] {
             Some(e) if matches!(e.slot.info().state, SlotState::Running { .. }) => {
+                if e.slot.connection_lost() {
+                    return self.end_lost(id, keep_live);
+                }
                 e.slot.kill();
-                Ok(())
+                Ok(None)
             }
             _ => Err(format!("{} is not running", slot_name(id))),
         }
+    }
+
+    /// Ends by pid a held session whose connection was lost while its
+    /// holder lives: a Kill could not reach it. Its exit is recorded when
+    /// the holder goes, as for any held slot.
+    fn end_lost(&self, id: SlotId, keep_live: bool) -> Result<Option<Ending>, String> {
+        let Some(launch) = &self.launch else {
+            return Err(format!("{} is not reachable", slot_name(id)));
+        };
+        let (pid_file, exit) = (
+            pid_path(&launch.state_dir, id),
+            exit_path(&launch.state_dir, id),
+        );
+        let Some(pids) = client::read_pid_file(&pid_file) else {
+            return Err(format!(
+                "{} has no holder pid file; left it running",
+                slot_name(id)
+            ));
+        };
+        if holder_state(&pids) == HolderState::Unknown {
+            return Err(format!(
+                "{} cannot confirm that pid {} is still its holder; left it running",
+                slot_name(id),
+                pids.holder
+            ));
+        }
+        Ok(end_in_background(
+            id,
+            pids,
+            keep_live.then_some((pid_file, exit)),
+        ))
     }
 
     pub fn list(&self) -> Vec<SlotInfo> {
@@ -500,11 +974,42 @@ impl SlotManager {
             .map(|id| match &slots[id as usize] {
                 Some(e) => e.info(),
                 None => match &self.restored[id as usize] {
+                    // A holder that died since shows as exited.
+                    Some(Restored {
+                        info,
+                        unreachable: Some(u),
+                        ..
+                    }) if self.unreachable(id).is_none() => {
+                        ended_info(info, u.ended.lock().unwrap().unwrap_or_else(unix_now))
+                    }
                     Some(r) => r.info.clone(),
                     None => Self::empty_info(id),
                 },
             })
             .collect()
+    }
+
+    /// The slot's holder, if it is alive but not attached. A holder found
+    /// dead ends its session here, if the retry thread has not already:
+    /// its exit is recorded once and its card changes to exited, so the
+    /// slot can take a new session.
+    fn unreachable(&self, id: SlotId) -> Option<&Unreachable> {
+        let restored = self.restored[id as usize].as_ref()?;
+        let u = restored.unreachable.as_ref()?;
+        if u.ended.lock().unwrap().is_some() {
+            return None;
+        }
+        if !holder_gone(&u.pids) {
+            return Some(u);
+        }
+        let (at, now) = end_once(&u.ended, self.launch.as_ref().map(|l| &*l.ledger), id);
+        if now {
+            tracing::info!("{} unreachable holder is gone", slot_name(id));
+            let _ = self
+                .events
+                .send(Event::SlotChanged(ended_info(&restored.info, at)));
+        }
+        None
     }
 
     fn empty_info(id: SlotId) -> SlotInfo {
@@ -518,6 +1023,7 @@ impl SlotManager {
             rows: DEFAULT_ROWS,
             activity: None,
             session_note: None,
+            held: false,
         }
     }
 
@@ -536,9 +1042,13 @@ impl SlotManager {
             return Err(invalid_id(id));
         }
         let slots = self.slots.lock().unwrap();
-        let entry = slots[id as usize]
-            .as_ref()
-            .ok_or_else(|| format!("{} is empty", slot_name(id)))?;
+        let entry = slots[id as usize].as_ref().ok_or_else(|| {
+            if let Some(u) = self.unreachable(id) {
+                u.refusal(id)
+            } else {
+                format!("{} is empty", slot_name(id))
+            }
+        })?;
         let (snapshot, pos, live) = entry.slot.attach_at();
         Ok(Attachment {
             slot: entry.slot.clone(),
@@ -548,20 +1058,546 @@ impl SlotManager {
         })
     }
 
-    /// N4: kill every child. Called on daemon shutdown.
-    pub fn shutdown_all(&mut self) {
-        // Before any kill: the exit monitors must see it when the children die.
+    /// Ends every session, held ones included, for uninstall. Like
+    /// shutdown, it records no exits: the ledger rows stay live and the
+    /// next daemon offers each session as resumable. Held slots get a `Kill`
+    /// and local ones are killed; a session this daemon could not attach
+    /// (the unreachable placeholder, an older build's holder) is ended by
+    /// pid. The exit file a holder leaves is removed once it has gone, since
+    /// a restart reads one as an exit. Waits for that, so it is done when
+    /// this returns. Locks and relays are kept. Leaves the daemon marked as
+    /// shutting down: it must stop afterwards, as `StopAll` does. Errs,
+    /// naming the slots, when a session could not be ended (its holder
+    /// cannot be confirmed or is still there); that session keeps running
+    /// and its files stay.
+    pub fn end_all(&mut self) -> Result<(), String> {
         self.shutting_down.store(true, Ordering::SeqCst);
-        for entry in self
+        let mut waits: Vec<(SlotId, Ending)> = Vec::new();
+        let mut left: Vec<SlotId> = Vec::new();
+        {
+            let slots = self.slots.lock().unwrap();
+            for entry in slots.iter().flatten() {
+                if !matches!(entry.slot.info().state, SlotState::Running { .. }) {
+                    continue;
+                }
+                let id = entry.slot.info().id;
+                let files = self
+                    .launch
+                    .as_ref()
+                    .filter(|_| entry.slot.is_held())
+                    .map(|l| (pid_path(&l.state_dir, id), exit_path(&l.state_dir, id)));
+                let pids = files
+                    .as_ref()
+                    .and_then(|(pid_file, _)| client::read_pid_file(pid_file));
+                if entry.slot.connection_lost() {
+                    match self.end_lost(id, true) {
+                        Ok(ending) => waits.extend(ending.map(|h| (id, h))),
+                        Err(e) => {
+                            tracing::warn!("{e}");
+                            left.push(id);
+                        }
+                    }
+                    continue;
+                }
+                entry.slot.kill();
+                if let (Some(pids), Some((pid_file, exit))) = (pids, files) {
+                    let spawned = std::thread::Builder::new()
+                        .name(format!("end-{}", slot_name(id)))
+                        .spawn(move || clear_exit_file(id, &pids, &pid_file, &exit));
+                    match spawned {
+                        Ok(handle) => waits.push((id, handle)),
+                        Err(e) => tracing::warn!("{} exit file not cleared: {e}", slot_name(id)),
+                    }
+                }
+            }
+        }
+        for id in 0..SLOT_COUNT as SlotId {
+            if self.unreachable(id).is_some() {
+                match self.stop_slot(id, true) {
+                    Ok(ending) => waits.extend(ending.map(|h| (id, h))),
+                    Err(e) => {
+                        tracing::warn!("{e}");
+                        left.push(id);
+                    }
+                }
+            }
+        }
+        for (id, handle) in waits {
+            if !handle.join().unwrap_or(false) {
+                left.push(id);
+            }
+        }
+        if left.is_empty() {
+            return Ok(());
+        }
+        left.sort_unstable();
+        left.dedup();
+        let names: Vec<String> = left.into_iter().map(slot_name).collect();
+        Err(format!("could not end {}; still running", names.join(", ")))
+    }
+
+    /// Called on daemon shutdown. Held sessions keep running under their
+    /// holders for the next daemon: each one's activity is saved to its
+    /// activity file and its connection closed. N4: local children are
+    /// killed. Either way the ledger rows stay live.
+    pub fn shutdown_all(&mut self) {
+        // Before any kill or close: the exit monitors must see it when the
+        // children die or their connections end.
+        self.shutting_down.store(true, Ordering::SeqCst);
+        let entries: Vec<Entry> = self
             .slots
             .lock()
             .unwrap()
             .iter_mut()
             .filter_map(Option::take)
-        {
-            entry.slot.kill();
+            .collect();
+        for entry in &entries {
+            if !entry.slot.is_held() {
+                entry.slot.kill();
+                continue;
+            }
+            let running = matches!(entry.slot.info().state, SlotState::Running { .. });
+            if let (Some(launch), Some(activity), true) = (&self.launch, &entry.activity, running) {
+                let id = entry.slot.info().id;
+                let path = activity_path(&launch.state_dir, id);
+                if let Err(e) = crate::holder::write_json_atomic(&path, activity) {
+                    tracing::warn!("{} activity not saved: {e}", slot_name(id));
+                }
+            }
+            entry.slot.let_go();
         }
     }
+}
+
+impl Unreachable {
+    /// Why a start or an attach on this slot is refused.
+    fn refusal(&self, id: SlotId) -> String {
+        if self.older.is_some() {
+            return OLDER_BUILD.to_string();
+        }
+        format!(
+            "{} has a session this daemon cannot reach; stop it first",
+            slot_name(id)
+        )
+    }
+}
+
+/// Why an older build's session cannot be attached or replaced.
+const OLDER_BUILD: &str = "this session runs on an older Overseer build; stop it to use the slot";
+
+/// Removes slot `id`'s pid file when it names no live holder: what it
+/// names may be some other process by now.
+fn forget_stale_pid_file(state_dir: &Path, id: SlotId) {
+    let path = pid_path(state_dir, id);
+    match crate::holder::load_pid_file(&path) {
+        Ok(Some(p)) if !holder_gone(&p) => {}
+        Ok(None) => {}
+        _ => {
+            tracing::info!("{} removing a stale holder pid file", slot_name(id));
+            remove_file(&path);
+        }
+    }
+}
+
+/// What a reattach needs beyond the slot, shared with a retry thread.
+#[derive(Clone)]
+struct Reattach {
+    slots: Slots,
+    state_dir: PathBuf,
+    events: broadcast::Sender<Event>,
+    ledger: Arc<Ledger>,
+    shutting_down: Arc<AtomicBool>,
+    runtime: tokio::runtime::Handle,
+}
+
+/// The slot's session as the ledger and the last daemon left it.
+struct Session {
+    /// The base command from the ledger; `None` takes the holder's argv.
+    command: Option<Vec<String>>,
+    session_id: String,
+    note: Option<String>,
+    activity: Option<Activity>,
+}
+
+enum Attempt {
+    /// With the exit monitor's receiver and the trust watch's.
+    Got(
+        Box<Slot>,
+        broadcast::Receiver<Bytes>,
+        broadcast::Receiver<Bytes>,
+    ),
+    /// Nothing listens on the socket.
+    Gone,
+    /// The holder is another build's: its Hello, or `None` when it could
+    /// not be read.
+    Unsupported(Option<HolderHello>),
+    Failed(String),
+}
+
+/// One try at attaching the holder at `socket` as slot `id`.
+fn try_attach(socket: &Path, id: SlotId) -> Attempt {
+    let (tx, monitor_rx) = broadcast::channel(OUTPUT_CHANNEL_CAP);
+    // For the trust watch, subscribed once the replay is in: a trust
+    // question in the replay was asked before the restart, and the saved
+    // activity already says whether it is still open. Dropped after, so
+    // the channel still closes when the stream ends.
+    let live = tx.clone();
+    let attached = Slot::attach_held(socket, tx);
+    let trust_rx = live.subscribe();
+    drop(live);
+    match attached {
+        Ok(Attached::Slot(slot)) if slot.info().id == id => {
+            Attempt::Got(Box::new(slot), monitor_rx, trust_rx)
+        }
+        Ok(Attached::Slot(slot)) => {
+            let other = slot.info().id;
+            slot.let_go();
+            Attempt::Failed(format!("its holder keeps {}", slot_name(other)))
+        }
+        Ok(Attached::Unsupported(hello)) => Attempt::Unsupported(Some(hello)),
+        Ok(Attached::Unreadable) => Attempt::Unsupported(None),
+        Err(e) if nobody_listens(&e) => Attempt::Gone,
+        Err(e) => Attempt::Failed(format!("{e:#}")),
+    }
+}
+
+/// Puts a slot attached again into `slots` (the locked slots) and starts
+/// its watchers as a start does. Returns its info.
+fn install(
+    ctx: &Reattach,
+    slots: &mut [Option<Entry>; SLOT_COUNT],
+    id: SlotId,
+    slot: Box<Slot>,
+    monitor_rx: broadcast::Receiver<Bytes>,
+    trust_rx: broadcast::Receiver<Bytes>,
+    session: Session,
+) -> SlotInfo {
+    let slot = Arc::new(*slot);
+    let command = session
+        .command
+        .unwrap_or_else(|| slot.info().command.unwrap_or_default());
+    let mut entry = Entry::new(slot.clone(), session.session_id, command.clone());
+    entry.session_note = session.note;
+    entry.activity = session.activity;
+    entry.activity_file = Some(activity_path(&ctx.state_dir, id));
+    // Restore took the file: put it back for the next daemon.
+    entry.save_activity();
+    if let SlotState::Running { pid, .. } = slot.info().state {
+        tracing::info!(
+            "{} attached again to its session (pid {pid})",
+            slot_name(id)
+        );
+    }
+    let info = entry.info();
+    slots[id as usize] = Some(entry);
+    slot.nudge_redraw();
+    if is_claude(&command) {
+        ctx.runtime.spawn(watch_trust(
+            slot.clone(),
+            trust_rx,
+            ctx.events.clone(),
+            ctx.slots.clone(),
+        ));
+    }
+    ctx.runtime.spawn(watch_lost(slot.clone(), ctx.clone()));
+    ctx.runtime.spawn(monitor_exit(
+        slot,
+        monitor_rx,
+        ctx.events.clone(),
+        ctx.slots.clone(),
+        Some(ctx.ledger.clone()),
+        ctx.shutting_down.clone(),
+    ));
+    info
+}
+
+/// What the retry thread needs to notice an unreachable holder's death.
+struct Watch {
+    pids: PidFile,
+    given_up: Arc<AtomicBool>,
+    ended: Ended,
+    /// The placeholder's card.
+    info: SlotInfo,
+}
+
+/// Waits for `slot`'s holder connection to be lost while the holder lives
+/// (see [`Slot::lost`]), then attaches the holder again in the background.
+/// Returns at once for a local slot, and when the slot exits first.
+async fn watch_lost(slot: Arc<Slot>, ctx: Reattach) {
+    let Some(mut lost) = slot.lost() else {
+        return;
+    };
+    let mut exit = slot.exit_watch();
+    tokio::select! {
+        r = lost.wait_for(|l| *l) => {
+            if r.is_err() {
+                return;
+            }
+        }
+        _ = exit.wait_for(Option::is_some) => return,
+    }
+    let id = slot.info().id;
+    let spawned = std::thread::Builder::new()
+        .name(format!("reattach-lost-{}", slot_name(id)))
+        .spawn(move || reattach_lost(ctx, slot));
+    if let Err(e) = spawned {
+        tracing::warn!("{} not attached again: {e}", slot_name(id));
+    }
+}
+
+/// Attaches again, up to [`ATTACH_RETRIES`] times, the live holder of
+/// `old`, a held slot whose connection was lost. On success the new slot
+/// takes `old`'s place with its session, activity and note; `old` is let
+/// go, so its exit is never recorded. Otherwise `old` stays: it reads as
+/// running, Stop ends it by pid, and its exit is recorded once the holder
+/// goes. Never records an exit itself.
+fn reattach_lost(ctx: Reattach, old: Arc<Slot>) {
+    let id = old.info().id;
+    let socket = socket_path(&ctx.state_dir, id);
+    let current = |slots: &[Option<Entry>; SLOT_COUNT]| {
+        slots[id as usize]
+            .as_ref()
+            .is_some_and(|e| Arc::ptr_eq(&e.slot, &old))
+    };
+    let stopped = || {
+        ctx.shutting_down.load(Ordering::SeqCst)
+            || old.exit_watch().borrow().is_some()
+            || !current(&ctx.slots.lock().unwrap())
+    };
+    for attempt in 0..ATTACH_RETRIES {
+        let pause = if attempt == 0 {
+            LOST_FIRST_PAUSE
+        } else {
+            ATTACH_RETRY_PAUSE
+        };
+        std::thread::sleep(pause);
+        if stopped() {
+            return;
+        }
+        match try_attach(&socket, id) {
+            Attempt::Got(slot, monitor_rx, trust_rx) => {
+                let mut slots = ctx.slots.lock().unwrap();
+                if ctx.shutting_down.load(Ordering::SeqCst) || !current(&slots) {
+                    slot.let_go();
+                    return;
+                }
+                let entry = slots[id as usize].take().expect("checked above");
+                let session = Session {
+                    command: Some(entry.command.clone()),
+                    session_id: entry.session_id.clone(),
+                    note: entry.session_note.clone(),
+                    activity: entry.activity.clone(),
+                };
+                // Let go before the new slot's watchers start: its exit
+                // monitor then finds the slot replaced and records nothing.
+                entry.slot.let_go();
+                let info = install(&ctx, &mut slots, id, slot, monitor_rx, trust_rx, session);
+                let _ = ctx.events.send(Event::SlotChanged(info));
+                return;
+            }
+            Attempt::Gone => {
+                tracing::warn!("{} holder alive but not listening", slot_name(id));
+            }
+            Attempt::Failed(why) => {
+                tracing::warn!("{} holder not attached again: {why}", slot_name(id));
+            }
+            Attempt::Unsupported(_) => break,
+        }
+    }
+    if !stopped() {
+        tracing::warn!(
+            "{} holder not attached again after {ATTACH_RETRIES} tries; Stop ends it",
+            slot_name(id)
+        );
+    }
+}
+
+/// Tries again, in the background, to attach a holder that is alive but
+/// was not attached at start, up to `retries` times. Unless it attaches,
+/// it then watches the holder: when the holder dies, the session's exit is
+/// recorded and its card changes to exited. Stops early when Stop ends the
+/// session or on shutdown.
+fn retry_attach(
+    ctx: Reattach,
+    socket: PathBuf,
+    id: SlotId,
+    session: Session,
+    watch: Watch,
+    retries: u32,
+) {
+    let spawned = std::thread::Builder::new()
+        .name(format!("reattach-{}", slot_name(id)))
+        .spawn(move || {
+            let stopped = || {
+                watch.given_up.load(Ordering::SeqCst)
+                    || ctx.shutting_down.load(Ordering::SeqCst)
+                    || watch.ended.lock().unwrap().is_some()
+            };
+            for _ in 0..retries {
+                std::thread::sleep(ATTACH_RETRY_PAUSE);
+                if stopped() || holder_gone(&watch.pids) {
+                    break;
+                }
+                match try_attach(&socket, id) {
+                    Attempt::Got(slot, monitor_rx, trust_rx) => {
+                        let mut slots = ctx.slots.lock().unwrap();
+                        if stopped() || slots[id as usize].is_some() {
+                            slot.let_go();
+                            return;
+                        }
+                        let info =
+                            install(&ctx, &mut slots, id, slot, monitor_rx, trust_rx, session);
+                        let _ = ctx.events.send(Event::SlotChanged(info));
+                        return;
+                    }
+                    Attempt::Failed(why) => {
+                        tracing::warn!("{} holder still not attached: {why}", slot_name(id));
+                    }
+                    // The holder is alive (checked above), so try again.
+                    Attempt::Gone => {
+                        tracing::warn!("{} holder alive but not listening", slot_name(id));
+                    }
+                    Attempt::Unsupported(_) => break,
+                }
+            }
+            if retries > 0 && !stopped() && !holder_gone(&watch.pids) {
+                tracing::warn!(
+                    "{} holder not attached after {ATTACH_RETRIES} more tries; Stop ends it",
+                    slot_name(id)
+                );
+            }
+            while !stopped() {
+                if holder_gone(&watch.pids) {
+                    // Under the slots lock, as Stop ends it, and only while
+                    // no session has taken the slot.
+                    let slots = ctx.slots.lock().unwrap();
+                    if slots[id as usize].is_none() && !stopped() {
+                        let (at, now) = end_once(&watch.ended, Some(&ctx.ledger), id);
+                        if now {
+                            tracing::info!("{} unreachable holder is gone", slot_name(id));
+                            let info = ended_info(&watch.info, at);
+                            let _ = ctx.events.send(Event::SlotChanged(info));
+                        }
+                    }
+                    return;
+                }
+                std::thread::sleep(HOLDER_WATCH);
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!("{} attach not retried: {e}", slot_name(id));
+    }
+}
+
+/// How long, after ending a session by pid, to wait for its holder to go
+/// before its exit file is removed.
+const HOLDER_GONE_WAIT: Duration = Duration::from_secs(10);
+
+/// Ends a session this daemon cannot reach by the pids in its holder's
+/// pid file ([`end_by_pid`]), on a thread of its own since that waits for
+/// the holder to go. With `exit_file` (the slot's pid and exit file
+/// paths), once the holder has gone the exit file it wrote is removed,
+/// unless a new holder has taken the slot meanwhile.
+fn end_in_background(
+    id: SlotId,
+    pids: PidFile,
+    exit_file: Option<(PathBuf, PathBuf)>,
+) -> Option<Ending> {
+    tracing::info!(
+        "{} ending a session by pid (holder {}, child {})",
+        slot_name(id),
+        pids.holder,
+        pids.child
+    );
+    let spawned = std::thread::Builder::new()
+        .name(format!("end-{}", slot_name(id)))
+        .spawn(move || {
+            end_by_pid(&pids);
+            match exit_file {
+                Some((pid_file, exit)) => clear_exit_file(id, &pids, &pid_file, &exit),
+                None => holder_gone(&pids),
+            }
+        });
+    match spawned {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            tracing::warn!("{} not ended: {e}", slot_name(id));
+            None
+        }
+    }
+}
+
+/// The thread [`end_in_background`] starts; it ends with whether the holder
+/// is gone.
+type Ending = std::thread::JoinHandle<bool>;
+
+/// Waits for the holder `pids` to go, then removes the exit file it wrote,
+/// so the session reads as live (resumable) after a restart rather than as
+/// exited. Leaves it when a new holder has taken the slot meanwhile.
+/// Returns whether the holder is gone.
+fn clear_exit_file(id: SlotId, pids: &PidFile, pid_file: &Path, exit: &Path) -> bool {
+    // The holder writes its exit file, then removes its pid file.
+    let ours = || client::read_pid_file(pid_file).is_some_and(|p| p == *pids);
+    let deadline = std::time::Instant::now() + HOLDER_GONE_WAIT;
+    while ours() && !holder_gone(pids) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    match client::read_pid_file(pid_file) {
+        Some(p) if p != *pids => true,
+        Some(_) if !holder_gone(pids) => {
+            tracing::warn!("{} holder still there; exit file kept", slot_name(id));
+            false
+        }
+        _ => {
+            remove_file(exit);
+            true
+        }
+    }
+}
+
+/// The activity the last daemon saved for slot `id`, if any. The file is
+/// removed either way: it only ever describes the session it was saved for.
+fn take_activity(state_dir: &Path, id: SlotId) -> Option<Activity> {
+    let path = activity_path(state_dir, id);
+    let activity = read_json(&path);
+    remove_file(&path);
+    activity
+}
+
+fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            tracing::warn!("{} not readable: {e}", path.display());
+            return None;
+        }
+    };
+    serde_json::from_slice(&bytes)
+        .inspect_err(|e| tracing::warn!("{} not readable: {e}", path.display()))
+        .ok()
+}
+
+fn remove_file(path: &Path) {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            tracing::warn!("{} not removed: {e}", path.display());
+        }
+        _ => {}
+    }
+}
+
+/// Whether connecting to a holder's socket failed because nothing listens
+/// there any more.
+fn nobody_listens(e: &anyhow::Error) -> bool {
+    e.chain()
+        .filter_map(|c| c.downcast_ref::<std::io::Error>())
+        .any(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            )
+        })
 }
 
 /// Emits `SlotChanged` once the child has exited AND its output stream has
@@ -623,7 +1659,7 @@ async fn watch_trust(
             "{} is waiting on Claude's folder-trust question",
             slot_name(e.slot.info().id)
         );
-        e.activity = Some(crate::trust::activity(unix_now()));
+        e.set_activity(Some(crate::trust::activity(unix_now())));
         let _ = events.send(Event::SlotChanged(e.info()));
     }
 }
@@ -661,7 +1697,7 @@ async fn monitor_exit(
         .as_mut()
         .filter(|e| Arc::ptr_eq(&e.slot, &slot))
         .map(|e| {
-            e.activity = None;
+            e.set_activity(None);
             e.info()
         });
     if let Some(info) = current {

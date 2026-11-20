@@ -10,8 +10,8 @@ use bytes::Bytes;
 use overseer_proto::{
     read_frame,
     settings::{SettingEdit, TokenStatus},
-    slot_name, write_frame, BoardView, DaemonInfo, Event, Frame, Request, Response, SlotId,
-    SlotState, TokenKind,
+    slot_name, write_frame, BoardView, DaemonInfo, Event, Frame, HookEvent, Request, Response,
+    SlotId, SlotState, TokenKind,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
@@ -50,6 +50,10 @@ pub struct DaemonConfig {
     pub state_dir: PathBuf,
     /// The binary the generated hooks call (`<hook_program> hook <Event>`).
     pub hook_program: PathBuf,
+    /// The binary run as `<holder_program> hold <state_dir>` to keep each
+    /// session's terminal in its own process. `None` runs sessions in the
+    /// daemon, which then ends them when it stops.
+    pub holder_program: Option<PathBuf>,
     /// Settings from `config.toml`.
     pub settings: crate::config::Config,
     /// Write target patterns, from `targets.toml` and the defaults.
@@ -222,7 +226,35 @@ fn notice_once(ledger: &Ledger, slot: SlotId, text: &str) {
     }
 }
 
-pub async fn run(mut cfg: DaemonConfig) -> anyhow::Result<()> {
+/// Runs the daemon until a `Shutdown` or `StopAll` request. Signals are
+/// left alone: an embedding process (the tests) keeps its own. The daemon
+/// proper runs [`run_until`] with [`stop_signal`].
+pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
+    run_until(cfg, std::future::pending()).await
+}
+
+/// SIGTERM or SIGINT: launchd stopping the job (`bootout`, `kickstart -k`)
+/// or Ctrl-C on a foreground daemon. The handlers are in place once this
+/// returns, so a signal sent from then on is never the default kill.
+/// Needs a tokio runtime.
+pub fn stop_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = signal(SignalKind::terminate())?;
+    let mut int = signal(SignalKind::interrupt())?;
+    Ok(async move {
+        tokio::select! {
+            _ = term.recv() => tracing::info!("SIGTERM: shutting down"),
+            _ = int.recv() => tracing::info!("SIGINT: shutting down"),
+        }
+    })
+}
+
+/// [`run`], also stopping, by the same path as a `Shutdown` request, when
+/// `stop` resolves.
+pub async fn run_until(
+    mut cfg: DaemonConfig,
+    stop: impl std::future::Future<Output = ()>,
+) -> anyhow::Result<()> {
     let listener = bind(&cfg.socket).await?;
     // Before anything reads the settings: a refused folder turns the notes
     // writer and the sprint sync off.
@@ -287,6 +319,7 @@ pub async fn run(mut cfg: DaemonConfig) -> anyhow::Result<()> {
     let exit_events = events.subscribe();
     let courier_events = events.subscribe();
     let state_dir = cfg.state_dir.clone();
+    let holder_program = cfg.holder_program;
     let mut mgr = SlotManager::new(cfg.default_command, events)
         .with_env(env.clone())
         .with_session_note(cfg.settings.session_note.clone())
@@ -302,12 +335,30 @@ pub async fn run(mut cfg: DaemonConfig) -> anyhow::Result<()> {
                 user: cfg.settings.user().to_string(),
             },
         );
+    if let Some(program) = holder_program {
+        mgr = mgr.with_holder(program);
+    }
     mgr.restore();
     // A session that did not survive the restart, or whose exit was never
     // seen, has ended: only a resumable one keeps its waits and relays.
     let ended = sessionless(&mgr.list());
     locks.reconcile_exits(&ended, unix_now());
     let manager: Manager = Arc::new(Mutex::new(mgr));
+    // Hooks that found no daemon were spooled. They come after the restore,
+    // so what happened while down wins over the saved activity; an event of
+    // a run that is no longer there is dropped by the same run check as a
+    // live one. A spool that cannot be read never blocks startup.
+    match overseer_proto::spool::take(&state_dir) {
+        Ok(events) => {
+            if !events.is_empty() {
+                tracing::info!("applying {} hook events spooled while down", events.len());
+            }
+            for ev in &events {
+                apply_hook(&manager, &locks, ev);
+            }
+        }
+        Err(e) => tracing::warn!("hook spool not read: {e:#}"),
+    }
     if let Some(b) = &brain {
         {
             let (manager, store, ledger) = (manager.clone(), store.clone(), ledger.clone());
@@ -368,6 +419,7 @@ pub async fn run(mut cfg: DaemonConfig) -> anyhow::Result<()> {
     });
     let shutdown = Arc::new(Notify::new());
     let mut conns = JoinSet::new();
+    tokio::pin!(stop);
 
     loop {
         tokio::select! {
@@ -394,17 +446,23 @@ pub async fn run(mut cfg: DaemonConfig) -> anyhow::Result<()> {
                 Err(e) => tracing::warn!("accept failed: {e}"),
             },
             _ = shutdown.notified() => break,
+            _ = &mut stop => break,
             Some(_) = conns.join_next(), if !conns.is_empty() => {}
         }
     }
 
+    // First stop taking connections: a hook sent from now on finds no
+    // daemon and spools its event for the next one, rather than queueing
+    // on a listener nobody will accept from again. Connections already
+    // accepted run on until `conns` is dropped.
+    drop(listener);
+    let _ = std::fs::remove_file(&cfg.socket);
     store.shutdown();
-    // The sessions are killed next; they keep their locks for the restart.
+    // The sessions are let go next; they keep their locks for the restart.
     locks.shutdown();
     manager.lock().unwrap().shutdown_all();
     // A label change just before a restart should still reach the bead.
     store.drain_labels(crate::work::store::LABEL_DRAIN).await;
-    let _ = std::fs::remove_file(&cfg.socket);
     tokio::time::sleep(SHUTDOWN_GRACE).await;
     // Dropping `conns` aborts every connection task, closing the sockets.
     drop(conns);
@@ -950,7 +1008,7 @@ fn handle_frame(
             });
         }
         Frame::Request { seq, req } => {
-            let is_shutdown = matches!(req, Request::Shutdown);
+            let is_shutdown = matches!(req, Request::Shutdown | Request::StopAll);
             // Each of these can queue a relay or make one deliverable.
             let pokes = matches!(
                 req,
@@ -1302,6 +1360,12 @@ fn handle_request(
             None => err(format!("{} is empty", slot_name(id))),
         },
         Request::Shutdown => Response::Ok,
+        // The daemon stops after answering (see `handle_frame`): it has
+        // been told to end its sessions, so it must not go on serving.
+        Request::StopAll => match manager.lock().unwrap().end_all() {
+            Ok(()) => Response::Ok,
+            Err(e) => err(e),
+        },
         // Coordinator requests.
         Request::GetBoard => Response::Board(BoardView {
             slots: manager.lock().unwrap().list(),
@@ -1337,11 +1401,18 @@ fn handle_request(
         // Always Ok: a hook runs inside Claude and must never see a failure
         // because of the daemon's state.
         Request::Hook(ev) => {
-            manager.lock().unwrap().hook(&ev);
-            locks.on_hook(&ev, unix_now());
+            apply_hook(manager, locks, &ev);
             Response::Ok
         }
     }
+}
+
+/// Applies one hook event to its slot and to the lock table. Shared by the
+/// `Hook` request and the replay of the events spooled while the daemon was
+/// down.
+fn apply_hook(manager: &Manager, locks: &LockService, ev: &HookEvent) {
+    manager.lock().unwrap().hook(ev);
+    locks.on_hook(ev, unix_now());
 }
 
 /// Largest Output frame built by merging queued chunks.

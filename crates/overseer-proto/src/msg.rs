@@ -73,6 +73,10 @@ pub struct SlotInfo {
     /// ledger has one.
     #[serde(default)]
     pub session_note: Option<String>,
+    /// True when a holder process keeps the slot's terminal, so the session
+    /// can outlive the daemon.
+    #[serde(default)]
+    pub held: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -594,6 +598,11 @@ pub enum Request {
         rows: u16,
     },
     Shutdown,
+    /// Ends every session, held ones included, leaving their ledger rows
+    /// live so the next daemon offers them as resumable, then stops the
+    /// daemon as `Shutdown` does. Answers an error naming the sessions it
+    /// could not end (the daemon stops anyway and they keep running).
+    StopAll,
     /// A Claude Code hook event, relayed by `overseer hook`.
     Hook(HookEvent),
     /// The cached work-item list with owners, source health and notices.
@@ -1358,6 +1367,7 @@ mod tests {
             rows: 24,
             activity: None,
             session_note: None,
+            held: false,
         };
         let running = info(SlotState::Running { pid: 1, since: 40 });
         assert_eq!(c.session_start(&running), Some(40));

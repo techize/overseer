@@ -436,6 +436,7 @@ pub(crate) fn empty_slots() -> Vec<SlotInfo> {
             rows: 24,
             activity: None,
             session_note: None,
+            held: false,
         })
         .collect()
 }

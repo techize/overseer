@@ -19,6 +19,7 @@ fn sample_info() -> SlotInfo {
         rows: 40,
         activity: None,
         session_note: None,
+        held: false,
     }
 }
 

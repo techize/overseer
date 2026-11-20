@@ -765,6 +765,7 @@ mod tests {
             rows: 24,
             activity: None,
             session_note: None,
+            held: false,
         };
         assert_eq!(
             initial_fields(2, Some(&last), home, notes()),
@@ -811,6 +812,7 @@ mod tests {
             rows: 24,
             activity: None,
             session_note: None,
+            held: false,
         };
         assert_eq!(
             initial_fields(2, Some(&last), home, Some(Path::new("/srv/demo-notes")))[1],
@@ -1031,6 +1033,7 @@ mod tests {
             rows: 24,
             activity: None,
             session_note: None,
+            held: false,
         };
         assert_eq!(
             prefilled_fields(3, Some(&last), home(), Some(&prefill), notes()),

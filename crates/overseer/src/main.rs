@@ -47,6 +47,39 @@ enum Cmd {
     },
     /// Remove the LaunchAgent.
     UninstallAgent,
+    /// Keep one session's terminal alive across daemon restarts (run by the
+    /// daemon, not by hand). Reads the session's spawn spec from stdin.
+    #[command(hide = true)]
+    Hold {
+        /// The daemon's state directory.
+        #[arg(required_unless_present = "end", conflicts_with = "end")]
+        state_dir: Option<std::path::PathBuf>,
+        /// End the holder named by this pid file.
+        #[arg(long, value_name = "PIDFILE")]
+        end: Option<std::path::PathBuf>,
+    },
+}
+
+/// How long `hold --end` waits for a holder to go after its final SIGTERM.
+const HOLDER_GONE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// `overseer hold --end <pidfile>`: ends the session the pid file names,
+/// if its holder still runs, and waits up to [`HOLDER_GONE_WAIT`] for the
+/// holder to go. Nothing to end is a success; only a pid file that exists
+/// but cannot be read is an error.
+fn end_holder(path: &std::path::Path) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use overseer_daemon::holder::{end_by_pid, holder_gone, load_pid_file};
+    let pid_file =
+        load_pid_file(path).with_context(|| format!("read pid file {}", path.display()))?;
+    if let Some(p) = pid_file {
+        end_by_pid(&p);
+        let deadline = std::time::Instant::now() + HOLDER_GONE_WAIT;
+        while !holder_gone(&p) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+    Ok(())
 }
 
 fn default_command() -> Vec<String> {
@@ -75,6 +108,12 @@ fn main() {
         return;
     };
     let result = match command {
+        // No logger and no stdio: the holder outlives the daemon's pipes.
+        Cmd::Hold { end: None, .. } => overseer_daemon::holder::main(),
+        Cmd::Hold {
+            end: Some(pid_file),
+            ..
+        } => end_holder(&pid_file),
         // No logger and no stderr: a hook must be silent and always exit 0.
         Cmd::Hook { event } => {
             hook::run(&event);
@@ -118,16 +157,24 @@ fn main() {
                 security: overseer_daemon::work::store::SECURITY.to_owned(),
             };
             let result = runtime().and_then(|rt| {
-                rt.block_on(overseer_daemon::run(DaemonConfig {
-                    socket,
-                    default_command: default_command(),
-                    env: overseer_daemon::EnvSource::LoginShell,
-                    state_dir: overseer_proto::paths::state_dir(),
-                    hook_program: std::env::current_exe()?,
-                    settings,
-                    patterns,
-                    files,
-                }))
+                // launchd stops the job with SIGTERM (bootout, kickstart -k):
+                // it takes the same path as a Shutdown request, so held
+                // sessions are let go and their activity saved.
+                let stop = rt.block_on(async { overseer_daemon::stop_signal() })?;
+                rt.block_on(overseer_daemon::run_until(
+                    DaemonConfig {
+                        socket,
+                        default_command: default_command(),
+                        env: overseer_daemon::EnvSource::LoginShell,
+                        state_dir: overseer_proto::paths::state_dir(),
+                        hook_program: std::env::current_exe()?,
+                        holder_program: Some(std::env::current_exe()?),
+                        settings,
+                        patterns,
+                        files,
+                    },
+                    stop,
+                ))
             });
             match &result {
                 Ok(()) => tracing::info!("daemon stopped"),

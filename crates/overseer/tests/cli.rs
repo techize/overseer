@@ -232,7 +232,35 @@ impl Drop for Env {
             .args(["ctl", "shutdown"])
             .output();
         std::thread::sleep(Duration::from_millis(200));
+        end_holders(&self.home);
         let _ = std::fs::remove_dir_all(&self.home);
+    }
+}
+
+/// Ends the held sessions a daemon left in `state_dir` and their process
+/// groups, by their pid files: a daemon shutdown keeps them running.
+fn end_holders(state_dir: &std::path::Path) {
+    let Ok(dir) = std::fs::read_dir(overseer_daemon::holder::holders_dir(state_dir)) else {
+        return;
+    };
+    for entry in dir.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "pid") {
+            continue;
+        }
+        let Some(p) = std::fs::read(&path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<overseer_daemon::holder::PidFile>(&b).ok())
+        else {
+            continue;
+        };
+        // SAFETY: plain signals to pids this test's holders wrote. The child
+        // leads its own session and process group.
+        unsafe {
+            libc::kill(-(p.child as i32), libc::SIGKILL);
+            libc::kill(p.child as i32, libc::SIGKILL);
+            libc::kill(p.holder as i32, libc::SIGKILL);
+        }
     }
 }
 
@@ -1139,8 +1167,8 @@ fn pid_after(text: &str, marker: &str) -> u32 {
     rest.split_whitespace().next().unwrap().parse().unwrap()
 }
 
-const WARNING_START: &str = "The daemon (build dev) has 1 running session: S1 demo lane. \
-    Restarting it ends them; each comes back as resumable, and r on its card resumes it.";
+/// Said when a restart leaves the running sessions alone.
+const KEPT_NOTE: &str = "Running sessions are kept: they reattach to the new daemon.";
 
 /// S1 running the sleeping `claude`, labelled `demo lane`.
 fn start_claude(env: &Env) -> u32 {
@@ -1154,7 +1182,7 @@ fn start_claude(env: &Env) -> u32 {
 }
 
 #[test]
-fn install_agent_keeps_a_daemon_with_running_sessions() {
+fn install_agent_restarts_a_daemon_with_held_sessions_without_asking() {
     let env = Env::new();
     let pid = start_claude(&env);
     let out = stdout_of(
@@ -1162,37 +1190,33 @@ fn install_agent_keeps_a_daemon_with_running_sessions() {
             .pipe_stdin("/dev/null")
             .unwrap(),
     );
-    assert!(out.contains(WARNING_START), "{out}");
+    assert!(out.contains(KEPT_NOTE), "{out}");
     assert!(
-        out.contains(
-            "The daemon keeps running build dev. Run overseer ctl restart when you are ready to finish the upgrade."
-        ),
+        out.contains("Restarted the daemon (build dev to dev)."),
         "{out}"
     );
+    assert!(!out.contains("Restart the daemon now?"), "{out}");
+    assert!(!out.contains("would end"), "{out}");
     let s1 = status_line(&env, 1);
     assert!(s1.starts_with("S1  running  pid "), "{s1}");
     assert_eq!(pid_after(&s1, "pid "), pid);
-    // The stub's `print` fails, so `bootout` is never logged anyway; the
-    // `bootstrap` check and the unchanged pid are the real guards.
-    let log = env.launchctl_log();
-    assert!(!log.contains("bootout"), "{log}");
-    assert!(!log.contains("bootstrap"), "{log}");
 }
 
 #[test]
-fn install_agent_yes_restarts_and_the_session_is_resumable() {
+fn install_agent_yes_restarts_and_the_session_survives() {
     let env = Env::new();
-    start_claude(&env);
+    let pid = start_claude(&env);
     let out = stdout_of(&mut env.agent_claude(&["install-agent", "--yes"]));
-    assert!(out.contains(WARNING_START), "{out}");
+    assert!(out.contains(KEPT_NOTE), "{out}");
     assert!(
         out.contains("Restarted the daemon (build dev to dev)."),
         "{out}"
     );
     // The stub's bootstrap starts nothing and its kickstart fails, so this
-    // autostart spawns the daemon, which finds S1 in the ledger.
+    // autostart spawns the daemon, which attaches to S1's holder again.
     let s1 = status_line(&env, 1);
-    assert!(s1.starts_with("S1  resumable"), "{s1}");
+    assert!(s1.starts_with("S1  running  pid "), "{s1}");
+    assert_eq!(pid_after(&s1, "pid "), pid);
 }
 
 #[test]
@@ -1247,35 +1271,62 @@ fn install_agent_with_no_daemon_starts_it() {
 #[test]
 fn ctl_restart_yes_brings_the_daemon_back() {
     let env = Env::new();
-    start_claude(&env);
+    let pid = start_claude(&env);
     let before = pid_after(&stdout_of(&mut env.ctl(&["version"])), "  pid ");
     let out = stdout_of(&mut env.ctl(&["restart", "--yes"]));
-    let warned = out.find(WARNING_START).unwrap_or_else(|| panic!("{out}"));
+    let warned = out.find(KEPT_NOTE).unwrap_or_else(|| panic!("{out}"));
     let restarted = out
         .find("Restarted the daemon (build dev to dev).")
         .unwrap_or_else(|| panic!("{out}"));
     assert!(warned < restarted, "{out}");
     let after = pid_after(&stdout_of(&mut env.ctl(&["version"])), "  pid ");
     assert_ne!(before, after);
+    // The session kept running under its holder.
     let s1 = status_line(&env, 1);
-    assert!(s1.starts_with("S1  resumable"), "{s1}");
+    assert!(s1.starts_with("S1  running  pid "), "{s1}");
+    assert_eq!(pid_after(&s1, "pid "), pid);
 }
 
 #[test]
-fn ctl_restart_without_a_terminal_keeps_running_sessions() {
+fn ctl_restart_without_a_terminal_keeps_held_sessions_running() {
     let env = Env::new();
     let pid = start_claude(&env);
+    let before = pid_after(&stdout_of(&mut env.ctl(&["version"])), "  pid ");
     let out = stdout_of(env.ctl(&["restart"]).pipe_stdin("/dev/null").unwrap());
-    assert!(out.contains(WARNING_START), "{out}");
-    assert!(
-        out.contains(
-            "Kept the daemon (build dev) because 1 running session would end: S1 demo lane. \
-             Run overseer ctl restart --yes to restart it anyway."
-        ),
-        "{out}"
-    );
-    assert!(!out.contains("when you are ready"), "{out}");
+    assert!(out.contains(KEPT_NOTE), "{out}");
+    assert!(!out.contains("Kept the daemon"), "{out}");
+    let after = pid_after(&stdout_of(&mut env.ctl(&["version"])), "  pid ");
+    assert_ne!(before, after);
     assert_eq!(pid_after(&status_line(&env, 1), "pid "), pid);
+}
+
+#[test]
+fn ctl_stop_all_with_no_daemon_fails_without_starting_one() {
+    let env = Env::new();
+    let out = env
+        .ctl(&["stop-all"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no daemon is running"),
+        "{out:?}"
+    );
+    assert!(!env.home.join("overseer.sock").exists(), "a daemon started");
+}
+
+#[test]
+fn ctl_stop_all_ends_sessions_and_they_come_back_resumable() {
+    let env = Env::new();
+    start_claude(&env);
+    let pid = pid_after(&stdout_of(&mut env.ctl(&["version"])), "  pid ");
+    env.ctl(&["stop-all"]).assert().success();
+    // It stopped the daemon: the next command starts a new one.
+    let s1 = status_line(&env, 1);
+    assert!(s1.starts_with("S1  resumable"), "{s1}");
+    let now = pid_after(&stdout_of(&mut env.ctl(&["version"])), "  pid ");
+    assert_ne!(pid, now);
 }
 
 /// How a fake daemon on `<home>/overseer.sock` treats requests.
@@ -1416,4 +1467,221 @@ fn ctl_restart_kickstarts_this_homes_agent_when_it_is_loaded() {
         log.lines().any(|l| l.starts_with(&kick)),
         "no {kick:?} in:\n{log}"
     );
+}
+
+/// `overseer hold --end <pidfile>` ends the holder a pid file names and the
+/// session it keeps; with nothing to end it still succeeds.
+#[test]
+fn hold_end_ends_a_holder_by_its_pid_file() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let dir = tempfile::Builder::new()
+        .prefix("ovc")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let spec = overseer_daemon::pty::SpawnSpec {
+        slot: 3,
+        label: "demo".into(),
+        cwd: PathBuf::from("/tmp"),
+        argv: vec!["/bin/sleep".into(), "30".into()],
+        env: vec![("PATH".into(), "/usr/bin:/bin".into())],
+        cols: 80,
+        rows: 24,
+        run: "demo-run".into(),
+    };
+    let mut holder = StdCommand::new(env!("CARGO_BIN_EXE_overseer"))
+        .arg("hold")
+        .arg(dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = holder.stdin.take().unwrap();
+    stdin
+        .write_all(&serde_json::to_vec(&spec).unwrap())
+        .unwrap();
+    drop(stdin);
+    let pid_path = overseer_daemon::holder::pid_path(dir.path(), 3);
+    let start = Instant::now();
+    while !pid_path.exists() {
+        assert!(start.elapsed() < Duration::from_secs(5), "no pid file");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let p: overseer_daemon::holder::PidFile =
+        serde_json::from_slice(&std::fs::read(&pid_path).unwrap()).unwrap();
+    let hold_end = |path: &std::path::Path| {
+        Command::cargo_bin("overseer")
+            .unwrap()
+            .args(["hold", "--end"])
+            .arg(path)
+            .assert()
+    };
+    hold_end(&pid_path).success();
+    let start = Instant::now();
+    loop {
+        if holder.try_wait().unwrap().is_some() {
+            break;
+        }
+        if start.elapsed() > Duration::from_secs(5) {
+            // SAFETY: plain signals to this test's own holder and its child.
+            unsafe {
+                libc::kill(-(p.child as i32), libc::SIGKILL);
+                libc::kill(p.holder as i32, libc::SIGKILL);
+            }
+            let _ = holder.wait();
+            panic!("holder not ended");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // SAFETY: signal 0 only checks that the pid exists.
+    assert!(
+        unsafe { libc::kill(p.child as i32, 0) } != 0,
+        "child left running"
+    );
+
+    // Nothing left to end, or no pid file at all: still a success.
+    hold_end(&pid_path).success();
+    hold_end(&dir.path().join("missing.pid")).success();
+    // A pid file that cannot be read is an error.
+    let bad = dir.path().join("bad.pid");
+    std::fs::write(&bad, "not json").unwrap();
+    hold_end(&bad).failure();
+}
+
+/// `overseer hold --end` returns only once the holder has gone, even when
+/// it takes the final SIGTERM to the holder: its child ignores SIGTERM.
+#[test]
+fn hold_end_waits_for_the_holder_to_go() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let dir = tempfile::Builder::new()
+        .prefix("ovc")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let spec = overseer_daemon::pty::SpawnSpec {
+        slot: 4,
+        label: "demo".into(),
+        cwd: PathBuf::from("/tmp"),
+        argv: vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "trap '' TERM; while :; do sleep 1; done".into(),
+        ],
+        env: vec![("PATH".into(), "/usr/bin:/bin".into())],
+        cols: 80,
+        rows: 24,
+        run: "demo-run".into(),
+    };
+    let mut holder = StdCommand::new(env!("CARGO_BIN_EXE_overseer"))
+        .arg("hold")
+        .arg(dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = holder.stdin.take().unwrap();
+    stdin
+        .write_all(&serde_json::to_vec(&spec).unwrap())
+        .unwrap();
+    drop(stdin);
+    let pid_path = overseer_daemon::holder::pid_path(dir.path(), 4);
+    let start = Instant::now();
+    while !pid_path.exists() {
+        assert!(start.elapsed() < Duration::from_secs(5), "no pid file");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let p: overseer_daemon::holder::PidFile =
+        serde_json::from_slice(&std::fs::read(&pid_path).unwrap()).unwrap();
+    // The holder is this test's child: reaped here as soon as it exits, as
+    // launchd reaps a real one, so a check after `hold --end` sees it gone.
+    let reaper = std::thread::spawn(move || holder.wait().unwrap());
+    Command::cargo_bin("overseer")
+        .unwrap()
+        .args(["hold", "--end"])
+        .arg(&pid_path)
+        .assert()
+        .success();
+    // SAFETY: signal 0 only checks that the pid exists.
+    let left = unsafe { libc::kill(p.holder as i32, 0) } == 0;
+    // SAFETY: plain signals to this test's own holder and its child.
+    unsafe {
+        libc::kill(-(p.child as i32), libc::SIGKILL);
+        libc::kill(p.holder as i32, libc::SIGKILL);
+    }
+    reaper.join().unwrap();
+    assert!(!left, "hold --end returned while the holder still ran");
+}
+
+/// The activity of slot `n`, asked of the daemon on this home's socket.
+fn activity_kind(env: &Env, n: usize) -> Option<overseer_proto::ActivityKind> {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let client = overseer_proto::Client::connect(env.home.join("overseer.sock"))
+            .await
+            .unwrap();
+        match client
+            .request(overseer_proto::Request::ListSlots)
+            .await
+            .unwrap()
+        {
+            overseer_proto::Response::Slots(slots) => slots[n].activity.as_ref().map(|a| a.kind),
+            other => panic!("{other:?}"),
+        }
+    })
+}
+
+/// `overseer hook <event>` from inside slot `n`, as Claude runs it.
+fn send_hook(env: &Env, n: u8, event: &str) {
+    use std::io::Write;
+    let mut hook = StdCommand::new(assert_cmd::cargo::cargo_bin("overseer"))
+        .env("OVERSEER_HOME", &env.home)
+        .env("OVERSEER_SLOT", format!("S{n}"))
+        .env("OVERSEER_LAUNCHCTL", env.launchctl_stub())
+        .env_remove("OVERSEER_RUN")
+        .args(["hook", event])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let body = format!("{{\"session_id\":\"demo-session\",\"hook_event_name\":\"{event}\"}}");
+    hook.stdin
+        .take()
+        .unwrap()
+        .write_all(body.as_bytes())
+        .unwrap();
+    assert!(hook.wait().unwrap().success());
+}
+
+/// launchd stops the daemon with SIGTERM (`make install`'s bootout,
+/// `ctl restart`'s `kickstart -k`): it takes the shutdown path, so the next
+/// daemon finds the session still running, with its activity.
+#[test]
+fn a_sigterm_keeps_held_sessions_and_their_activity() {
+    let env = Env::new();
+    let stub = env.claude_stub();
+    let stub = stub.to_str().unwrap();
+    let mut first = spawn_daemon(&env, &[("OVERSEER_DEFAULT_COMMAND", stub)]);
+    let pid = start_claude(&env);
+    send_hook(&env, 1, "SessionStart");
+    let idle = Some(overseer_proto::ActivityKind::Idle);
+    let up = Instant::now();
+    while activity_kind(&env, 1) != idle {
+        assert!(up.elapsed() < Duration::from_secs(5), "no activity");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // SAFETY: a plain signal to this test's own daemon.
+    unsafe { libc::kill(first.id() as i32, libc::SIGTERM) };
+    let status = wait_exit(&mut first, Duration::from_secs(10));
+    // Like a Shutdown request: a clean exit launchd does not respawn.
+    assert_eq!(status.code(), Some(0), "{status:?}");
+
+    let mut second = spawn_daemon(&env, &[("OVERSEER_DEFAULT_COMMAND", stub)]);
+    let s1 = status_line(&env, 1);
+    assert!(s1.starts_with("S1  running  pid "), "{s1}");
+    assert_eq!(pid_after(&s1, "pid "), pid);
+    assert_eq!(activity_kind(&env, 1), idle);
+    env.ctl(&["shutdown"]).assert().success();
+    wait_exit(&mut second, Duration::from_secs(10));
 }

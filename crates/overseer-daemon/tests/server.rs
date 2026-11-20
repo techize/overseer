@@ -20,12 +20,17 @@ use tokio::time::{sleep, timeout};
 
 const SCRIPT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fake-claude.sh");
 const WAIT: Duration = Duration::from_secs(5);
+/// Every daemon the harness starts runs its sessions through this holder.
+const HOLDER: &str = env!("CARGO_BIN_EXE_overseer-test-holder");
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
 fn temp_socket() -> PathBuf {
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
     let dir = std::env::temp_dir().join(format!("ovs-{}-{n}", std::process::id()));
+    // A run before this one, under the same pid, may have left the dir,
+    // holder pid files and all.
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir.join("s.sock")
 }
@@ -34,6 +39,9 @@ struct Daemon {
     socket: PathBuf,
     state_dir: PathBuf,
     task: JoinHandle<anyhow::Result<()>>,
+    /// Leaves the held sessions running on drop, for a restart test that
+    /// starts a second daemon on the same state dir.
+    keep: bool,
 }
 
 async fn start_daemon() -> Daemon {
@@ -75,6 +83,17 @@ async fn start_daemon_full(
     settings: overseer_daemon::Config,
     patterns: Vec<Pattern>,
 ) -> Daemon {
+    start_daemon_holder(socket, env, settings, patterns, HOLDER.into()).await
+}
+
+/// [`start_daemon_full`], running sessions under the holder `holder`.
+async fn start_daemon_holder(
+    socket: PathBuf,
+    env: overseer_daemon::EnvSource,
+    settings: overseer_daemon::Config,
+    patterns: Vec<Pattern>,
+    holder: PathBuf,
+) -> Daemon {
     let state_dir = socket.parent().unwrap().join("state");
     let cfg = DaemonConfig {
         socket: socket.clone(),
@@ -83,6 +102,7 @@ async fn start_daemon_full(
         state_dir: state_dir.clone(),
         files: overseer_daemon::SettingsFiles::in_dir(&state_dir),
         hook_program: PathBuf::from("/bin/true"),
+        holder_program: Some(holder),
         settings,
         patterns,
     };
@@ -93,6 +113,7 @@ async fn start_daemon_full(
                 socket,
                 state_dir,
                 task,
+                keep: false,
             };
         }
         sleep(Duration::from_millis(20)).await;
@@ -104,6 +125,54 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         self.task.abort();
         let _ = std::fs::remove_file(&self.socket);
+        if !self.keep {
+            end_holders(&self.state_dir);
+        }
+    }
+}
+
+/// Ends every holder still running in `state_dir`, and its child's process
+/// group, so no test leaves processes behind, even when it fails. Aborting
+/// the daemon task skips its shutdown, which would otherwise end them.
+fn end_holders(state_dir: &std::path::Path) {
+    let Ok(dir) = std::fs::read_dir(overseer_daemon::holder::holders_dir(state_dir)) else {
+        return;
+    };
+    let mut holders = Vec::new();
+    for entry in dir.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "pid") {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let Ok(p) = serde_json::from_slice::<overseer_daemon::holder::PidFile>(&bytes) else {
+            continue;
+        };
+        // SAFETY: plain signals to pids this test's holders wrote. The child
+        // leads its own session and process group.
+        unsafe {
+            libc::kill(-(p.child as i32), libc::SIGKILL);
+            libc::kill(p.child as i32, libc::SIGKILL);
+            libc::kill(p.holder as i32, libc::SIGKILL);
+        }
+        holders.push((p.holder as i32, path));
+    }
+    // The daemon's reaper threads collect them; wait until they are gone.
+    let start = std::time::Instant::now();
+    while start.elapsed() < WAIT
+        && holders
+            .iter()
+            // SAFETY: signal 0 only checks that the pid exists.
+            .any(|(pid, _)| unsafe { libc::kill(*pid, 0) } == 0)
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // A killed holder leaves its pid file, which a later start in this
+    // state dir would read as a holder that might still run.
+    for (_, path) in holders {
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -235,6 +304,17 @@ async fn start_list_stop() {
 }
 
 #[tokio::test]
+async fn held_slot_reports_held() {
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    assert_eq!(c.start(1).await, Response::Ok);
+    let slots = c.list().await;
+    assert!(slots[1].held, "{:?}", slots[1]);
+    assert!(matches!(slots[1].state, SlotState::Running { .. }));
+    assert!(!slots[0].held);
+}
+
+#[tokio::test]
 async fn an_unknown_request_is_answered_and_the_connection_stays_open() {
     let d = start_daemon().await;
     let mut c = Client::connect(&d.socket).await;
@@ -297,6 +377,7 @@ async fn start_daemon_with_security(email: &str, security: String) -> Daemon {
         state_dir: state_dir.clone(),
         files,
         hook_program: PathBuf::from("/bin/true"),
+        holder_program: Some(HOLDER.into()),
         settings: overseer_daemon::Config {
             jira_email: email.into(),
             ..offline_settings()
@@ -310,6 +391,7 @@ async fn start_daemon_with_security(email: &str, security: String) -> Daemon {
                 socket,
                 state_dir,
                 task,
+                keep: false,
             };
         }
         sleep(Duration::from_millis(20)).await;
@@ -677,6 +759,7 @@ async fn second_daemon_refused() {
         state_dir: d.state_dir.clone(),
         files: overseer_daemon::SettingsFiles::in_dir(&d.state_dir),
         hook_program: PathBuf::from("/bin/true"),
+        holder_program: Some(HOLDER.into()),
         settings: offline_settings(),
         patterns: default_patterns(),
     })
@@ -4517,6 +4600,7 @@ impl PlanRig {
             state_dir: state_dir.clone(),
             files: overseer_daemon::SettingsFiles::in_dir(&state_dir),
             hook_program: PathBuf::from("/bin/true"),
+            holder_program: Some(HOLDER.into()),
             settings,
             patterns: default_patterns(),
         };
@@ -4527,6 +4611,7 @@ impl PlanRig {
                     socket,
                     state_dir,
                     task,
+                    keep: false,
                 };
             }
             sleep(Duration::from_millis(20)).await;
@@ -5235,4 +5320,1195 @@ async fn sessions_start_without_the_api_tokens() {
             .any(|l| l.starts_with("ATLASSIAN_API_TOKEN=") || l.starts_with("BITBUCKET_API_TOKEN=")),
         "{lines:?}"
     );
+}
+
+/// Held sessions across a daemon restart (#62): the first daemon stops
+/// through its shutdown path and a second one starts on the same state dir
+/// and socket.
+mod restart {
+    use super::*;
+    use std::path::Path;
+    use std::time::Instant;
+
+    use overseer_daemon::holder::{exit_path, pid_path, socket_path, PidFile};
+
+    /// Past the daemon's own give-up time for a redraw.
+    const REDRAW_WAIT: Duration = Duration::from_secs(30);
+
+    /// The sessions a stopped daemon left running; ends them when dropped,
+    /// so a failing test leaves nothing behind.
+    struct Down {
+        socket: PathBuf,
+        state_dir: PathBuf,
+    }
+
+    impl Drop for Down {
+        fn drop(&mut self) {
+            end_holders(&self.state_dir);
+        }
+    }
+
+    /// Stops `d` with the shutdown request, leaving its held sessions
+    /// running. launchd's SIGTERM takes the same path in the daemon; the
+    /// CLI tests send that signal to a daemon process.
+    async fn stop_keeping(mut d: Daemon) -> Down {
+        let mut c = Client::connect(&d.socket).await;
+        assert_eq!(c.request(Request::Shutdown).await, Response::Ok);
+        timeout(WAIT, &mut d.task)
+            .await
+            .expect("run returned")
+            .unwrap()
+            .unwrap();
+        d.keep = true;
+        Down {
+            socket: d.socket.clone(),
+            state_dir: d.state_dir.clone(),
+        }
+    }
+
+    /// Waits for a daemon that was sent `StopAll` (or `Shutdown`) to stop,
+    /// leaving whatever still runs.
+    async fn await_stopped(mut d: Daemon) -> Down {
+        timeout(WAIT, &mut d.task)
+            .await
+            .expect("the daemon did not stop")
+            .unwrap()
+            .unwrap();
+        d.keep = true;
+        Down {
+            socket: d.socket.clone(),
+            state_dir: d.state_dir.clone(),
+        }
+    }
+
+    /// The test's own folder, beside the state dir.
+    fn dir_of(d: &Daemon) -> PathBuf {
+        d.state_dir.parent().unwrap().to_path_buf()
+    }
+
+    async fn until(what: &str, within: Duration, mut done: impl FnMut() -> bool) {
+        let start = Instant::now();
+        while !done() {
+            assert!(start.elapsed() < within, "timed out waiting for {what}");
+            sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    fn pid_alive(pid: u32) -> bool {
+        // SAFETY: signal 0 only checks that the pid exists.
+        unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+
+    /// `fake-claude.sh` with `args`.
+    fn fake(args: &[&str]) -> Vec<String> {
+        std::iter::once(SCRIPT)
+            .chain(args.iter().copied())
+            .map(String::from)
+            .collect()
+    }
+
+    /// The fake in its box mode: it draws Claude Code's input box at start
+    /// and on every resize, logging each draw to `<dir>/draws`.
+    fn boxed(dir: &Path) -> Vec<String> {
+        fake(&["box", &dir.to_string_lossy()])
+    }
+
+    fn draws(dir: &Path) -> usize {
+        std::fs::read_to_string(dir.join("draws"))
+            .map(|s| s.lines().count())
+            .unwrap_or(0)
+    }
+
+    impl Client {
+        async fn start_cmd(&mut self, id: u8, command: Vec<String>) {
+            let start = Request::StartSlot {
+                id,
+                label: format!("t{id}"),
+                cwd: PathBuf::from("/tmp"),
+                command: Some(command),
+                prompt: None,
+            };
+            assert_eq!(self.request(start).await, Response::Ok);
+        }
+
+        async fn type_line(&mut self, id: u8, line: &str) {
+            self.send(Frame::Input {
+                id,
+                data: Bytes::from(format!("{line}\r")),
+            })
+            .await;
+        }
+
+        /// Attaches to `id` and returns the snapshot.
+        async fn snapshot(&mut self, id: u8) -> Vec<u8> {
+            assert_eq!(self.request(Request::Attach { id }).await, Response::Ok);
+            loop {
+                match self.recv().await.expect("connection closed") {
+                    Frame::Output { id: i, data } if i == id => return data.to_vec(),
+                    Frame::Event(_) => {}
+                    other => panic!("expected snapshot, got {other:?}"),
+                }
+            }
+        }
+
+        /// Waits until every relay to `to` is delivered. Longer than
+        /// `all_delivered`: the redraw a restart asks for, and the quiet
+        /// after it, take a while on a loaded machine.
+        async fn delivered_after_redraw(&mut self, to: u8) {
+            let start = Instant::now();
+            loop {
+                let v = self.locks().await;
+                let mine = || v.relays.iter().filter(|r| r.to == to);
+                if mine().all(|r| r.state == RelayState::Delivered) {
+                    return;
+                }
+                assert!(start.elapsed() < REDRAW_WAIT, "never delivered: {v:?}");
+                sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        async fn relay_state(&mut self, to: u8) -> (RelayState, Option<String>) {
+            let v = self.locks().await;
+            let r = v.relays.iter().find(|r| r.to == to).expect("relay listed");
+            (r.state, r.held.clone())
+        }
+    }
+
+    fn running_pid(info: &SlotInfo) -> u32 {
+        match info.state {
+            SlotState::Running { pid, .. } => pid,
+            ref other => panic!("S{} not running: {other:?}", info.id),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_held_session_survives_a_restart() {
+        let d = start_daemon().await;
+        let mut c = Client::connect(&d.socket).await;
+        assert_eq!(c.start(1).await, Response::Ok);
+        assert_eq!(c.request(Request::Attach { id: 1 }).await, Response::Ok);
+        c.type_line(1, "before").await;
+        c.output_until(1, "ECHO:before").await;
+        let pid = running_pid(&c.list().await[1]);
+        drop(c);
+
+        let down = stop_keeping(d).await;
+        let d = start_daemon_at(down.socket.clone()).await;
+        let mut c = Client::connect(&d.socket).await;
+        let info = c.list().await.remove(1);
+        assert_eq!(running_pid(&info), pid, "{info:?}");
+        assert!(info.held);
+        let snap = String::from_utf8_lossy(&c.snapshot(1).await).into_owned();
+        assert!(snap.contains("ECHO:before"), "{snap:?}");
+        c.type_line(1, "after").await;
+        c.output_until(1, "ECHO:after").await;
+    }
+
+    #[tokio::test]
+    async fn a_hook_sent_while_down_is_applied_after_restart() {
+        let d = start_daemon().await;
+        let mut c = Client::connect(&d.socket).await;
+        let run_cmd = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "echo \"RUN=[$OVERSEER_RUN]\"; exec cat".to_string(),
+        ];
+        c.start_cmd(1, run_cmd).await;
+        assert_eq!(c.request(Request::Attach { id: 1 }).await, Response::Ok);
+        let out = c.output_until(1, "]").await;
+        let at = out.find("RUN=[").expect("run printed") + 5;
+        let run = out[at..at + out[at..].find(']').unwrap()].to_string();
+        assert!(!run.is_empty());
+        c.hook(hook(1, HookKind::SessionStart)).await;
+        assert_eq!(activity_of(&c.list().await[1]).kind, ActivityKind::Idle);
+        drop(c);
+
+        let down = stop_keeping(d).await;
+        // What `overseer hook` leaves when it finds no daemon.
+        let mut working = hook(1, HookKind::UserPromptSubmit);
+        working.run = Some(run);
+        overseer_proto::spool::append(&down.state_dir, &working).unwrap();
+        let d = start_daemon_at(down.socket.clone()).await;
+        let mut c = Client::connect(&d.socket).await;
+        assert_eq!(activity_of(&c.list().await[1]).kind, ActivityKind::Working);
+        assert!(
+            !down
+                .state_dir
+                .join(overseer_proto::spool::SPOOL_FILE)
+                .exists(),
+            "spool not taken"
+        );
+    }
+
+    #[tokio::test]
+    async fn output_while_down_is_shown_after_restart() {
+        let d = start_daemon().await;
+        let go = dir_of(&d).join("go");
+        let mut c = Client::connect(&d.socket).await;
+        assert_eq!(c.start(1).await, Response::Ok);
+        c.type_line(1, &format!("later {}", go.display())).await;
+        sleep(Duration::from_millis(200)).await;
+        drop(c);
+
+        let down = stop_keeping(d).await;
+        std::fs::write(&go, "").unwrap();
+        let done = go.with_extension("done");
+        until("the marker", WAIT, || done.exists()).await;
+        let d = start_daemon_at(down.socket.clone()).await;
+        let mut c = Client::connect(&d.socket).await;
+        let snap = String::from_utf8_lossy(&c.snapshot(1).await).into_owned();
+        assert!(snap.contains("DOWN-MARK"), "{snap:?}");
+    }
+
+    #[tokio::test]
+    async fn exit_while_down_shows_the_code() {
+        let d = start_daemon().await;
+        let go = dir_of(&d).join("go");
+        let mut c = Client::connect(&d.socket).await;
+        assert_eq!(c.start(1).await, Response::Ok);
+        c.type_line(1, &format!("exitwhen {} 7", go.display()))
+            .await;
+        sleep(Duration::from_millis(200)).await;
+        drop(c);
+
+        let down = stop_keeping(d).await;
+        std::fs::write(&go, "").unwrap();
+        let (exit, pid) = (exit_path(&down.state_dir, 1), pid_path(&down.state_dir, 1));
+        until("the holder to end", WAIT, || exit.exists() && !pid.exists()).await;
+        let d = start_daemon_at(down.socket.clone()).await;
+        let mut c = Client::connect(&d.socket).await;
+        let info = c.list().await.remove(1);
+        assert!(
+            matches!(info.state, SlotState::Exited { code: Some(7), .. }),
+            "{info:?}"
+        );
+        assert!(!exit.exists(), "exit file left behind");
+        assert!(live_slots(&d).is_empty(), "exit not recorded");
+        assert_eq!(c.start(1).await, Response::Ok);
+        assert!(matches!(c.list().await[1].state, SlotState::Running { .. }));
+    }
+
+    #[tokio::test]
+    async fn stop_all_ends_sessions_but_keeps_them_resumable() {
+        let d0 = start_daemon().await;
+        let dir = dir_of(&d0).join("claude");
+        drop(d0);
+        let (bin, log) = stub_claude(&dir);
+        let d = start_daemon_with(temp_socket(), claude_env(&dir, true)).await;
+        let mut c = Client::connect(&d.socket).await;
+        for id in [1, 2] {
+            c.start_cmd(id, vec![bin.to_string_lossy().into_owned()])
+                .await;
+        }
+        wait_for_log(&log, 2).await;
+        let slots = c.list().await;
+        let pids = [running_pid(&slots[1]), running_pid(&slots[2])];
+        let down = Down {
+            socket: d.socket.clone(),
+            state_dir: d.state_dir.clone(),
+        };
+
+        assert_eq!(c.request(Request::StopAll).await, Response::Ok);
+        for pid in pids {
+            until("the child to end", WAIT, || !pid_alive(pid)).await;
+        }
+        // Holders have gone, leaving no exit file to read as exited.
+        for id in [1, 2] {
+            let (exit, pid) = (
+                exit_path(&down.state_dir, id),
+                pid_path(&down.state_dir, id),
+            );
+            until("the holder to end", WAIT, || !pid.exists()).await;
+            assert!(!exit.exists(), "exit file left for S{id}");
+        }
+        drop(c);
+
+        let down2 = await_stopped(d).await;
+        let d = start_daemon_with(down2.socket.clone(), claude_env(&dir, true)).await;
+        let mut c = Client::connect(&d.socket).await;
+        let slots = c.list().await;
+        for id in [1, 2] {
+            assert!(
+                matches!(&slots[id].state, SlotState::Resumable { .. }),
+                "{:?}",
+                slots[id]
+            );
+        }
+        drop(down);
+    }
+
+    #[tokio::test]
+    async fn killed_holder_falls_back_to_resumable() {
+        let d0 = start_daemon().await;
+        let dir = dir_of(&d0).join("claude");
+        drop(d0);
+        let (bin, log) = stub_claude(&dir);
+        let d = start_daemon_with(temp_socket(), claude_env(&dir, true)).await;
+        let mut c = Client::connect(&d.socket).await;
+        c.start_cmd(1, vec![bin.to_string_lossy().into_owned()])
+            .await;
+        let first = wait_for_log(&log, 1).await;
+        let session_id = arg_after(&first[0], "--session-id").unwrap();
+        drop(c);
+
+        let down = stop_keeping(d).await;
+        let p: PidFile =
+            serde_json::from_slice(&std::fs::read(pid_path(&down.state_dir, 1)).unwrap()).unwrap();
+        // SAFETY: a plain signal to this test's own holder.
+        unsafe { libc::kill(p.holder as i32, libc::SIGKILL) };
+        until("the holder to go", WAIT, || !pid_alive(p.holder)).await;
+        let d = start_daemon_with(down.socket.clone(), claude_env(&dir, true)).await;
+        let mut c = Client::connect(&d.socket).await;
+        let info = c.list().await.remove(1);
+        assert!(
+            matches!(&info.state, SlotState::Resumable { session_id: s, .. } if *s == session_id),
+            "{info:?}"
+        );
+        assert!(
+            !socket_path(&down.state_dir, 1).exists(),
+            "dead socket kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn activity_survives_a_restart() {
+        let d = start_daemon().await;
+        let dir = dir_of(&d);
+        let mut c = Client::connect(&d.socket).await;
+        c.start_cmd(1, boxed(&dir)).await;
+        until("the first draw", WAIT, || draws(&dir) >= 1).await;
+        c.hook(hook(1, HookKind::SessionStart)).await;
+        assert_eq!(activity_of(&c.list().await[1]).kind, ActivityKind::Idle);
+        drop(c);
+
+        let down = stop_keeping(d).await;
+        let d = start_daemon_at(down.socket.clone()).await;
+        let mut c = Client::connect(&d.socket).await;
+        assert_eq!(activity_of(&c.list().await[1]).kind, ActivityKind::Idle);
+        assert_eq!(c.request(Request::Attach { id: 1 }).await, Response::Ok);
+        assert_eq!(c.relay(None, 1, "hello").await, queued_for(1));
+        c.delivered_after_redraw(1).await;
+        c.output_until(1, &format!("ECHO:\x1b[200~{HELLO}")).await;
+    }
+
+    #[tokio::test]
+    async fn no_relay_before_the_redraw() {
+        let d = start_daemon().await;
+        let dir = dir_of(&d);
+        let mut c = Client::connect(&d.socket).await;
+        c.start_cmd(1, boxed(&dir)).await;
+        until("the first draw", WAIT, || draws(&dir) >= 1).await;
+        c.hook(hook(1, HookKind::SessionStart)).await;
+        drop(c);
+
+        let down = stop_keeping(d).await;
+        let started = Instant::now();
+        let d = start_daemon_at(down.socket.clone()).await;
+        let mut c = Client::connect(&d.socket).await;
+        assert_eq!(activity_of(&c.list().await[1]).kind, ActivityKind::Idle);
+        assert_eq!(c.relay(None, 1, "hello").await, queued_for(1));
+        c.held_for(1, "screen is being redrawn").await;
+        let half = Duration::from_millis(500);
+        sleep(half.saturating_sub(started.elapsed())).await;
+        assert_eq!(
+            c.relay_state(1).await,
+            (RelayState::Pending, Some("screen is being redrawn".into()))
+        );
+        // The gate opens once the redraw is over.
+        c.delivered_after_redraw(1).await;
+    }
+
+    #[tokio::test]
+    async fn a_burst_bigger_than_the_ring_still_converges() {
+        let d = start_daemon().await;
+        let dir = dir_of(&d);
+        let go = dir.join("go");
+        let mut c = Client::connect(&d.socket).await;
+        c.start_cmd(1, boxed(&dir)).await;
+        until("the first draw", WAIT, || draws(&dir) >= 1).await;
+        c.hook(hook(1, HookKind::SessionStart)).await;
+        c.type_line(1, &format!("burstwhen {}", go.display())).await;
+        let seen = go.with_extension("seen");
+        until("the fake to read the burst line", WAIT, || seen.exists()).await;
+        drop(c);
+
+        let down = stop_keeping(d).await;
+        let before = draws(&dir);
+        std::fs::write(&go, "").unwrap();
+        let done = go.with_extension("done");
+        until("the burst", WAIT * 6, || done.exists()).await;
+        let d = start_daemon_at(down.socket.clone()).await;
+        let mut c = Client::connect(&d.socket).await;
+        // The redraw the restart asks for lands; the screen then converges
+        // on the box, however many echoes of the redraw follow.
+        until("the redraw", WAIT, || draws(&dir) > before).await;
+        let started = Instant::now();
+        loop {
+            // A fresh client each time: a snapshot is the first output
+            // after an attach, never live output from an earlier one.
+            let mut v = Client::connect(&d.socket).await;
+            let info = v.list().await.remove(1);
+            let (cols, rows) = (info.cols as usize, info.rows as usize);
+            let snap = v.snapshot(1).await;
+            let mut term = overseer_term::TermBridge::new(cols, rows, 0);
+            term.feed(&snap);
+            let screen = term.snapshot();
+            let row = |r: usize| -> String {
+                screen.cells[r * cols..(r + 1) * cols]
+                    .iter()
+                    .map(|c| c.ch)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            };
+            let rule = "\u{2500}".repeat(cols);
+            let want = [
+                "DRAWN".to_string(),
+                String::new(),
+                rule.clone(),
+                "\u{276f}".to_string(),
+                rule,
+                "  ? for shortcuts".to_string(),
+            ];
+            let got: Vec<String> = (0..rows).map(row).collect();
+            let rest_empty = got[want.len()..].iter().all(String::is_empty);
+            if got[..want.len()] == want[..] && rest_empty {
+                break;
+            }
+            if started.elapsed() > REDRAW_WAIT {
+                assert_eq!(got[..want.len()], want[..], "{got:#?}");
+                assert!(rest_empty, "{got:#?}");
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        // The courier reads the daemon's own screen: it finds the box.
+        assert_eq!(c.relay(None, 1, "hello").await, queued_for(1));
+        c.delivered_after_redraw(1).await;
+    }
+
+    /// Stands in for a holder that is alive but never greets: an idle test
+    /// holder (a holder by name, so its pid file is trusted) and a `sleep`
+    /// as its child, each leading its own process group, named by its pid
+    /// file, and a listener on its socket that accepts and says nothing.
+    struct MuteHolder {
+        holder: std::process::Child,
+        child: std::process::Child,
+        pid_file: PathBuf,
+        /// Connections the daemon has opened and then closed.
+        closed: std::sync::Arc<AtomicU32>,
+    }
+
+    impl MuteHolder {
+        fn new(state_dir: &Path, slot: u8) -> MuteHolder {
+            use std::os::unix::fs::DirBuilderExt;
+            use std::os::unix::process::CommandExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(overseer_daemon::holder::holders_dir(state_dir))
+                .unwrap();
+            let run = |program: &str, arg: &str| {
+                std::process::Command::new(program)
+                    .arg(arg)
+                    .process_group(0)
+                    .spawn()
+                    .unwrap()
+            };
+            let (holder, child) = (run(HOLDER, "idle"), run("/bin/sleep", "60"));
+            let pid_file = pid_path(state_dir, slot);
+            let pid = PidFile {
+                holder: holder.id(),
+                child: child.id(),
+                version: overseer_daemon::holder::HOLDER_PROTOCOL,
+                holder_start: None,
+                child_start: None,
+            };
+            std::fs::write(&pid_file, serde_json::to_vec(&pid).unwrap()).unwrap();
+            let listener =
+                std::os::unix::net::UnixListener::bind(socket_path(state_dir, slot)).unwrap();
+            let closed = std::sync::Arc::new(AtomicU32::new(0));
+            let seen = closed.clone();
+            std::thread::spawn(move || {
+                for conn in listener.incoming() {
+                    let Ok(mut conn) = conn else { return };
+                    let seen = seen.clone();
+                    std::thread::spawn(move || {
+                        use std::io::Read;
+                        let mut buf = [0u8; 1024];
+                        while matches!(conn.read(&mut buf), Ok(n) if n > 0) {}
+                        seen.fetch_add(1, Ordering::SeqCst);
+                    });
+                }
+            });
+            MuteHolder {
+                holder,
+                child,
+                pid_file,
+                closed,
+            }
+        }
+
+        fn ended(&mut self) -> bool {
+            self.holder.try_wait().unwrap().is_some() && self.child.try_wait().unwrap().is_some()
+        }
+    }
+
+    impl Drop for MuteHolder {
+        fn drop(&mut self) {
+            // Gone before anything reads the pid file again: its pids may
+            // be reused once reaped.
+            let _ = std::fs::remove_file(&self.pid_file);
+            let _ = self.holder.kill();
+            let _ = self.child.kill();
+            let _ = self.holder.wait();
+            let _ = self.child.wait();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_holder_that_never_greets_keeps_a_card_stop_can_end() {
+        let socket = temp_socket();
+        let state_dir = socket.parent().unwrap().join("state");
+        let mut mute = MuteHolder::new(&state_dir, 1);
+        let child = mute.child.id();
+        let d = start_daemon_at(socket).await;
+        // The daemon gives up on the hello and starts serving.
+        let closed = mute.closed.clone();
+        until("the attach to time out", WAIT * 3, || {
+            closed.load(Ordering::SeqCst) >= 1
+        })
+        .await;
+        let mut c = Client::connect(&d.socket).await;
+        let info = c.list().await.remove(1);
+        assert_eq!(running_pid(&info), child, "{info:?}");
+        assert!(info.held, "{info:?}");
+        // A new session there would take the live holder's socket.
+        assert!(matches!(c.start(1).await, Response::Error { .. }));
+        assert_eq!(c.request(Request::StopSlot { id: 1 }).await, Response::Ok);
+        until("the session to end", WAIT, || mute.ended()).await;
+        let info = c.list().await.remove(1);
+        assert!(!matches!(info.state, SlotState::Running { .. }), "{info:?}");
+        // Reaped, and its pid file gone, before the daemon guard looks.
+        drop(mute);
+    }
+
+    #[tokio::test]
+    async fn stop_all_stops_the_daemon_after_answering() {
+        let d = start_daemon().await;
+        let mut c = Client::connect(&d.socket).await;
+        assert_eq!(c.start(1).await, Response::Ok);
+        assert_eq!(c.request(Request::StopAll).await, Response::Ok);
+        let down = await_stopped(d).await;
+        assert!(tokio::net::UnixStream::connect(&down.socket).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn stop_all_that_cannot_end_a_session_says_so_and_leaves_its_files() {
+        let socket = temp_socket();
+        let state_dir = socket.parent().unwrap().join("state");
+        let mute = MuteHolder::new(&state_dir, 1);
+        let d = start_daemon_at(socket).await;
+        let closed = mute.closed.clone();
+        until("the attach to time out", WAIT * 3, || {
+            closed.load(Ordering::SeqCst) >= 1
+        })
+        .await;
+        let mut c = Client::connect(&d.socket).await;
+        // Killed but not reaped: alive to a signal check, not identifiable.
+        // SAFETY: a plain signal to this test's own process.
+        unsafe { libc::kill(mute.holder.id() as i32, libc::SIGKILL) };
+        sleep(Duration::from_millis(200)).await;
+        let Response::Error { message } = c.request(Request::StopAll).await else {
+            panic!("StopAll answered Ok for a session it could not end");
+        };
+        assert!(message.contains("S1"), "{message}");
+        assert!(mute.pid_file.exists(), "pid file removed");
+        let down = await_stopped(d).await;
+        assert!(pid_path(&down.state_dir, 1).exists());
+        drop(mute);
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_holder_that_dies_frees_its_slot() {
+        let socket = temp_socket();
+        let state_dir = socket.parent().unwrap().join("state");
+        let mut mute = MuteHolder::new(&state_dir, 1);
+        let d = start_daemon_at(socket).await;
+        let closed = mute.closed.clone();
+        until("the attach to time out", WAIT * 3, || {
+            closed.load(Ordering::SeqCst) >= 1
+        })
+        .await;
+        let mut c = Client::connect(&d.socket).await;
+        let mut w = Client::connect(&d.socket).await;
+        let info = c.list().await.remove(1);
+        assert!(matches!(info.state, SlotState::Running { .. }), "{info:?}");
+        // The holder dies on its own, with no Stop.
+        mute.holder.kill().unwrap();
+        mute.holder.wait().unwrap();
+        let info = tokio::time::timeout(WAIT * 3, w.exited_event(1))
+            .await
+            .expect("no SlotChanged when the holder died");
+        assert!(!info.held, "{info:?}");
+        let listed = c.list().await.remove(1);
+        assert_eq!(listed.state, info.state, "a stable exit time");
+        // The slot takes a new session.
+        c.start_cmd(1, fake(&[])).await;
+        let info = c.list().await.remove(1);
+        assert!(matches!(info.state, SlotState::Running { .. }), "{info:?}");
+        assert_eq!(c.request(Request::StopSlot { id: 1 }).await, Response::Ok);
+        c.exited_event(1).await;
+        drop(mute);
+    }
+
+    /// What an attach to an older build's session answers.
+    const OLDER: &str = "this session runs on an older Overseer build; stop it to use the slot";
+
+    /// A process this test started; killed and reaped when dropped, so a
+    /// failing test leaves nothing behind.
+    struct Reap(std::process::Child);
+
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// The test holder as an older build would run it: it announces
+    /// protocol 99. Started by hand for `slot` in `state_dir`, running
+    /// `argv`.
+    fn start_old_holder(program: &Path, state_dir: &Path, slot: u8, argv: Vec<String>) -> Reap {
+        use std::io::Write;
+        let spec = overseer_daemon::pty::SpawnSpec {
+            slot,
+            label: "demo".into(),
+            cwd: PathBuf::from("/tmp"),
+            argv,
+            env: vec![("PATH".into(), "/usr/bin:/bin".into())],
+            cols: 80,
+            rows: 24,
+            run: "demo-old".into(),
+        };
+        let mut proc = std::process::Command::new(program)
+            .arg("hold")
+            .arg(state_dir)
+            .env("OVERSEER_TEST_HOLDER_VERSION", "99")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut stdin = proc.stdin.take().unwrap();
+        stdin
+            .write_all(&serde_json::to_vec(&spec).unwrap())
+            .unwrap();
+        drop(stdin);
+        Reap(proc)
+    }
+
+    /// An older build's session in S2: a claude stub started by a first
+    /// daemon, whose holder is then swapped for an older build's running
+    /// the fake, and a second daemon started over it.
+    struct OlderSession {
+        // Dropped in this order: the daemon, then the holder, then the
+        // guard that ends whatever is left.
+        d: Daemon,
+        old: Reap,
+        _down: Down,
+        pids: PidFile,
+        session_id: String,
+        /// The claude stub's folder, for [`claude_env`].
+        claude_dir: PathBuf,
+    }
+
+    async fn older_session() -> OlderSession {
+        older_session_from(None).await
+    }
+
+    /// [`older_session`]; with `Some(replace)`, the old holder runs from a
+    /// copy of the test holder that an install then removes and, with
+    /// `replace`, puts another file in place of.
+    async fn older_session_from(removed: Option<bool>) -> OlderSession {
+        let d0 = start_daemon().await;
+        let dir = dir_of(&d0).join("claude");
+        drop(d0);
+        let (bin, log) = stub_claude(&dir);
+        let d = start_daemon_with(temp_socket(), claude_env(&dir, true)).await;
+        let mut c = Client::connect(&d.socket).await;
+        c.start_cmd(2, vec![bin.to_string_lossy().into_owned()])
+            .await;
+        let first = wait_for_log(&log, 1).await;
+        let session_id = arg_after(&first[0], "--session-id").unwrap();
+        drop(c);
+
+        let down = stop_keeping(d).await;
+        // The session goes on under an older build's holder.
+        end_holders(&down.state_dir);
+        let program = if removed.is_some() {
+            let bin = dir.join("overseer-test-holder");
+            std::fs::copy(HOLDER, &bin).unwrap();
+            bin
+        } else {
+            PathBuf::from(HOLDER)
+        };
+        let old = start_old_holder(&program, &down.state_dir, 2, fake(&[]));
+        let pid = pid_path(&down.state_dir, 2);
+        until("the old holder's pid file", WAIT, || pid.exists()).await;
+        if let Some(replace) = removed {
+            std::fs::remove_file(&program).unwrap();
+            if replace {
+                std::fs::copy("/bin/echo", &program).unwrap();
+            }
+        }
+        let pids: PidFile = serde_json::from_slice(&std::fs::read(&pid).unwrap()).unwrap();
+        assert_eq!(pids.version, 99);
+        let d = start_daemon_with(down.socket.clone(), claude_env(&dir, true)).await;
+        OlderSession {
+            d,
+            old,
+            _down: down,
+            pids,
+            session_id,
+            claude_dir: dir,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_older_build_session_is_kept_and_can_be_stopped() {
+        let o = older_session().await;
+        let mut c = Client::connect(&o.d.socket).await;
+        let info = c.list().await.remove(2);
+        assert_eq!(running_pid(&info), o.pids.child, "{info:?}");
+        assert!(info.label.ends_with(" (older build)"), "{info:?}");
+        assert!(info.held, "{info:?}");
+        assert!(matches!(c.start(2).await, Response::Error { .. }));
+        assert_eq!(
+            c.request(Request::Attach { id: 2 }).await,
+            Response::Error {
+                message: OLDER.into()
+            }
+        );
+        assert_eq!(c.request(Request::StopSlot { id: 2 }).await, Response::Ok);
+        until("the child to end", Duration::from_secs(3), || {
+            !pid_alive(o.pids.child)
+        })
+        .await;
+        let info = c.list().await.remove(2);
+        assert!(
+            matches!(&info.state, SlotState::Resumable { session_id: s, .. } if *s == o.session_id),
+            "{info:?}"
+        );
+        assert_eq!(info.label, "t2", "{info:?}");
+    }
+
+    #[tokio::test]
+    async fn an_older_build_holder_that_dies_frees_its_slot() {
+        let mut o = older_session().await;
+        let mut c = Client::connect(&o.d.socket).await;
+        let mut w = Client::connect(&o.d.socket).await;
+        assert!(matches!(c.list().await[2].state, SlotState::Running { .. }));
+        // The holder dies on its own, with no Stop; reaped, as launchd
+        // would reap an orphan.
+        o.old.0.kill().unwrap();
+        o.old.0.wait().unwrap();
+        let info = tokio::time::timeout(WAIT * 3, w.exited_event(2))
+            .await
+            .expect("no SlotChanged when the holder died");
+        assert!(!info.held, "{info:?}");
+        c.start_cmd(2, fake(&[])).await;
+        assert_eq!(c.request(Request::StopSlot { id: 2 }).await, Response::Ok);
+        c.exited_event(2).await;
+    }
+
+    /// After a reboot, a pid file's holder pid can belong to a new process
+    /// that runs a holder's binary (the GUI, or a daemon). Its start time
+    /// gives it away: the files are cleared, nothing is signalled, and the
+    /// slot takes a new session at once.
+    #[tokio::test]
+    async fn a_stale_pid_file_naming_a_reused_holder_pid_is_cleared() {
+        use std::os::unix::fs::DirBuilderExt;
+        use std::os::unix::process::CommandExt;
+        let socket = temp_socket();
+        let state_dir = socket.parent().unwrap().join("state");
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(overseer_daemon::holder::holders_dir(&state_dir))
+            .unwrap();
+        let mut other = Reap(
+            std::process::Command::new(HOLDER)
+                .arg("idle")
+                .process_group(0)
+                .spawn()
+                .unwrap(),
+        );
+        let id = other.0.id();
+        let start = overseer_daemon::holder::process_start(id).unwrap();
+        let (pid, sock) = (pid_path(&state_dir, 1), socket_path(&state_dir, 1));
+        let stale = PidFile {
+            holder: id,
+            child: id,
+            version: overseer_daemon::holder::HOLDER_PROTOCOL,
+            holder_start: Some(start + 1),
+            child_start: Some(start + 1),
+        };
+        std::fs::write(&pid, serde_json::to_vec(&stale).unwrap()).unwrap();
+        drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
+        let d = start_daemon_at(socket).await;
+        let mut c = Client::connect(&d.socket).await;
+        let info = c.list().await.remove(1);
+        assert!(!matches!(info.state, SlotState::Running { .. }), "{info:?}");
+        until("the stale files to go", WAIT, || {
+            !pid.exists() && !sock.exists()
+        })
+        .await;
+        c.start_cmd(1, fake(&[])).await;
+        assert_eq!(c.request(Request::StopSlot { id: 1 }).await, Response::Ok);
+        c.exited_event(1).await;
+        assert!(
+            other.0.try_wait().unwrap().is_none(),
+            "the other process was signalled"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_pid_file_never_signals_another_process() {
+        use std::os::unix::fs::DirBuilderExt;
+        use std::os::unix::process::CommandExt;
+        let socket = temp_socket();
+        let state_dir = socket.parent().unwrap().join("state");
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(overseer_daemon::holder::holders_dir(&state_dir))
+            .unwrap();
+        // Some other process now has the pid the file names, and leads its
+        // own process group as a holder's child would.
+        let mut other = Reap(
+            std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .process_group(0)
+                .spawn()
+                .unwrap(),
+        );
+        let (pid, sock) = (pid_path(&state_dir, 1), socket_path(&state_dir, 1));
+        let stale = PidFile {
+            holder: other.0.id(),
+            child: other.0.id(),
+            version: overseer_daemon::holder::HOLDER_PROTOCOL,
+            holder_start: None,
+            child_start: None,
+        };
+        std::fs::write(&pid, serde_json::to_vec(&stale).unwrap()).unwrap();
+        drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
+        let d = start_daemon_at(socket).await;
+        let mut c = Client::connect(&d.socket).await;
+        let info = c.list().await.remove(1);
+        assert!(!matches!(info.state, SlotState::Running { .. }), "{info:?}");
+        until("the stale files to go", WAIT, || {
+            !pid.exists() && !sock.exists()
+        })
+        .await;
+        assert!(
+            other.0.try_wait().unwrap().is_none(),
+            "the other process was signalled"
+        );
+        // The slot takes a new session at once.
+        c.start_cmd(1, fake(&[])).await;
+        assert_eq!(c.request(Request::StopSlot { id: 1 }).await, Response::Ok);
+        c.exited_event(1).await;
+        assert!(
+            other.0.try_wait().unwrap().is_none(),
+            "the other process was signalled"
+        );
+    }
+
+    /// A held session whose holder's binary an install removed (and with
+    /// `replace`, put another file in its place, as `bundle.sh` does)
+    /// survives a restart: the new daemon attaches it.
+    async fn a_session_outlives_its_holder_binary(replace: bool) {
+        let socket = temp_socket();
+        let bin = socket.parent().unwrap().join("overseer-test-holder");
+        std::fs::copy(HOLDER, &bin).unwrap();
+        let d = start_daemon_holder(
+            socket,
+            overseer_daemon::EnvSource::Inherit,
+            offline_settings(),
+            default_patterns(),
+            bin.clone(),
+        )
+        .await;
+        let mut c = Client::connect(&d.socket).await;
+        assert_eq!(c.start(1).await, Response::Ok);
+        assert_eq!(c.request(Request::Attach { id: 1 }).await, Response::Ok);
+        c.type_line(1, "before").await;
+        c.output_until(1, "ECHO:before").await;
+        let pid = running_pid(&c.list().await[1]);
+        drop(c);
+
+        let down = stop_keeping(d).await;
+        std::fs::remove_file(&bin).unwrap();
+        if replace {
+            std::fs::copy("/bin/echo", &bin).unwrap();
+        }
+        let d = start_daemon_at(down.socket.clone()).await;
+        let mut c = Client::connect(&d.socket).await;
+        let info = c.list().await.remove(1);
+        assert_eq!(running_pid(&info), pid, "{info:?}");
+        assert!(info.held, "{info:?}");
+        assert!(pid_path(&down.state_dir, 1).exists(), "pid file removed");
+        let snap = String::from_utf8_lossy(&c.snapshot(1).await).into_owned();
+        assert!(snap.contains("ECHO:before"), "{snap:?}");
+        // Still running a while later: nothing took it for dead.
+        sleep(Duration::from_millis(1500)).await;
+        assert_eq!(running_pid(&c.list().await[1]), pid);
+        assert!(matches!(c.start(1).await, Response::Error { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_session_outlives_its_replaced_holder_binary() {
+        a_session_outlives_its_holder_binary(true).await;
+    }
+
+    #[tokio::test]
+    async fn a_session_outlives_its_removed_holder_binary() {
+        a_session_outlives_its_holder_binary(false).await;
+    }
+
+    #[tokio::test]
+    async fn a_stopped_older_build_session_is_still_resumable_after_a_restart() {
+        let o = older_session().await;
+        let mut c = Client::connect(&o.d.socket).await;
+        assert_eq!(c.request(Request::StopSlot { id: 2 }).await, Response::Ok);
+        let state_dir = o.d.state_dir.clone();
+        let (exit, pid) = (exit_path(&state_dir, 2), pid_path(&state_dir, 2));
+        // The old holder has gone and no exit file of its is left.
+        until("the old holder to end", WAIT * 2, || {
+            !pid.exists() && !exit.exists()
+        })
+        .await;
+        sleep(Duration::from_millis(500)).await;
+        assert!(!exit.exists(), "exit file left behind");
+        drop(c);
+        let OlderSession {
+            d,
+            old,
+            _down,
+            session_id,
+            claude_dir,
+            ..
+        } = o;
+        drop(old);
+        let down = stop_keeping(d).await;
+        let d = start_daemon_with(down.socket.clone(), claude_env(&claude_dir, true)).await;
+        let mut c = Client::connect(&d.socket).await;
+        let info = c.list().await.remove(2);
+        assert!(
+            matches!(&info.state, SlotState::Resumable { session_id: s, .. } if *s == session_id),
+            "{info:?}"
+        );
+        drop(_down);
+    }
+
+    #[tokio::test]
+    async fn a_stop_all_older_build_session_is_still_resumable_after_a_restart() {
+        let o = older_session().await;
+        let mut c = Client::connect(&o.d.socket).await;
+        assert_eq!(c.request(Request::StopAll).await, Response::Ok);
+        let state_dir = o.d.state_dir.clone();
+        let (exit, pid) = (exit_path(&state_dir, 2), pid_path(&state_dir, 2));
+        // The old holder has gone and no exit file of its is left.
+        until("the old holder to end", WAIT * 2, || {
+            !pid.exists() && !exit.exists()
+        })
+        .await;
+        sleep(Duration::from_millis(500)).await;
+        assert!(!exit.exists(), "exit file left behind");
+        drop(c);
+        let OlderSession {
+            d,
+            old,
+            _down,
+            session_id,
+            claude_dir,
+            ..
+        } = o;
+        drop(old);
+        let down = await_stopped(d).await;
+        let d = start_daemon_with(down.socket.clone(), claude_env(&claude_dir, true)).await;
+        let mut c = Client::connect(&d.socket).await;
+        let info = c.list().await.remove(2);
+        assert!(
+            matches!(&info.state, SlotState::Resumable { session_id: s, .. } if *s == session_id),
+            "{info:?}"
+        );
+        drop(_down);
+    }
+
+    #[tokio::test]
+    async fn an_older_build_session_whose_binary_was_replaced_keeps_its_card() {
+        older_session_keeps_its_card(true).await;
+    }
+
+    #[tokio::test]
+    async fn an_older_build_session_whose_binary_was_removed_keeps_its_card() {
+        older_session_keeps_its_card(false).await;
+    }
+
+    async fn older_session_keeps_its_card(replace: bool) {
+        let o = older_session_from(Some(replace)).await;
+        let mut c = Client::connect(&o.d.socket).await;
+        let info = c.list().await.remove(2);
+        assert_eq!(running_pid(&info), o.pids.child, "{info:?}");
+        assert!(info.label.ends_with(" (older build)"), "{info:?}");
+        // Past a few holder watches: still running, still refusing.
+        sleep(Duration::from_millis(2500)).await;
+        let info = c.list().await.remove(2);
+        assert_eq!(running_pid(&info), o.pids.child, "{info:?}");
+        assert!(matches!(c.start(2).await, Response::Error { .. }));
+        assert!(pid_path(&o.d.state_dir, 2).exists(), "pid file removed");
+        assert_eq!(c.request(Request::StopSlot { id: 2 }).await, Response::Ok);
+        until("the child to end", Duration::from_secs(3), || {
+            !pid_alive(o.pids.child)
+        })
+        .await;
+    }
+
+    /// Once a daemon starts to stop, a hook finds no daemon (and spools its
+    /// event) rather than connecting to one that will never answer: the
+    /// socket is gone before the daemon lets go of its sessions. The
+    /// activity file's temporary name is made a FIFO, so shutdown blocks in
+    /// saving S1's activity until the test reads it: a window as long as
+    /// the test needs to look into.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hook_during_shutdown_finds_no_daemon() {
+        let d = start_daemon().await;
+        let mut c = Client::connect(&d.socket).await;
+        assert_eq!(c.start(1).await, Response::Ok);
+        c.hook(hook(1, HookKind::SessionStart)).await;
+        assert_eq!(activity_of(&c.list().await[1]).kind, ActivityKind::Idle);
+        let saved = overseer_daemon::holder::activity_path(&d.state_dir, 1);
+        let mut fifo = saved.into_os_string();
+        fifo.push(".tmp");
+        let fifo = PathBuf::from(fifo);
+        let name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+
+        assert_eq!(c.request(Request::Shutdown).await, Response::Ok);
+        let daemon_socket = d.socket.clone();
+        let reachable = tokio::task::spawn_blocking(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            let reachable = std::os::unix::net::UnixStream::connect(&daemon_socket).is_ok();
+            // Lets the shutdown go on.
+            let _ = std::fs::read(&fifo);
+            reachable
+        })
+        .await
+        .unwrap();
+        drop(c);
+        let _down = await_stopped(d).await;
+        assert!(
+            !reachable,
+            "a hook could still connect while the daemon let go of its sessions"
+        );
+    }
+
+    /// The activity file is written as the activity changes, not only at
+    /// shutdown, so a daemon that is killed outright keeps it too.
+    #[tokio::test]
+    async fn activity_is_saved_as_it_changes() {
+        let d = start_daemon().await;
+        let mut c = Client::connect(&d.socket).await;
+        assert_eq!(c.start(1).await, Response::Ok);
+        let path = overseer_daemon::holder::activity_path(&d.state_dir, 1);
+        assert!(!path.exists(), "activity saved before any was reported");
+        c.hook(hook(1, HookKind::SessionStart)).await;
+        assert_eq!(activity_of(&c.list().await[1]).kind, ActivityKind::Idle);
+        let saved: overseer_proto::Activity =
+            serde_json::from_slice(&std::fs::read(&path).expect("activity not saved")).unwrap();
+        assert_eq!(saved.kind, ActivityKind::Idle);
+        c.hook(hook(1, HookKind::UserPromptSubmit)).await;
+        assert_eq!(activity_of(&c.list().await[1]).kind, ActivityKind::Working);
+        let saved: overseer_proto::Activity =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved.kind, ActivityKind::Working);
+    }
+
+    /// A live holder whose socket refuses connections at restore (its file
+    /// replaced by a dead socket) keeps its card and its files: the daemon
+    /// never takes a live holder for gone.
+    #[tokio::test]
+    async fn a_live_holder_whose_socket_refuses_keeps_its_card() {
+        let d = start_daemon().await;
+        let mut c = Client::connect(&d.socket).await;
+        assert_eq!(c.start(1).await, Response::Ok);
+        let pid = running_pid(&c.list().await[1]);
+        drop(c);
+        let down = stop_keeping(d).await;
+        let sock = socket_path(&down.state_dir, 1);
+        std::fs::remove_file(&sock).unwrap();
+        // Bound and closed: the file stays and connects are refused.
+        drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
+
+        let d = start_daemon_at(down.socket.clone()).await;
+        let mut c = Client::connect(&d.socket).await;
+        let info = c.list().await.remove(1);
+        assert_eq!(running_pid(&info), pid, "{info:?}");
+        assert!(info.held, "{info:?}");
+        assert!(pid_path(&down.state_dir, 1).exists(), "pid file removed");
+        assert!(sock.exists(), "socket of a live holder removed");
+        assert_eq!(c.request(Request::StopSlot { id: 1 }).await, Response::Ok);
+        c.exited_event(1).await;
+    }
+
+    /// Another client taking a live holder's connection does not end the
+    /// session: the slot never reads as exited, and the daemon attaches the
+    /// holder again once it is free.
+    #[tokio::test]
+    async fn a_lost_connection_to_a_live_holder_is_attached_again() {
+        use overseer_daemon::holder::{read_frame, write_frame, Frame as Held, HOLDER_PROTOCOL};
+        let d = start_daemon().await;
+        let mut c = Client::connect(&d.socket).await;
+        assert_eq!(c.start(1).await, Response::Ok);
+        let pid = running_pid(&c.list().await[1]);
+        let mut w = Client::connect(&d.socket).await;
+
+        let sock = socket_path(&d.state_dir, 1);
+        let mut other = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+        other.set_read_timeout(Some(WAIT)).unwrap();
+        write_frame(
+            &mut other,
+            &Held::DaemonHello {
+                version: HOLDER_PROTOCOL,
+            },
+        )
+        .unwrap();
+        assert!(matches!(read_frame(&mut other), Ok(Some(Held::Hello(_)))));
+        // The daemon's connection is gone now; the slot still runs.
+        sleep(Duration::from_millis(300)).await;
+        let info = c.list().await.remove(1);
+        assert_eq!(running_pid(&info), pid, "{info:?}");
+        drop(other);
+
+        // Attached again: a SlotChanged for S1 that is not an exit.
+        let info = timeout(WAIT * 3, async {
+            loop {
+                match w.recv().await.expect("connection closed") {
+                    Frame::Event(Event::SlotChanged(info)) if info.id == 1 => return info,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("never attached again");
+        assert_eq!(running_pid(&info), pid, "{info:?}");
+        assert!(info.held, "{info:?}");
+        assert_eq!(c.request(Request::Attach { id: 1 }).await, Response::Ok);
+        c.type_line(1, "again").await;
+        c.output_until(1, "ECHO:again").await;
+        assert_eq!(c.request(Request::StopSlot { id: 1 }).await, Response::Ok);
+        c.exited_event(1).await;
+    }
 }

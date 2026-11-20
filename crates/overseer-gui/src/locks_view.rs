@@ -460,6 +460,7 @@ mod tests {
             rows: 24,
             activity: None,
             session_note: None,
+            held: false,
         }
     }
 

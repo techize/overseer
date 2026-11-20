@@ -274,10 +274,24 @@ fn shutdown_running_daemon() -> anyhow::Result<()> {
         let Ok(client) = Client::connect(socket_path()).await else {
             return Ok(());
         };
+        // The daemon lets go of its socket as soon as it starts to stop, so
+        // the wait is for its process too, when it says which it is: a new
+        // daemon must not start while the old one still lets go of its
+        // sessions.
+        let pid = match tokio::time::timeout(QUERY_WAIT, client.request(Request::DaemonInfo)).await
+        {
+            Ok(Ok(Response::DaemonInfo(info))) => Some(info.pid),
+            _ => None,
+        };
+        // A fresh connection: an old daemon hangs up on DaemonInfo.
+        drop(client);
+        let client = Client::connect(socket_path()).await.ok();
         println!("stopping the running daemon");
-        let _ = client.request(Request::Shutdown).await;
+        if let Some(client) = client {
+            let _ = client.request(Request::Shutdown).await;
+        }
         let deadline = Instant::now() + BOOTOUT_WAIT;
-        while Client::connect(socket_path()).await.is_ok() {
+        while Client::connect(socket_path()).await.is_ok() || pid.is_some_and(process_alive) {
             if Instant::now() >= deadline {
                 bail!("the running daemon did not stop");
             }
@@ -287,20 +301,41 @@ fn shutdown_running_daemon() -> anyhow::Result<()> {
     })
 }
 
+/// Whether a process with this pid exists.
+fn process_alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: signal 0 sends nothing; it only checks the pid.
+    pid > 0
+        && (unsafe { libc::kill(pid, 0) } == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
+}
+
 /// The daemon answering on the socket: its build and its running sessions.
 pub struct RunningDaemon {
     pub build: String,
-    /// Slot and label of each `Running` slot.
-    pub running: Vec<(SlotId, String)>,
+    /// Slot, label and whether a holder keeps it (`held`), for each `Running`
+    /// slot. A daemon that does not report `held` reads as `false`.
+    pub running: Vec<(SlotId, String, bool)>,
     /// False when the daemon answered the connection but its sessions could
     /// not be listed; `running` is then empty and means nothing.
     pub listed: bool,
 }
 
 impl RunningDaemon {
-    /// Whether restarting could end a session: some run, or nobody knows.
+    /// Whether restarting could end a session: some run without a holder,
+    /// or nobody knows. Held sessions survive a restart.
     pub fn may_end_sessions(&self) -> bool {
-        !self.listed || !self.running.is_empty()
+        !self.listed || self.running.iter().any(|(_, _, held)| !held)
+    }
+
+    /// The running sessions a restart would end, as (slot, label).
+    fn unheld(&self) -> impl Iterator<Item = (SlotId, &str)> {
+        self.running
+            .iter()
+            .filter(|(_, _, held)| !held)
+            .map(|(id, label, _)| (*id, label.as_str()))
     }
 }
 
@@ -374,9 +409,18 @@ pub fn restart_warning(d: &RunningDaemon) -> String {
     format!(
         "The daemon (build {}) has {}: {}. Restarting it ends them; each comes back as resumable, and r on its card resumes it.",
         d.build,
-        running_sessions_count(d.running.len()),
-        running_sessions_text(d.running.iter().map(|(id, l)| (*id, l.as_str()))),
+        running_sessions_count(d.unheld().count()),
+        running_sessions_text(d.unheld()),
     )
+}
+
+/// What a restart does to the running sessions, said as it happens.
+pub fn restart_note(d: &RunningDaemon) -> &'static str {
+    if d.may_end_sessions() {
+        "Sessions started before this version end this one last time; each comes back as resumable."
+    } else {
+        "Running sessions are kept: they reattach to the new daemon."
+    }
 }
 
 pub const RESTART_PROMPT: &str = "Restart the daemon now? [y/N] ";
@@ -402,8 +446,8 @@ pub fn restart_kept_text(d: &RunningDaemon) -> String {
     format!(
         "Kept the daemon (build {}) because {} would end: {}. Run overseer ctl restart --yes to restart it anyway.",
         d.build,
-        running_sessions_count(d.running.len()),
-        running_sessions_text(d.running.iter().map(|(id, l)| (*id, l.as_str()))),
+        running_sessions_count(d.unheld().count()),
+        running_sessions_text(d.unheld()),
     )
 }
 
@@ -460,7 +504,7 @@ fn query_daemon(socket: &Path) -> Option<RunningDaemon> {
         let running = running
             .into_iter()
             .filter(|s| matches!(s.state, SlotState::Running { .. }))
-            .map(|s| (s.id, s.label))
+            .map(|s| (s.id, s.label, s.held))
             .collect();
         Some(RunningDaemon {
             build,
@@ -500,7 +544,13 @@ fn warn_and_settle(
             println!("{}", restart_warning(d));
         }
     }
-    settle(choice)
+    let choice = settle(choice)?;
+    if let (RestartChoice::Restart, Some(d)) = (&choice, daemon) {
+        if !d.listed || !d.running.is_empty() {
+            println!("{}", restart_note(d));
+        }
+    }
+    Ok(choice)
 }
 
 /// Writes this home's plist, then starts, restarts or keeps the daemon by
@@ -839,9 +889,76 @@ mod tests {
     fn daemon(running: &[(SlotId, &str)]) -> RunningDaemon {
         RunningDaemon {
             build: "b1".to_string(),
-            running: running.iter().map(|(i, l)| (*i, l.to_string())).collect(),
+            running: running
+                .iter()
+                .map(|(i, l)| (*i, l.to_string(), false))
+                .collect(),
             listed: true,
         }
+    }
+
+    fn held_daemon(running: &[(SlotId, &str)]) -> RunningDaemon {
+        let mut d = daemon(running);
+        for r in &mut d.running {
+            r.2 = true;
+        }
+        d
+    }
+
+    #[test]
+    fn all_held_restarts_without_asking() {
+        let d = held_daemon(&[(1, "demo lane"), (3, "docs")]);
+        assert!(!d.may_end_sessions());
+        for o in [opts(false, false, true), opts(false, false, false)] {
+            assert_eq!(restart_choice(Some(&d), false, o), RestartChoice::Restart);
+        }
+        // --no-restart still wins.
+        assert_eq!(
+            restart_choice(Some(&d), false, opts(false, true, true)),
+            RestartChoice::Keep
+        );
+    }
+
+    #[test]
+    fn one_unheld_session_asks_as_before() {
+        let mut d = held_daemon(&[(1, "demo lane"), (3, "docs")]);
+        d.running[1].2 = false;
+        assert!(d.may_end_sessions());
+        assert_eq!(
+            restart_choice(Some(&d), false, opts(false, false, true)),
+            RestartChoice::Ask
+        );
+        assert_eq!(
+            restart_choice(Some(&d), false, opts(false, false, false)),
+            RestartChoice::Keep
+        );
+    }
+
+    #[test]
+    fn restart_says_whether_sessions_are_kept() {
+        assert_eq!(
+            restart_note(&held_daemon(&[(1, "demo lane")])),
+            "Running sessions are kept: they reattach to the new daemon."
+        );
+        assert_eq!(
+            restart_note(&daemon(&[(1, "demo lane")])),
+            "Sessions started before this version end this one last time; each comes back as resumable."
+        );
+    }
+
+    #[test]
+    fn bundle_replaces_the_binary_instead_of_overwriting_it() {
+        let script = include_str!("../../../scripts/bundle.sh");
+        let rm = script
+            .find("rm -f \"$app/Contents/MacOS/overseer\"")
+            .expect("bundle.sh removes the old binary");
+        let cp = script
+            .find("cp \"$bin\"")
+            .expect("bundle.sh copies the binary");
+        assert!(
+            rm < cp,
+            "the old binary must go before the new one is copied"
+        );
     }
 
     fn unlisted() -> RunningDaemon {

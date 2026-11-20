@@ -1519,6 +1519,7 @@ async fn daemon(v: &Vault, settings: Config) -> (PathBuf, tokio::task::JoinHandl
         state_dir: v.base.join("state"),
         files: overseer_daemon::SettingsFiles::in_dir(&v.base),
         hook_program: PathBuf::from("/bin/true"),
+        holder_program: None,
         settings,
         patterns: overseer_daemon::locks::targets::default_patterns(),
     };

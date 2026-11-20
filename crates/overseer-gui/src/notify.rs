@@ -551,6 +551,7 @@ mod tests {
                 idle_wait: false,
             }),
             session_note: None,
+            held: false,
         }
     }
 

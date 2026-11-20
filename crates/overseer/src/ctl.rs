@@ -166,10 +166,14 @@ pub enum CtlCmd {
         #[arg(allow_hyphen_values = true)]
         text: String,
     },
-    /// Stop the daemon and every session.
+    /// Stop the daemon. Sessions kept by a holder keep running.
     Shutdown,
-    /// Restart the daemon. Running sessions end and come back as
-    /// resumable; you are asked first when any are running.
+    /// End every session, kept ones included, so they come back as
+    /// resumable under the next daemon, and stop the daemon. Fails, naming
+    /// them, when a session cannot be ended. Used by uninstall.
+    StopAll,
+    /// Restart the daemon. Sessions kept by a holder survive it; others end
+    /// and come back as resumable, and you are asked first when any would.
     Restart {
         /// Restart without asking, even with sessions running.
         #[arg(long)]
@@ -1015,6 +1019,14 @@ pub async fn run(cmd: CtlCmd) -> anyhow::Result<()> {
     if matches!(cmd, CtlCmd::Version) {
         return version().await;
     }
+    if matches!(cmd, CtlCmd::StopAll) {
+        // Never starts a daemon: with none running there is nothing for it
+        // to end, and a caller (uninstall) then falls back to the pid files.
+        let client = Client::connect(socket_path())
+            .await
+            .map_err(|_| anyhow::anyhow!("no daemon is running"))?;
+        return expect_ok(client.request(Request::StopAll).await?);
+    }
     let client = connect().await?;
     match cmd {
         CtlCmd::Version => unreachable!("handled before connecting"),
@@ -1317,6 +1329,7 @@ pub async fn run(cmd: CtlCmd) -> anyhow::Result<()> {
             )
         }
         CtlCmd::Shutdown => expect_ok(client.request(Request::Shutdown).await?),
+        CtlCmd::StopAll => unreachable!("handled before connecting"),
     }
 }
 
@@ -1648,6 +1661,7 @@ mod tests {
             rows: 24,
             activity: None,
             session_note: None,
+            held: false,
         };
         assert_eq!(format_slot(&s), "S3  resumable  eks");
     }
@@ -1674,6 +1688,7 @@ mod tests {
                 idle_wait: false,
             }),
             session_note: None,
+            held: false,
         }
     }
 

@@ -364,6 +364,7 @@ mod tests {
                 rows: 24,
                 activity: None,
                 session_note: None,
+                held: false,
             },
         ));
         assert_eq!(hub.routes.lock().unwrap().dispatch(ev.clone()), Some(ev));
