@@ -893,6 +893,22 @@ pub(crate) fn unanswered_from_on(
         .optional()?)
 }
 
+/// The oldest relay from slot `from` to `to` that is still waiting to be
+/// typed in, if any. A worker may have only one waiting for S0 at a time.
+pub(crate) fn waiting_from_on(conn: &Connection, from: SlotId, to: SlotId) -> Result<Option<i64>> {
+    Ok(conn
+        .query_row(
+            &format!(
+                "SELECT id FROM relays
+                 WHERE sender = 'slot' AND from_slot = ?1 AND to_slot = ?2 AND {PENDING}
+                 ORDER BY id LIMIT 1"
+            ),
+            params![from, to],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2127,6 +2143,23 @@ mod tests {
         })
         .unwrap();
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn waiting_from_sees_only_pending_relays_from_that_slot() {
+        with(|c| {
+            let s2 = Sender::Slot { slot: 2 };
+            assert_eq!(waiting_from_on(c, 2, 0)?, None);
+            queue_relay_on(c, &Sender::You, 0, "hi", None, 10)?;
+            queue_relay_on(c, &Sender::Slot { slot: 3 }, 0, "hi", None, 10)?;
+            assert_eq!(waiting_from_on(c, 2, 0)?, None);
+            let first = queue_relay_on(c, &s2, 0, "can you resend #191?", None, 11)?;
+            assert_eq!(waiting_from_on(c, 2, 0)?, Some(first));
+            assert_eq!(waiting_from_on(c, 2, 1)?, None);
+            mark_delivered_on(c, &[first], 12)?;
+            assert_eq!(waiting_from_on(c, 2, 0)?, None);
+            Ok(())
+        })
     }
 
     #[test]

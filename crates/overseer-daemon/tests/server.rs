@@ -3120,25 +3120,49 @@ async fn jonathan_and_s0_can_send_to_anyone() {
 }
 
 #[tokio::test]
-async fn worker_can_answer_s0_once() {
+async fn worker_answers_s0_and_keeps_one_message_waiting() {
     let d = lock_daemon().await;
     let mut c = Client::connect(&d.socket).await;
     for id in [0, 2] {
         assert_eq!(c.start(id).await, Response::Ok);
     }
     assert_eq!(c.relay(Some(0), 2, "status?").await, queued_for(2));
-    // Not delivered yet, so there is nothing to answer.
-    assert!(matches!(
-        c.relay(Some(2), 0, "early").await,
-        Response::Error { .. }
-    ));
     let v = c.locks().await;
     deliver_all(&d, 2, &v);
     assert_eq!(c.relay(Some(2), 0, "on it").await, queued_for(0));
+    let v = c.locks().await;
+    let answer = v.relays.iter().find(|r| r.text == "on it").unwrap();
+    // The answer is still waiting for S0, so a second message is refused.
     assert!(is_error(
         &c.relay(Some(2), 0, "and another").await,
-        "S2 can message S0 only to answer a message from S0."
+        &format!(
+            "S2 already has a message waiting for S0 (relay {}). Wait until it is \
+             typed in, or drop it with drop_relay and send one message.",
+            answer.id
+        )
     ));
+    deliver_all(&d, 0, &v);
+    assert_eq!(c.relay(Some(2), 0, "and another").await, queued_for(0));
+}
+
+#[tokio::test]
+async fn worker_can_start_a_message_to_s0() {
+    let d = lock_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    for id in [0, 2] {
+        assert_eq!(c.start(id).await, Response::Ok);
+    }
+    assert_eq!(
+        c.relay(Some(2), 0, "please resend #191").await,
+        queued_for(0)
+    );
+    let v = c.locks().await;
+    let r = v
+        .relays
+        .iter()
+        .find(|r| r.text == "please resend #191")
+        .unwrap();
+    assert_eq!((r.to, r.state), (0, RelayState::Pending));
 }
 
 #[tokio::test]
@@ -3150,18 +3174,19 @@ async fn worker_cannot_start_a_conversation() {
     }
     assert!(is_error(
         &c.relay(Some(2), 1, "hi").await,
-        "S2 can message S1 only to answer a message from S1."
+        "S2 can message S1 only to answer a message from S1. Workers may \
+         message S0 at any time."
     ));
     assert!(is_error(
         &c.relay(Some(2), 2, "hi").await,
         "you cannot message yourself"
     ));
-    // A relay from Demo is not a message from S0 to answer.
+    // A relay from Demo is not a message from S1 to answer.
     assert_eq!(c.relay(None, 2, "hello").await, queued_for(2));
     let v = c.locks().await;
     deliver_all(&d, 2, &v);
     assert!(matches!(
-        c.relay(Some(2), 0, "hi").await,
+        c.relay(Some(2), 1, "hi").await,
         Response::Error { .. }
     ));
     assert!(c

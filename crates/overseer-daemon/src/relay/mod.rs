@@ -8,7 +8,7 @@ pub mod screen;
 use overseer_proto::msg::{slot_name, Sender};
 use overseer_proto::{Response, SlotId};
 
-use crate::locks::table::{queue_relay_on, unanswered_from_on};
+use crate::locks::table::{queue_relay_on, unanswered_from_on, waiting_from_on};
 use crate::locks::LockService;
 use crate::manager::valid_id;
 
@@ -22,26 +22,38 @@ fn error(message: impl Into<String>) -> Response {
 }
 
 /// Whether `from` may message `to`. The user (`None`) and S0 always may.
-/// A worker may only answer a delivered relay from `to` that it has not
-/// answered yet (`unanswered`), and the answer carries that relay as its
-/// `reply_to`. Workers can therefore never start a conversation.
+/// A worker may answer a delivered relay from `to` that it has not answered
+/// yet (`unanswered`), and the answer carries that relay as its `reply_to`.
+/// A worker may also start a message to S0, but only while none of its
+/// messages to S0 is still waiting to be typed in (`waiting`), so it cannot
+/// flood the coordinator. Workers never start a conversation with each
+/// other.
 pub fn may_send(
     from: Option<SlotId>,
     to: SlotId,
     unanswered: Option<i64>,
+    waiting: Option<i64>,
 ) -> Result<Option<i64>, String> {
     match from {
         None => Ok(None),
         Some(f) if f == to => Err("you cannot message yourself".into()),
         Some(0) => Ok(None),
-        Some(f) => unanswered.map(Some).ok_or_else(|| {
-            format!(
-                "{} can message {} only to answer a message from {}.",
-                slot_name(f),
-                slot_name(to),
-                slot_name(to)
-            )
-        }),
+        Some(_) if unanswered.is_some() => Ok(unanswered),
+        Some(f) if to == 0 => match waiting {
+            None => Ok(None),
+            Some(id) => Err(format!(
+                "{} already has a message waiting for S0 (relay {id}). Wait until it \
+                 is typed in, or drop it with drop_relay and send one message.",
+                slot_name(f)
+            )),
+        },
+        Some(f) => Err(format!(
+            "{} can message {} only to answer a message from {}. Workers may \
+             message S0 at any time.",
+            slot_name(f),
+            slot_name(to),
+            slot_name(to)
+        )),
     }
 }
 
@@ -71,11 +83,18 @@ pub fn send(
     }
     let sender = from.map_or(Sender::You, |slot| Sender::Slot { slot });
     let done = locks.change("relay", |conn| {
-        let unanswered = match from {
-            Some(f) if f != 0 && f != to => unanswered_from_on(conn, f, to)?,
-            _ => None,
+        let (unanswered, waiting) = match from {
+            Some(f) if f != 0 && f != to => (
+                unanswered_from_on(conn, f, to)?,
+                if to == 0 {
+                    waiting_from_on(conn, f, 0)?
+                } else {
+                    None
+                },
+            ),
+            _ => (None, None),
         };
-        match may_send(from, to, unanswered) {
+        match may_send(from, to, unanswered, waiting) {
             Ok(_) if !live => Ok(Err(format!("{} has no session to message.", slot_name(to)))),
             Ok(reply_to) => queue_relay_on(conn, &sender, to, text, reply_to, now).map(|_| Ok(())),
             Err(refusal) => Ok(Err(refusal)),
@@ -99,29 +118,56 @@ mod tests {
 
     #[test]
     fn jonathan_and_s0_always_pass_without_a_reply_to() {
-        assert_eq!(may_send(None, 3, None), Ok(None));
-        assert_eq!(may_send(Some(0), 3, None), Ok(None));
-        assert_eq!(may_send(Some(0), 3, Some(9)), Ok(None));
+        assert_eq!(may_send(None, 3, None, None), Ok(None));
+        assert_eq!(may_send(Some(0), 3, None, None), Ok(None));
+        assert_eq!(may_send(Some(0), 3, Some(9), Some(4)), Ok(None));
     }
 
     #[test]
     fn a_slot_cannot_message_itself() {
         assert_eq!(
-            may_send(Some(2), 2, Some(1)),
+            may_send(Some(2), 2, Some(1), None),
             Err("you cannot message yourself".into())
         );
         assert_eq!(
-            may_send(Some(0), 0, None),
+            may_send(Some(0), 0, None, None),
             Err("you cannot message yourself".into())
         );
     }
 
     #[test]
-    fn a_worker_passes_only_with_an_unanswered_relay_and_replies_to_it() {
-        assert_eq!(may_send(Some(2), 0, Some(7)), Ok(Some(7)));
+    fn a_worker_answers_with_the_relay_it_replies_to() {
+        assert_eq!(may_send(Some(2), 0, Some(7), None), Ok(Some(7)));
+        assert_eq!(may_send(Some(2), 0, Some(7), Some(8)), Ok(Some(7)));
+        assert_eq!(may_send(Some(2), 1, Some(5), None), Ok(Some(5)));
+    }
+
+    #[test]
+    fn a_worker_may_start_a_message_to_s0() {
+        assert_eq!(may_send(Some(2), 0, None, None), Ok(None));
+    }
+
+    #[test]
+    fn a_worker_has_one_message_waiting_for_s0_at_a_time() {
         assert_eq!(
-            may_send(Some(2), 1, None),
-            Err("S2 can message S1 only to answer a message from S1.".into())
+            may_send(Some(2), 0, None, Some(8)),
+            Err(
+                "S2 already has a message waiting for S0 (relay 8). Wait until it is \
+                 typed in, or drop it with drop_relay and send one message."
+                    .into()
+            )
+        );
+    }
+
+    #[test]
+    fn a_worker_cannot_start_a_message_to_another_worker() {
+        assert_eq!(
+            may_send(Some(2), 1, None, None),
+            Err(
+                "S2 can message S1 only to answer a message from S1. Workers may \
+                 message S0 at any time."
+                    .into()
+            )
         );
     }
 }

@@ -192,7 +192,10 @@ fn worker_notify_without_a_message_is_an_error() {
     let mut s2 = Mcp::start(&d.home, "S2");
     let (text, err) = s2.tool("notify_session", json!({"slot": "S3", "text": "hello"}));
     assert!(err);
-    assert_eq!(text, "S2 can message S3 only to answer a message from S3.");
+    assert_eq!(
+        text,
+        "S2 can message S3 only to answer a message from S3. Workers may message S0 at any time."
+    );
 }
 
 #[test]
