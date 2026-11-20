@@ -512,6 +512,12 @@ impl LockService {
         }
     }
 
+    /// Whether `shutdown` was called: session exits from then on keep
+    /// their locks, items and status requests for a resume.
+    pub fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst)
+    }
+
     /// The daemon is stopping: session exits from here on keep their locks.
     pub fn shutdown(&self) {
         self.stopping.store(true, Ordering::SeqCst);
