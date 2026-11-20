@@ -318,6 +318,7 @@ pub async fn run_until(
     // Subscribed before any slot can start, so no exit is missed.
     let exit_events = events.subscribe();
     let courier_events = events.subscribe();
+    let log_events = events.subscribe();
     let state_dir = cfg.state_dir.clone();
     let holder_program = cfg.holder_program;
     let mut mgr = SlotManager::new(cfg.default_command, events)
@@ -384,7 +385,7 @@ pub async fn run_until(
         move || sessionless(&manager.lock().unwrap().list())
     });
     let courier = Courier::spawn(
-        ledger,
+        ledger.clone(),
         manager.clone(),
         locks.clone(),
         courier_events,
@@ -404,6 +405,20 @@ pub async fn run_until(
         locks.clone(),
         manager.clone(),
         courier.clone(),
+    ));
+    let log_check = tokio::spawn(watch_session_logs(
+        log_events,
+        LogCheck {
+            manager: manager.clone(),
+            ledger: ledger.clone(),
+            store: store.clone(),
+            brain: brain.clone(),
+            brain_dir: cfg.settings.brain_dir.clone(),
+            home: crate::config::home_from_env(),
+            patterns: cfg.settings.session_logs.clone(),
+            runs_file: cfg.settings.slot_runs.clone(),
+            min_secs: cfg.settings.session_log_min_mins.saturating_mul(60) as i64,
+        },
     ));
     store.start_polling();
     let plans = Arc::new(PlanCtx {
@@ -458,6 +473,8 @@ pub async fn run_until(
     drop(listener);
     let _ = std::fs::remove_file(&cfg.socket);
     store.shutdown();
+    // Sessions ended by the shutdown are not checked.
+    log_check.abort();
     // The sessions are let go next; they keep their locks for the restart.
     locks.shutdown();
     manager.lock().unwrap().shutdown_all();
@@ -529,6 +546,90 @@ fn brain_context(
 
 /// Ends the locks of each slot whose session exits. After a lag, which
 /// may have lost exit events, every slot with no session is reconciled.
+/// What the session-log check needs (see [`crate::session_logs`]).
+struct LogCheck {
+    manager: Manager,
+    ledger: Arc<Ledger>,
+    store: Arc<WorkStore>,
+    brain: Option<Arc<BrainService>>,
+    brain_dir: PathBuf,
+    home: PathBuf,
+    patterns: Vec<String>,
+    runs_file: String,
+    /// Shorter runs are not checked: a session stopped at once has
+    /// nothing to log.
+    min_secs: i64,
+}
+
+/// Checks a slot's session logs each time its session really ends.
+async fn watch_session_logs(mut events: broadcast::Receiver<Event>, c: LogCheck) {
+    if c.patterns.is_empty() {
+        return;
+    }
+    loop {
+        match events.recv().await {
+            Ok(Event::SlotChanged(info)) => {
+                let SlotState::Exited { at, .. } = info.state else {
+                    continue;
+                };
+                // A start may have replaced the session since this was sent.
+                if !sessionless(&c.manager.lock().unwrap().list()).contains(&info.id) {
+                    continue;
+                }
+                check_session_logs(&c, info.id, at).await;
+            }
+            Ok(_) => {}
+            // A missed exit is not checked: the next one is.
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!("session log check lagged by {n} events");
+            }
+            Err(broadcast::error::RecvError::Closed) => return,
+        }
+    }
+}
+
+async fn check_session_logs(c: &LogCheck, slot: SlotId, ended: i64) {
+    use crate::session_logs as logs;
+    let started = match c.ledger.session_times(slot) {
+        Ok(Some((started, _))) => started,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!("session log check for S{slot}: {e:#}");
+            return;
+        }
+    };
+    if ended - started < c.min_secs {
+        return;
+    }
+    let run = logs::Run {
+        slot,
+        started,
+        ended,
+    };
+    let (brain_dir, home, patterns) = (c.brain_dir.clone(), c.home.clone(), c.patterns.clone());
+    let found = tokio::task::spawn_blocking(move || {
+        logs::read_logs(&logs::find_logs(&brain_dir, &home, &patterns, &run))
+    })
+    .await
+    .unwrap_or_default();
+    let record = c.brain.as_ref().filter(|_| !c.runs_file.is_empty());
+    let runs_file = logs::runs_file(&c.runs_file, &run);
+    if let Some(text) = logs::notice(&run, &found, record.map(|_| runs_file.as_str())) {
+        // S0 follows up; its own logs are only flagged on its card.
+        let relay_to = (slot != 0).then_some(0);
+        c.store.notify(slot, relay_to, &text, unix_now());
+    }
+    if let Some(b) = record {
+        let message = format!("{} run times", overseer_proto::slot_name(slot));
+        if let Response::Error { message } = b
+            .append_line(&runs_file, &logs::run_line(&run, &found), &message)
+            .await
+        {
+            tracing::warn!("S{slot} run times not recorded: {message}")
+        }
+    }
+}
+
 async fn watch_exits(
     mut events: broadcast::Receiver<Event>,
     locks: Arc<LockService>,
