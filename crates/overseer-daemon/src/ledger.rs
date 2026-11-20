@@ -966,6 +966,19 @@ impl Ledger {
         Ok(rows.next().transpose()?)
     }
 
+    /// When the slot's last session started and, once seen, exited.
+    pub fn session_times(&self, slot: SlotId) -> Result<Option<(i64, Option<i64>)>> {
+        let conn = self.conn();
+        let row = conn
+            .query_row(
+                "SELECT started, exited FROM sessions WHERE slot = ?1",
+                rusqlite::params![slot],
+                |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?)),
+            )
+            .ok();
+        Ok(row.and_then(|(s, e)| s.map(|s| (s, e))))
+    }
+
     /// Fixes the slot's session note path (relative to the vault).
     pub fn set_session_note(&self, slot: SlotId, rel: &str) -> Result<()> {
         self.conn().execute(

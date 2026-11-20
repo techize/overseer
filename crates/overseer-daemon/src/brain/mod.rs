@@ -713,6 +713,40 @@ impl BrainService {
         self.enqueue(from, vec![rel], message).await
     }
 
+    /// Appends `line` to the vault file `rel` and commits it as Overseer:
+    /// the session-log check's record of a run's real times.
+    pub async fn append_line(&self, rel: &str, line: &str, message: &str) -> Response {
+        let err = |message: String| Response::Error { message };
+        let rel = match vault_rel(&self.cfg.brain, None, Path::new(rel), &self.opts.home) {
+            Ok(r) => r,
+            Err(e) => return err(e),
+        };
+        let abs = self.cfg.brain.join(&rel);
+        {
+            let _g = self.files.lock(&canon(&abs)).await;
+            let mut file = match std::fs::read_to_string(&abs) {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(e) => return err(format!("cannot read {rel}: {e}")),
+            };
+            if !file.is_empty() && !file.ends_with('\n') {
+                file.push('\n');
+            }
+            file.push_str(line.trim_end());
+            file.push('\n');
+            if let Some(dir) = abs.parent() {
+                if let Err(e) = std::fs::create_dir_all(dir) {
+                    return err(format!("cannot create the folder for {rel}: {e}"));
+                }
+            }
+            if let Err(e) = shared::write_atomic(&abs, &file) {
+                return err(format!("cannot write {rel}: {e}"));
+            }
+        }
+        self.enqueue(Sender::Overseer, vec![rel], message.to_string())
+            .await
+    }
+
     /// Replaces the one occurrence of `old` in a shared file and commits it.
     pub async fn edit_shared(&self, from: Sender, rel: &str, old: &str, new: &str) -> Response {
         let err = |message: String| Response::Error { message };

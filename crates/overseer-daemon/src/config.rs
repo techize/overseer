@@ -41,6 +41,18 @@ pub struct Config {
     pub journal_path: String,
     /// A session's note under `brain_dir`; also takes `{slot}` and `{label}`.
     pub session_note: String,
+    /// Globs under `brain_dir` for the logs a slot's session writes, read
+    /// when the session ends to check their times and `outcome` and
+    /// `highlights`; `{yyyy}`, `{mm}`, `{dd}`, `{Month}` and `{slot}` (`s1`)
+    /// are filled in. Empty turns the check off.
+    pub session_logs: Vec<String>,
+    /// The file under `brain_dir` that gets each ended run's real start and
+    /// end as a JSON line, while the notes writer is on; the date fields
+    /// are the run's start day's. One file a day keeps two machines from
+    /// appending to the same file. Empty turns it off.
+    pub slot_runs: String,
+    /// Sessions that ran fewer minutes than this are not checked.
+    pub session_log_min_mins: u64,
     /// Each slot's section is written by Overseer only. Usually outside the
     /// vault; where it is in the vault, or a symlink into it (R7), the
     /// backup commits it like a free file.
@@ -133,6 +145,15 @@ impl Default for Config {
             journal_path: "06-Daily/{yyyy}/{mm}-{Month}/{yyyy}-{mm}-{dd}-journal.md".to_string(),
             session_note: "Sessions/{yyyy}/{mm}-{Month}/{yyyy}-{mm}-{dd}-{slot}-{label}.md"
                 .to_string(),
+            session_logs: [
+                "Sessions/{yyyy}-{mm}-{dd}-{slot}-*.md",
+                "Sessions/{yyyy}/{mm}-{Month}/{yyyy}-{mm}-{dd}-{slot}-*.md",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+            slot_runs: "Sessions/Runs/{yyyy}-{mm}-{dd}-runs.jsonl".to_string(),
+            session_log_min_mins: 15,
             current_session: PathBuf::from("~/.claude/CURRENT_SESSION.md"),
             backup_mins: 5,
             push: true,
@@ -459,6 +480,15 @@ mod tests {
             c.session_note,
             "Sessions/{yyyy}/{mm}-{Month}/{yyyy}-{mm}-{dd}-{slot}-{label}.md"
         );
+        assert_eq!(
+            c.session_logs,
+            vec![
+                "Sessions/{yyyy}-{mm}-{dd}-{slot}-*.md",
+                "Sessions/{yyyy}/{mm}-{Month}/{yyyy}-{mm}-{dd}-{slot}-*.md"
+            ]
+        );
+        assert_eq!(c.slot_runs, "Sessions/Runs/{yyyy}-{mm}-{dd}-runs.jsonl");
+        assert_eq!(c.session_log_min_mins, 15);
         assert_eq!(c.current_session, h.0.join(".claude/CURRENT_SESSION.md"));
         assert_eq!(c.backup_mins, 5);
         assert!(c.push);

@@ -15,6 +15,7 @@ pub mod pty;
 pub mod relay;
 pub mod ring;
 pub mod server;
+pub mod session_logs;
 pub mod settings;
 pub mod slot;
 pub mod trust;

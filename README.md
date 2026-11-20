@@ -179,6 +179,19 @@ Overseer keeps journals, session notes and sprint files in a notes folder
   puts back the copy from that commit and commits it. Then
   `sync_2ndbrain` with `confirm` (or `overseer ctl notes-sync --confirm`)
   pushes. The hold outlasts a daemon restart.
+- When a slot's session ends, Overseer reads the session logs that slot wrote
+  during the run (`session_logs`, default `Sessions/<date>-s<n>-*.md` and the
+  same name under `Sessions/<yyyy>/<mm>-<Month>/`). When a log has no
+  `**Time**` header, no end time, no `outcome` or no `highlights`, when the
+  logs' times do not cover the run to within 15 minutes, or when no log was
+  written, the slot's panel gets a notice such as
+  `Session log check for S2 (08:06-16:24): ... has no outcome or highlights`,
+  and S0 gets the same text as a relay so it can follow up. Runs shorter than
+  `session_log_min_mins` (default 15) are not checked. With the notes writer
+  on, each run's real start and end are also appended, one JSON line per run,
+  to `slot_runs` (default `Sessions/Runs/<date>-runs.jsonl`) and committed, so
+  a session index can fill in missing or short times. Set `session_logs` to
+  `[]` to turn the check off, or `slot_runs` to `""` to stop the record.
 
 ### What each optional tool adds
 
