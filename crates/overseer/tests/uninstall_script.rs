@@ -207,3 +207,28 @@ fn a_holder_that_cannot_be_identified_is_still_running() {
     assert!(s.holders().join("S1.pid").exists());
     assert!(s.holders().join("S1.exit").exists());
 }
+
+/// An older binary's `hold --end` succeeds even when the holder it names
+/// is still alive and its pid file still there: uninstall still checks,
+/// keeps `holders/` and reports the slot.
+#[test]
+fn an_older_hold_end_that_leaves_a_live_holder_is_still_running() {
+    let s = Setup::new();
+    s.write_exec("launchctl", "exit 0");
+    let live = sleeper();
+    s.write_exec(
+        "overseer",
+        r#"case "$1 $2" in
+"ctl stop-all") echo "no daemon is running" >&2; exit 1 ;;
+"hold --end") exit 0 ;;
+esac
+exit 0"#,
+    );
+    s.holder(1, live.id());
+    let out = s.run();
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    drop(live);
+    assert!(err.contains("still running: S1"), "{err}");
+    assert!(s.holders().join("S1.pid").exists(), "{err}");
+    assert!(s.holders().join("S1.exit").exists(), "{err}");
+}

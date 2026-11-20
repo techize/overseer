@@ -69,7 +69,8 @@ const HOLDER_GONE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 /// belongs to another process (a stale file after a reboot). It is an
 /// error when the pid file exists but cannot be read, or when the holder
 /// is still there: alive, or a live process whose identity cannot be read,
-/// which is never signalled. `scripts/uninstall.sh` goes by this.
+/// which is never signalled. On success no pid file naming that holder is
+/// left. `scripts/uninstall.sh` goes by this.
 fn end_holder(path: &std::path::Path) -> anyhow::Result<()> {
     use anyhow::Context;
     use overseer_daemon::holder::{end_by_pid, holder_gone, load_pid_file};
@@ -87,6 +88,17 @@ fn end_holder(path: &std::path::Path) -> anyhow::Result<()> {
                 path.display(),
                 p.holder
             );
+        }
+        // Its holder is gone, so the file is stale (as the daemon's
+        // `forget_stale_pid_file` treats it): removed, unless a new holder
+        // has written its own meanwhile. uninstall.sh reads a pid file left
+        // after a success as a holder an older build could not end.
+        if load_pid_file(path).ok().flatten().as_ref() == Some(&p) {
+            if let Err(e) = std::fs::remove_file(path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    return Err(e).with_context(|| format!("remove {}", path.display()));
+                }
+            }
         }
     }
     Ok(())

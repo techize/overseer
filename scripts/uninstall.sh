@@ -38,11 +38,25 @@ if [ -n "$ov" ]; then
         # hold --end checks the holder's identity (its name and recorded
         # start time), not just that its pid is alive: after a reboot a
         # stale pid file's pid can belong to any process. It fails while
-        # the holder is still there, or cannot be shown not to be.
-        if "$ov" hold --end "$pidfile"; then
-            rm -f "${pidfile%.pid}.exit"
-        else
+        # the holder is still there, or cannot be shown not to be, and on
+        # success leaves no pid file.
+        if ! "$ov" hold --end "$pidfile"; then
             alive="$alive $slot"
+            continue
+        fi
+        # An older binary's hold --end succeeds even when its holder is
+        # still alive, and leaves the pid file: then the pid decides, after
+        # a moment for a holder sent its final SIGTERM to go.
+        pid=$(sed -n 's/.*"holder"[^0-9]*\([0-9][0-9]*\).*/\1/p' "$pidfile" 2>/dev/null || true)
+        tries=0
+        while [ -e "$pidfile" ] && [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && [ "$tries" -lt 10 ]; do
+            sleep 0.2
+            tries=$((tries + 1))
+        done
+        if [ -e "$pidfile" ] && [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            alive="$alive $slot"
+        else
+            rm -f "${pidfile%.pid}.exit"
         fi
     done
     if [ -n "$alive" ]; then

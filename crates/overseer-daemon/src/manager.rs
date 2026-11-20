@@ -1734,7 +1734,8 @@ async fn monitor_exit(
     if let Some(info) = current {
         // Only the slot's own exit is logged: a slot that shutdown or a
         // reattach let go of, or killed, is no longer in its entry, and
-        // shutdown logs that itself.
+        // shutdown logs that itself. An own exit whose slot was replaced
+        // by a new start during the drain goes unlogged too.
         if let SlotState::Exited { code, .. } = &info.state {
             tracing::info!("{} exited (code {code:?})", slot_name(info.id));
         }
