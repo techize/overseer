@@ -638,6 +638,11 @@ impl SlotManager {
         // Held through replace and event send so a monitor's identity check
         // cannot interleave with them.
         let mut slots = self.slots.lock().unwrap();
+        // A session started now would be one shutdown never lets go of:
+        // checked under the slots lock that shutdown takes its slots under.
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err(SHUTTING_DOWN.to_string());
+        }
         if let Some(entry) = &slots[id as usize] {
             if matches!(entry.slot.info().state, SlotState::Running { .. }) {
                 return Err(format!("{} is already running", slot_name(id)));
@@ -1181,6 +1186,9 @@ impl Unreachable {
         )
     }
 }
+
+/// Why a start or resume is refused once shutdown (or stop-all) began.
+const SHUTTING_DOWN: &str = "the daemon is shutting down";
 
 /// Why an older build's session cannot be attached or replaced.
 const OLDER_BUILD: &str = "this session runs on an older Overseer build; stop it to use the slot";
@@ -1789,6 +1797,42 @@ mod tests {
         assert!(err.contains("not a directory"), "{err}");
         assert_eq!(mgr.list()[2].state, SlotState::Empty);
         assert!(ev_rx.try_recv().is_err(), "no event for a refused start");
+    }
+
+    /// A start or resume that arrives while the daemon drains would start
+    /// a session nobody lets go of: both are refused once shutdown begins.
+    #[tokio::test]
+    async fn start_and_resume_are_refused_once_shutting_down() {
+        let (events, mut ev_rx) = broadcast::channel(16);
+        let mut mgr = SlotManager::new(vec!["/bin/sleep".into(), "30".into()], events);
+        let mut info = SlotManager::empty_info(3);
+        info.cwd = Some(PathBuf::from("/tmp"));
+        info.state = SlotState::Resumable {
+            session_id: "demo-session".into(),
+            at: 1,
+        };
+        mgr.restored[3] = Some(Restored {
+            info,
+            session_id: "demo-session".into(),
+            unreachable: None,
+        });
+        mgr.shutdown_all();
+
+        let err = mgr
+            .start(2, "x".into(), Path::new("/tmp"), None, None)
+            .unwrap_err();
+        assert!(err.contains("the daemon is shutting down"), "{err}");
+        let err = mgr.resume(3).unwrap_err();
+        assert!(err.contains("the daemon is shutting down"), "{err}");
+        let slots = mgr.list();
+        assert_eq!(slots[2].state, SlotState::Empty);
+        assert!(
+            matches!(slots[3].state, SlotState::Resumable { .. }),
+            "{:?}",
+            slots[3]
+        );
+        assert!(ev_rx.try_recv().is_err(), "no event for a refused start");
+        mgr.shutdown_all();
     }
 }
 
