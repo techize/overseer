@@ -327,7 +327,11 @@ impl SlotManager {
     /// live ledger row is `row`, if any.
     fn restore_held(&mut self, launch: &Launch, id: SlotId, row: Option<&SessionRow>) {
         let state_dir = &launch.state_dir;
-        let saved = take_activity(state_dir, id);
+        // Left in place until the session is known to be over, so a holder
+        // that is kept but not attached (a placeholder) keeps it for the
+        // daemon after this one; attaching writes it back as it changes.
+        let saved = read_activity(state_dir, id);
+        let activity = activity_path(state_dir, id);
         // An exit file comes first: its holder is gone or about to go.
         let exit = exit_path(state_dir, id);
         if let Some(file) = read_json::<ExitFile>(&exit) {
@@ -360,11 +364,13 @@ impl SlotManager {
                 unreachable: None,
             });
             remove_file(&exit);
+            remove_file(&activity);
             return;
         }
         let socket = socket_path(state_dir, id);
         if !socket.exists() {
             forget_stale_pid_file(state_dir, id);
+            remove_file(&activity);
             return;
         }
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
@@ -410,6 +416,7 @@ impl SlotManager {
             );
             remove_file(&socket);
             forget_stale_pid_file(state_dir, id);
+            remove_file(&activity);
             return;
         };
         tracing::warn!(
@@ -638,6 +645,11 @@ impl SlotManager {
         // Held through replace and event send so a monitor's identity check
         // cannot interleave with them.
         let mut slots = self.slots.lock().unwrap();
+        // A session started now would be one shutdown never lets go of:
+        // checked under the slots lock that shutdown takes its slots under.
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err(SHUTTING_DOWN.to_string());
+        }
         if let Some(entry) = &slots[id as usize] {
             if matches!(entry.slot.info().state, SlotState::Running { .. }) {
                 return Err(format!("{} is already running", slot_name(id)));
@@ -1153,6 +1165,12 @@ impl SlotManager {
             .collect();
         for entry in &entries {
             if !entry.slot.is_held() {
+                if matches!(entry.slot.info().state, SlotState::Running { .. }) {
+                    tracing::info!(
+                        "{} ended at shutdown (not held, so it cannot outlive the daemon)",
+                        slot_name(entry.slot.info().id)
+                    );
+                }
                 entry.slot.kill();
                 continue;
             }
@@ -1181,6 +1199,9 @@ impl Unreachable {
         )
     }
 }
+
+/// Why a start or resume is refused once shutdown (or stop-all) began.
+const SHUTTING_DOWN: &str = "the daemon is shutting down";
 
 /// Why an older build's session cannot be attached or replaced.
 const OLDER_BUILD: &str = "this session runs on an older Overseer build; stop it to use the slot";
@@ -1280,7 +1301,7 @@ fn install(
     entry.session_note = session.note;
     entry.activity = session.activity;
     entry.activity_file = Some(activity_path(&ctx.state_dir, id));
-    // Restore took the file: put it back for the next daemon.
+    // From here on the file follows the slot's activity.
     entry.save_activity();
     if let SlotState::Running { pid, .. } = slot.info().state {
         tracing::info!(
@@ -1345,12 +1366,14 @@ async fn watch_lost(slot: Arc<Slot>, ctx: Reattach) {
     }
 }
 
-/// Attaches again, up to [`ATTACH_RETRIES`] times, the live holder of
-/// `old`, a held slot whose connection was lost. On success the new slot
-/// takes `old`'s place with its session, activity and note; `old` is let
-/// go, so its exit is never recorded. Otherwise `old` stays: it reads as
-/// running, Stop ends it by pid, and its exit is recorded once the holder
-/// goes. Never records an exit itself.
+/// Attaches again the live holder of `old`, a held slot whose connection
+/// was lost: [`ATTACH_RETRIES`] quick tries, then one every
+/// [`HOLDER_WATCH`] for as long as the holder lives and the slot is
+/// `old`'s. On success the new slot takes `old`'s place with its session,
+/// activity and note; `old` is let go, so its exit is never recorded.
+/// Until then `old` stays: it reads as running, Stop ends it by pid, and
+/// its exit is recorded once the holder goes. Never records an exit
+/// itself.
 fn reattach_lost(ctx: Reattach, old: Arc<Slot>) {
     let id = old.info().id;
     let socket = socket_path(&ctx.state_dir, id);
@@ -1364,12 +1387,22 @@ fn reattach_lost(ctx: Reattach, old: Arc<Slot>) {
             || old.exit_watch().borrow().is_some()
             || !current(&ctx.slots.lock().unwrap())
     };
-    for attempt in 0..ATTACH_RETRIES {
-        let pause = if attempt == 0 {
-            LOST_FIRST_PAUSE
-        } else {
-            ATTACH_RETRY_PAUSE
+    let mut attempt = 0;
+    loop {
+        let quick = attempt < ATTACH_RETRIES;
+        let pause = match attempt {
+            0 => LOST_FIRST_PAUSE,
+            _ if quick => ATTACH_RETRY_PAUSE,
+            _ => HOLDER_WATCH,
         };
+        if attempt == ATTACH_RETRIES && !stopped() {
+            tracing::warn!(
+                "{} holder not attached again after {ATTACH_RETRIES} tries; trying every {}s, Stop ends it",
+                slot_name(id),
+                HOLDER_WATCH.as_secs()
+            );
+        }
+        attempt = attempt.saturating_add(1);
         std::thread::sleep(pause);
         if stopped() {
             return;
@@ -1395,20 +1428,23 @@ fn reattach_lost(ctx: Reattach, old: Arc<Slot>) {
                 let _ = ctx.events.send(Event::SlotChanged(info));
                 return;
             }
-            Attempt::Gone => {
+            // Only the quick tries are logged: the slow ones would fill
+            // the log for as long as the holder stays out of reach.
+            Attempt::Gone if quick => {
                 tracing::warn!("{} holder alive but not listening", slot_name(id));
             }
-            Attempt::Failed(why) => {
+            Attempt::Failed(why) if quick => {
                 tracing::warn!("{} holder not attached again: {why}", slot_name(id));
             }
-            Attempt::Unsupported(_) => break,
+            Attempt::Gone | Attempt::Failed(_) => {}
+            Attempt::Unsupported(_) => {
+                tracing::warn!(
+                    "{} holder now answers as another build's; Stop ends it",
+                    slot_name(id)
+                );
+                return;
+            }
         }
-    }
-    if !stopped() {
-        tracing::warn!(
-            "{} holder not attached again after {ATTACH_RETRIES} tries; Stop ends it",
-            slot_name(id)
-        );
     }
 }
 
@@ -1556,12 +1592,10 @@ fn clear_exit_file(id: SlotId, pids: &PidFile, pid_file: &Path, exit: &Path) -> 
 }
 
 /// The activity the last daemon saved for slot `id`, if any. The file is
-/// removed either way: it only ever describes the session it was saved for.
-fn take_activity(state_dir: &Path, id: SlotId) -> Option<Activity> {
-    let path = activity_path(state_dir, id);
-    let activity = read_json(&path);
-    remove_file(&path);
-    activity
+/// left for the caller to remove once its session is over: it only ever
+/// describes the session it was saved for.
+fn read_activity(state_dir: &Path, id: SlotId) -> Option<Activity> {
+    read_json(&activity_path(state_dir, id))
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
@@ -1688,9 +1722,6 @@ async fn monitor_exit(
     // identity and send under the same lock `start` uses to replace and
     // announce.
     let info = slot.info();
-    if let SlotState::Exited { code, .. } = &info.state {
-        tracing::info!("{} exited (code {code:?})", slot_name(info.id));
-    }
     let mut slots = slots.lock().unwrap();
     // The entry's info, not the slot's: it carries the base command.
     let current = slots[info.id as usize]
@@ -1701,6 +1732,13 @@ async fn monitor_exit(
             e.info()
         });
     if let Some(info) = current {
+        // Only the slot's own exit is logged: a slot that shutdown or a
+        // reattach let go of, or killed, is no longer in its entry, and
+        // shutdown logs that itself. An own exit whose slot was replaced
+        // by a new start during the drain goes unlogged too.
+        if let SlotState::Exited { code, .. } = &info.state {
+            tracing::info!("{} exited (code {code:?})", slot_name(info.id));
+        }
         // A daemon shutdown kills the children too, but those sessions must
         // stay live in the ledger so they can be resumed. Synchronous for the
         // same reason as the start write.
@@ -1789,6 +1827,42 @@ mod tests {
         assert!(err.contains("not a directory"), "{err}");
         assert_eq!(mgr.list()[2].state, SlotState::Empty);
         assert!(ev_rx.try_recv().is_err(), "no event for a refused start");
+    }
+
+    /// A start or resume that arrives while the daemon drains would start
+    /// a session nobody lets go of: both are refused once shutdown begins.
+    #[tokio::test]
+    async fn start_and_resume_are_refused_once_shutting_down() {
+        let (events, mut ev_rx) = broadcast::channel(16);
+        let mut mgr = SlotManager::new(vec!["/bin/sleep".into(), "30".into()], events);
+        let mut info = SlotManager::empty_info(3);
+        info.cwd = Some(PathBuf::from("/tmp"));
+        info.state = SlotState::Resumable {
+            session_id: "demo-session".into(),
+            at: 1,
+        };
+        mgr.restored[3] = Some(Restored {
+            info,
+            session_id: "demo-session".into(),
+            unreachable: None,
+        });
+        mgr.shutdown_all();
+
+        let err = mgr
+            .start(2, "x".into(), Path::new("/tmp"), None, None)
+            .unwrap_err();
+        assert!(err.contains("the daemon is shutting down"), "{err}");
+        let err = mgr.resume(3).unwrap_err();
+        assert!(err.contains("the daemon is shutting down"), "{err}");
+        let slots = mgr.list();
+        assert_eq!(slots[2].state, SlotState::Empty);
+        assert!(
+            matches!(slots[3].state, SlotState::Resumable { .. }),
+            "{:?}",
+            slots[3]
+        );
+        assert!(ev_rx.try_recv().is_err(), "no event for a refused start");
+        mgr.shutdown_all();
     }
 }
 

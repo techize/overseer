@@ -315,12 +315,11 @@ fn a_second_connection_replaces_the_first() {
 
 #[test]
 fn exit_with_no_daemon_writes_the_exit_file() {
+    // Start returns on the pid file or, when the holder has already gone
+    // on a slow runner, on the exit file: nothing here waits for the
+    // short-lived pid file itself.
     let h = Holder::start("sleep 0.5; exit 3");
-    let start = Instant::now();
-    while !h.exit_path().exists() {
-        assert!(start.elapsed() < Duration::from_secs(3), "no exit file");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    h.wait_for(|| h.exit_path().exists(), "exit file");
     let exit: ExitFile = serde_json::from_slice(&std::fs::read(h.exit_path()).unwrap()).unwrap();
     assert_eq!(exit.code, Some(3));
     h.wait_for(

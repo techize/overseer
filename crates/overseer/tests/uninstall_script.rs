@@ -84,17 +84,6 @@ fn sleeper() -> Sleeper {
     )
 }
 
-/// The pid of a `sleep <secs>` that is not this test's child, so it is
-/// reaped as soon as it exits, as a real holder is by launchd.
-fn orphan_sleep(secs: &str) -> u32 {
-    let out = Command::new("/bin/sh")
-        .arg("-c")
-        .arg(format!("sleep {secs} >/dev/null 2>&1 & echo $!"))
-        .output()
-        .unwrap();
-    String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
-}
-
 #[test]
 fn a_refused_stop_all_falls_back_to_the_pid_files_and_clears_exit_files() {
     let s = Setup::new();
@@ -123,12 +112,12 @@ fn a_holder_still_running_keeps_holders_but_not_the_exit_files_of_the_ended() {
     let s = Setup::new();
     s.write_exec("launchctl", "exit 0");
     let live = sleeper();
-    // S1 ends; S2's `hold --end` leaves it running.
+    // S1 ends; S2's `hold --end` leaves it running and says so.
     s.write_exec(
         "overseer",
         r#"case "$1 $2" in
 "ctl stop-all") echo "no daemon is running" >&2; exit 1 ;;
-"hold --end") case "$3" in *S1.pid) rm -f "$3" ;; esac; exit 0 ;;
+"hold --end") case "$3" in *S1.pid) rm -f "$3"; exit 0 ;; esac; exit 1 ;;
 esac
 exit 0"#,
     );
@@ -164,11 +153,69 @@ exit 0"#,
     assert!(!s.holders().exists());
 }
 
+/// A fake `overseer` whose `ctl stop-all` finds no daemon and whose
+/// `hold --end` is the real binary's, identity check and all.
+fn real_hold_end(s: &Setup) {
+    s.write_exec(
+        "overseer",
+        &format!(
+            r#"case "$1 $2" in
+"ctl stop-all") echo "no daemon is running" >&2; exit 1 ;;
+"hold --end") exec "{}" hold --end "$3" ;;
+esac
+exit 0"#,
+            env!("CARGO_BIN_EXE_overseer")
+        ),
+    );
+}
+
+/// After a reboot a pid file's holder pid can belong to some other live
+/// process. It is not a holder: nothing is signalled, the session is not
+/// reported as still running, and `holders/` goes.
 #[test]
-fn a_holder_that_goes_a_moment_after_hold_end_is_not_still_running() {
+fn a_stale_pid_file_naming_another_process_is_not_still_running() {
     let s = Setup::new();
     s.write_exec("launchctl", "exit 0");
-    // `hold --end` leaves the pid file; the holder goes a moment later.
+    real_hold_end(&s);
+    let mut other = sleeper();
+    s.holder(1, other.id());
+    let out = s.run();
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    let signalled = other.0.try_wait().unwrap();
+    drop(other);
+    assert!(signalled.is_none(), "the other process was signalled");
+    assert!(!err.contains("still running"), "{err}");
+    assert!(!s.holders().exists(), "{err}");
+}
+
+/// A live process whose identity cannot be read may be the holder: it is
+/// never signalled, and it keeps `holders/` as still running.
+#[test]
+fn a_holder_that_cannot_be_identified_is_still_running() {
+    let s = Setup::new();
+    s.write_exec("launchctl", "exit 0");
+    real_hold_end(&s);
+    // Killed but not reaped: alive to a signal check, not identifiable.
+    let mut zombie = sleeper();
+    zombie.0.kill().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    s.holder(1, zombie.id());
+    let out = s.run();
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    drop(zombie);
+    assert!(err.contains("still running: S1"), "{err}");
+    assert!(s.holders().join("S1.pid").exists());
+    assert!(s.holders().join("S1.exit").exists());
+}
+
+/// An older binary's `hold --end` succeeds even when the holder it names
+/// is still alive and its pid file still there: uninstall still checks,
+/// keeps `holders/` and reports the slot.
+#[test]
+fn an_older_hold_end_that_leaves_a_live_holder_is_still_running() {
+    let s = Setup::new();
+    s.write_exec("launchctl", "exit 0");
+    let live = sleeper();
     s.write_exec(
         "overseer",
         r#"case "$1 $2" in
@@ -177,9 +224,11 @@ fn a_holder_that_goes_a_moment_after_hold_end_is_not_still_running() {
 esac
 exit 0"#,
     );
-    s.holder(1, orphan_sleep("0.5"));
+    s.holder(1, live.id());
     let out = s.run();
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(!err.contains("still running"), "{err}");
-    assert!(!s.holders().exists(), "{err}");
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    drop(live);
+    assert!(err.contains("still running: S1"), "{err}");
+    assert!(s.holders().join("S1.pid").exists(), "{err}");
+    assert!(s.holders().join("S1.exit").exists(), "{err}");
 }
