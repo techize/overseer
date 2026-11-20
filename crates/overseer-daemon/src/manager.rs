@@ -327,7 +327,11 @@ impl SlotManager {
     /// live ledger row is `row`, if any.
     fn restore_held(&mut self, launch: &Launch, id: SlotId, row: Option<&SessionRow>) {
         let state_dir = &launch.state_dir;
-        let saved = take_activity(state_dir, id);
+        // Left in place until the session is known to be over, so a holder
+        // that is kept but not attached (a placeholder) keeps it for the
+        // daemon after this one; attaching writes it back as it changes.
+        let saved = read_activity(state_dir, id);
+        let activity = activity_path(state_dir, id);
         // An exit file comes first: its holder is gone or about to go.
         let exit = exit_path(state_dir, id);
         if let Some(file) = read_json::<ExitFile>(&exit) {
@@ -360,11 +364,13 @@ impl SlotManager {
                 unreachable: None,
             });
             remove_file(&exit);
+            remove_file(&activity);
             return;
         }
         let socket = socket_path(state_dir, id);
         if !socket.exists() {
             forget_stale_pid_file(state_dir, id);
+            remove_file(&activity);
             return;
         }
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
@@ -410,6 +416,7 @@ impl SlotManager {
             );
             remove_file(&socket);
             forget_stale_pid_file(state_dir, id);
+            remove_file(&activity);
             return;
         };
         tracing::warn!(
@@ -1288,7 +1295,7 @@ fn install(
     entry.session_note = session.note;
     entry.activity = session.activity;
     entry.activity_file = Some(activity_path(&ctx.state_dir, id));
-    // Restore took the file: put it back for the next daemon.
+    // From here on the file follows the slot's activity.
     entry.save_activity();
     if let SlotState::Running { pid, .. } = slot.info().state {
         tracing::info!(
@@ -1579,12 +1586,10 @@ fn clear_exit_file(id: SlotId, pids: &PidFile, pid_file: &Path, exit: &Path) -> 
 }
 
 /// The activity the last daemon saved for slot `id`, if any. The file is
-/// removed either way: it only ever describes the session it was saved for.
-fn take_activity(state_dir: &Path, id: SlotId) -> Option<Activity> {
-    let path = activity_path(state_dir, id);
-    let activity = read_json(&path);
-    remove_file(&path);
-    activity
+/// left for the caller to remove once its session is over: it only ever
+/// describes the session it was saved for.
+fn read_activity(state_dir: &Path, id: SlotId) -> Option<Activity> {
+    read_json(&activity_path(state_dir, id))
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {

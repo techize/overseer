@@ -6463,6 +6463,46 @@ mod restart {
         c.exited_event(1).await;
     }
 
+    /// A live holder that a daemon could not attach keeps the activity the
+    /// daemon before saved for it, through another restart: the daemon that
+    /// attaches it at last starts from that activity.
+    #[tokio::test]
+    async fn an_unattached_placeholder_keeps_its_activity_across_a_restart() {
+        let d = start_daemon().await;
+        let mut c = Client::connect(&d.socket).await;
+        assert_eq!(c.start(1).await, Response::Ok);
+        let pid = running_pid(&c.list().await[1]);
+        c.hook(hook(1, HookKind::SessionStart)).await;
+        assert_eq!(activity_of(&c.list().await[1]).kind, ActivityKind::Idle);
+        drop(c);
+        let down = stop_keeping(d).await;
+
+        // The next daemon cannot reach the holder: its socket refuses.
+        let sock = socket_path(&down.state_dir, 1);
+        let aside = down.state_dir.parent().unwrap().join("r1.sock");
+        std::fs::rename(&sock, &aside).unwrap();
+        drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
+        let d = start_daemon_at(down.socket.clone()).await;
+        let mut c = Client::connect(&d.socket).await;
+        let info = c.list().await.remove(1);
+        assert_eq!(running_pid(&info), pid, "{info:?}");
+        drop(c);
+        let down2 = stop_keeping(d).await;
+        let saved = overseer_daemon::holder::activity_path(&down.state_dir, 1);
+        assert!(saved.exists(), "the placeholder's activity was lost");
+
+        // The one after reaches it again, and its activity with it.
+        std::fs::rename(&aside, &sock).unwrap();
+        let d = start_daemon_at(down.socket.clone()).await;
+        let mut c = Client::connect(&d.socket).await;
+        let info = c.list().await.remove(1);
+        assert_eq!(running_pid(&info), pid, "{info:?}");
+        assert_eq!(activity_of(&info).kind, ActivityKind::Idle);
+        assert_eq!(c.request(Request::StopSlot { id: 1 }).await, Response::Ok);
+        c.exited_event(1).await;
+        drop(down2);
+    }
+
     /// Past the daemon's quick tries at attaching a lost holder again
     /// (about 4.2s of pauses).
     const PAST_RETRIES: Duration = Duration::from_secs(5);
