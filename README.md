@@ -489,6 +489,13 @@ trimming):
   that session, and Cmd+click on any PR row opens it in the browser.
 - A running session waiting for its next prompt shows Your turn, and the
   header counts them ("1 your turn") beside Needs you.
+- The header ends with each work source, its count and the time of its last
+  good read (`jira 12 14:02 · beads 133 14:05`), so a stale source shows. A
+  source whose last read failed says why and since when its items are from
+  (`jira: HTTP 401 (last 13:40)`), and the line turns orange. The daemon reads
+  each source on its own timer (`jira_poll_secs`, `beads_poll_secs`,
+  `pr_poll_secs`); Refresh beside the line reads them all now and shows
+  `Refreshing...` until they are done.
 - Pace needs `sprint_start` (a date like `2026-11-09`) and `sprint_days`
   (default 10). Without `sprint_start` the pace marker and the pace warning
   are hidden. The kanban is hidden when there are no sprint tickets.
