@@ -19,8 +19,8 @@ use std::path::Path;
 use gpui::{div, prelude::*, px, rgb, Context, FontWeight, Window};
 use overseer_proto::{
     slot_name, Activity, ActivityKind, BrainView, ClaimKind, CoordView, ItemKind, LockView,
-    PlanState, QueueEntry, QueueState, RelayState, Sender, SlotId, SlotInfo, SlotState, WorkItem,
-    WorkView, PRS_OFF,
+    PlanState, QueueEntry, QueueState, RelayState, Sender, SlotId, SlotInfo, SlotState,
+    SourceStatus, WorkItem, WorkView, PRS_OFF,
 };
 
 use crate::app::{colors, OverseerApp};
@@ -114,32 +114,75 @@ pub fn header_title(work: &WorkView) -> Option<String> {
     work.sprint.clone().filter(|s| !s.is_empty())
 }
 
-/// The header's source health: `jira 12 · beads 133 · 14:05`, or
-/// `jira: acli not found · beads 133 · 14:05` when a source failed. Jira
-/// leads; the time is the newest successful read, through `clock`.
-pub fn source_line(view: &WorkView, clock: impl Fn(i64) -> String) -> String {
-    // The PR source is off by default; the header does not mention it then.
+/// The sources the header shows, Jira first. The PR source is off by
+/// default; the header does not mention it then.
+fn shown_sources(view: &WorkView) -> Vec<&SourceStatus> {
     let mut sources: Vec<_> = view
         .sources
         .iter()
         .filter(|s| s.ok || s.message.as_deref() != Some(PRS_OFF))
         .collect();
     sources.sort_by_key(|s| s.name != "jira");
-    let mut parts: Vec<String> = sources
+    sources
+}
+
+/// The header's source health, each source with the time of its last good
+/// read through `clock`: `jira 12 14:02 · beads 133 14:05`. A source that
+/// failed shows why and, when it read before, since when its items are
+/// from: `jira: acli not found (last 13:40)`. A good read with a warning
+/// (such as Jira returning no tickets, so the last list is kept) shows it
+/// after the time. Each source has its own time, so a stale one cannot
+/// hide behind a fresh one.
+pub fn source_line(view: &WorkView, clock: impl Fn(i64) -> String) -> String {
+    shown_sources(view)
         .iter()
         .map(|s| {
             if s.ok {
-                format!("{} {}", s.name, s.count)
+                let mut part = format!("{} {}", s.name, s.count);
+                if let Some(at) = s.at {
+                    part.push_str(&format!(" {}", clock(at)));
+                }
+                if let Some(msg) = s.message.as_deref().filter(|m| !m.is_empty()) {
+                    part.push_str(&format!(": {}", short_message(msg)));
+                }
+                part
             } else {
                 let msg = s.message.as_deref().unwrap_or("failed");
-                format!("{}: {}", s.name, short_message(msg))
+                let mut part = format!("{}: {}", s.name, short_message(msg));
+                if let Some(at) = s.at {
+                    part.push_str(&format!(" (last {})", clock(at)));
+                }
+                part
             }
         })
-        .collect();
-    if let Some(at) = sources.iter().filter(|s| s.ok).filter_map(|s| s.at).max() {
-        parts.push(clock(at));
-    }
-    parts.join(" · ")
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// Whether a source the header shows failed its last read, so the header
+/// marks the line and a stale column is visible rather than silent.
+pub fn sources_failing(view: &WorkView) -> bool {
+    shown_sources(view).iter().any(|s| !s.ok)
+}
+
+/// The header's Refresh: reads every work source now. It reads
+/// `Refreshing...` and ignores clicks until the daemon answers.
+fn refresh_button(busy: bool, cx: &mut Context<OverseerApp>) -> impl IntoElement {
+    div()
+        .id("work-refresh")
+        .px_2()
+        .rounded(px(4.))
+        .border_1()
+        .border_color(rgb(colors::BUTTON_BORDER))
+        .bg(rgb(colors::BUTTON))
+        .text_xs()
+        .text_color(rgb(if busy { colors::MUTED } else { colors::TEXT }))
+        .when(!busy, |b| {
+            b.cursor_pointer()
+                .hover(|s| s.bg(rgb(colors::CARD_HOVER)))
+                .on_click(cx.listener(|this, _, _, cx| this.refresh_work(cx)))
+        })
+        .child(if busy { "Refreshing..." } else { "Refresh" })
 }
 
 /// Longest source error the header shows before cutting it.
@@ -1020,9 +1063,14 @@ impl OverseerApp {
                             )
                             .child(
                                 div()
-                                    .text_color(rgb(colors::MUTED))
+                                    .text_color(rgb(if sources_failing(&self.work) {
+                                        colors::ORANGE
+                                    } else {
+                                        colors::MUTED
+                                    }))
                                     .child(source_line(&self.work, local_hhmm)),
-                            ),
+                            )
+                            .child(refresh_button(self.refreshing_work, cx)),
                     ),
             )
             // A notes folder Overseer would not take: notes stay off until
@@ -1810,12 +1858,14 @@ mod tests {
             source("beads", true, 133, Some(14 * 60 + 5), None),
             source("jira", true, 12, Some(14 * 60 + 2), None),
         ];
-        assert_eq!(source_line(&v, hhmm), "jira 12 · beads 133 · 14:05");
+        assert_eq!(source_line(&v, hhmm), "jira 12 14:02 · beads 133 14:05");
+        assert!(!sources_failing(&v));
         v.sources[1] = source("jira", false, 0, None, Some("acli not found"));
         assert_eq!(
             source_line(&v, hhmm),
-            "jira: acli not found · beads 133 · 14:05"
+            "jira: acli not found · beads 133 14:05"
         );
+        assert!(sources_failing(&v));
         // Nothing read yet: no time.
         v.sources[0] = source("beads", false, 0, None, Some("not read yet"));
         assert_eq!(
@@ -1823,6 +1873,40 @@ mod tests {
             "jira: acli not found · beads: not read yet"
         );
         assert_eq!(source_line(&no_work(), hhmm), "");
+        assert!(!sources_failing(&no_work()));
+    }
+
+    #[test]
+    fn a_failed_source_says_since_when_its_items_are() {
+        let mut v = no_work();
+        v.sources = vec![
+            source("jira", false, 12, Some(13 * 60 + 40), Some("HTTP 401")),
+            source("beads", true, 133, Some(14 * 60 + 5), None),
+        ];
+        assert_eq!(
+            source_line(&v, hhmm),
+            "jira: HTTP 401 (last 13:40) · beads 133 14:05"
+        );
+        assert!(sources_failing(&v));
+    }
+
+    #[test]
+    fn a_kept_jira_list_shows_its_old_time_and_why() {
+        let mut v = no_work();
+        v.sources = vec![
+            source(
+                "jira",
+                true,
+                12,
+                Some(13 * 60 + 40),
+                Some("Jira returned no tickets; keeping the last list"),
+            ),
+            source("beads", true, 133, Some(14 * 60 + 5), None),
+        ];
+        assert_eq!(
+            source_line(&v, hhmm),
+            "jira 12 13:40: Jira returned no tickets; keeping the la… · beads 133 14:05"
+        );
     }
 
     #[test]
@@ -1835,12 +1919,14 @@ mod tests {
         let without = source_line(&v, hhmm);
         v.sources.push(source("prs", false, 0, None, Some(PRS_OFF)));
         assert_eq!(source_line(&v, hhmm), without);
+        assert!(!sources_failing(&v));
         // A failing PR source still shows.
         v.sources[2] = source("prs", false, 0, None, Some("bb failed"));
         assert_eq!(
             source_line(&v, hhmm),
-            "jira 12 · beads 133 · prs: bb failed · 14:05"
+            "jira 12 14:02 · beads 133 14:05 · prs: bb failed"
         );
+        assert!(sources_failing(&v));
     }
 
     #[test]

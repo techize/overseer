@@ -535,6 +535,8 @@ pub struct OverseerApp {
     _clicks: Task<()>,
     /// A reconnect loop is running; see `connection_lost`.
     reconnecting: bool,
+    /// A Refresh of the work sources is waiting for the daemon.
+    pub(crate) refreshing_work: bool,
 }
 
 impl OverseerApp {
@@ -610,6 +612,7 @@ impl OverseerApp {
             _events: events,
             _clicks: clicked,
             reconnecting: false,
+            refreshing_work: false,
         };
         app.probe_daemon(cx);
         app
@@ -972,6 +975,34 @@ impl OverseerApp {
                     this.status = Some(e);
                     cx.notify();
                 }
+            });
+        })
+        .detach();
+    }
+
+    /// Reads every work source now (the header's Refresh). The new items
+    /// come back as `WorkChanged` events, one per source as it finishes;
+    /// the reply only ends the wait, or puts a failure in the status line.
+    pub(crate) fn refresh_work(&mut self, cx: &mut Context<Self>) {
+        if self.refreshing_work {
+            return;
+        }
+        self.refreshing_work = true;
+        self.status = None;
+        cx.notify();
+        let client = self.client.clone();
+        cx.spawn(async move |this, cx| {
+            let result = client.request(Request::RefreshWorkItems).await;
+            let _ = this.update(cx, |this, cx| {
+                this.refreshing_work = false;
+                match result {
+                    Ok(Response::Error { message }) => this.status = Some(message),
+                    Err(e) => {
+                        this.status = Some(format!("{} ({e:#})", crate::terminal_view::LOST_DAEMON))
+                    }
+                    Ok(_) => {}
+                }
+                cx.notify();
             });
         })
         .detach();
