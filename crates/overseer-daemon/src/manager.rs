@@ -1353,12 +1353,14 @@ async fn watch_lost(slot: Arc<Slot>, ctx: Reattach) {
     }
 }
 
-/// Attaches again, up to [`ATTACH_RETRIES`] times, the live holder of
-/// `old`, a held slot whose connection was lost. On success the new slot
-/// takes `old`'s place with its session, activity and note; `old` is let
-/// go, so its exit is never recorded. Otherwise `old` stays: it reads as
-/// running, Stop ends it by pid, and its exit is recorded once the holder
-/// goes. Never records an exit itself.
+/// Attaches again the live holder of `old`, a held slot whose connection
+/// was lost: [`ATTACH_RETRIES`] quick tries, then one every
+/// [`HOLDER_WATCH`] for as long as the holder lives and the slot is
+/// `old`'s. On success the new slot takes `old`'s place with its session,
+/// activity and note; `old` is let go, so its exit is never recorded.
+/// Until then `old` stays: it reads as running, Stop ends it by pid, and
+/// its exit is recorded once the holder goes. Never records an exit
+/// itself.
 fn reattach_lost(ctx: Reattach, old: Arc<Slot>) {
     let id = old.info().id;
     let socket = socket_path(&ctx.state_dir, id);
@@ -1372,12 +1374,22 @@ fn reattach_lost(ctx: Reattach, old: Arc<Slot>) {
             || old.exit_watch().borrow().is_some()
             || !current(&ctx.slots.lock().unwrap())
     };
-    for attempt in 0..ATTACH_RETRIES {
-        let pause = if attempt == 0 {
-            LOST_FIRST_PAUSE
-        } else {
-            ATTACH_RETRY_PAUSE
+    let mut attempt = 0;
+    loop {
+        let quick = attempt < ATTACH_RETRIES;
+        let pause = match attempt {
+            0 => LOST_FIRST_PAUSE,
+            _ if quick => ATTACH_RETRY_PAUSE,
+            _ => HOLDER_WATCH,
         };
+        if attempt == ATTACH_RETRIES && !stopped() {
+            tracing::warn!(
+                "{} holder not attached again after {ATTACH_RETRIES} tries; trying every {}s, Stop ends it",
+                slot_name(id),
+                HOLDER_WATCH.as_secs()
+            );
+        }
+        attempt = attempt.saturating_add(1);
         std::thread::sleep(pause);
         if stopped() {
             return;
@@ -1403,20 +1415,23 @@ fn reattach_lost(ctx: Reattach, old: Arc<Slot>) {
                 let _ = ctx.events.send(Event::SlotChanged(info));
                 return;
             }
-            Attempt::Gone => {
+            // Only the quick tries are logged: the slow ones would fill
+            // the log for as long as the holder stays out of reach.
+            Attempt::Gone if quick => {
                 tracing::warn!("{} holder alive but not listening", slot_name(id));
             }
-            Attempt::Failed(why) => {
+            Attempt::Failed(why) if quick => {
                 tracing::warn!("{} holder not attached again: {why}", slot_name(id));
             }
-            Attempt::Unsupported(_) => break,
+            Attempt::Gone | Attempt::Failed(_) => {}
+            Attempt::Unsupported(_) => {
+                tracing::warn!(
+                    "{} holder now answers as another build's; Stop ends it",
+                    slot_name(id)
+                );
+                return;
+            }
         }
-    }
-    if !stopped() {
-        tracing::warn!(
-            "{} holder not attached again after {ATTACH_RETRIES} tries; Stop ends it",
-            slot_name(id)
-        );
     }
 }
 

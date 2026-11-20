@@ -6463,6 +6463,165 @@ mod restart {
         c.exited_event(1).await;
     }
 
+    /// Past the daemon's quick tries at attaching a lost holder again
+    /// (about 4.2s of pauses).
+    const PAST_RETRIES: Duration = Duration::from_secs(5);
+
+    /// Takes slot `id`'s holder connection from the daemon `d` and keeps the
+    /// holder out of its reach: the holder's socket is moved aside and a
+    /// dead one put in its place, so every try at attaching it again is
+    /// refused while the holder lives. Returns where the real socket went.
+    fn lose_connection(d: &Daemon, id: u8) -> PathBuf {
+        use overseer_daemon::holder::{read_frame, write_frame, Frame as Held, HOLDER_PROTOCOL};
+        let sock = socket_path(&d.state_dir, id);
+        let aside = dir_of(d).join(format!("r{id}.sock"));
+        std::fs::rename(&sock, &aside).unwrap();
+        // Bound and closed: the file stays and connects are refused.
+        drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
+        let mut other = std::os::unix::net::UnixStream::connect(&aside).unwrap();
+        other.set_read_timeout(Some(WAIT)).unwrap();
+        write_frame(
+            &mut other,
+            &Held::DaemonHello {
+                version: HOLDER_PROTOCOL,
+            },
+        )
+        .unwrap();
+        // Greeted: the daemon's connection has been replaced.
+        assert!(matches!(read_frame(&mut other), Ok(Some(Held::Hello(_)))));
+        aside
+    }
+
+    fn pid_file_of(d: &Daemon, id: u8) -> PidFile {
+        serde_json::from_slice(&std::fs::read(pid_path(&d.state_dir, id)).unwrap()).unwrap()
+    }
+
+    /// The slots the ledger in `state_dir` still has as live.
+    fn live_in(state_dir: &Path) -> Vec<u8> {
+        let ledger = overseer_daemon::ledger::Ledger::open(&state_dir.join("overseer.db")).unwrap();
+        let rows = ledger.live_at_shutdown().unwrap();
+        rows.iter().map(|r| r.slot).collect()
+    }
+
+    /// A lost slot whose quick retries ran out keeps trying, slowly: once
+    /// its holder can be reached again, it is attached again.
+    #[tokio::test]
+    async fn a_lost_slot_past_its_retries_is_attached_again_later() {
+        let d = start_daemon().await;
+        let mut c = Client::connect(&d.socket).await;
+        assert_eq!(c.start(1).await, Response::Ok);
+        let pid = running_pid(&c.list().await[1]);
+        let aside = lose_connection(&d, 1);
+        sleep(PAST_RETRIES).await;
+        assert_eq!(running_pid(&c.list().await[1]), pid);
+
+        let mut w = Client::connect(&d.socket).await;
+        std::fs::rename(&aside, socket_path(&d.state_dir, 1)).unwrap();
+        let info = timeout(WAIT, w.next_change(1))
+            .await
+            .expect("never attached again");
+        assert_eq!(running_pid(&info), pid, "{info:?}");
+        assert_eq!(c.request(Request::Attach { id: 1 }).await, Response::Ok);
+        c.type_line(1, "again").await;
+        c.output_until(1, "ECHO:again").await;
+        assert_eq!(c.request(Request::StopSlot { id: 1 }).await, Response::Ok);
+        c.exited_event(1).await;
+    }
+
+    /// Stop ends a lost slot by pid: its holder and child go, its card
+    /// ends and its exit is recorded.
+    #[tokio::test]
+    async fn stop_ends_a_lost_slot_past_its_retries() {
+        let d = start_daemon().await;
+        let mut c = Client::connect(&d.socket).await;
+        assert_eq!(c.start(1).await, Response::Ok);
+        let pids = pid_file_of(&d, 1);
+        lose_connection(&d, 1);
+        sleep(PAST_RETRIES).await;
+        assert_eq!(running_pid(&c.list().await[1]), pids.child);
+
+        assert_eq!(c.request(Request::StopSlot { id: 1 }).await, Response::Ok);
+        c.exited_event(1).await;
+        until("the child and holder to end", WAIT, || {
+            !pid_alive(pids.child) && !pid_alive(pids.holder)
+        })
+        .await;
+        assert!(live_slots(&d).is_empty(), "exit not recorded");
+        let info = c.list().await.remove(1);
+        assert!(!matches!(info.state, SlotState::Running { .. }), "{info:?}");
+    }
+
+    /// Stop-all ends a lost slot by pid too, keeping its session live in
+    /// the ledger and leaving no exit file to read as an exit.
+    #[tokio::test]
+    async fn stop_all_ends_a_lost_slot_past_its_retries() {
+        let d = start_daemon().await;
+        let mut c = Client::connect(&d.socket).await;
+        assert_eq!(c.start(1).await, Response::Ok);
+        let pids = pid_file_of(&d, 1);
+        lose_connection(&d, 1);
+        sleep(PAST_RETRIES).await;
+        assert_eq!(running_pid(&c.list().await[1]), pids.child);
+
+        assert_eq!(c.request(Request::StopAll).await, Response::Ok);
+        until("the child and holder to end", WAIT, || {
+            !pid_alive(pids.child) && !pid_alive(pids.holder)
+        })
+        .await;
+        drop(c);
+        let down = await_stopped(d).await;
+        assert!(!exit_path(&down.state_dir, 1).exists(), "exit file left");
+        assert!(!pid_path(&down.state_dir, 1).exists(), "pid file left");
+        assert_eq!(live_in(&down.state_dir), vec![1], "exit recorded");
+    }
+
+    /// A lost slot whose holder cannot be identified is never signalled:
+    /// Stop and stop-all refuse, and it keeps running.
+    #[tokio::test]
+    async fn a_lost_slot_whose_holder_is_unknown_is_not_signalled() {
+        let d = start_daemon().await;
+        let mut c = Client::connect(&d.socket).await;
+        assert_eq!(c.start(1).await, Response::Ok);
+        let pids = pid_file_of(&d, 1);
+        lose_connection(&d, 1);
+        sleep(PAST_RETRIES).await;
+
+        // Killed but not reaped: alive to a signal check, not identifiable.
+        let mut zombie = Reap(
+            std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .spawn()
+                .unwrap(),
+        );
+        // SAFETY: a plain signal to this test's own child.
+        unsafe { libc::kill(zombie.0.id() as i32, libc::SIGKILL) };
+        sleep(Duration::from_millis(200)).await;
+        let path = pid_path(&d.state_dir, 1);
+        let real = std::fs::read(&path).unwrap();
+        let unknown = PidFile {
+            holder: zombie.0.id(),
+            holder_start: None,
+            ..pids.clone()
+        };
+        std::fs::write(&path, serde_json::to_vec(&unknown).unwrap()).unwrap();
+
+        let Response::Error { message } = c.request(Request::StopSlot { id: 1 }).await else {
+            panic!("Stop answered Ok for a holder it cannot confirm");
+        };
+        assert!(message.contains("cannot confirm"), "{message}");
+        let Response::Error { message } = c.request(Request::StopAll).await else {
+            panic!("StopAll answered Ok for a holder it cannot confirm");
+        };
+        assert!(message.contains("S1"), "{message}");
+        sleep(Duration::from_millis(500)).await;
+        assert!(pid_alive(pids.holder), "the holder was signalled");
+        assert!(pid_alive(pids.child), "the child was signalled");
+        std::fs::write(&path, real).unwrap();
+        drop(c);
+        let _down = await_stopped(d).await;
+        let _ = zombie.0.wait();
+    }
+
     /// Another client taking a live holder's connection does not end the
     /// session: the slot never reads as exited, and the daemon attaches the
     /// holder again once it is free.
