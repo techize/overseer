@@ -65,8 +65,11 @@ const HOLDER_GONE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// `overseer hold --end <pidfile>`: ends the session the pid file names,
 /// if its holder still runs, and waits up to [`HOLDER_GONE_WAIT`] for the
-/// holder to go. Nothing to end is a success; only a pid file that exists
-/// but cannot be read is an error.
+/// holder to go. Nothing to end is a success, and so is a pid that now
+/// belongs to another process (a stale file after a reboot). It is an
+/// error when the pid file exists but cannot be read, or when the holder
+/// is still there: alive, or a live process whose identity cannot be read,
+/// which is never signalled. `scripts/uninstall.sh` goes by this.
 fn end_holder(path: &std::path::Path) -> anyhow::Result<()> {
     use anyhow::Context;
     use overseer_daemon::holder::{end_by_pid, holder_gone, load_pid_file};
@@ -77,6 +80,13 @@ fn end_holder(path: &std::path::Path) -> anyhow::Result<()> {
         let deadline = std::time::Instant::now() + HOLDER_GONE_WAIT;
         while !holder_gone(&p) && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if !holder_gone(&p) {
+            anyhow::bail!(
+                "the holder in {} (pid {}) is still running",
+                path.display(),
+                p.holder
+            );
         }
     }
     Ok(())

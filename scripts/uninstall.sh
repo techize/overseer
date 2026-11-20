@@ -35,21 +35,14 @@ if [ -n "$ov" ]; then
     for pidfile in "$state"/holders/*.pid; do
         [ -e "$pidfile" ] || continue
         slot=$(basename "$pidfile" .pid)
-        if ! "$ov" hold --end "$pidfile"; then
-            alive="$alive $slot"
-            continue
-        fi
-        pid=$(sed -n 's/.*"holder"[^0-9]*\([0-9][0-9]*\).*/\1/p' "$pidfile" 2>/dev/null || true)
-        # A holder just sent its final SIGTERM may take a moment to go.
-        tries=0
-        while [ -e "$pidfile" ] && [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && [ "$tries" -lt 10 ]; do
-            sleep 0.2
-            tries=$((tries + 1))
-        done
-        if [ -e "$pidfile" ] && [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            alive="$alive $slot"
-        else
+        # hold --end checks the holder's identity (its name and recorded
+        # start time), not just that its pid is alive: after a reboot a
+        # stale pid file's pid can belong to any process. It fails while
+        # the holder is still there, or cannot be shown not to be.
+        if "$ov" hold --end "$pidfile"; then
             rm -f "${pidfile%.pid}.exit"
+        else
+            alive="$alive $slot"
         fi
     done
     if [ -n "$alive" ]; then

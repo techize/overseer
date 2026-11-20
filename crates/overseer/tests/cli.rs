@@ -1517,23 +1517,25 @@ fn hold_end_ends_a_holder_by_its_pid_file() {
             .arg(path)
             .assert()
     };
-    hold_end(&pid_path).success();
-    let start = Instant::now();
-    loop {
-        if holder.try_wait().unwrap().is_some() {
-            break;
+    // The holder is this test's child: reaped here as soon as it exits, as
+    // launchd reaps a real one. Unreaped, it would stay a process whose
+    // identity cannot be read, which `hold --end` reports as still there.
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let reaper = std::thread::spawn(move || {
+        let _ = done_tx.send(holder.wait().unwrap());
+    });
+    let ended = hold_end(&pid_path).try_success();
+    if done_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+        // SAFETY: plain signals to this test's own holder and its child.
+        unsafe {
+            libc::kill(-(p.child as i32), libc::SIGKILL);
+            libc::kill(p.holder as i32, libc::SIGKILL);
         }
-        if start.elapsed() > Duration::from_secs(5) {
-            // SAFETY: plain signals to this test's own holder and its child.
-            unsafe {
-                libc::kill(-(p.child as i32), libc::SIGKILL);
-                libc::kill(p.holder as i32, libc::SIGKILL);
-            }
-            let _ = holder.wait();
-            panic!("holder not ended");
-        }
-        std::thread::sleep(Duration::from_millis(20));
+        reaper.join().unwrap();
+        panic!("holder not ended");
     }
+    reaper.join().unwrap();
+    ended.unwrap();
     // SAFETY: signal 0 only checks that the pid exists.
     assert!(
         unsafe { libc::kill(p.child as i32, 0) } != 0,
