@@ -93,6 +93,17 @@ impl CoordService {
         let _ = self.events.send(Event::CoordChanged(self.view()));
     }
 
+    /// A slot's session ended or was replaced: a status request it never
+    /// answered goes, so the board does not show it against a session
+    /// that is gone and a fresh session does not inherit it.
+    pub fn session_ended(&self, slot: SlotId) {
+        match self.ledger.answer_status(slot) {
+            Ok(true) => self.announce(),
+            Ok(false) => {}
+            Err(e) => tracing::warn!("dropping {}'s status request: {e:#}", slot_name(slot)),
+        }
+    }
+
     /// Queues a relay from Overseer for `to`; announced as a lock change.
     fn tell(&self, locks: &LockService, to: SlotId, text: &str, now: i64) -> anyhow::Result<()> {
         self.tell_as(locks, to, text, &RelayKind::Note, now)
