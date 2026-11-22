@@ -254,19 +254,23 @@ pub fn card_click(info: &SlotInfo) -> CardClick {
 }
 
 /// What clicking a ticket card does: open its owner's session (Running or
-/// Resumable), start work in a slot, or report that no slot is free.
+/// Resumable), start work in a slot, start it in an idle slot alongside the
+/// work that slot already owns, or report that every slot has a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TicketClick {
     Open(SlotId),
     Start(SlotId),
+    Join(SlotId),
     NoSlot,
 }
 
 /// The slot starting work on a ticket uses. With an owner: that owner when
 /// it is Empty or Exited and not S0, else None (a Running or Resumable owner
 /// is opened, never started over). With no owner: the lowest Empty or
-/// Exited slot in S1 to S6 that owns no work, so a click never piles a
-/// ticket onto another ticket's slot. S0 and Running slots are never picked.
+/// Exited slot in S1 to S6 that owns no work, so a click piles a ticket onto
+/// another ticket's slot only when it must; failing that, the lowest Empty
+/// or Exited slot in S1 to S6, whose kickoff then names its other work too.
+/// S0, Running and Resumable slots are never picked.
 pub fn start_slot(owner: Option<SlotId>, slots: &[SlotInfo], work: &WorkView) -> Option<SlotId> {
     let free = |i: &&SlotInfo| matches!(i.state, SlotState::Empty | SlotState::Exited { .. });
     match owner {
@@ -275,12 +279,18 @@ pub fn start_slot(owner: Option<SlotId>, slots: &[SlotInfo], work: &WorkView) ->
             .filter(|i| i.id != 0)
             .filter(free)
             .map(|i| i.id),
-        None => slots
-            .iter()
-            .filter(|i| (1..=6).contains(&i.id))
-            .filter(free)
-            .find(|i| crate::board::owned_by(work, i.id).is_empty())
-            .map(|i| i.id),
+        None => {
+            let idle = || {
+                slots
+                    .iter()
+                    .filter(|i| (1..=6).contains(&i.id))
+                    .filter(free)
+            };
+            idle()
+                .find(|i| crate::board::owned_by(work, i.id).is_empty())
+                .or_else(|| idle().next())
+                .map(|i| i.id)
+        }
     }
 }
 
@@ -299,6 +309,9 @@ pub fn ticket_click(owner: Option<SlotId>, slots: &[SlotInfo], work: &WorkView) 
         return TicketClick::Open(info.id);
     }
     match start_slot(owner, slots, work) {
+        Some(slot) if owner != Some(slot) && !crate::board::owned_by(work, slot).is_empty() => {
+            TicketClick::Join(slot)
+        }
         Some(slot) => TicketClick::Start(slot),
         None => TicketClick::NoSlot,
     }
@@ -1570,7 +1583,7 @@ impl OverseerApp {
             .and_then(|i| i.owner);
         let Some(slot) = start_slot(owner, &self.slots, &self.work) else {
             self.status = Some(format!(
-                "No free slot for {key}: stop or clear a session first."
+                "No free slot for {key}: S1 to S6 all have sessions. Stop one, or assign {key} from a slot's card."
             ));
             cx.notify();
             return;
@@ -1639,7 +1652,9 @@ impl OverseerApp {
                     self.open_card(id, window, cx);
                 }
             }
-            TicketClick::Start(_) | TicketClick::NoSlot => self.start_ticket(key, window, cx),
+            TicketClick::Start(_) | TicketClick::Join(_) | TicketClick::NoSlot => {
+                self.start_ticket(key, window, cx)
+            }
         }
     }
 
@@ -2389,15 +2404,23 @@ mod tests {
         s[1].state = SlotState::Exited { code: None, at: 0 };
         assert_eq!(start_slot(None, &s, &w), Some(2));
         assert_eq!(ticket_click(None, &s, &w), TicketClick::Start(2));
-        // Only S1 free, and it owns DEMO-5: none.
+        // Only S1 free, and it owns DEMO-5: S1 after all, alongside DEMO-5.
         let mut s = slots_with(&[2, 3, 4, 5, 6]);
         s[1].state = SlotState::Exited { code: None, at: 0 };
+        assert_eq!(start_slot(None, &s, &w), Some(1));
+        assert_eq!(ticket_click(None, &s, &w), TicketClick::Join(1));
+        // An Empty S1 that was given DEMO-5 (a cancelled start) is the same.
+        s[1].state = SlotState::Empty;
+        assert_eq!(start_slot(None, &s, &w), Some(1));
+        assert_eq!(ticket_click(None, &s, &w), TicketClick::Join(1));
+        // A Resumable S1 is never joined: no slot left.
+        s[1].state = SlotState::Resumable {
+            session_id: "demo-session".into(),
+            at: 0,
+        };
         assert_eq!(start_slot(None, &s, &w), None);
         assert_eq!(ticket_click(None, &s, &w), TicketClick::NoSlot);
-        // An Empty S1 that was given DEMO-5 (a cancelled start) is skipped
-        // the same way.
         s[1].state = SlotState::Empty;
-        assert_eq!(start_slot(None, &s, &w), None);
         // DEMO-5's own click still restarts it in S1.
         assert_eq!(ticket_click(Some(1), &s, &w), TicketClick::Start(1));
     }

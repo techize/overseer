@@ -1654,6 +1654,46 @@ impl WorkStore {
         self.finish(done)
     }
 
+    /// A slot's session ended (it exited, was stopped, or a resumable one
+    /// was declined): every item it owned is released and logged, so the
+    /// next plan or ticket click finds them free. Returns the released keys.
+    pub fn release_slot(self: &Arc<Self>, slot: SlotId, now: i64) -> Vec<String> {
+        let _turn = self.change_turn.lock().unwrap_or_else(|e| e.into_inner());
+        let done = self.ledger.transaction(|conn| {
+            let mut keys = Vec::new();
+            for (key, owner) in ledger::assignments_on(conn)? {
+                if owner == slot {
+                    ledger::release_on(conn, &key)?;
+                    ledger::log_on(conn, now, &key, Some(slot), "released", "session ended")?;
+                    keys.push(key);
+                }
+            }
+            Ok(keys)
+        });
+        let keys = match done {
+            Ok(keys) => keys,
+            Err(e) => {
+                tracing::warn!("releasing {}'s items: {e:#}", slot_name(slot));
+                return Vec::new();
+            }
+        };
+        if keys.is_empty() {
+            return keys;
+        }
+        tracing::info!("{} ended; released {}", slot_name(slot), keys.join(", "));
+        for key in &keys {
+            if self.kind_of(key) == ItemKind::Bead {
+                self.queue_label(Label {
+                    id: key.clone(),
+                    add: None,
+                    remove: Some(slot),
+                });
+            }
+        }
+        self.announce();
+        keys
+    }
+
     /// After a committed change: labels a bead in the background and tells
     /// clients. The caller holds `change_turn`.
     fn finish(self: &Arc<Self>, done: anyhow::Result<Outcome>) -> Response {
@@ -2185,6 +2225,22 @@ mod tests {
         // Seen once only.
         s.regroup(3);
         assert_eq!(s.ledger.notices().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn release_slot_drops_only_that_slots_items() {
+        let s = store(r"DEMO-\d+");
+        s.ledger.assign("DEMO-12", 5, 1).unwrap();
+        s.ledger.assign("DEMO-13", 5, 1).unwrap();
+        s.ledger.assign("DEMO-14", 2, 1).unwrap();
+        let mut keys = s.release_slot(5, 2);
+        keys.sort();
+        assert_eq!(keys, ["DEMO-12", "DEMO-13"]);
+        assert_eq!(
+            s.ledger.assignments().unwrap(),
+            vec![("DEMO-14".to_string(), 2)]
+        );
+        assert!(s.release_slot(5, 3).is_empty());
     }
 
     /// Many threads assign, move and release one bead. Each queued label

@@ -492,6 +492,7 @@ impl CoordService {
         // below, which belong to the new one.
         if !running {
             ctx.locks.on_session_ended(slot, now);
+            self.session_ended(slot);
         }
 
         // 1. Items, then the items this slot takes over from another.

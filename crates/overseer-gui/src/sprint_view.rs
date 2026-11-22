@@ -172,7 +172,8 @@ pub fn hover_hint(click: &TicketClick, has_folder: bool) -> String {
     let mut hint = match click {
         TicketClick::Open(s) => format!("Click: open {}", slot_name(*s)),
         TicketClick::Start(s) => format!("Click: start in {}", slot_name(*s)),
-        TicketClick::NoSlot => "Click: no free slot".to_string(),
+        TicketClick::Join(s) => format!("Click: start in {} with its other work", slot_name(*s)),
+        TicketClick::NoSlot => "Click: no free slot, every slot has a session".to_string(),
     };
     if has_folder {
         hint.push_str(" · Cmd+click: folder");
@@ -599,15 +600,21 @@ impl Render for TextTooltip {
     }
 }
 
+/// The hover card's width. A fixed width, not a maximum: a tooltip is laid
+/// out without a width limit, so with only `max_w` the text was measured on
+/// one line, wrapped when painted, and ran over the rows below it (#71).
+const HOVER_WIDTH: f32 = 360.;
+
 /// The hover card on a ticket: the key in the accent colour, the title
-/// wrapped, label and value rows, and the click hint in grey.
+/// wrapped to four lines, label and value rows of up to two lines, and the
+/// click hint in grey.
 struct HoverCard(HoverModel);
 
 impl Render for HoverCard {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         let m = &self.0;
         div()
-            .max_w(px(360.))
+            .w(px(HOVER_WIDTH))
             .flex()
             .flex_col()
             .gap_1()
@@ -625,7 +632,7 @@ impl Render for HoverCard {
                     .text_color(rgb(colors::ACCENT))
                     .child(m.key.clone()),
             )
-            .child(div().child(m.title.clone()))
+            .child(div().line_clamp(4).child(m.title.clone()))
             .children(m.lines.iter().map(|(label, value)| {
                 div()
                     .flex()
@@ -637,7 +644,13 @@ impl Render for HoverCard {
                             .text_color(rgb(colors::MUTED))
                             .child(label.clone()),
                     )
-                    .child(div().flex_1().min_w(px(0.)).child(value.clone()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .line_clamp(2)
+                            .child(value.clone()),
+                    )
             }))
             .child(div().text_color(rgb(colors::MUTED)).child(m.hint.clone()))
     }
@@ -1304,8 +1317,12 @@ mod tests {
             "Click: start in S4"
         );
         assert_eq!(
+            hover_hint(&TicketClick::Join(2), false),
+            "Click: start in S2 with its other work"
+        );
+        assert_eq!(
             hover_hint(&TicketClick::NoSlot, false),
-            "Click: no free slot"
+            "Click: no free slot, every slot has a session"
         );
     }
 
