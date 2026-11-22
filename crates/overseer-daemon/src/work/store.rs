@@ -1720,6 +1720,27 @@ impl WorkStore {
         }
     }
 
+    /// Leaves `text` on `slot`'s card and, with `relay_to`, also sends it
+    /// to that slot as a relay from Overseer.
+    pub fn notify(&self, slot: SlotId, relay_to: Option<SlotId>, text: &str, now: i64) {
+        let done = self.ledger.transaction(|conn| {
+            ledger::add_notice_on(conn, slot, now, text)?;
+            if let Some(to) = relay_to {
+                crate::locks::table::queue_relay_on(conn, &Sender::Overseer, to, text, None, now)?;
+            }
+            Ok(())
+        });
+        match done {
+            Ok(()) => {
+                self.announce();
+                if relay_to.is_some() {
+                    self.relays_queued();
+                }
+            }
+            Err(e) => tracing::warn!("notice for {}: {e:#}", slot_name(slot)),
+        }
+    }
+
     pub fn clear_notices(&self, slot: SlotId) -> Response {
         if !valid_id(slot) {
             return Response::Error {

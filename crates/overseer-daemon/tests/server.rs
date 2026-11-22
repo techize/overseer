@@ -5343,6 +5343,98 @@ async fn a_refused_notes_folder_puts_a_notice_on_the_board() {
 }
 
 #[tokio::test]
+async fn an_ended_session_gets_its_logs_checked_and_its_times_recorded() {
+    // An empty folder Overseer owns: it becomes a git vault at start.
+    let notes = tempfile::tempdir().unwrap();
+    let settings = overseer_daemon::Config {
+        brain_dir: notes.path().to_path_buf(),
+        notes_owned: true,
+        brain_writer: true,
+        backup_mins: 0,
+        push: false,
+        current_session: notes.path().join("home/.claude/CURRENT_SESSION.md"),
+        session_log_min_mins: 0,
+        ..offline_settings()
+    };
+    let d = start_daemon_cfg(temp_socket(), overseer_daemon::EnvSource::Inherit, settings).await;
+    let mut c = Client::connect(&d.socket).await;
+    assert_eq!(c.start(2).await, Response::Ok);
+    // The session writes a log with no outcome or highlights.
+    let day = overseer_daemon::brain::paths::local_date(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64,
+    );
+    let name = format!(
+        "{:04}-{:02}-{:02}-s2-demo-lane",
+        day.year, day.month, day.day
+    );
+    let log = notes.path().join(format!("Sessions/{name}.md"));
+    std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+    std::fs::write(
+        &log,
+        "---\noutcome: null\nhighlights: []\n---\n# DEMO-12 demo lane\n\n**Time**: 08:00 - 08:05\n",
+    )
+    .unwrap();
+    // S0 has a session, so the relay to it is kept.
+    assert_eq!(c.start(0).await, Response::Ok);
+    assert_eq!(c.request(Request::StopSlot { id: 2 }).await, Response::Ok);
+    let text = loop {
+        if let Frame::Event(Event::WorkChanged(v)) = c.recv().await.unwrap() {
+            if let Some(n) = v.notices.iter().find(|n| n.slot == 2) {
+                break n.text.clone();
+            }
+        }
+    };
+    assert!(text.starts_with("Session log check for S2 ("), "{text}");
+    assert!(
+        text.contains(&format!("{name}.md has no outcome or highlights")),
+        "{text}"
+    );
+    let runs_rel = format!(
+        "Sessions/Runs/{:04}-{:02}-{:02}-runs.jsonl",
+        day.year, day.month, day.day
+    );
+    assert!(
+        text.contains(&format!("The real times are in {runs_rel}.")),
+        "{text}"
+    );
+    // The same text went to S0 as a relay from Overseer.
+    let locks = c.locks().await;
+    assert!(
+        locks
+            .relays
+            .iter()
+            .any(|r| r.to == 0 && r.from == Sender::Overseer && r.text == text),
+        "{:?}",
+        locks.relays
+    );
+    // The run's real times are recorded and committed.
+    let runs = notes.path().join(&runs_rel);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let line = loop {
+        let logged = std::process::Command::new("git")
+            .args(["log", "--format=%s", "-1", "--", &runs_rel])
+            .current_dir(notes.path())
+            .output()
+            .unwrap();
+        if String::from_utf8_lossy(&logged.stdout).trim() == "S2 run times" {
+            break std::fs::read_to_string(&runs).unwrap();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no commit of the run times"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let row: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+    assert_eq!(row["slot"], "S2");
+    assert_eq!(row["logs"], serde_json::json!([name]));
+    assert!(row["ended"].as_i64().unwrap() >= row["started"].as_i64().unwrap());
+}
+
+#[tokio::test]
 async fn sessions_start_without_the_api_tokens() {
     let dir = std::env::temp_dir().join(format!("ovs-tokens-env-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
