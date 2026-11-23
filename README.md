@@ -581,3 +581,15 @@ cargo run -p overseer
 
 Tests run against a temporary `OVERSEER_HOME`, so they never touch the installed
 daemon.
+
+To ship a round of pull requests:
+
+```
+scripts/ship.sh --install 81 82
+```
+
+It merges each PR at the commit its checks ran on and deletes its branch,
+stopping at the first one that is not open, has checks failing or still
+running, or conflicts with `main` (it names those left to ship). With
+`--install` it then puts the checkout on `main` (a worktree only, never the
+main checkout), runs the workspace tests and, when they pass, installs.

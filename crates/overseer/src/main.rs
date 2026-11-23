@@ -1,5 +1,6 @@
 mod agent;
 mod attach;
+mod bug_report;
 mod ctl;
 mod hook;
 mod mcp;

@@ -166,6 +166,23 @@ pub enum CtlCmd {
         #[arg(allow_hyphen_values = true)]
         text: String,
     },
+    /// Write a bug report to a file to read before posting: the builds, the
+    /// board, each `--slot`'s screen and the daemon log tail, with the home
+    /// folder shown as ~. `--post <file>` then files that report as an issue.
+    BugReport {
+        /// What happened, and what you expected. `-` reads it from stdin.
+        #[arg(allow_hyphen_values = true, required_unless_present = "post")]
+        what: Option<String>,
+        /// A slot whose screen to include, as S2 or 2. Repeatable.
+        #[arg(long = "slot", conflicts_with = "post")]
+        slots: Vec<String>,
+        /// File a report written earlier, once you have read it.
+        #[arg(long, conflicts_with = "what")]
+        post: Option<PathBuf>,
+        /// The repository the issue goes to.
+        #[arg(long, default_value = "techize/overseer")]
+        repo: String,
+    },
     /// Stop the daemon. Sessions kept by a holder keep running.
     Shutdown,
     /// End every session, kept ones included, so they come back as
@@ -1019,6 +1036,25 @@ pub async fn run(cmd: CtlCmd) -> anyhow::Result<()> {
     if matches!(cmd, CtlCmd::Version) {
         return version().await;
     }
+    // Never starts a daemon: a report says when none is running.
+    if let CtlCmd::BugReport {
+        what,
+        slots,
+        post,
+        repo,
+    } = cmd
+    {
+        return match post {
+            Some(path) => crate::bug_report::post(&path, &repo),
+            None => {
+                let slots = slots
+                    .iter()
+                    .map(|s| parse_slot(s))
+                    .collect::<Result<Vec<_>, _>>()?;
+                crate::bug_report::write(text_or_stdin(what.unwrap_or_default())?, &slots).await
+            }
+        };
+    }
     if matches!(cmd, CtlCmd::StopAll) {
         // Never starts a daemon: with none running there is nothing for it
         // to end, and a caller (uninstall) then falls back to the pid files.
@@ -1330,6 +1366,7 @@ pub async fn run(cmd: CtlCmd) -> anyhow::Result<()> {
         }
         CtlCmd::Shutdown => expect_ok(client.request(Request::Shutdown).await?),
         CtlCmd::StopAll => unreachable!("handled before connecting"),
+        CtlCmd::BugReport { .. } => unreachable!("handled before connecting"),
     }
 }
 
