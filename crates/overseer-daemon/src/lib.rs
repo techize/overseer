@@ -18,6 +18,7 @@ pub mod server;
 pub mod session_logs;
 pub mod settings;
 pub mod slot;
+pub mod stretches;
 pub mod trust;
 pub mod vt;
 pub mod work;

@@ -366,6 +366,8 @@ pub async fn run_until(
         }
         Err(e) => tracing::warn!("hook spool not read: {e:#}"),
     }
+    let (seen_tx, seen_rx) = mpsc::unbounded_channel();
+    manager.lock().unwrap().feed_stretches(seen_tx);
     if let Some(b) = &brain {
         {
             let (manager, store, ledger) = (manager.clone(), store.clone(), ledger.clone());
@@ -416,6 +418,7 @@ pub async fn run_until(
     ));
     let log_check = tokio::spawn(watch_session_logs(
         log_events,
+        seen_rx,
         LogCheck {
             manager: manager.clone(),
             ledger: ledger.clone(),
@@ -578,35 +581,115 @@ struct LogCheck {
     min_secs: i64,
 }
 
-/// Checks a slot's session logs each time its session really ends.
-async fn watch_session_logs(mut events: broadcast::Receiver<Event>, c: LogCheck) {
-    if c.patterns.is_empty() {
-        return;
-    }
+/// Checks a slot's session logs each time its session really ends, and
+/// tracks each transcript's stretch of work: one a `/clear` ends is
+/// recorded, its logs are checked and the slot is told to log the next
+/// stretch apart (#80).
+async fn watch_session_logs(
+    mut events: broadcast::Receiver<Event>,
+    mut seen: mpsc::UnboundedReceiver<crate::stretches::Seen>,
+    c: LogCheck,
+) {
+    let mut stretches = crate::stretches::Stretches::default();
     loop {
-        match events.recv().await {
-            Ok(Event::SlotChanged(info)) => {
-                let SlotState::Exited { at, .. } = info.state else {
-                    continue;
-                };
-                // A start may have replaced the session since this was sent.
-                if !sessionless(&c.manager.lock().unwrap().list()).contains(&info.id) {
-                    continue;
+        tokio::select! {
+            s = seen.recv() => {
+                let Some(s) = s else { return };
+                if let Some(done) = stretches.seen(&s) {
+                    stretch_ended(&c, &done, true).await;
                 }
-                check_session_logs(&c, info.id, at).await;
             }
-            Ok(_) => {}
-            // A missed exit is not checked: the next one is.
-            Err(broadcast::error::RecvError::Lagged(n)) => {
-                tracing::warn!("session log check lagged by {n} events");
-            }
-            Err(broadcast::error::RecvError::Closed) => return,
+            ev = events.recv() => match ev {
+                Ok(Event::SlotChanged(info)) => {
+                    let SlotState::Exited { at, .. } = info.state else {
+                        continue;
+                    };
+                    // A start may have replaced the session since this was sent.
+                    if !sessionless(&c.manager.lock().unwrap().list()).contains(&info.id) {
+                        continue;
+                    }
+                    // Events still queued belong to the session that ended.
+                    while let Ok(s) = seen.try_recv() {
+                        if let Some(done) = stretches.seen(&s) {
+                            stretch_ended(&c, &done, true).await;
+                        }
+                    }
+                    if let Some(done) = stretches.ended(info.id) {
+                        stretch_ended(&c, &done, false).await;
+                    }
+                    check_session_logs(&c, info.id, at).await;
+                }
+                Ok(_) => {}
+                // A missed exit is not checked: the next one is.
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!("session log check lagged by {n} events");
+                }
+                Err(broadcast::error::RecvError::Closed) => return,
+            },
         }
+    }
+}
+
+/// The logs a run wrote, after a notice (to the slot and S0) of what they
+/// miss. `record` names the runs file the notice points to.
+async fn check_run(
+    c: &LogCheck,
+    run: crate::session_logs::Run,
+    record: Option<&str>,
+) -> Vec<crate::session_logs::Log> {
+    use crate::session_logs as logs;
+    let (brain_dir, home, patterns) = (c.brain_dir.clone(), c.home.clone(), c.patterns.clone());
+    let found = tokio::task::spawn_blocking(move || {
+        logs::read_logs(&logs::find_logs(&brain_dir, &home, &patterns, &run))
+    })
+    .await
+    .unwrap_or_default();
+    if let Some(text) = logs::notice(&run, &found, record) {
+        // S0 follows up; its own logs are only flagged on its card.
+        let relay_to = (run.slot != 0).then_some(0);
+        c.store.notify(run.slot, relay_to, &text, unix_now());
+    }
+    found
+}
+
+/// The runs file to record in, when the notes writer is on.
+fn runs_record(c: &LogCheck) -> Option<&Arc<BrainService>> {
+    c.brain.as_ref().filter(|_| !c.runs_file.is_empty())
+}
+
+async fn append_run_line(b: &BrainService, slot: SlotId, file: &str, line: &str, what: &str) {
+    let message = format!("{} {what}", overseer_proto::slot_name(slot));
+    if let Response::Error { message } = b.append_line(file, line, &message).await {
+        tracing::warn!("S{slot} {what} not recorded: {message}")
+    }
+}
+
+/// A transcript's stretch of work ended: it is recorded and, when a
+/// `/clear` ended a stretch long enough to log, its logs are checked and
+/// the slot is told to log what comes next apart.
+async fn stretch_ended(c: &LogCheck, s: &crate::stretches::Stretch, cleared: bool) {
+    use crate::session_logs as logs;
+    let run = logs::Run {
+        slot: s.slot,
+        started: s.first,
+        ended: s.last,
+    };
+    let file = logs::runs_file(&c.runs_file, &run);
+    let record = runs_record(c);
+    if cleared && !c.patterns.is_empty() && s.last - s.first >= c.min_secs {
+        check_run(c, run, record.map(|_| file.as_str())).await;
+        c.store.tell(s.slot, &logs::cleared_text(s), unix_now());
+    }
+    if let Some(b) = record {
+        append_run_line(b, s.slot, &file, &logs::stretch_line(s), "activity").await;
     }
 }
 
 async fn check_session_logs(c: &LogCheck, slot: SlotId, ended: i64) {
     use crate::session_logs as logs;
+    if c.patterns.is_empty() {
+        return;
+    }
     let started = match c.ledger.session_times(slot) {
         Ok(Some((started, _))) => started,
         Ok(None) => return,
@@ -623,27 +706,11 @@ async fn check_session_logs(c: &LogCheck, slot: SlotId, ended: i64) {
         started,
         ended,
     };
-    let (brain_dir, home, patterns) = (c.brain_dir.clone(), c.home.clone(), c.patterns.clone());
-    let found = tokio::task::spawn_blocking(move || {
-        logs::read_logs(&logs::find_logs(&brain_dir, &home, &patterns, &run))
-    })
-    .await
-    .unwrap_or_default();
-    let record = c.brain.as_ref().filter(|_| !c.runs_file.is_empty());
-    let runs_file = logs::runs_file(&c.runs_file, &run);
-    if let Some(text) = logs::notice(&run, &found, record.map(|_| runs_file.as_str())) {
-        // S0 follows up; its own logs are only flagged on its card.
-        let relay_to = (slot != 0).then_some(0);
-        c.store.notify(slot, relay_to, &text, unix_now());
-    }
+    let file = logs::runs_file(&c.runs_file, &run);
+    let record = runs_record(c);
+    let found = check_run(c, run, record.map(|_| file.as_str())).await;
     if let Some(b) = record {
-        let message = format!("{} run times", overseer_proto::slot_name(slot));
-        if let Response::Error { message } = b
-            .append_line(&runs_file, &logs::run_line(&run, &found), &message)
-            .await
-        {
-            tracing::warn!("S{slot} run times not recorded: {message}")
-        }
+        append_run_line(b, slot, &file, &logs::run_line(&run, &found), "run times").await;
     }
 }
 

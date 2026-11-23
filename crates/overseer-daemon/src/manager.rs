@@ -112,6 +112,8 @@ impl Entry {
 type Slots = Arc<Mutex<[Option<Entry>; SLOT_COUNT]>>;
 
 pub struct SlotManager {
+    /// Where applied hook events go for the stretch tracker, once set.
+    stretch_feed: Option<tokio::sync::mpsc::UnboundedSender<crate::stretches::Seen>>,
     /// Shared with the exit monitors so they can tell whether their slot is
     /// still the current occupant before announcing anything.
     slots: Slots,
@@ -240,6 +242,7 @@ pub struct Attachment {
 impl SlotManager {
     pub fn new(default_command: Vec<String>, events: broadcast::Sender<Event>) -> Self {
         SlotManager {
+            stretch_feed: None,
             slots: Default::default(),
             default_command,
             events,
@@ -581,6 +584,16 @@ impl SlotManager {
     }
 
     /// Uses `env` as the base environment for slots started from now on.
+    /// From now on every hook event applied to a slot's main conversation
+    /// is also sent to `tx`, with the transcript it belongs to. Set after
+    /// the spooled events are replayed: their times are not known.
+    pub fn feed_stretches(
+        &mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<crate::stretches::Seen>,
+    ) {
+        self.stretch_feed = Some(tx);
+    }
+
     pub fn with_env(mut self, env: BaseEnv) -> Self {
         self.env = env;
         self
@@ -848,6 +861,18 @@ impl SlotManager {
                 }
                 entry.session_id = id.clone();
             }
+        }
+        if let Some(tx) = self
+            .stretch_feed
+            .as_ref()
+            .filter(|_| !entry.session_id.is_empty())
+        {
+            let _ = tx.send(crate::stretches::Seen {
+                slot: ev.slot,
+                session: entry.session_id.clone(),
+                kind: ev.event,
+                at: unix_now(),
+            });
         }
         let next = apply(entry.activity.as_ref(), ev, unix_now());
         if entry.set_activity(next) {

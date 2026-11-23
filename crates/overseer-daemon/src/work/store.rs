@@ -1741,6 +1741,18 @@ impl WorkStore {
         }
     }
 
+    /// A relay from Overseer to a slot's session, with no notice.
+    pub fn tell(&self, slot: SlotId, text: &str, now: i64) {
+        let done = self.ledger.transaction(|conn| {
+            crate::locks::table::queue_relay_on(conn, &Sender::Overseer, slot, text, None, now)?;
+            Ok(())
+        });
+        match done {
+            Ok(()) => self.relays_queued(),
+            Err(e) => tracing::warn!("relay to {}: {e:#}", slot_name(slot)),
+        }
+    }
+
     pub fn clear_notices(&self, slot: SlotId) -> Response {
         if !valid_id(slot) {
             return Response::Error {

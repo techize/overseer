@@ -5435,6 +5435,90 @@ async fn an_ended_session_gets_its_logs_checked_and_its_times_recorded() {
 }
 
 #[tokio::test]
+async fn a_clear_ends_a_stretch_records_it_and_asks_for_a_part_log() {
+    let notes = tempfile::tempdir().unwrap();
+    let settings = overseer_daemon::Config {
+        brain_dir: notes.path().to_path_buf(),
+        notes_owned: true,
+        brain_writer: true,
+        backup_mins: 0,
+        push: false,
+        current_session: notes.path().join("home/.claude/CURRENT_SESSION.md"),
+        session_log_min_mins: 0,
+        ..offline_settings()
+    };
+    let d = start_daemon_cfg(temp_socket(), overseer_daemon::EnvSource::Inherit, settings).await;
+    let mut c = Client::connect(&d.socket).await;
+    assert_eq!(c.start(2).await, Response::Ok);
+    let in_transcript = |kind, id: &str| HookEvent {
+        session_id: Some(id.into()),
+        ..hook(2, kind)
+    };
+    c.hook(in_transcript(HookKind::SessionStart, "demo-transcript-a"))
+        .await;
+    c.hook(in_transcript(
+        HookKind::UserPromptSubmit,
+        "demo-transcript-a",
+    ))
+    .await;
+    c.hook(in_transcript(HookKind::Stop, "demo-transcript-a"))
+        .await;
+    // `/clear`: the same session starts a new transcript.
+    c.hook(in_transcript(HookKind::SessionStart, "demo-transcript-b"))
+        .await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let relay = loop {
+        let locks = c.locks().await;
+        if let Some(r) = locks
+            .relays
+            .iter()
+            .find(|r| r.to == 2 && r.from == Sender::Overseer && r.text.contains("was cleared"))
+        {
+            break r.text.clone();
+        }
+        assert!(std::time::Instant::now() < deadline, "{:?}", locks.relays);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(
+        relay.starts_with("S2 was cleared after work from "),
+        "{relay}"
+    );
+    assert!(relay.contains("write a new session log"), "{relay}");
+    assert!(relay.contains("Leave the Time lines of earlier logs as they are."));
+    // The stretch is recorded as the slot's activity.
+    let day = overseer_daemon::brain::paths::local_date(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64,
+    );
+    let runs_rel = format!(
+        "Sessions/Runs/{:04}-{:02}-{:02}-runs.jsonl",
+        day.year, day.month, day.day
+    );
+    let line = loop {
+        let logged = std::process::Command::new("git")
+            .args(["log", "--format=%s", "-1", "--", &runs_rel])
+            .current_dir(notes.path())
+            .output()
+            .unwrap();
+        if String::from_utf8_lossy(&logged.stdout).trim() == "S2 activity" {
+            break std::fs::read_to_string(notes.path().join(&runs_rel)).unwrap();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no commit of the activity"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let row: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+    assert_eq!(row["kind"], "activity");
+    assert_eq!(row["slot"], "S2");
+    assert_eq!(row["session"], "demo-transcript-a");
+    assert!(row["ended"].as_i64().unwrap() >= row["started"].as_i64().unwrap());
+}
+
+#[tokio::test]
 async fn sessions_start_without_the_api_tokens() {
     let dir = std::env::temp_dir().join(format!("ovs-tokens-env-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);

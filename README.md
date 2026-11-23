@@ -192,6 +192,16 @@ Overseer keeps journals, session notes and sprint files in a notes folder
   to `slot_runs` (default `Sessions/Runs/<date>-runs.jsonl`) and committed, so
   a session index can fill in missing or short times. Set `session_logs` to
   `[]` to turn the check off, or `slot_runs` to `""` to stop the record.
+- A `/clear` starts a new stretch of work in the same session. When the slot
+  had worked at least `session_log_min_mins` before it, Overseer checks that
+  stretch's logs as above and tells the slot to write a part log for what
+  comes next (`Sessions/<date>-s<n>-<topic>-part2.md`), leaving earlier
+  logs' `**Time**` lines alone. Each stretch, from its first prompt, tool call
+  or turn end to its last, is also appended to `slot_runs` as an
+  `"kind":"activity"` line, so a session index can flag work no log covers.
+  A daemon restart loses the start of the stretch open at the time. Every
+  range on a `**Time**` line counts (`08:02 - 10:35, 10:46 - 12:15`); parts
+  in brackets or naming idle time, a break or lunch are skipped.
 
 ### What each optional tool adds
 

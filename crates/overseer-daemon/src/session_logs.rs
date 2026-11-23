@@ -46,16 +46,70 @@ pub struct Run {
     pub ended: i64,
 }
 
-/// The same `**Time**` shapes the session index reads: an optional list
-/// marker, an optional `~`, and an optional end after `-`, `–` or `—`.
-fn time_re() -> &'static Regex {
+/// The `**Time**` line: an optional list marker, then the rest of the line.
+fn time_line_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(
-            r"(?m)^\s*(?:[-*]\s+)?\*\*Time\*\*:\s*~?\s*(\d{1,2}):(\d{2})(?:\s*[-–—]\s*~?\s*(\d{1,2}):(\d{2}))?",
-        )
-        .expect("time regex")
+        Regex::new(r"(?m)^\s*(?:[-*]\s+)?\*\*Time\*\*:(.*)$").expect("time line regex")
     })
+}
+
+/// One time, or a range after a hyphen, en dash or em dash, each time with an optional `~`.
+fn range_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"~?\s*(\d{1,2}):(\d{2})(?:\s*[-\u{2013}\u{2014}]\s*~?\s*(\d{1,2}):(\d{2}))?")
+            .expect("range regex")
+    })
+}
+
+/// Words that mark a range as time away, not work.
+const AWAY_WORDS: [&str; 6] = ["idle", "break", "lunch", "away", "paused", "gap"];
+
+/// The work ranges on a log's `**Time**` line, the same rule the session
+/// index uses: text in brackets is a note and skipped; the rest splits at
+/// `,` and `;`, and a part naming time away (idle, a break) is skipped.
+/// Every `start - end` range counts, and so does a lone start when it is
+/// the line's first time (a log written before its end). Ranges are
+/// minutes after midnight.
+pub fn time_ranges(text: &str) -> Vec<(u32, Option<u32>)> {
+    let Some(line) = time_line_re().captures(text).map(|c| c[1].to_string()) else {
+        return Vec::new();
+    };
+    let mut plain = String::new();
+    let mut depth = 0u32;
+    for ch in line.chars() {
+        match ch {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => plain.push(ch),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    let mut first = true;
+    for part in plain.split([',', ';']) {
+        let lower = part.to_lowercase();
+        let away = lower
+            .split(|c: char| !c.is_alphabetic())
+            .any(|w| AWAY_WORDS.contains(&w));
+        for c in range_re().captures_iter(part) {
+            let start = minutes(&c[1], &c[2]);
+            let end = c
+                .get(3)
+                .zip(c.get(4))
+                .and_then(|(h, m)| minutes(h.as_str(), m.as_str()));
+            let lone_ok = first;
+            first = false;
+            match (start, end) {
+                _ if away => {}
+                (Some(s), Some(e)) => out.push((s, Some(e))),
+                (Some(s), None) if lone_ok => out.push((s, None)),
+                _ => {}
+            }
+        }
+    }
+    out
 }
 
 fn minutes(h: &str, m: &str) -> Option<u32> {
@@ -120,15 +174,10 @@ fn has_value(fm: &str, key: &str) -> bool {
 pub fn parse(text: &str) -> LogFacts {
     let (fm, body) = split_frontmatter(text);
     let fm = fm.unwrap_or("");
-    let (start, end) = match time_re().captures(body) {
-        Some(c) => (
-            minutes(&c[1], &c[2]),
-            c.get(3)
-                .zip(c.get(4))
-                .and_then(|(h, m)| minutes(h.as_str(), m.as_str())),
-        ),
-        None => (None, None),
-    };
+    // The first range's start and the last range's end.
+    let ranges = time_ranges(body);
+    let start = ranges.first().map(|r| r.0);
+    let end = ranges.last().and_then(|r| r.1);
     LogFacts {
         start,
         end,
@@ -192,7 +241,7 @@ pub fn problems(logs: &[Log], start: u32, end: u32, same_day: bool) -> Vec<Strin
         if let Some(first) = first {
             if first > start + SLACK_MINS {
                 out.push(format!(
-                    "the logs start at {} but the session started at {}",
+                    "the logs start at {} but work started at {}",
                     hhmm(first),
                     hhmm(start)
                 ));
@@ -201,7 +250,7 @@ pub fn problems(logs: &[Log], start: u32, end: u32, same_day: bool) -> Vec<Strin
         if let Some(last) = last {
             if last + SLACK_MINS < end {
                 out.push(format!(
-                    "the logs end at {} but the session ran until {}",
+                    "the logs end at {} but work went on until {}",
                     hhmm(last),
                     hhmm(end)
                 ));
@@ -246,6 +295,7 @@ pub fn run_line(run: &Run, logs: &[Log]) -> String {
     let (sd, start) = local_minutes(run.started);
     let (_, end) = local_minutes(run.ended);
     serde_json::json!({
+        "kind": "run",
         "date": ymd(&sd),
         "slot": overseer_proto::slot_name(run.slot),
         "start": hhmm(start),
@@ -255,6 +305,41 @@ pub fn run_line(run: &Run, logs: &[Log]) -> String {
         "logs": logs.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(),
     })
     .to_string()
+}
+
+/// The JSON line `slot_runs` gets for one transcript's stretch of work: a
+/// slot's real activity, which a `/clear` splits where the run does not.
+pub fn stretch_line(s: &crate::stretches::Stretch) -> String {
+    let (sd, start) = local_minutes(s.first);
+    let (_, end) = local_minutes(s.last);
+    serde_json::json!({
+        "kind": "activity",
+        "date": ymd(&sd),
+        "slot": overseer_proto::slot_name(s.slot),
+        "session": s.session,
+        "start": hhmm(start),
+        "end": hhmm(end),
+        "started": s.first,
+        "ended": s.last,
+    })
+    .to_string()
+}
+
+/// What a slot cleared after a stretch of work is told: the work from here
+/// is a new stretch and needs a log of its own (#80).
+pub fn cleared_text(s: &crate::stretches::Stretch) -> String {
+    let (_, start) = local_minutes(s.first);
+    let (_, end) = local_minutes(s.last);
+    let name = overseer_proto::slot_name(s.slot);
+    format!(
+        "{name} was cleared after work from {} to {}. What you do from here is a new stretch: \
+         when you wrap it, write a new session log for it (a part log, named like \
+         Sessions/<date>-{}-<topic>-part2.md) with its own **Time** line. Leave the Time lines \
+         of earlier logs as they are.",
+        hhmm(start),
+        hhmm(end),
+        name.to_lowercase()
+    )
 }
 
 /// The `slot_runs` file for a run: the template filled for its start day.
@@ -350,6 +435,41 @@ mod tests {
     }
 
     #[test]
+    fn every_work_range_on_the_time_line_counts() {
+        let m = |h: u32, mm: u32| h * 60 + mm;
+        assert_eq!(
+            time_ranges("**Time**: 08:02 - 10:35, 10:46 - 12:15, 16:50 - 17:25 GMT\n"),
+            [
+                (m(8, 2), Some(m(10, 35))),
+                (m(10, 46), Some(m(12, 15))),
+                (m(16, 50), Some(m(17, 25)))
+            ]
+        );
+        assert_eq!(
+            time_ranges("- **Time**: 11:57 - 12:05 BST, plus a close-off check 15:25 - 15:35 BST"),
+            [(m(11, 57), Some(m(12, 5))), (m(15, 25), Some(m(15, 35)))]
+        );
+        // Time away and bracketed notes are not work.
+        assert_eq!(
+            time_ranges("**Time**: 12:14 - 16:12 GMT, idle 13:15 - 16:00"),
+            [(m(12, 14), Some(m(16, 12)))]
+        );
+        assert_eq!(
+            time_ranges("**Time**: 13:08 - 16:45 GMT (started 28 Oct 17:30, with gaps)"),
+            [(m(13, 8), Some(m(16, 45)))]
+        );
+        assert_eq!(time_ranges("**Time**: ~ (continued session) BST"), []);
+        // A lone start counts only as the line's first time.
+        assert_eq!(time_ranges("**Time**: ~9:05"), [(m(9, 5), None)]);
+        assert_eq!(
+            time_ranges("**Time**: 08:00 - 09:00, then 10:00"),
+            [(m(8, 0), Some(m(9, 0)))]
+        );
+        let f = parse("**Time**: 08:02 - 10:35, 10:46 - 12:15\n");
+        assert_eq!((f.start, f.end), (Some(m(8, 2)), Some(m(12, 15))));
+    }
+
+    #[test]
     fn a_good_log_covering_the_run_is_fine() {
         let logs = [log("2026-11-20-s1-demo", GOOD)];
         assert!(problems(&logs, 8 * 60 + 6, 16 * 60 + 24, true).is_empty());
@@ -367,7 +487,7 @@ mod tests {
             problems(&logs, 8 * 60 + 6, 15 * 60 + 30, true),
             [
                 "2026-11-20-s5-demo.md has no outcome or highlights",
-                "the logs end at 08:40 but the session ran until 15:30",
+                "the logs end at 08:40 but work went on until 15:30",
             ]
         );
         let logs = [log(
@@ -390,7 +510,7 @@ mod tests {
         let late = [log("b", b)];
         assert_eq!(
             problems(&late, 8 * 60, 12 * 60, true),
-            ["the logs start at 10:00 but the session started at 08:00"]
+            ["the logs start at 10:00 but work started at 08:00"]
         );
         // Past midnight the minutes are not compared.
         assert!(problems(&late, 23 * 60, 30, false).is_empty());
