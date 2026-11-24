@@ -48,7 +48,7 @@ pub struct LockService {
     /// exits must not drop their locks.
     stopping: AtomicBool,
     /// Why each slot's pending relays wait, as the courier last found it.
-    held: Mutex<[Option<&'static str>; SLOT_COUNT]>,
+    held: Mutex<[Option<(&'static str, i64)>; SLOT_COUNT]>,
     /// The slots with no session (empty or exited), from the slot manager.
     sessionless: OnceLock<SessionlessFn>,
 }
@@ -209,25 +209,32 @@ impl LockService {
         let held = *self.held.lock().unwrap();
         for r in &mut view.relays {
             if r.state == RelayState::Pending {
-                r.held = held
-                    .get(r.to as usize)
-                    .copied()
-                    .flatten()
-                    .map(|why| crate::relay::courier::held_text(why, &self.user));
+                let hold = held.get(r.to as usize).copied().flatten();
+                r.held = hold.map(|(why, _)| crate::relay::courier::held_text(why, &self.user));
+                r.held_since = hold.map(|(_, since)| since);
             }
         }
         view
     }
 
     /// The courier's reason `slot`'s pending relays wait, `None` when they
-    /// are not held. A change is announced.
+    /// are not held. A change of reason is announced. The time the hold
+    /// began is kept while the slot stays held, so a changing reason does
+    /// not make a stuck relay look new.
     pub(crate) fn set_held(&self, slot: SlotId, reason: Option<&'static str>) {
+        self.set_held_at(slot, reason, unix_now());
+    }
+
+    fn set_held_at(&self, slot: SlotId, reason: Option<&'static str>, now: i64) {
         let changed = {
             let mut held = self.held.lock().unwrap();
             let Some(entry) = held.get_mut(slot as usize) else {
                 return;
             };
-            std::mem::replace(entry, reason) != reason
+            let next = reason.map(|why| (why, entry.map_or(now, |(_, since)| since)));
+            let changed = entry.map(|(why, _)| why) != reason;
+            *entry = next;
+            changed
         };
         if changed {
             self.announce();
@@ -773,6 +780,42 @@ mod tests {
         locks.set_held(2, None);
         assert!(matches!(rx.try_recv(), Ok(Event::LocksChanged(_))));
         assert!(locks.view().relays.iter().all(|r| r.held.is_none()));
+    }
+
+    fn pending_to(locks: &LockService, slot: SlotId) -> overseer_proto::Relay {
+        locks
+            .view()
+            .relays
+            .into_iter()
+            .find(|r| r.to == slot && r.state == RelayState::Pending)
+            .expect("a pending relay to the slot")
+    }
+
+    #[test]
+    fn held_since_is_when_the_hold_began_and_survives_reason_changes() {
+        let (events, _rx) = broadcast::channel(16);
+        let locks = LockService::new(
+            Arc::new(Ledger::in_memory()),
+            Vec::new(),
+            events,
+            BaseEnv::ready(Vec::new()),
+            Duration::from_secs(3600),
+            "Demo".into(),
+        );
+        locks
+            .change("test", |c| {
+                table::queue_relay_on(c, &overseer_proto::Sender::You, 2, "waiting", None, 1)
+            })
+            .unwrap();
+        locks.set_held_at(2, Some("session is working"), 100);
+        locks.set_held_at(2, Some("input box not found"), 150);
+        let r = pending_to(&locks, 2);
+        assert_eq!(r.held.as_deref(), Some("input box not found"));
+        assert_eq!(r.held_since, Some(100));
+        locks.set_held_at(2, None, 200);
+        assert_eq!(pending_to(&locks, 2).held_since, None);
+        locks.set_held_at(2, Some("session is working"), 300);
+        assert_eq!(pending_to(&locks, 2).held_since, Some(300));
     }
 
     fn item(key: &str, kind: ItemKind, parent: Option<&str>, owner: Option<SlotId>) -> WorkItem {
