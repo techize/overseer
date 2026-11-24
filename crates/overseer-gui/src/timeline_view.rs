@@ -30,15 +30,42 @@ pub struct RowBars {
     pub bars: Vec<Bar>,
 }
 
-/// Where the shared axis starts: the earliest stretch start of the day, or
-/// the day's start when nothing ran.
+/// Where the shared axis starts: the earliest work of the day (waits are
+/// not work), or the day's start when nothing ran.
 pub fn axis_start(v: &DayView) -> i64 {
     v.rows
         .iter()
         .flat_map(|r| r.stretches.iter())
-        .map(|s| s.first)
+        .flat_map(|s| s.spans.iter())
+        .filter(|sp| !matches!(sp.kind, SpanKind::Wait | SpanKind::Other))
+        .map(|sp| sp.from)
         .min()
         .unwrap_or(v.start)
+}
+
+/// The view as of `now`, which moves on between the daemon's sends: the axis
+/// ends at the later of the two, and each stretch drawn to the view's `now`
+/// (running, or waiting with no end stored) reaches it.
+pub fn live(v: &DayView, now: i64) -> DayView {
+    let mut out = v.clone();
+    if now <= v.now {
+        return out;
+    }
+    out.now = now;
+    for s in out.rows.iter_mut().flat_map(|r| r.stretches.iter_mut()) {
+        if s.running || s.last == v.now {
+            s.last = now;
+            if let Some(last) = s.spans.last_mut() {
+                last.to = now;
+            }
+        }
+    }
+    out
+}
+
+/// How many red gaps there are across all rows.
+pub fn gap_count(v: &DayView) -> usize {
+    v.rows.iter().map(|r| v.gaps(r.slot).len()).sum()
 }
 
 /// True when there is something to draw: at least one stretch.
@@ -46,11 +73,10 @@ pub fn has_stretches(v: &DayView) -> bool {
     v.rows.iter().any(|r| !r.stretches.is_empty())
 }
 
-/// The folded line: `Today: all logged`, `Today: 1 gap`, `Today: 2 gaps`.
+/// The folded line: `Today: no gaps`, `Today: 1 gap`, `Today: 2 gaps`.
 pub fn fold_label(v: &DayView) -> String {
-    let gaps: usize = v.rows.iter().map(|r| v.gaps(r.slot).len()).sum();
-    match gaps {
-        0 => "Today: all logged".to_string(),
+    match gap_count(v) {
+        0 => "Today: no gaps".to_string(),
         1 => "Today: 1 gap".to_string(),
         n => format!("Today: {n} gaps"),
     }
@@ -58,7 +84,7 @@ pub fn fold_label(v: &DayView) -> String {
 
 /// Every span of every row as `x` and `w` on one axis from `axis_start` to
 /// `v.now`, scaled to `width` and clamped into `[0, width]`. A stretch with
-/// no spans draws nothing.
+/// no spans, and a span of a kind this build does not know, draw nothing.
 pub fn bars(v: &DayView, width: f32) -> Vec<RowBars> {
     let start = axis_start(v);
     let span_secs = ((v.now - start).max(1)) as f32;
@@ -69,6 +95,9 @@ pub fn bars(v: &DayView, width: f32) -> Vec<RowBars> {
             let mut out = Vec::new();
             for (si, st) in row.stretches.iter().enumerate() {
                 for (pi, sp) in st.spans.iter().enumerate() {
+                    if sp.kind == SpanKind::Other {
+                        continue;
+                    }
                     let x = at(sp.from);
                     let w = (at(sp.to) - x).max(0.);
                     out.push(Bar {
@@ -98,6 +127,7 @@ pub fn hover(s: &DayStretch, span: &Span, clock: impl Fn(i64) -> String) -> Stri
         SpanKind::Unlogged => "not logged yet".to_string(),
         SpanKind::Short => "short gap, not flagged".to_string(),
         SpanKind::Wait => "waiting".to_string(),
+        SpanKind::Other => return range,
     };
     format!("{range} {what}")
 }
@@ -108,6 +138,7 @@ fn fill(kind: SpanKind) -> u32 {
         SpanKind::Gap => colors::RED,
         SpanKind::Unlogged => colors::EDGE_IDLE,
         SpanKind::Wait => colors::GREY,
+        SpanKind::Other => colors::BORDER,
     }
 }
 
@@ -132,12 +163,17 @@ impl Render for BarTooltip {
 impl OverseerApp {
     /// The panel, or nothing when no session has run today. It folds to one
     /// line; a click on the line opens the bars.
-    pub(crate) fn render_timeline(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let v = &self.timeline;
-        if v.rows.is_empty() || !has_stretches(v) {
+    /// `now` is the board's clock, so open stretches grow between sends.
+    pub(crate) fn render_timeline(
+        &self,
+        now: i64,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        if self.timeline.rows.is_empty() || !has_stretches(&self.timeline) {
             return None;
         }
-        let gaps = fold_label(v) != "Today: all logged";
+        let v = &live(&self.timeline, now);
+        let gaps = gap_count(v) > 0;
         let header = div()
             .id("timeline-header")
             .text_xs()
@@ -145,8 +181,10 @@ impl OverseerApp {
             .text_color(rgb(if gaps { colors::RED } else { colors::TEXT_DIM }))
             .cursor_pointer()
             .on_click(cx.listener(|this, _, _, cx| {
-                this.timeline_open = !this.timeline_open;
-                cx.notify();
+                if !this.modal_open() {
+                    this.timeline_open = !this.timeline_open;
+                    cx.notify();
+                }
             }))
             .child(fold_label(v));
         let mut panel = div()
@@ -270,7 +308,8 @@ mod tests {
             1,
             vec![stretch(0, 100, vec![sp(0, 100, SpanKind::Logged)], &[])],
         )]);
-        assert_eq!(fold_label(&none), "Today: all logged");
+        assert_eq!(fold_label(&none), "Today: no gaps");
+        assert_eq!(gap_count(&none), 0);
         let one = view(vec![row(
             1,
             vec![stretch(0, 100, vec![sp(0, 100, SpanKind::Gap)], &[])],
@@ -287,6 +326,7 @@ mod tests {
             ),
         ]);
         assert_eq!(fold_label(&two), "Today: 2 gaps");
+        assert_eq!(gap_count(&two), 2);
     }
 
     #[test]
@@ -357,5 +397,102 @@ mod tests {
         assert_eq!(at(SpanKind::Unlogged), "09:02-10:40 not logged yet");
         assert_eq!(at(SpanKind::Short), "09:02-10:40 short gap, not flagged");
         assert_eq!(at(SpanKind::Wait), "09:02-10:40 waiting");
+    }
+
+    fn running(mut s: DayStretch) -> DayStretch {
+        s.running = true;
+        s
+    }
+
+    #[test]
+    fn live_draws_open_stretches_to_the_board_clock() {
+        // Built at 1000; the board's clock reads 1100.
+        let v = view(vec![
+            row(
+                1,
+                vec![running(stretch(
+                    500,
+                    1000,
+                    vec![
+                        sp(500, 800, SpanKind::Logged),
+                        sp(800, 1000, SpanKind::Unlogged),
+                    ],
+                    &[],
+                ))],
+            ),
+            // Waiting over thirty minutes: not running, but drawn to now.
+            row(
+                2,
+                vec![stretch(
+                    200,
+                    1000,
+                    vec![
+                        sp(200, 300, SpanKind::Logged),
+                        sp(300, 1000, SpanKind::Wait),
+                    ],
+                    &[],
+                )],
+            ),
+            row(
+                3,
+                vec![stretch(100, 400, vec![sp(100, 400, SpanKind::Logged)], &[])],
+            ),
+        ]);
+        let l = live(&v, 1100);
+        assert_eq!(l.now, 1100);
+        let s1 = &l.rows[0].stretches[0];
+        assert_eq!((s1.last, s1.spans[0].to, s1.spans[1].to), (1100, 800, 1100));
+        let s2 = &l.rows[1].stretches[0];
+        assert_eq!((s2.last, s2.spans[1].to), (1100, 1100));
+        // An ended stretch stays where it ended.
+        assert_eq!(l.rows[2].stretches[0], v.rows[2].stretches[0]);
+        // Bars reach the right edge at the board's clock.
+        let b = bars(&l, 100.0);
+        let end = b[0].bars[1].x + b[0].bars[1].w;
+        assert!((end - 100.0).abs() < 1e-3, "ends at width, got {end}");
+        // A clock behind the view never pulls it back.
+        assert_eq!(live(&v, 900), v);
+    }
+
+    #[test]
+    fn the_axis_starts_at_the_first_work_not_a_wait() {
+        let v = view(vec![
+            row(
+                1,
+                vec![stretch(
+                    0,
+                    1000,
+                    vec![sp(0, 600, SpanKind::Wait), sp(600, 1000, SpanKind::Logged)],
+                    &[],
+                )],
+            ),
+            row(
+                2,
+                vec![stretch(
+                    700,
+                    900,
+                    vec![sp(700, 900, SpanKind::Unlogged)],
+                    &[],
+                )],
+            ),
+        ]);
+        assert_eq!(axis_start(&v), 600);
+    }
+
+    #[test]
+    fn spans_of_unknown_kinds_draw_nothing() {
+        let v = view(vec![row(
+            1,
+            vec![stretch(
+                0,
+                1000,
+                vec![sp(0, 500, SpanKind::Logged), sp(500, 1000, SpanKind::Other)],
+                &[],
+            )],
+        )]);
+        let b = bars(&v, 100.0);
+        assert_eq!(b[0].bars.len(), 1);
+        assert_eq!(b[0].bars[0].kind, SpanKind::Logged);
+        assert_eq!(gap_count(&v), 0);
     }
 }

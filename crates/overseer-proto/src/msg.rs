@@ -1331,6 +1331,10 @@ pub enum SpanKind {
     /// Uncovered but short enough not to flag; drawn as logged, with the
     /// hover `short gap, not flagged`.
     Short,
+    /// A kind this build does not know, so a newer daemon cannot break an
+    /// older client. Clients draw and list nothing for it.
+    #[serde(other)]
+    Other,
 }
 
 /// A stretch of one kind, in unix seconds.
@@ -1492,6 +1496,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(v.items[0].kind, AttentionKind::Other);
+    }
+
+    #[test]
+    fn unknown_span_kind_reads_as_other() {
+        let sp: Span =
+            serde_json::from_str(r#"{"from":1,"to":2,"kind":"from_the_future"}"#).unwrap();
+        assert_eq!(sp.kind, SpanKind::Other);
     }
 
     #[test]

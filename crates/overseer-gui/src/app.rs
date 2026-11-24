@@ -31,8 +31,8 @@ use gpui::{
     Subscription, Task, Window,
 };
 use overseer_proto::{
-    AttentionView, BrainView, Client, CoordView, DayView, Event, Frame, LockView, Request, Response, SlotId,
-    SlotInfo, SlotState, WorkView,
+    AttentionView, BrainView, Client, CoordView, DayView, Event, Frame, LockView, Request,
+    Response, SlotId, SlotInfo, SlotState, WorkView,
 };
 
 use crate::board::Dir;

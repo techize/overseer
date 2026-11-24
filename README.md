@@ -501,11 +501,12 @@ trimming):
   it; a pull request row opens the PR and marks it seen, as clicking it in the
   Open PRs panel does. `overseer ctl attention` prints the same list (`--json`
   for scripts).
-- The `Today` panel sits below it and folds to one line, `Today: all logged`
+- The `Today` panel sits below it and folds to one line, `Today: no gaps`
   or `Today: 2 gaps`. Click the line to open one bar per session on a shared
   time axis: green is covered by a session log, red is a stretch of more
   than 10 minutes with no log entry (only once the stretch has ended), grey
-  is time not logged yet in a stretch still running, and a thin line is a
+  is time not logged yet, in a stretch still running or one too short to
+  need a log, and a thin line is a
   long wait for you, which is not counted as work. Hover a bar for its times
   and the log that covers it; click a row to open that session. The panel
   is hidden until a session has run today. `overseer ctl timeline` prints

@@ -923,18 +923,25 @@ fn attention_lines(v: &AttentionView, now: i64) -> Vec<String> {
         .collect()
 }
 
-/// One line per stretch, then one indented line per gap, unlogged or waiting span.
+/// One line per stretch, then one indented line per gap, unlogged or
+/// waiting span. Span kinds this build does not know are left out.
 fn timeline_lines(v: &DayView, clock: impl Fn(i64) -> String) -> Vec<String> {
     let mut out = Vec::new();
     for row in &v.rows {
         for st in &row.stretches {
-            let work = || st.spans.iter().filter(|sp| sp.kind != SpanKind::Wait);
+            let work = || {
+                st.spans
+                    .iter()
+                    .filter(|sp| !matches!(sp.kind, SpanKind::Wait | SpanKind::Other))
+            };
             let status = if work().all(|sp| matches!(sp.kind, SpanKind::Logged | SpanKind::Short)) {
                 "logged"
             } else if st.running {
                 "running"
-            } else {
+            } else if work().any(|sp| sp.kind == SpanKind::Gap) {
                 "gaps"
+            } else {
+                "not logged"
             };
             let mut line = format!(
                 "{} {}-{} {status}",
@@ -951,7 +958,7 @@ fn timeline_lines(v: &DayView, clock: impl Fn(i64) -> String) -> Vec<String> {
                     SpanKind::Gap => "gap",
                     SpanKind::Unlogged => "not logged yet",
                     SpanKind::Wait => "waiting",
-                    SpanKind::Logged | SpanKind::Short => continue,
+                    SpanKind::Logged | SpanKind::Short | SpanKind::Other => continue,
                 };
                 out.push(format!("  {word} {}-{}", clock(sp.from), clock(sp.to)));
             }
@@ -2248,6 +2255,53 @@ mod tests {
                 "  gap 09:00-09:30",
                 "  waiting 09:30-11:00",
             ]
+        );
+    }
+
+    #[test]
+    fn timeline_lines_call_an_ended_stretch_with_no_gap_not_logged() {
+        let v = DayView {
+            rows: vec![overseer_proto::DayRow {
+                slot: 1,
+                stretches: vec![overseer_proto::DayStretch {
+                    session: "demo-1".into(),
+                    first: at(9, 0),
+                    last: at(9, 10),
+                    running: false,
+                    spans: vec![span(at(9, 0), at(9, 10), SpanKind::Unlogged)],
+                    logs: vec![],
+                }],
+            }],
+            ..DayView::default()
+        };
+        assert_eq!(
+            timeline_lines(&v, clock),
+            vec!["S1 09:00-09:10 not logged", "  not logged yet 09:00-09:10"]
+        );
+    }
+
+    #[test]
+    fn timeline_lines_skip_span_kinds_they_do_not_know() {
+        let v = DayView {
+            rows: vec![overseer_proto::DayRow {
+                slot: 1,
+                stretches: vec![overseer_proto::DayStretch {
+                    session: "demo-1".into(),
+                    first: at(9, 0),
+                    last: at(10, 0),
+                    running: false,
+                    spans: vec![
+                        span(at(9, 0), at(9, 30), SpanKind::Logged),
+                        span(at(9, 30), at(10, 0), SpanKind::Other),
+                    ],
+                    logs: vec!["demo".into()],
+                }],
+            }],
+            ..DayView::default()
+        };
+        assert_eq!(
+            timeline_lines(&v, clock),
+            vec!["S1 09:00-10:00 logged (demo)"]
         );
     }
 

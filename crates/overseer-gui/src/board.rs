@@ -970,7 +970,7 @@ impl OverseerApp {
         let bottom = row([4, 5, 6], self, cx);
         let pr_panel = self.render_pr_panel(now, cx);
         let attention = self.render_attention(now, cx);
-        let timeline = self.render_timeline(cx);
+        let timeline = self.render_timeline(now, cx);
         let kanban = self.render_kanban(now, cx);
         div()
             .key_context("Board")
