@@ -1,6 +1,7 @@
 //! Overseer daemon: owns the PTY slots and serves them over a Unix socket.
 
 pub mod activity;
+pub mod attention;
 pub mod brain;
 pub mod config;
 pub mod coord;
