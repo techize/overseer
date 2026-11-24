@@ -351,20 +351,6 @@ fn main_repo_name(common: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-
-    #[test]
-    fn update_reports_only_changes() {
-        let svc = AttentionService {
-            view: Mutex::new(AttentionView::default()),
-        };
-        let one = |since| vec![item(AttentionKind::NeedsYou, 1, since, "needs you")];
-        assert!(svc.update(one(10)));
-        assert!(!svc.update(one(10)));
-        assert!(svc.update(one(20)));
-        assert_eq!(svc.current().items, one(20));
-        assert!(svc.update(Vec::new()));
-        assert!(!svc.update(Vec::new()));
-    }
     use super::*;
     use overseer_proto::{
         Activity, ActivityKind, Approvals, BuildState, ItemKind, Notice, PullRequest, Relay,
@@ -525,6 +511,46 @@ mod tests {
         fn keys(&self) -> Vec<String> {
             self.derive().into_iter().map(|i| i.key).collect()
         }
+    }
+
+    #[test]
+    fn update_reports_only_changes() {
+        let svc = AttentionService {
+            view: Mutex::new(AttentionView::default()),
+        };
+        let one = |since| vec![item(AttentionKind::NeedsYou, 1, since, "needs you")];
+        assert!(svc.update(one(10)));
+        assert!(!svc.update(one(10)));
+        assert!(svc.update(one(20)));
+        assert_eq!(svc.current().items, one(20));
+        assert!(svc.update(Vec::new()));
+        assert!(!svc.update(Vec::new()));
+    }
+
+    #[test]
+    fn plain_idle_and_idle_wait_needs_you_both_wait_after_two_minutes() {
+        let mut w = World::new();
+        w.work = work(vec![owned("DEMO-1", 2)], vec![], vec![]);
+        // Finished after a Stop: plain Idle, no idle-input wait.
+        w.slots = vec![slot(2, act(ActivityKind::Idle, NOW - WAIT_AFTER + 1))];
+        assert!(w.derive().is_empty());
+        w.slots = vec![slot(2, act(ActivityKind::Idle, NOW - WAIT_AFTER))];
+        assert_eq!(w.keys(), ["waiting:2"]);
+
+        // An idle-input wait reported as NeedsYou.
+        let mut a = act(ActivityKind::NeedsYou, NOW - WAIT_AFTER + 1);
+        a.as_mut().unwrap().idle_wait = true;
+        w.slots = vec![slot(2, a)];
+        assert!(w.derive().is_empty());
+        let mut a = act(ActivityKind::NeedsYou, NOW - WAIT_AFTER);
+        a.as_mut().unwrap().idle_wait = true;
+        w.slots = vec![slot(2, a)];
+        let items = w.derive();
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            (items[0].key.as_str(), items[0].since),
+            ("waiting:2", NOW - WAIT_AFTER)
+        );
     }
 
     #[test]

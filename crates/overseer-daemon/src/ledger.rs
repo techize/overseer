@@ -596,19 +596,21 @@ pub struct PrSeen {
 }
 
 /// Notes the PRs seen in one poll at `now`. A PR with no row is inserted with
-/// its current comments counted as seen. A PR first seen with no count
-/// (a `pr_command` poll) has none stored, and the first count read later is
-/// taken as seen, so it does not show every comment as new. Each "since" time is kept while its
-/// condition holds, set to `now` when it starts, and cleared when it ends.
-/// New comments (more than the stored count) start `comments_since`; fewer
-/// lower the stored count and clear it; a PR that reports no count leaves
-/// both alone. Likewise a PR whose build or approvals could not be read
-/// keeps that time as it was, so a poll that missed them does not reset it. Rows for repos in `read_repos` whose PR is not in `prs` are
-/// deleted; repos whose read failed are not in `read_repos`, so their rows
-/// stay. With `targets` (every repo polled this time), rows for repos not in
-/// it are deleted too, since those PRs leave the board. Pass `None` when the
-/// list of targets is incomplete (the repo list read failed), so a transient
-/// failure keeps the rows of repos that were merely not listed.
+/// its current comments counted as seen. A PR first seen with no count (a
+/// `pr_command` poll) has none stored, and the first count read later is
+/// taken as seen, so it does not show every comment as new. Each "since"
+/// time is kept while its condition holds, set to `now` when it starts, and
+/// cleared when it ends. New comments (more than the stored count) start
+/// `comments_since`; fewer lower the stored count and clear it; a PR that
+/// reports no count leaves both alone. Likewise a PR whose build or
+/// approvals could not be read keeps that time as it was, so a poll that
+/// missed them does not reset it. Rows for repos in `read_repos` whose PR is
+/// not in `prs` are deleted; repos whose read failed are not in
+/// `read_repos`, so their rows stay. With `targets` (every repo polled this
+/// time), rows for repos not in it are deleted too, since those PRs leave the
+/// board. Pass `None` when the list of targets is incomplete (the repo list
+/// read failed), so a transient failure keeps the rows of repos that were
+/// merely not listed.
 pub(crate) fn record_prs_on(
     conn: &Connection,
     prs: &[PullRequest],

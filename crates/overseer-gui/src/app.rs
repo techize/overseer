@@ -737,6 +737,10 @@ impl OverseerApp {
         self.status = Some(crate::terminal_view::LOST_DAEMON.into());
         self.slots_known = false;
         self.forward_slots(cx);
+        // The list is the daemon's; with it gone, nothing is known to wait.
+        // Reconnecting asks for it again.
+        self.attention = AttentionView::default();
+        crate::notify::set_dock_badge(0);
         cx.notify();
         if self.reconnecting {
             return;
