@@ -866,6 +866,7 @@ impl OverseerApp {
                 let word = tone_word(r.tone);
                 let url = r.url.clone().filter(|u| is_http_url(u));
                 let slot = r.slot;
+                let (repo, pr_id) = (r.repo.clone(), r.id);
                 div()
                     .id(("pr-row", n))
                     .flex()
@@ -950,7 +951,8 @@ impl OverseerApp {
                                         }
                                     }
                                     (_, Some(url)) => {
-                                        open_external(url.clone(), "the pull request")
+                                        open_external(url.clone(), "the pull request");
+                                        this.pr_seen(repo.clone(), pr_id, cx);
                                     }
                                     _ => {}
                                 }

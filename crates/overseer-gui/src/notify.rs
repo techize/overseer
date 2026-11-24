@@ -279,6 +279,13 @@ pub fn post(note: &Note) {
     platform::post(note);
 }
 
+/// Shows `count` on the Dock icon, or clears it at zero. Called from the
+/// app's frame handler, on the main thread as AppKit needs. Like the
+/// notifications, it does nothing outside an app bundle.
+pub fn set_dock_badge(count: usize) {
+    platform::set_dock_badge(crate::attention_view::badge_label(count).as_deref());
+}
+
 // objc 0.2's `msg_send!` expands a cfg this crate does not declare.
 #[allow(unexpected_cfgs)]
 mod platform {
@@ -307,9 +314,10 @@ mod platform {
     const PRESENT_LIST: usize = 1 << 3;
     const PRESENT_BANNER: usize = 1 << 4;
 
-    /// The notification centre, or None outside an app bundle, where
-    /// `currentNotificationCenter` raises instead of returning.
-    fn center() -> Option<Id> {
+    /// Whether the app runs from a bundle with an identifier. Without one
+    /// (`cargo run`, `cargo test`) the notification centre raises and the
+    /// Dock tile is not ours to badge.
+    fn bundled() -> bool {
         // SAFETY: Foundation class methods with no arguments; the results
         // are autoreleased or shared singletons and only checked for nil.
         unsafe {
@@ -319,13 +327,44 @@ mod platform {
             } else {
                 msg_send![bundle, bundleIdentifier]
             };
-            if ident.is_null() {
-                tracing::debug!("not running from an app bundle; skipping notifications");
-                return None;
-            }
+            !ident.is_null()
+        }
+    }
+
+    /// The notification centre, or None outside an app bundle, where
+    /// `currentNotificationCenter` raises instead of returning.
+    fn center() -> Option<Id> {
+        if !bundled() {
+            tracing::debug!("not running from an app bundle; skipping notifications");
+            return None;
+        }
+        // SAFETY: a class method with no arguments returning a shared
+        // singleton, only checked for nil.
+        unsafe {
             let cls = Class::get("UNUserNotificationCenter")?;
             let center: Id = msg_send![cls, currentNotificationCenter];
             (!center.is_null()).then_some(center)
+        }
+    }
+
+    /// Sets the Dock tile's badge, `None` clearing it. Main thread only.
+    pub fn set_dock_badge(label: Option<&str>) {
+        if !bundled() {
+            return;
+        }
+        // SAFETY: NSApp is the shared application and its dockTile a
+        // shared object; the label is an autoreleased NSString or nil.
+        unsafe {
+            let app: Id = msg_send![class!(NSApplication), sharedApplication];
+            if app.is_null() {
+                return;
+            }
+            let tile: Id = msg_send![app, dockTile];
+            if tile.is_null() {
+                return;
+            }
+            let label: Id = label.map_or(std::ptr::null_mut(), nsstring);
+            let _: () = msg_send![tile, setBadgeLabel: label];
         }
     }
 

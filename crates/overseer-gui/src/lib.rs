@@ -1,6 +1,7 @@
 //! GPUI front end for Overseer.
 
 pub mod app;
+pub mod attention_view;
 pub mod board;
 pub mod daemon_info;
 pub mod kanban_size;
