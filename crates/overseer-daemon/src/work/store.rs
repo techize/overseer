@@ -227,13 +227,16 @@ pub const NO_BITBUCKET_EMAIL: &str =
 /// The per-repo error for a `pr_repos` folder the API cannot name.
 pub const NO_BITBUCKET_REMOTE: &str = "no Bitbucket remote";
 
-/// The open PRs of one target, as `parse_prs` reads them.
+/// The open PRs of one target, as `parse_prs` reads them. Through the API,
+/// only `author`'s PRs are kept (see [`author_matches`]), so others cost no
+/// statuses reads.
 async fn read_target(
     reader: &PrReader,
     repo: &str,
     target: &PrTarget,
     vars: &Vars,
     ai_reviewers: &[String],
+    author: &str,
 ) -> Result<Vec<PullRequest>, String> {
     let out = match (reader, target) {
         (PrReader::Command(cmd), PrTarget::Folder(dir)) => {
@@ -254,12 +257,14 @@ async fn read_target(
             };
             let (api, token) = (api.clone(), token.clone());
             let (repo, ai) = (repo.to_owned(), ai_reviewers.to_vec());
+            let author = author.to_owned();
             // The statuses are read here too, one PR after another, so the
             // per-repo limit on polls still bounds the requests.
             return run_blocking_for("Bitbucket", move || {
                 let started = Instant::now();
                 let out = api.open_prs(&token, &ws, &slug)?;
                 let mut prs = parse_prs(&out, &repo, &ai)?;
+                prs.retain(|p| author_matches(&author, p));
                 fill_builds(&api, &token, (&ws, &slug), &mut prs, started, BUILD_BUDGET);
                 Ok(prs)
             })
@@ -273,6 +278,16 @@ async fn read_target(
         pr.head = None;
     }
     Ok(prs)
+}
+
+/// With `author` set (trimmed and lowercased), only that author's PRs,
+/// ignoring case.
+fn author_matches(author: &str, pr: &PullRequest) -> bool {
+    author.is_empty()
+        || pr
+            .author
+            .as_deref()
+            .is_some_and(|a| a.trim().to_lowercase() == author)
 }
 
 /// How long after a repo's PR list read starts the build states may still
@@ -499,6 +514,7 @@ async fn poll_prs(
     targets: &[(String, PrTarget)],
     vars: Arc<Vars>,
     ai_reviewers: Arc<[String]>,
+    author: Arc<str>,
 ) -> Vec<Result<Vec<PullRequest>, String>> {
     let mut results: Vec<Option<Result<Vec<PullRequest>, String>>> =
         targets.iter().map(|_| None).collect();
@@ -510,15 +526,18 @@ async fn poll_prs(
             let Some((i, (repo, target))) = next.next() else {
                 break;
             };
-            let (reader, repo, target, vars, ai) = (
+            let (reader, repo, target, vars, ai, author) = (
                 reader.clone(),
                 repo.clone(),
                 target.clone(),
                 vars.clone(),
                 ai_reviewers.clone(),
+                author.clone(),
             );
-            running
-                .spawn(async move { (i, read_target(&reader, &repo, &target, &vars, &ai).await) });
+            running.spawn(async move {
+                let read = read_target(&reader, &repo, &target, &vars, &ai, &author).await;
+                (i, read)
+            });
         }
         match running.join_next().await {
             Some(Ok((i, read))) => results[i] = Some(read),
@@ -1023,7 +1042,9 @@ impl WorkStore {
                 };
                 let repos_error = self.read_repo_list(&reader, &vars).await;
                 let targets = self.pr_targets(unix_now());
-                let got = poll_prs(&reader, &targets, vars, self.ai_reviewers.clone()).await;
+                let author: Arc<str> = self.pr_author.as_str().into();
+                let got =
+                    poll_prs(&reader, &targets, vars, self.ai_reviewers.clone(), author).await;
                 let now = unix_now();
                 let mut cache = self.cache();
                 let mut errors = Vec::new();
@@ -1567,11 +1588,7 @@ impl WorkStore {
 
     /// With `pr_author` set, only that author's PRs, ignoring case.
     fn wants_author(&self, pr: &PullRequest) -> bool {
-        self.pr_author.is_empty()
-            || pr
-                .author
-                .as_deref()
-                .is_some_and(|a| a.trim().to_lowercase() == self.pr_author)
+        author_matches(&self.pr_author, pr)
     }
 
     /// `pr` with the first ticket key in its title, else in its branch.
@@ -3153,6 +3170,46 @@ esac"#,
         assert_eq!(
             seen[0].path,
             "/2.0/repositories/demo-ws/demo-web/pullrequests?state=OPEN&pagelen=50&fields=%2Bvalues.participants%2C%2Bvalues.comment_count"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn pr_author_reads_statuses_only_for_that_authors_prs() {
+        use super::super::jira_api::tests::fake;
+        let dir = temp_dir("bb-author");
+        let web = dir.join("demo-web");
+        git_folder(&web, "git@bitbucket.org:demo-ws/demo-web.git");
+        let prs = r#"{"values":[
+            {"id":5,"title":"Other work","author":{"display_name":"Sam Demo"},
+             "source":{"commit":{"hash":"bbb"}}},
+            {"id":7,"title":"Own work","author":{"display_name":"Dana Demo"},
+             "source":{"commit":{"hash":"aaa"}}}]}"#;
+        let statuses = r#"{"values":[{"state":"FAILED"}]}"#;
+        let (base, rx) = fake(vec![(200, prs.into()), (200, statuses.into())]);
+        let mut s = store_with(|c| {
+            c.jira_email = "demo@example.test".into();
+            c.pr_repos = vec![web.clone()];
+            c.pr_command = sh("echo ran >&2; exit 1");
+            c.pr_author = "dana demo".into();
+        });
+        use_bitbucket(
+            &mut s,
+            &dir,
+            "case \"$*\" in *overseer-bitbucket*) echo bb-tok ;; *) exit 44 ;; esac",
+            &base,
+        );
+        s.refresh(Source::Prs).await;
+        let v = s.view();
+        let got: Vec<_> = v.prs.iter().map(|p| (p.id, p.build)).collect();
+        assert_eq!(got, [(7, Some(overseer_proto::BuildState::Failed))]);
+        let paths: Vec<_> = rx.try_iter().map(|s| s.path).collect();
+        assert_eq!(
+            paths,
+            [
+                "/2.0/repositories/demo-ws/demo-web/pullrequests?state=OPEN&pagelen=50&fields=%2Bvalues.participants%2C%2Bvalues.comment_count",
+                "/2.0/repositories/demo-ws/demo-web/commit/aaa/statuses?pagelen=100",
+            ]
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
