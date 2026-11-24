@@ -1069,10 +1069,13 @@ impl WorkStore {
                 s.message = (!errors.is_empty()).then(|| errors.join("; "));
                 drop(cache);
                 // Not part of the poll's success: the board is right without it.
+                // After a failed repo-list read the targets lack the workspace
+                // repos, so they cannot be used to prune.
                 let names: Vec<String> = targets.iter().map(|(r, _)| r.clone()).collect();
+                let known = repos_error.is_none().then_some(names.as_slice());
                 if let Err(e) = self
                     .ledger
-                    .transaction(|c| ledger::record_prs_on(c, &read_prs, &read_repos, &names, now))
+                    .transaction(|c| ledger::record_prs_on(c, &read_prs, &read_repos, known, now))
                 {
                     tracing::warn!("recording seen PRs failed: {e:#}");
                 }
@@ -2833,6 +2836,87 @@ esac"#,
         let repos: Vec<_> = v.prs.iter().map(|p| p.repo.as_str()).collect();
         assert_eq!(repos, ["demo-api"]);
         assert!(prs_source(&v).ok, "{:?}", prs_source(&v));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn seen_row(s: &WorkStore, repo: &str, id: u64, comments: Option<u32>, at: i64) {
+        let mut pr = pr_with_head(id, "aaa");
+        pr.repo = repo.into();
+        pr.comments = comments;
+        s.ledger
+            .transaction(|c| ledger::record_prs_on(c, &[pr], &[repo.to_string()], None, at))
+            .unwrap();
+    }
+
+    fn cache_pr(s: &WorkStore, repo: &str, id: u64, comments: Option<u32>) {
+        let mut pr = pr_with_head(id, "aaa");
+        pr.repo = repo.into();
+        pr.comments = comments;
+        s.cache().prs.insert(repo.into(), vec![pr]);
+    }
+
+    #[test]
+    fn marking_an_unknown_or_uncounted_pr_changes_nothing() {
+        let s = store("");
+        seen_row(&s, "demo-api", 1, Some(2), 10);
+        seen_row(&s, "demo-api", 1, Some(5), 20);
+        cache_pr(&s, "demo-api", 1, None);
+        let before = s.ledger.pr_seen().unwrap();
+        assert!(matches!(s.mark_pr_seen("demo-web", 9), Response::Ok));
+        assert!(matches!(s.mark_pr_seen("demo-api", 1), Response::Ok));
+        assert_eq!(s.ledger.pr_seen().unwrap(), before);
+        assert_eq!(before[0].comments_since, Some(20));
+    }
+
+    #[test]
+    fn marking_a_pr_seen_records_the_count_and_announces() {
+        let s = store("");
+        let mut rx = s.events.subscribe();
+        seen_row(&s, "demo-api", 1, Some(2), 10);
+        seen_row(&s, "demo-api", 1, Some(5), 20);
+        cache_pr(&s, "demo-api", 1, Some(5));
+        assert!(matches!(s.mark_pr_seen("demo-api", 1), Response::Ok));
+        let row = &s.ledger.pr_seen().unwrap()[0];
+        assert_eq!((row.comments, row.comments_since), (5, None));
+        assert!(matches!(rx.try_recv(), Ok(Event::WorkChanged(_))));
+    }
+
+    #[tokio::test]
+    async fn a_poll_records_the_prs_it_read() {
+        let dir = temp_dir("prs-seen");
+        let api = dir.join("demo-api");
+        std::fs::create_dir_all(&api).unwrap();
+        let s = store_with(|c| {
+            c.pr_repos = vec![api.clone()];
+            c.pr_command = sh(FAKE_BB);
+        });
+        s.refresh(Source::Prs).await;
+        let rows = s.ledger.pr_seen().unwrap();
+        let ids: Vec<_> = rows.iter().map(|r| r.id).collect();
+        assert_eq!(ids.len(), prs_source(&s.view()).count, "{ids:?}");
+        assert!(ids.contains(&7), "{ids:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_failed_repo_list_keeps_workspace_pr_rows() {
+        let dir = temp_dir("ws-seen-keep");
+        let api = dir.join("demo-api");
+        std::fs::create_dir_all(&api).unwrap();
+        let s = ws_store(&dir, |c| c.pr_repos = vec![api.clone()]);
+        // A workspace repo seen before a restart; its list read now fails.
+        seen_row(&s, "demo-web", 21, Some(3), 10);
+        s.refresh(Source::Prs).await;
+        let msg = prs_source(&s.view()).message.clone().unwrap_or_default();
+        assert!(msg.starts_with("repos: "), "{msg}");
+        let repos: Vec<_> = s
+            .ledger
+            .pr_seen()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.repo)
+            .collect();
+        assert!(repos.contains(&"demo-web".to_string()), "{repos:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

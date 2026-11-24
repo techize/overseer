@@ -602,13 +602,15 @@ pub struct PrSeen {
 /// lower the stored count and clear it; a PR that reports no count leaves
 /// both alone. Rows for repos in `read_repos` whose PR is not in `prs` are
 /// deleted; repos whose read failed are not in `read_repos`, so their rows
-/// stay. Rows for repos not in `targets` (no longer polled at all) are
-/// deleted too, since those PRs leave the board.
+/// stay. With `targets` (every repo polled this time), rows for repos not in
+/// it are deleted too, since those PRs leave the board. Pass `None` when the
+/// list of targets is incomplete (the repo list read failed), so a transient
+/// failure keeps the rows of repos that were merely not listed.
 pub(crate) fn record_prs_on(
     conn: &Connection,
     prs: &[PullRequest],
     read_repos: &[String],
-    targets: &[String],
+    targets: Option<&[String]>,
     now: i64,
 ) -> Result<()> {
     for pr in prs {
@@ -646,7 +648,7 @@ pub(crate) fn record_prs_on(
         .collect::<rusqlite::Result<_>>()?;
     drop(stmt);
     for (repo, id) in rows {
-        let gone = if targets.contains(&repo) {
+        let gone = if targets.is_none_or(|t| t.contains(&repo)) {
             read_repos.contains(&repo) && !prs.iter().any(|p| p.repo == repo && p.id as i64 == id)
         } else {
             true
@@ -2019,7 +2021,7 @@ mod tests {
 
     fn rec(l: &Ledger, prs: &[PullRequest], read: &[&str], now: i64) {
         let read: Vec<String> = read.iter().map(|r| r.to_string()).collect();
-        l.transaction(|c| record_prs_on(c, prs, &read, &read, now))
+        l.transaction(|c| record_prs_on(c, prs, &read, Some(&read), now))
             .unwrap();
     }
 
@@ -2090,19 +2092,31 @@ mod tests {
             demo_pr("demo-api", 7, Some(1)),
             demo_pr("demo-web", 3, Some(1)),
         ];
-        l.transaction(|c| record_prs_on(c, &prs, &both, &both, 10))
+        l.transaction(|c| record_prs_on(c, &prs, &both, Some(&both), 10))
             .unwrap();
         // demo-api read without PR 7; demo-web's read failed.
         let read = ["demo-api".to_string()];
-        l.transaction(|c| record_prs_on(c, &[], &read, &both, 20))
+        l.transaction(|c| record_prs_on(c, &[], &read, Some(&both), 20))
             .unwrap();
         let rows = l.pr_seen().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].repo, "demo-web");
         // demo-web is no longer a target at all.
-        l.transaction(|c| record_prs_on(c, &[], &read, &read, 30))
+        l.transaction(|c| record_prs_on(c, &[], &read, Some(&read), 30))
             .unwrap();
         assert!(l.pr_seen().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pr_seen_keeps_unlisted_repos_when_targets_are_unknown() {
+        let l = Ledger::in_memory();
+        let read = ["demo-api".to_string()];
+        let prs = [demo_pr("demo-ws", 3, Some(4))];
+        l.transaction(|c| record_prs_on(c, &prs, &["demo-ws".to_string()], None, 10))
+            .unwrap();
+        l.transaction(|c| record_prs_on(c, &[], &read, None, 20))
+            .unwrap();
+        assert_eq!(l.pr_seen().unwrap().len(), 1);
     }
 
     #[test]
