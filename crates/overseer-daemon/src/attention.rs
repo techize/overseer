@@ -285,8 +285,10 @@ fn pr_items(i: &Inputs, pr: &PullRequest, out: &mut Vec<AttentionItem>) {
             "changes requested".into(),
         );
     }
-    if let Some(n) = pr.comments.filter(|&c| c > seen.comments) {
-        let what = match n - seen.comments {
+    // No stored count yet means nothing has been seen to count from.
+    let counts = pr.comments.zip(seen.comments).filter(|(n, base)| n > base);
+    if let Some((n, base)) = counts {
+        let what = match n - base {
             1 => "1 new comment".to_string(),
             n => format!("{n} new comments"),
         };
@@ -478,7 +480,7 @@ mod tests {
         PrSeen {
             repo: repo.into(),
             id,
-            comments: 0,
+            comments: Some(0),
             build_failed_since: None,
             changes_since: None,
             comments_since: None,
@@ -744,7 +746,7 @@ mod tests {
         p.comments = Some(5);
         w.work = work(vec![], vec![], vec![p]);
         w.seen = vec![PrSeen {
-            comments: 4,
+            comments: Some(4),
             build_failed_since: Some(30),
             changes_since: Some(20),
             comments_since: Some(10),
@@ -838,11 +840,30 @@ mod tests {
     }
 
     #[test]
+    fn pr_comments_need_a_stored_count_to_count_from() {
+        let mut w = World::new();
+        let mut p = pr("demo-api", 6, "feature/c");
+        p.build = Some(BuildState::Passed);
+        p.approvals = Some(Approvals::default());
+        p.comments = Some(5);
+        w.work = work(vec![], vec![], vec![p]);
+        w.seen = vec![PrSeen {
+            comments: None,
+            comments_since: Some(1),
+            ..seen("demo-api", 6)
+        }];
+        assert!(w.derive().is_empty());
+
+        w.seen[0].comments = Some(4);
+        assert_eq!(w.derive()[0].text, "DEMO-6 change: 1 new comment");
+    }
+
+    #[test]
     fn bb_prs_with_no_counts_raise_nothing() {
         let mut w = World::new();
         w.work = work(vec![], vec![], vec![pr("demo-api", 4, "feature/y")]);
         w.seen = vec![PrSeen {
-            comments: 0,
+            comments: Some(0),
             comments_since: Some(1),
             ..seen("demo-api", 4)
         }];

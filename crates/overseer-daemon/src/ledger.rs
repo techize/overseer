@@ -201,7 +201,7 @@ UPDATE relays SET drop_reason = 'session ended'
 /// it was first noticed, so ages survive a restart.
 const V10_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS pr_seen (
     repo TEXT NOT NULL, id INTEGER NOT NULL,
-    comments INTEGER NOT NULL, at INTEGER NOT NULL,
+    comments INTEGER, at INTEGER NOT NULL,
     build_failed_since INTEGER, changes_since INTEGER, comments_since INTEGER,
     PRIMARY KEY (repo, id))";
 
@@ -588,15 +588,17 @@ pub fn record_stages_on(conn: &Connection, seen: &[(String, Stage)], now: i64) -
 pub struct PrSeen {
     pub repo: String,
     pub id: u64,
-    /// The comment count the user last saw.
-    pub comments: u32,
+    /// The comment count the user last saw; `None` until a poll reads one.
+    pub comments: Option<u32>,
     pub build_failed_since: Option<i64>,
     pub changes_since: Option<i64>,
     pub comments_since: Option<i64>,
 }
 
 /// Notes the PRs seen in one poll at `now`. A PR with no row is inserted with
-/// its current comments counted as seen. Each "since" time is kept while its
+/// its current comments counted as seen. A PR first seen with no count
+/// (a `pr_command` poll) has none stored, and the first count read later is
+/// taken as seen, so it does not show every comment as new. Each "since" time is kept while its
 /// condition holds, set to `now` when it starts, and cleared when it ends.
 /// New comments (more than the stored count) start `comments_since`; fewer
 /// lower the stored count and clear it; a PR that reports no count leaves
@@ -622,26 +624,28 @@ pub(crate) fn record_prs_on(
             "INSERT INTO pr_seen (repo, id, comments, at, build_failed_since, changes_since)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(repo, id) DO UPDATE SET
-               build_failed_since = CASE WHEN NOT ?8 THEN build_failed_since
+               build_failed_since = CASE WHEN NOT ?7 THEN build_failed_since
                  WHEN ?5 IS NULL THEN NULL
                  ELSE COALESCE(build_failed_since, ?5) END,
-               changes_since = CASE WHEN NOT ?9 THEN changes_since
+               changes_since = CASE WHEN NOT ?8 THEN changes_since
                  WHEN ?6 IS NULL THEN NULL
                  ELSE COALESCE(changes_since, ?6) END,
                comments_since = CASE
-                 WHEN ?7 IS NULL THEN comments_since
-                 WHEN ?7 > comments THEN COALESCE(comments_since, ?4)
-                 WHEN ?7 < comments THEN NULL
+                 WHEN ?3 IS NULL OR comments IS NULL THEN comments_since
+                 WHEN ?3 > comments THEN COALESCE(comments_since, ?4)
+                 WHEN ?3 < comments THEN NULL
                  ELSE comments_since END,
-               comments = CASE WHEN ?7 IS NOT NULL AND ?7 < comments THEN ?7 ELSE comments END",
+               comments = CASE
+                 WHEN ?3 IS NULL THEN comments
+                 WHEN comments IS NULL OR ?3 < comments THEN ?3
+                 ELSE comments END",
             rusqlite::params![
                 pr.repo,
                 pr.id as i64,
-                count.unwrap_or(0),
+                count,
                 now,
                 failed.then_some(now),
                 changes.then_some(now),
-                count,
                 pr.build.is_some(),
                 pr.approvals.is_some(),
             ],
@@ -2036,8 +2040,22 @@ mod tests {
         rec(&l, &[demo_pr("demo-api", 1, Some(5))], &["demo-api"], 10);
         let rows = l.pr_seen().unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].comments, 5);
+        assert_eq!(rows[0].comments, Some(5));
         assert_eq!(rows[0].comments_since, None);
+    }
+
+    #[test]
+    fn pr_seen_first_count_after_an_uncounted_sighting_is_the_baseline() {
+        let l = Ledger::in_memory();
+        // First seen by a poll that reads no counts, as `pr_command` does.
+        rec(&l, &[demo_pr("demo-api", 1, None)], &["demo-api"], 5);
+        assert_eq!(l.pr_seen().unwrap()[0].comments, None);
+        rec(&l, &[demo_pr("demo-api", 1, Some(5))], &["demo-api"], 10);
+        let row = &l.pr_seen().unwrap()[0];
+        assert_eq!((row.comments, row.comments_since), (Some(5), None));
+        rec(&l, &[demo_pr("demo-api", 1, Some(6))], &["demo-api"], 20);
+        let row = &l.pr_seen().unwrap()[0];
+        assert_eq!((row.comments, row.comments_since), (Some(5), Some(20)));
     }
 
     #[test]
@@ -2047,7 +2065,7 @@ mod tests {
         rec(&l, &[demo_pr("demo-api", 1, Some(7))], &["demo-api"], 10);
         rec(&l, &[demo_pr("demo-api", 1, Some(8))], &["demo-api"], 20);
         let row = &l.pr_seen().unwrap()[0];
-        assert_eq!((row.comments, row.comments_since), (5, Some(10)));
+        assert_eq!((row.comments, row.comments_since), (Some(5), Some(10)));
         rec(&l, &[demo_pr("demo-api", 1, None)], &["demo-api"], 30);
         assert_eq!(l.pr_seen().unwrap()[0].comments_since, Some(10));
     }
@@ -2060,10 +2078,10 @@ mod tests {
         l.transaction(|c| mark_pr_seen_on(c, "demo-api", 1, 8))
             .unwrap();
         let row = &l.pr_seen().unwrap()[0];
-        assert_eq!((row.comments, row.comments_since), (8, None));
+        assert_eq!((row.comments, row.comments_since), (Some(8), None));
         rec(&l, &[demo_pr("demo-api", 1, Some(6))], &["demo-api"], 20);
         let row = &l.pr_seen().unwrap()[0];
-        assert_eq!((row.comments, row.comments_since), (6, None));
+        assert_eq!((row.comments, row.comments_since), (Some(6), None));
     }
 
     #[test]

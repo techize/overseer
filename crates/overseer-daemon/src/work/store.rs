@@ -2877,7 +2877,7 @@ esac"#,
         cache_pr(&s, "demo-api", 1, Some(5));
         assert!(matches!(s.mark_pr_seen("demo-api", 1), Response::Ok));
         let row = &s.ledger.pr_seen().unwrap()[0];
-        assert_eq!((row.comments, row.comments_since), (5, None));
+        assert_eq!((row.comments, row.comments_since), (Some(5), None));
         assert!(matches!(rx.try_recv(), Ok(Event::WorkChanged(_))));
     }
 
