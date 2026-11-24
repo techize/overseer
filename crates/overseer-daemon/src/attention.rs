@@ -4,14 +4,21 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use overseer_proto::{
-    ActivityKind, AttentionItem, AttentionKind, BuildState, LockView, PullRequest, RelayState,
-    SlotId, SlotInfo, SlotState, WorkView,
+    ActivityKind, AttentionItem, AttentionKind, AttentionView, BuildState, Event, LockView,
+    PullRequest, RelayState, SlotId, SlotInfo, SlotState, WorkView,
 };
+use tokio::sync::broadcast;
 
-use crate::ledger::PrSeen;
+use crate::ledger::{Ledger, PrSeen};
+use crate::locks::LockService;
+use crate::manager::SlotManager;
 use crate::relay::courier::{NO_BOX, WORKING};
+use crate::work::store::unix_now;
+use crate::work::WorkStore;
 
 /// Seconds a finished slot with a ticket waits before it is an item.
 pub const WAIT_AFTER: i64 = 120;
@@ -43,6 +50,96 @@ pub fn derive(i: &Inputs) -> Vec<AttentionItem> {
     }
     items.sort_by(|a, b| a.since.cmp(&b.since).then_with(|| a.key.cmp(&b.key)));
     items
+}
+
+/// How often the list is rederived with no event, so a wait that only
+/// ripens with time still shows up.
+const TICK: Duration = Duration::from_secs(30);
+
+/// Holds the current attention list and announces it when it changes.
+pub struct AttentionService {
+    view: Mutex<AttentionView>,
+}
+
+impl AttentionService {
+    pub fn current(&self) -> AttentionView {
+        self.view.lock().unwrap().clone()
+    }
+
+    /// Stores the list; true only when it differs from the last one.
+    fn update(&self, items: Vec<AttentionItem>) -> bool {
+        let mut view = self.view.lock().unwrap();
+        if view.items == items {
+            return false;
+        }
+        view.items = items;
+        true
+    }
+
+    /// Starts the task that keeps the list current. `author_set` is read
+    /// once: settings only take effect when the daemon restarts.
+    pub fn spawn(
+        ledger: Arc<Ledger>,
+        manager: Arc<Mutex<SlotManager>>,
+        locks: Arc<LockService>,
+        store: Arc<WorkStore>,
+        events: broadcast::Sender<Event>,
+        author_set: bool,
+    ) -> Arc<AttentionService> {
+        let svc = Arc::new(AttentionService {
+            view: Mutex::new(AttentionView::default()),
+        });
+        // Subscribe before seeding so no change falls between the two.
+        let mut rx = events.subscribe();
+        let reread = move || (manager.lock().unwrap().list(), locks.view(), store.view());
+        let (mut slots, mut lock_view, mut work) = reread();
+        let task = svc.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(TICK);
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => {}
+                    ev = rx.recv() => match ev {
+                        Ok(Event::SlotChanged(info)) => {
+                            match slots.iter_mut().find(|s| s.id == info.id) {
+                                Some(s) => *s = info,
+                                None => slots.push(info),
+                            }
+                        }
+                        Ok(Event::LocksChanged(v)) => lock_view = v,
+                        Ok(Event::WorkChanged(v)) => work = v,
+                        Ok(_) => continue,
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            (slots, lock_view, work) = reread();
+                        }
+                        Err(broadcast::error::RecvError::Closed) => return,
+                    },
+                }
+                let seen = ledger.pr_seen().unwrap_or_else(|e| {
+                    tracing::warn!("attention: reading pr_seen failed: {e:#}");
+                    Vec::new()
+                });
+                let branches = slots
+                    .iter()
+                    .filter_map(|s| Some((s.id, repo_branch(s.cwd.as_deref()?)?)))
+                    .collect();
+                let items = derive(&Inputs {
+                    slots: &slots,
+                    locks: &lock_view,
+                    work: &work,
+                    seen: &seen,
+                    branches: &branches,
+                    author_set,
+                    now: unix_now(),
+                });
+                if task.update(items) {
+                    // Nobody listening is fine.
+                    let _ = events.send(Event::AttentionChanged(task.current()));
+                }
+            }
+        });
+        svc
+    }
 }
 
 fn item(kind: AttentionKind, slot: SlotId, since: i64, text: &str) -> AttentionItem {
@@ -249,6 +346,20 @@ fn main_repo_name(common: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn update_reports_only_changes() {
+        let svc = AttentionService {
+            view: Mutex::new(AttentionView::default()),
+        };
+        let one = |since| vec![item(AttentionKind::NeedsYou, 1, since, "needs you")];
+        assert!(svc.update(one(10)));
+        assert!(!svc.update(one(10)));
+        assert!(svc.update(one(20)));
+        assert_eq!(svc.current().items, one(20));
+        assert!(svc.update(Vec::new()));
+        assert!(!svc.update(Vec::new()));
+    }
     use super::*;
     use overseer_proto::{
         Activity, ActivityKind, Approvals, BuildState, ItemKind, Notice, PullRequest, Relay,
