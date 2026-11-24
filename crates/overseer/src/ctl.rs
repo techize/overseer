@@ -891,12 +891,16 @@ async fn run_settings(
 
 /// `{age:>4}  {who}  {text}`, one line per item, longest waiting first as the daemon sorts them.
 fn attention_lines(v: &AttentionView, now: i64) -> Vec<String> {
-    if v.items.is_empty() {
-        return vec!["Nothing waiting on you.".to_string()];
-    }
-    v.items
+    let known: Vec<_> = v
+        .items
         .iter()
         .filter(|i| i.kind != AttentionKind::Other)
+        .collect();
+    if known.is_empty() {
+        return vec!["Nothing waiting on you.".to_string()];
+    }
+    known
+        .into_iter()
         .map(|i| {
             let mut who = match &i.pr {
                 Some((repo, id)) => format!("{repo}#{id}"),
@@ -2044,6 +2048,23 @@ mod tests {
         assert_eq!(
             attention_lines(&v, 1000 + 300),
             vec!["  5m  S2  no log for 20m".to_string()]
+        );
+    }
+
+    #[test]
+    fn attention_lines_say_nothing_waits_when_only_unknown_kinds_are_left() {
+        let v = AttentionView {
+            items: vec![attention(
+                AttentionKind::Other,
+                Some(1),
+                None,
+                1000,
+                "future",
+            )],
+        };
+        assert_eq!(
+            attention_lines(&v, 1300),
+            vec!["Nothing waiting on you.".to_string()]
         );
     }
 

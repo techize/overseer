@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use overseer_proto::{
-    ActivityKind, AttentionItem, AttentionKind, AttentionView, BuildState, Event, LockView,
-    PullRequest, RelayState, SlotId, SlotInfo, SlotState, WorkView,
+    ActivityKind, AttentionItem, AttentionKind, AttentionView, BuildState, DayView, Event,
+    LockView, PullRequest, RelayState, SlotId, SlotInfo, SlotState, WorkView,
 };
 use tokio::sync::broadcast;
 
@@ -17,6 +17,7 @@ use crate::ledger::{Ledger, PrSeen};
 use crate::locks::LockService;
 use crate::manager::SlotManager;
 use crate::relay::courier::{NO_BOX, WORKING};
+use crate::session_logs::{hhmm, local_minutes};
 use crate::work::store::unix_now;
 use crate::work::WorkStore;
 
@@ -35,6 +36,8 @@ pub struct Inputs<'a> {
     pub seen: &'a [PrSeen],
     pub branches: &'a HashMap<SlotId, (String, String)>,
     pub author_set: bool,
+    /// Today's timeline, for the unlogged gaps.
+    pub day: &'a DayView,
     pub now: i64,
 }
 
@@ -45,6 +48,7 @@ pub fn derive(i: &Inputs) -> Vec<AttentionItem> {
         slot_items(i, s, &mut items);
     }
     notice_items(i, &mut items);
+    gap_items(i, &mut items);
     for pr in &i.work.prs {
         pr_items(i, pr, &mut items);
     }
@@ -93,6 +97,7 @@ impl AttentionService {
         let mut rx = events.subscribe();
         let reread = move || (manager.lock().unwrap().list(), locks.view(), store.view());
         let (mut slots, mut lock_view, mut work) = reread();
+        let mut day = DayView::default();
         let task = svc.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(TICK);
@@ -108,6 +113,7 @@ impl AttentionService {
                         }
                         Ok(Event::LocksChanged(v)) => lock_view = v,
                         Ok(Event::WorkChanged(v)) => work = v,
+                        Ok(Event::TimelineChanged(v)) => day = v,
                         Ok(_) => continue,
                         Err(broadcast::error::RecvError::Lagged(_)) => {
                             (slots, lock_view, work) = reread();
@@ -130,6 +136,7 @@ impl AttentionService {
                     seen: &seen,
                     branches: &branches,
                     author_set,
+                    day: &day,
                     now: unix_now(),
                 });
                 if task.update(items) {
@@ -246,6 +253,44 @@ fn notice_items(i: &Inputs, out: &mut Vec<AttentionItem>) {
     }
 }
 
+/// One item per slot with unlogged gaps today, timed from the end of the
+/// first gap and listing the first two.
+fn gap_items(i: &Inputs, out: &mut Vec<AttentionItem>) {
+    let mut slots: Vec<SlotId> = i.day.rows.iter().map(|r| r.slot).collect();
+    slots.sort_unstable();
+    slots.dedup();
+    for slot in slots {
+        let gaps = i.day.gaps(slot);
+        let Some(first) = gaps.first() else {
+            continue;
+        };
+        let range = |from: i64, to: i64| {
+            format!(
+                "{}-{}",
+                hhmm(local_minutes(from).1),
+                hhmm(local_minutes(to).1)
+            )
+        };
+        let times = match gaps.as_slice() {
+            [a] => range(a.from, a.to),
+            [a, b] => format!("{} and {}", range(a.from, a.to), range(b.from, b.to)),
+            [a, b, rest @ ..] => format!(
+                "{} and {} and {} more",
+                range(a.from, a.to),
+                range(b.from, b.to),
+                rest.len()
+            ),
+            [] => continue,
+        };
+        let count = match gaps.len() {
+            1 => "1 unlogged gap".to_string(),
+            n => format!("{n} unlogged gaps"),
+        };
+        let text = format!("{count} today, {times}");
+        out.push(item(AttentionKind::LogGap, slot, first.to, &text));
+    }
+}
+
 /// Items for one of your PRs, each timed by when Overseer first saw its
 /// condition. A PR with no seen row, or a condition with no time, raises
 /// nothing. A build or approvals list this poll could not read counts as
@@ -355,8 +400,8 @@ fn main_repo_name(common: &Path) -> Option<String> {
 mod tests {
     use super::*;
     use overseer_proto::{
-        Activity, ActivityKind, Approvals, BuildState, ItemKind, Notice, PullRequest, Relay,
-        RelayKind, RelayState, Sender, SlotState, WorkItem,
+        Activity, ActivityKind, Approvals, BuildState, DayRow, DayStretch, ItemKind, Notice,
+        PullRequest, Relay, RelayKind, RelayState, Sender, SlotState, Span, SpanKind, WorkItem,
     };
     use std::fs;
 
@@ -482,6 +527,7 @@ mod tests {
         seen: Vec<PrSeen>,
         branches: HashMap<SlotId, (String, String)>,
         author_set: bool,
+        day: DayView,
         now: i64,
     }
 
@@ -494,6 +540,7 @@ mod tests {
                 seen: vec![],
                 branches: HashMap::new(),
                 author_set: true,
+                day: DayView::default(),
                 now: NOW,
             }
         }
@@ -506,6 +553,7 @@ mod tests {
                 seen: &self.seen,
                 branches: &self.branches,
                 author_set: self.author_set,
+                day: &self.day,
                 now: self.now,
             })
         }
@@ -513,6 +561,124 @@ mod tests {
         fn keys(&self) -> Vec<String> {
             self.derive().into_iter().map(|i| i.key).collect()
         }
+    }
+
+    fn span(from: i64, to: i64, kind: SpanKind) -> Span {
+        Span { from, to, kind }
+    }
+
+    /// A day with one stretch for `slot` holding `spans`.
+    fn day_of(slot: SlotId, spans: Vec<Span>) -> DayView {
+        DayView {
+            day: "2026-11-24".into(),
+            start: 0,
+            now: NOW,
+            rows: vec![DayRow {
+                slot,
+                stretches: vec![DayStretch {
+                    session: "demo".into(),
+                    first: 0,
+                    last: NOW,
+                    running: true,
+                    spans,
+                    logs: vec![],
+                }],
+            }],
+        }
+    }
+
+    fn gap(from: i64, to: i64) -> Span {
+        span(from, to, SpanKind::Gap)
+    }
+
+    #[test]
+    fn log_gap_raised_per_slot_with_gaps() {
+        let mut w = World::new();
+        w.day = day_of(2, vec![gap(100, 800)]);
+        w.day.rows.push(DayRow {
+            slot: 5,
+            stretches: vec![DayStretch {
+                session: "demo".into(),
+                first: 0,
+                last: NOW,
+                running: false,
+                spans: vec![gap(1000, 1700)],
+                logs: vec![],
+            }],
+        });
+        assert_eq!(w.keys(), ["log_gap:2", "log_gap:5"]);
+        let items = w.derive();
+        assert!(items.iter().all(|i| i.kind == AttentionKind::LogGap));
+        assert_eq!(items[0].slot, Some(2));
+    }
+
+    #[test]
+    fn log_gap_text_lists_two_then_more() {
+        // Day start at 0 makes local times zone-dependent, so build the
+        // expected text from the same formatter.
+        let at = |t: i64| {
+            let (_, m) = crate::session_logs::local_minutes(t);
+            crate::session_logs::hhmm(m)
+        };
+        let g1 = gap(1_000_000, 1_000_700);
+        let g2 = gap(1_010_000, 1_010_700);
+        let g3 = gap(1_020_000, 1_020_700);
+        let range = |g: &Span| format!("{}-{}", at(g.from), at(g.to));
+        let mut w = World::new();
+
+        w.day = day_of(1, vec![g1.clone()]);
+        assert_eq!(
+            w.derive()[0].text,
+            format!("1 unlogged gap today, {}", range(&g1))
+        );
+
+        w.day = day_of(1, vec![g1.clone(), g2.clone()]);
+        assert_eq!(
+            w.derive()[0].text,
+            format!("2 unlogged gaps today, {} and {}", range(&g1), range(&g2))
+        );
+
+        w.day = day_of(1, vec![g1.clone(), g2.clone(), g3.clone()]);
+        assert_eq!(
+            w.derive()[0].text,
+            format!(
+                "3 unlogged gaps today, {} and {} and 1 more",
+                range(&g1),
+                range(&g2)
+            )
+        );
+    }
+
+    #[test]
+    fn log_gap_since_is_end_of_first_gap() {
+        let mut w = World::new();
+        // Out of order on purpose: gaps() sorts by start.
+        w.day = day_of(1, vec![gap(5000, 5700), gap(100, 900)]);
+        assert_eq!(w.derive()[0].since, 900);
+    }
+
+    #[test]
+    fn no_gaps_no_item() {
+        let mut w = World::new();
+        assert!(w.derive().is_empty());
+        w.day = day_of(
+            1,
+            vec![
+                span(0, 500, SpanKind::Logged),
+                span(500, 900, SpanKind::Unlogged),
+                span(900, 1200, SpanKind::Wait),
+            ],
+        );
+        assert!(w.derive().is_empty());
+    }
+
+    #[test]
+    fn log_gap_clears_when_covered() {
+        let mut w = World::new();
+        w.day = day_of(1, vec![gap(100, 800)]);
+        assert_eq!(w.keys(), ["log_gap:1"]);
+        w.day = day_of(1, vec![span(100, 800, SpanKind::Logged)]);
+        assert!(w.derive().is_empty());
     }
 
     #[test]

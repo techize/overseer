@@ -1307,8 +1307,12 @@ pub struct AttentionView {
 }
 
 impl AttentionView {
+    /// How many items to badge: kinds this build does not know are left out.
     pub fn count(&self) -> usize {
-        self.items.len()
+        self.items
+            .iter()
+            .filter(|i| i.kind != AttentionKind::Other)
+            .count()
     }
 }
 
@@ -1513,6 +1517,23 @@ mod tests {
         assert!(json.contains(r#""kind":"needs_you""#), "{json}");
         let back: Event = serde_json::from_str(&json).unwrap();
         assert_eq!(back, ev);
+        assert_eq!(v.count(), 1);
+    }
+
+    #[test]
+    fn attention_count_skips_kinds_this_build_does_not_know() {
+        let item = |kind| AttentionItem {
+            key: "k".into(),
+            kind,
+            slot: Some(1),
+            pr: None,
+            url: None,
+            since: 1,
+            text: "t".into(),
+        };
+        let v = AttentionView {
+            items: vec![item(AttentionKind::Other), item(AttentionKind::LogGap)],
+        };
         assert_eq!(v.count(), 1);
     }
 
