@@ -494,6 +494,13 @@ trimming):
   new key is absent, and the review names are added to In progress.
 - Click a session card, or press Cmd+0 to Cmd+6, to open that session over the
   board. Cmd+Esc, the x button, or a click outside the panel closes it.
+- The `WAITING ON YOU` panel at the top of the board lists what waits on you,
+  oldest first: sessions that need you or have finished their work, stuck
+  relays, notices, and pull requests with a failed build, changes requested
+  or new comments. The Dock icon shows the count. Click a session row to open
+  it; a pull request row opens the PR and marks it seen, as clicking it in the
+  Open PRs panel does. `overseer ctl attention` prints the same list (`--json`
+  for scripts).
 - When a slot's session ends (it exits, is stopped, or you decline to resume
   it), Overseer releases every item it owned and logs it, and drops a status
   request it never answered. The next plan or ticket click finds those items
