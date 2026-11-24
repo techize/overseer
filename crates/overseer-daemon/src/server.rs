@@ -1284,6 +1284,13 @@ fn handle_request(
         }
         Request::ListSlots => Response::Slots(manager.lock().unwrap().list()),
         Request::DaemonInfo => Response::DaemonInfo(ctx.info.clone()),
+        Request::SlotScreen { id } if !valid_id(id) => err(format!("invalid slot id {id}")),
+        Request::SlotScreen { id } => match manager.lock().unwrap().slot(id) {
+            Some(slot) => Response::Text {
+                text: crate::relay::screen::describe(&slot.screen().0),
+            },
+            None => err(format!("{} has no session", overseer_proto::slot_name(id))),
+        },
         // RefreshWorkItems, GetItemDetail and the settings requests are answered in
         // `handle_frame` from a task of their own (they can wait on the
         // Keychain); this arm only keeps the match whole.

@@ -778,6 +778,11 @@ pub enum Request {
     },
     /// Ask the daemon which build it runs.
     DaemonInfo,
+    /// `Response::Text`: a slot's live screen as text, and what the relay
+    /// courier reads from it (the input box, the working line).
+    SlotScreen {
+        id: SlotId,
+    },
     /// `Response::Settings`: `config.toml` as Settings shows it.
     GetSettings,
     /// Apply `edits` to `config.toml` when its hash is still `base_hash`;
@@ -1876,6 +1881,13 @@ mod tests {
             ],
             flag_after_secs: 3600,
         }
+    }
+
+    #[test]
+    fn slot_screen_round_trips() {
+        let req = Request::SlotScreen { id: 3 };
+        let back: Request = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        assert_eq!(back, req);
     }
 
     #[test]

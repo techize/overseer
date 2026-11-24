@@ -131,6 +131,38 @@ pub fn shows_working(snap: &Snapshot) -> bool {
     })
 }
 
+/// The screen as text, trailing blanks and blank rows dropped, then what
+/// the courier reads from it: for a bug report.
+pub fn describe(snap: &Snapshot) -> String {
+    let rows: Vec<String> = (0..snap.rows)
+        .map(|row| {
+            let line: String = row_cells(snap, row).iter().map(|c| c.ch).collect();
+            line.trim_end().to_string()
+        })
+        .collect();
+    let used = rows
+        .iter()
+        .rposition(|r| !r.is_empty())
+        .map_or(0, |i| i + 1);
+    let mut out = rows[..used].join("\n");
+    let input = match input_box(snap) {
+        InputBox::Empty => "empty",
+        InputBox::Typed => "typed",
+        InputBox::NotFound => "not found",
+    };
+    let working = if shows_working(snap) {
+        "shown"
+    } else {
+        "not shown"
+    };
+    let cursor = if snap.cursor.visible { "" } else { ", hidden" };
+    out.push_str(&format!(
+        "\n-- {}x{}, input box: {input}, working line: {working}, cursor at row {} col {}{cursor}",
+        snap.cols, snap.rows, snap.cursor.row, snap.cursor.col
+    ));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,6 +193,25 @@ mod tests {
     fn classify(bytes: &[u8], cols: u16) -> InputBox {
         let (snap, _) = screen_of(bytes, cols, ROWS);
         input_box(&snap)
+    }
+
+    #[test]
+    fn describe_gives_the_text_and_what_the_courier_reads() {
+        let bytes = box_with(&["\u{276F} DEMO-12 next"], COLS as usize);
+        let (snap, _) = screen_of(&bytes, COLS, ROWS);
+        let text = describe(&snap);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "Working on DEMO-12 in demo-api");
+        assert_eq!(lines[1], "");
+        assert_eq!(lines[3], "\u{276F} DEMO-12 next");
+        assert_eq!(lines[5], "  ? for shortcuts");
+        assert!(
+            lines[6].starts_with(
+                "-- 60x12, input box: typed, working line: not shown, cursor at row 5"
+            ),
+            "{text}"
+        );
+        assert_eq!(lines.len(), 7, "blank rows are dropped: {text}");
     }
 
     #[test]
