@@ -12,9 +12,9 @@ use overseer_proto::paths::{log_dir, socket_path};
 use overseer_proto::settings::{parse_text, Applies, SettingEdit, SettingsView};
 use overseer_proto::{
     age_text, build_notice, local_hhmm, slot_name, ActivityKind, AttentionKind, AttentionView,
-    BoardView, BrainRun, BrainView, ClaimKind, Client, DaemonInfo, ItemKind, LockView, Plan,
-    PlanDecision, PlanRecord, PlanState, QueueState, RelayState, Request, Response, SlotId,
-    SlotInfo, SlotState, WorkItem, WorkView,
+    BoardView, BrainRun, BrainView, ClaimKind, Client, DaemonInfo, DayView, ItemKind, LockView,
+    Plan, PlanDecision, PlanRecord, PlanState, QueueState, RelayState, Request, Response, SlotId,
+    SlotInfo, SlotState, SpanKind, WorkItem, WorkView,
 };
 
 #[derive(Subcommand)]
@@ -143,6 +143,12 @@ pub enum CtlCmd {
     /// What is waiting on you: approvals, stuck relays, failing or commented PRs.
     Attention {
         /// Print the raw AttentionView as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Today's timeline: each slot's stretches, with the gaps in the session log.
+    Timeline {
+        /// Print the raw DayView as JSON.
         #[arg(long)]
         json: bool,
     },
@@ -917,6 +923,46 @@ fn attention_lines(v: &AttentionView, now: i64) -> Vec<String> {
         .collect()
 }
 
+/// One line per stretch, then one indented line per gap, unlogged or waiting span.
+fn timeline_lines(v: &DayView, clock: impl Fn(i64) -> String) -> Vec<String> {
+    let mut out = Vec::new();
+    for row in &v.rows {
+        for st in &row.stretches {
+            let work = || st.spans.iter().filter(|sp| sp.kind != SpanKind::Wait);
+            let status = if work().all(|sp| matches!(sp.kind, SpanKind::Logged | SpanKind::Short)) {
+                "logged"
+            } else if st.running {
+                "running"
+            } else {
+                "gaps"
+            };
+            let mut line = format!(
+                "{} {}-{} {status}",
+                slot_name(row.slot),
+                clock(st.first),
+                clock(st.last)
+            );
+            if !st.logs.is_empty() {
+                line.push_str(&format!(" ({})", st.logs.join(", ")));
+            }
+            out.push(line);
+            for sp in &st.spans {
+                let word = match sp.kind {
+                    SpanKind::Gap => "gap",
+                    SpanKind::Unlogged => "not logged yet",
+                    SpanKind::Wait => "waiting",
+                    SpanKind::Logged | SpanKind::Short => continue,
+                };
+                out.push(format!("  {word} {}-{}", clock(sp.from), clock(sp.to)));
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push("Nothing worked on today.".to_string());
+    }
+    out
+}
+
 /// The pending plan, then the newest five others.
 fn plans_to_list(plans: &[PlanRecord]) -> Vec<&PlanRecord> {
     let pending = plans.iter().filter(|p| p.state == PlanState::Pending);
@@ -1374,6 +1420,20 @@ pub async fn run(cmd: CtlCmd) -> anyhow::Result<()> {
                     println!("{}", serde_json::to_string(&v)?);
                 } else {
                     for l in attention_lines(&v, now_secs()) {
+                        println!("{l}");
+                    }
+                }
+                Ok(())
+            }
+            Response::Error { message } => bail!("{message}"),
+            other => bail!("unexpected reply: {other:?}"),
+        },
+        CtlCmd::Timeline { json } => match client.request(Request::Timeline).await? {
+            Response::Timeline(v) => {
+                if json {
+                    println!("{}", serde_json::to_string(&v)?);
+                } else {
+                    for l in timeline_lines(&v, local_hhmm) {
                         println!("{l}");
                     }
                 }
@@ -2081,5 +2141,121 @@ mod tests {
         use clap::Parser;
         let cli = Cli::try_parse_from(["x", "attention", "--json"]).unwrap();
         assert!(matches!(cli.cmd, CtlCmd::Attention { json: true }));
+    }
+
+    #[test]
+    fn ctl_timeline_parses_with_json_flag() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["x", "timeline", "--json"]).unwrap();
+        assert!(matches!(cli.cmd, CtlCmd::Timeline { json: true }));
+    }
+
+    fn at(hh: i64, mm: i64) -> i64 {
+        hh * 3600 + mm * 60
+    }
+
+    fn clock(t: i64) -> String {
+        format!("{:02}:{:02}", t / 3600, t % 3600 / 60)
+    }
+
+    fn span(from: i64, to: i64, kind: SpanKind) -> overseer_proto::Span {
+        overseer_proto::Span { from, to, kind }
+    }
+
+    #[test]
+    fn timeline_lines_show_stretches_and_their_trouble_spans() {
+        let stretch = |session: &str, first, last, running, spans, logs: &[&str]| {
+            overseer_proto::DayStretch {
+                session: session.into(),
+                first,
+                last,
+                running,
+                spans,
+                logs: logs.iter().map(|s| s.to_string()).collect(),
+            }
+        };
+        let v = DayView {
+            day: "2026-11-24".into(),
+            start: 0,
+            now: at(11, 5),
+            rows: vec![
+                overseer_proto::DayRow {
+                    slot: 1,
+                    stretches: vec![stretch(
+                        "demo-1",
+                        at(9, 2),
+                        at(10, 40),
+                        false,
+                        vec![
+                            span(at(9, 2), at(10, 30), SpanKind::Logged),
+                            span(at(10, 30), at(10, 40), SpanKind::Short),
+                        ],
+                        &["2026-11-24-s1-demo"],
+                    )],
+                },
+                overseer_proto::DayRow {
+                    slot: 2,
+                    stretches: vec![stretch(
+                        "demo-2",
+                        at(9, 30),
+                        at(11, 5),
+                        true,
+                        vec![
+                            span(at(9, 30), at(10, 12), SpanKind::Logged),
+                            span(at(10, 12), at(10, 40), SpanKind::Gap),
+                            span(at(10, 40), at(11, 5), SpanKind::Unlogged),
+                        ],
+                        &[],
+                    )],
+                },
+            ],
+        };
+        assert_eq!(
+            timeline_lines(&v, clock),
+            vec![
+                "S1 09:02-10:40 logged (2026-11-24-s1-demo)",
+                "S2 09:30-11:05 running",
+                "  gap 10:12-10:40",
+                "  not logged yet 10:40-11:05",
+            ]
+        );
+    }
+
+    #[test]
+    fn timeline_lines_call_an_ended_stretch_with_gaps_gaps_and_list_waits() {
+        let v = DayView {
+            rows: vec![overseer_proto::DayRow {
+                slot: 3,
+                stretches: vec![overseer_proto::DayStretch {
+                    session: "demo-3".into(),
+                    first: at(9, 0),
+                    last: at(12, 0),
+                    running: false,
+                    spans: vec![
+                        span(at(9, 0), at(9, 30), SpanKind::Gap),
+                        span(at(9, 30), at(11, 0), SpanKind::Wait),
+                        span(at(11, 0), at(12, 0), SpanKind::Logged),
+                    ],
+                    logs: vec!["a".into(), "b".into()],
+                }],
+            }],
+            ..DayView::default()
+        };
+        assert_eq!(
+            timeline_lines(&v, clock),
+            vec![
+                "S3 09:00-12:00 gaps (a, b)",
+                "  gap 09:00-09:30",
+                "  waiting 09:30-11:00",
+            ]
+        );
+    }
+
+    #[test]
+    fn timeline_lines_say_when_nothing_ran_today() {
+        assert_eq!(
+            timeline_lines(&DayView::default(), clock),
+            vec!["Nothing worked on today."]
+        );
     }
 }
