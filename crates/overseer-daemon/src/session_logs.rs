@@ -205,7 +205,8 @@ pub fn local_minutes(t: i64) -> (LocalDate, u32) {
     (local_date(t), mins)
 }
 
-fn ymd(d: &LocalDate) -> String {
+/// A local date as `YYYY-MM-DD`.
+pub fn ymd(d: &LocalDate) -> String {
     format!("{:04}-{:02}-{:02}", d.year, d.month, d.day)
 }
 

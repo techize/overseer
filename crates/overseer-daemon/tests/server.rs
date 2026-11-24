@@ -7124,6 +7124,137 @@ mod restart {
         assert_eq!(c.request(Request::StopSlot { id: 1 }).await, Response::Ok);
         c.exited_event(1).await;
     }
+
+    /// The local `HH:MM` of unix seconds `t`.
+    fn hhmm_at(t: i64) -> String {
+        let mins = overseer_daemon::session_logs::local_minutes(t).1;
+        overseer_daemon::session_logs::hhmm(mins)
+    }
+
+    /// The daemon's timeline, asked for until its row for `slot` has a
+    /// stretch that passes `done`.
+    async fn timeline_until(
+        c: &mut Client,
+        slot: u8,
+        done: impl Fn(&overseer_proto::DayStretch) -> bool,
+    ) -> overseer_proto::DayView {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let v = match c.request(Request::Timeline).await {
+                Response::Timeline(v) => v,
+                other => panic!("unexpected {other:?}"),
+            };
+            let row = v.rows.iter().find(|r| r.slot == slot);
+            if row.is_some_and(|r| r.stretches.iter().any(&done)) {
+                return v;
+            }
+            assert!(Instant::now() < deadline, "{v:?}");
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn log_written_later_turns_unlogged_to_logged() {
+        use overseer_proto::SpanKind;
+        let d = start_daemon().await;
+        let mut c = Client::connect(&d.socket).await;
+        assert_eq!(c.start(1).await, Response::Ok);
+        c.hook(HookEvent {
+            session_id: Some("demo-transcript-a".into()),
+            ..hook(1, HookKind::SessionStart)
+        })
+        .await;
+        drop(c);
+        let down = stop_keeping(d).await;
+        // S1 has been at work half an hour, and its log so far has only a start.
+        let now = now_secs();
+        let first = (now - 1800).max(overseer_daemon::session_logs::local_day_start(now));
+        let ledger =
+            overseer_daemon::ledger::Ledger::open(&down.state_dir.join("overseer.db")).unwrap();
+        ledger
+            .put_stretch(1, "demo-transcript-a", first, now - 60)
+            .unwrap();
+        drop(ledger);
+        let notes = tempfile::tempdir().unwrap();
+        let day = overseer_daemon::brain::paths::local_date(now);
+        let log = notes.path().join(format!(
+            "Sessions/{:04}-{:02}-{:02}-s1-demo-lane.md",
+            day.year, day.month, day.day
+        ));
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        let start = hhmm_at(first);
+        std::fs::write(&log, format!("# DEMO-7 demo lane\n\n**Time**: {start}\n")).unwrap();
+        let settings = overseer_daemon::Config {
+            brain_dir: notes.path().to_path_buf(),
+            ..offline_settings()
+        };
+        let d = start_daemon_cfg(
+            down.socket.clone(),
+            overseer_daemon::EnvSource::Inherit,
+            settings,
+        )
+        .await;
+        let mut c = Client::connect(&d.socket).await;
+        c.hook(HookEvent {
+            session_id: Some("demo-transcript-a".into()),
+            ..hook(1, HookKind::UserPromptSubmit)
+        })
+        .await;
+        let v = timeline_until(&mut c, 1, |s| s.running && s.last >= now).await;
+        let s = &v.rows.iter().find(|r| r.slot == 1).unwrap().stretches[0];
+        assert!(
+            s.spans.iter().all(|sp| sp.kind != SpanKind::Gap),
+            "{:?}",
+            s.spans
+        );
+        assert!(
+            s.spans.iter().any(|sp| sp.kind == SpanKind::Logged),
+            "{:?}",
+            s.spans
+        );
+        // The log gets its end, then a `/clear` ends the stretch.
+        let end = hhmm_at((now_secs() + 120).min(day_end(now)));
+        std::fs::write(
+            &log,
+            format!("# DEMO-7 demo lane\n\n**Time**: {start} - {end}\n"),
+        )
+        .unwrap();
+        c.hook(HookEvent {
+            session_id: Some("demo-transcript-b".into()),
+            ..hook(1, HookKind::SessionStart)
+        })
+        .await;
+        let v = timeline_until(&mut c, 1, |s| {
+            s.session == "demo-transcript-a" && !s.running
+        })
+        .await;
+        let s = v.rows.iter().find(|r| r.slot == 1).unwrap();
+        let s = s
+            .stretches
+            .iter()
+            .find(|s| s.session == "demo-transcript-a")
+            .unwrap();
+        assert_eq!(s.first, first);
+        assert!(
+            s.spans
+                .iter()
+                .all(|sp| matches!(sp.kind, SpanKind::Logged | SpanKind::Short)),
+            "{:?}",
+            s.spans
+        );
+        assert!(
+            s.spans.iter().any(|sp| sp.kind == SpanKind::Logged),
+            "{:?}",
+            s.spans
+        );
+        assert_eq!(s.logs, vec![log.file_stem().unwrap().to_string_lossy()]);
+        drop(down);
+    }
+
+    /// The last minute of `t`'s local day, in unix seconds.
+    fn day_end(t: i64) -> i64 {
+        overseer_daemon::session_logs::local_day_start(t) + 86_400 - 60
+    }
 }
 
 #[tokio::test]
@@ -7153,6 +7284,69 @@ async fn attention_lists_a_slot_that_needs_you_and_announces_it() {
     assert_eq!(announced.items[0].slot, Some(2));
     match c.request(Request::Attention).await {
         Response::Attention(v) => assert_eq!(v, announced),
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn timeline_request_answers_today() {
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    assert_eq!(c.start(2).await, Response::Ok);
+    let in_transcript = |kind| HookEvent {
+        session_id: Some("demo-transcript-a".into()),
+        ..hook(2, kind)
+    };
+    c.hook(in_transcript(HookKind::SessionStart)).await;
+    c.hook(in_transcript(HookKind::UserPromptSubmit)).await;
+    let day = overseer_daemon::brain::paths::local_date(now_secs());
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let v = loop {
+        match c.request(Request::Timeline).await {
+            Response::Timeline(v) if !v.rows.is_empty() => break v,
+            Response::Timeline(v) => {
+                assert!(std::time::Instant::now() < deadline, "{v:?}")
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(
+        v.day,
+        format!("{:04}-{:02}-{:02}", day.year, day.month, day.day)
+    );
+    assert_eq!(v.rows.len(), 1, "{v:?}");
+    assert_eq!(v.rows[0].slot, 2);
+    assert_eq!(v.rows[0].stretches.len(), 1, "{v:?}");
+    assert_eq!(v.rows[0].stretches[0].session, "demo-transcript-a");
+    assert!(v.rows[0].stretches[0].running);
+}
+
+#[tokio::test]
+async fn timeline_changed_is_sent_when_a_stretch_starts() {
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    assert_eq!(c.start(2).await, Response::Ok);
+    let in_transcript = |kind| HookEvent {
+        session_id: Some("demo-transcript-a".into()),
+        ..hook(2, kind)
+    };
+    c.hook(in_transcript(HookKind::SessionStart)).await;
+    c.hook(in_transcript(HookKind::UserPromptSubmit)).await;
+    let announced = timeout(WAIT * 2, async {
+        loop {
+            match c.recv().await.expect("connection closed") {
+                Frame::Event(Event::TimelineChanged(v)) if !v.rows.is_empty() => return v,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("no timeline event");
+    assert_eq!(announced.rows.len(), 1, "{announced:?}");
+    assert_eq!(announced.rows[0].slot, 2);
+    match c.request(Request::Timeline).await {
+        Response::Timeline(v) => assert_eq!(v.rows, announced.rows),
         other => panic!("unexpected {other:?}"),
     }
 }

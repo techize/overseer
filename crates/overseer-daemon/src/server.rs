@@ -30,6 +30,7 @@ use crate::manager::{valid_id, Attachment, SlotManager};
 use crate::relay::courier::Courier;
 use crate::settings::SettingsFiles;
 use crate::slot::CatchUp;
+use crate::timeline_service::{LogSource, TimelineService};
 use crate::work::store::{unix_now, KickoffFacts};
 use crate::work::token::{save_token, token_status};
 use crate::work::WorkStore;
@@ -444,6 +445,17 @@ pub async fn run_until(
         events.clone(),
         !cfg.settings.pr_author.trim().is_empty(),
     );
+    let day_timeline = TimelineService::spawn(
+        ledger.clone(),
+        (!cfg.settings.session_logs.is_empty()).then(|| LogSource {
+            brain_dir: cfg.settings.brain_dir.clone(),
+            home: crate::config::home_from_env(),
+            patterns: cfg.settings.session_logs.clone(),
+        }),
+        cfg.settings.session_log_min_mins.saturating_mul(60) as i64,
+        timeline_nudge.clone(),
+        events.clone(),
+    );
     let plans = Arc::new(PlanCtx {
         manager: manager.clone(),
         store: store.clone(),
@@ -477,6 +489,7 @@ pub async fn run_until(
                             info: info.clone(),
                             settings: settings.clone(),
                             attention: attention.clone(),
+                            timeline: day_timeline.clone(),
                         },
                         shutdown.clone(),
                         env.clone(),
@@ -1078,6 +1091,7 @@ struct Services {
     info: Arc<DaemonInfo>,
     settings: Arc<SettingsCtx>,
     attention: Arc<AttentionService>,
+    timeline: Arc<TimelineService>,
 }
 
 async fn handle_conn(
@@ -1098,6 +1112,7 @@ async fn handle_conn(
         info,
         settings,
         attention,
+        timeline,
     } = services;
     let (mut rd, mut wr) = stream.into_split();
     let (out_tx, mut out_rx) = mpsc::channel::<Frame>(OUTBOUND_QUEUE);
@@ -1205,6 +1220,7 @@ async fn handle_conn(
                         info: &info,
                         settings: &settings,
                         attention: &attention,
+                        timeline: &timeline,
                     };
                     handle_frame(f, &ctx, &outbox, &shutdown, &mut streams)
                 }
@@ -1250,6 +1266,7 @@ struct Ctx<'a> {
     info: &'a DaemonInfo,
     settings: &'a Arc<SettingsCtx>,
     attention: &'a Arc<AttentionService>,
+    timeline: &'a Arc<TimelineService>,
 }
 
 fn handle_frame(
@@ -1533,8 +1550,7 @@ fn handle_request(
         }
         Request::PrSeen { repo, id } => store.mark_pr_seen(&repo, id),
         Request::Attention => Response::Attention(ctx.attention.current()),
-        // The timeline service arrives in a later task; until then it is empty.
-        Request::Timeline => Response::Timeline(overseer_proto::DayView::default()),
+        Request::Timeline => Response::Timeline(ctx.timeline.current()),
         Request::ListSlots => Response::Slots(manager.lock().unwrap().list()),
         Request::DaemonInfo => Response::DaemonInfo(ctx.info.clone()),
         Request::SlotScreen { id } if !valid_id(id) => err(format!("invalid slot id {id}")),
