@@ -257,17 +257,10 @@ async fn read_target(
             // The statuses are read here too, one PR after another, so the
             // per-repo limit on polls still bounds the requests.
             return run_blocking_for("Bitbucket", move || {
+                let started = Instant::now();
                 let out = api.open_prs(&token, &ws, &slug)?;
                 let mut prs = parse_prs(&out, &repo, &ai)?;
-                for pr in &mut prs {
-                    let Some(head) = pr.head.as_deref() else {
-                        continue;
-                    };
-                    match api.commit_statuses(&token, &ws, &slug, head) {
-                        Ok(statuses) => pr.build = build_state(&statuses),
-                        Err(e) => tracing::warn!("build state of {repo} #{}: {e}", pr.id),
-                    }
-                }
+                fill_builds(&api, &token, (&ws, &slug), &mut prs, started, BUILD_BUDGET);
                 Ok(prs)
             })
             .await;
@@ -280,6 +273,41 @@ async fn read_target(
         pr.head = None;
     }
     Ok(prs)
+}
+
+/// How long after a repo's PR list read starts the build states may still
+/// be read. The whole read must end inside the API timeout, so a slow
+/// Bitbucket costs build states, never the PR list.
+const BUILD_BUDGET: Duration = Duration::from_secs(20);
+
+/// Set `build` on each PR with a `head`, one statuses read after another,
+/// until `budget` has passed since `started`. The rest keep `build` as
+/// `None`, as does a PR whose statuses read fails.
+fn fill_builds(
+    api: &BitbucketApi,
+    token: &str,
+    (ws, slug): (&str, &str),
+    prs: &mut [PullRequest],
+    started: Instant,
+    budget: Duration,
+) {
+    let mut skipped = 0;
+    for pr in prs.iter_mut() {
+        let Some(head) = pr.head.clone() else {
+            continue;
+        };
+        if started.elapsed() >= budget {
+            skipped += 1;
+            continue;
+        }
+        match api.commit_statuses(token, ws, slug, &head) {
+            Ok(statuses) => pr.build = build_state(&statuses),
+            Err(e) => tracing::warn!("build state of {slug} #{}: {e}", pr.id),
+        }
+    }
+    if skipped > 0 {
+        tracing::info!("{slug}: build state not read for {skipped} PRs, out of time");
+    }
 }
 
 /// The workspace and slug of `dir`'s Bitbucket remote: `origin`, else the
@@ -2483,6 +2511,52 @@ esac"#;
             (None, None, None)
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn pr_with_head(id: u64, head: &str) -> PullRequest {
+        let out =
+            format!(r#"{{"values":[{{"id":{id},"source":{{"commit":{{"hash":"{head}"}}}}}}]}}"#);
+        parse_prs(&out, "demo-api", &[]).unwrap().remove(0)
+    }
+
+    fn demo_api(base: &str) -> BitbucketApi {
+        BitbucketApi::new("demo@example.test").with_base(format!("{base}/2.0/"))
+    }
+
+    #[test]
+    fn no_build_budget_reads_no_statuses() {
+        use super::super::jira_api::tests::fake;
+        let (base, rx) = fake(vec![]);
+        let mut prs = vec![pr_with_head(1, "aaa"), pr_with_head(2, "bbb")];
+        fill_builds(
+            &demo_api(&base),
+            "tok",
+            ("demo-ws", "demo-api"),
+            &mut prs,
+            Instant::now(),
+            Duration::ZERO,
+        );
+        assert!(rx.try_iter().next().is_none());
+        assert!(prs.iter().all(|p| p.build.is_none()));
+    }
+
+    #[test]
+    fn a_failed_statuses_read_leaves_only_that_build_unset() {
+        use super::super::jira_api::tests::fake;
+        let ok = r#"{"values":[{"state":"SUCCESSFUL"}]}"#;
+        let (base, rx) = fake(vec![(500, "boom".into()), (200, ok.into())]);
+        let mut prs = vec![pr_with_head(1, "aaa"), pr_with_head(2, "bbb")];
+        fill_builds(
+            &demo_api(&base),
+            "tok",
+            ("demo-ws", "demo-api"),
+            &mut prs,
+            Instant::now(),
+            BUILD_BUDGET,
+        );
+        assert_eq!(rx.try_iter().count(), 2);
+        assert_eq!(prs[0].build, None);
+        assert_eq!(prs[1].build, Some(overseer_proto::BuildState::Passed));
     }
 
     #[tokio::test]
