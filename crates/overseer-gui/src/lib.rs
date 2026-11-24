@@ -17,6 +17,7 @@ pub mod start_dialog;
 pub mod startup_error;
 pub mod terminal_view;
 pub mod theme;
+pub mod timeline_view;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

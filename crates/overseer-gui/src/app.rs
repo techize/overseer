@@ -31,7 +31,7 @@ use gpui::{
     Subscription, Task, Window,
 };
 use overseer_proto::{
-    AttentionView, BrainView, Client, CoordView, Event, Frame, LockView, Request, Response, SlotId,
+    AttentionView, BrainView, Client, CoordView, DayView, Event, Frame, LockView, Request, Response, SlotId,
     SlotInfo, SlotState, WorkView,
 };
 
@@ -474,6 +474,11 @@ pub struct OverseerApp {
     pub(crate) coord: CoordView,
     /// What is waiting on you, from the daemon; see `attention_view`.
     pub(crate) attention: AttentionView,
+    /// Today's sessions on a shared time axis, from the daemon; see
+    /// `timeline_view`.
+    pub(crate) timeline: DayView,
+    /// The Today panel shows its bars, not just its one line.
+    pub(crate) timeline_open: bool,
     /// The push problem text last announced; see `push_problem_note`.
     notified_push: Option<String>,
     /// The strip's list shows while hovered, or until clicked away.
@@ -585,6 +590,8 @@ impl OverseerApp {
             brain: empty_brain(),
             coord: empty_coord(),
             attention: AttentionView::default(),
+            timeline: DayView::default(),
+            timeline_open: false,
             notified_push: None,
             brain_hover: false,
             brain_pinned: false,
@@ -675,6 +682,9 @@ impl OverseerApp {
             if result.is_ok() {
                 result = lister.request_marked(Request::Attention, |_| true).await;
             }
+            if result.is_ok() {
+                result = lister.request_marked(Request::Timeline, |_| true).await;
+            }
             if let Err(e) = result {
                 let _ = this.update(cx, |this, cx| {
                     this.status = Some(format!("{} ({e:#})", crate::terminal_view::LOST_DAEMON));
@@ -740,6 +750,7 @@ impl OverseerApp {
         // The list is the daemon's; with it gone, nothing is known to wait.
         // Reconnecting asks for it again.
         self.attention = AttentionView::default();
+        self.timeline = DayView::default();
         crate::notify::set_dock_badge(0);
         cx.notify();
         if self.reconnecting {
@@ -876,6 +887,16 @@ impl OverseerApp {
             } => {
                 crate::notify::set_dock_badge(view.count());
                 self.attention = view;
+                cx.notify();
+            }
+            // Today's timeline, asked for on connecting and resent whole when
+            // it changes.
+            Frame::Event(Event::TimelineChanged(view))
+            | Frame::Response {
+                resp: Response::Timeline(view),
+                ..
+            } => {
+                self.timeline = view;
                 cx.notify();
             }
             Frame::Event(Event::WorkChanged(view))
