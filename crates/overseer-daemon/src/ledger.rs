@@ -205,7 +205,18 @@ const V10_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS pr_seen (
     build_failed_since INTEGER, changes_since INTEGER, comments_since INTEGER,
     PRIMARY KEY (repo, id))";
 
-const VERSION: i64 = 10;
+/// Stretches of a session's activity and the waits inside them, so the day
+/// timeline survives a restart.
+const V11_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS stretches (
+    slot INTEGER NOT NULL, session TEXT NOT NULL,
+    first INTEGER NOT NULL, last INTEGER NOT NULL, ended INTEGER,
+    PRIMARY KEY (slot, session, first));
+CREATE TABLE IF NOT EXISTS stretch_waits (
+    slot INTEGER NOT NULL, session TEXT NOT NULL,
+    start INTEGER NOT NULL, end INTEGER,
+    PRIMARY KEY (slot, start))";
+
+const VERSION: i64 = 11;
 
 /// Reports and state changes kept per slot.
 const REPORTS_PER_SLOT: i64 = 200;
@@ -219,7 +230,7 @@ fn migrate(conn: &Connection) -> Result<()> {
     if version >= VERSION {
         return Ok(());
     }
-    let steps: [(i64, &str); 10] = [
+    let steps: [(i64, &str); 11] = [
         (1, SESSIONS_SCHEMA),
         (2, V2_SCHEMA),
         (3, V3_SCHEMA),
@@ -230,6 +241,7 @@ fn migrate(conn: &Connection) -> Result<()> {
         (8, V8_SCHEMA),
         (9, V9_SCHEMA),
         (10, V10_SCHEMA),
+        (11, V11_SCHEMA),
     ];
     let mut batch = String::from("BEGIN;\n");
     for (n, sql) in steps {
@@ -583,6 +595,47 @@ pub fn record_stages_on(conn: &Connection, seen: &[(String, Stage)], now: i64) -
     Ok(())
 }
 
+/// One stretch of a session's activity, from its first to its last event.
+/// `ended` is set once the session is known to have stopped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredStretch {
+    pub slot: SlotId,
+    pub session: String,
+    pub first: i64,
+    pub last: i64,
+    pub ended: Option<i64>,
+}
+
+/// One wait inside a session's stretch; `end` is `None` while it goes on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredWait {
+    pub slot: SlotId,
+    pub session: String,
+    pub start: i64,
+    pub end: Option<i64>,
+}
+
+/// The stretches matching `clause` (the text after `WHERE`).
+fn stretches_where(
+    conn: &Connection,
+    clause: &str,
+    params: impl rusqlite::Params,
+) -> Result<Vec<StoredStretch>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT slot, session, first, last, ended FROM stretches WHERE {clause}"
+    ))?;
+    let rows = stmt.query_map(params, |r| {
+        Ok(StoredStretch {
+            slot: r.get(0)?,
+            session: r.get(1)?,
+            first: r.get(2)?,
+            last: r.get(3)?,
+            ended: r.get(4)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 /// One PR's row in `pr_seen`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrSeen {
@@ -828,6 +881,100 @@ impl Ledger {
     /// Every PR's seen row.
     pub fn pr_seen(&self) -> Result<Vec<PrSeen>> {
         pr_seen_on(&self.conn())
+    }
+
+    /// Notes a stretch's latest activity, inserting it if it is new.
+    pub fn put_stretch(&self, slot: SlotId, session: &str, first: i64, last: i64) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO stretches (slot, session, first, last) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (slot, session, first) DO UPDATE SET last = excluded.last",
+            rusqlite::params![slot, session, first, last],
+        )?;
+        Ok(())
+    }
+
+    /// Closes a stretch at `ended`, inserting it first if it was never stored.
+    pub fn end_stretch(
+        &self,
+        slot: SlotId,
+        session: &str,
+        first: i64,
+        last: i64,
+        ended: i64,
+    ) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO stretches (slot, session, first, last, ended) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (slot, session, first) DO UPDATE
+             SET last = excluded.last, ended = excluded.ended",
+            rusqlite::params![slot, session, first, last, ended],
+        )?;
+        Ok(())
+    }
+
+    /// Starts a wait on `slot`, unless it already has one open.
+    pub fn open_wait(&self, slot: SlotId, session: &str, start: i64) -> Result<()> {
+        let conn = self.conn();
+        let open: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM stretch_waits WHERE slot = ?1 AND end IS NULL",
+            [slot],
+            |r| r.get(0),
+        )?;
+        if open == 0 {
+            conn.execute(
+                "INSERT OR IGNORE INTO stretch_waits (slot, session, start) VALUES (?1, ?2, ?3)",
+                rusqlite::params![slot, session, start],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Ends the wait `slot` has open, if any.
+    pub fn close_wait(&self, slot: SlotId, end: i64) -> Result<()> {
+        self.conn().execute(
+            "UPDATE stretch_waits SET end = ?2 WHERE slot = ?1 AND end IS NULL",
+            rusqlite::params![slot, end],
+        )?;
+        Ok(())
+    }
+
+    /// Stretches with activity at or after `since`, by slot then start.
+    pub fn stretches_since(&self, since: i64) -> Result<Vec<StoredStretch>> {
+        stretches_where(
+            &self.conn(),
+            "last >= ?1 ORDER BY slot, first",
+            rusqlite::params![since],
+        )
+    }
+
+    /// Stretches that have not ended.
+    pub fn open_stretches(&self) -> Result<Vec<StoredStretch>> {
+        stretches_where(&self.conn(), "ended IS NULL ORDER BY slot, first", [])
+    }
+
+    /// Waits that are still open or ended at or after `since`.
+    pub fn waits_since(&self, since: i64) -> Result<Vec<StoredWait>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT slot, session, start, end FROM stretch_waits
+             WHERE end IS NULL OR end >= ?1 ORDER BY slot, start",
+        )?;
+        let rows = stmt.query_map([since], |r| {
+            Ok(StoredWait {
+                slot: r.get(0)?,
+                session: r.get(1)?,
+                start: r.get(2)?,
+                end: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Deletes stretches last active, and waits ended, before `before`.
+    pub fn prune_stretches(&self, before: i64) -> Result<()> {
+        let conn = self.conn();
+        conn.execute("DELETE FROM stretches WHERE last < ?1", [before])?;
+        conn.execute("DELETE FROM stretch_waits WHERE end < ?1", [before])?;
+        Ok(())
     }
 
     /// Every work item that has a slot, as `(key, slot)`.
@@ -2185,6 +2332,135 @@ mod tests {
         assert_eq!(user_version(&l), VERSION);
         assert!(l.pr_seen().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn v10_ledger_upgrades_to_v11_keeping_pr_seen() {
+        let path = temp_db("migrate-v11");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(&format!(
+                "{SESSIONS_SCHEMA};\n{V2_SCHEMA};\n{V3_SCHEMA};\n{V4_SCHEMA};\n{V5_SCHEMA};\n{V6_SCHEMA};\n{V7_SCHEMA};\n{V8_SCHEMA};\n{V9_SCHEMA};\n{V10_SCHEMA};\nPRAGMA user_version = 10;"
+            ))
+            .unwrap();
+            conn.execute(
+                "INSERT INTO pr_seen (repo, id, comments, at) VALUES ('demo-api', 7, 3, 100)",
+                [],
+            )
+            .unwrap();
+        }
+        let l = Ledger::open(&path).unwrap();
+        assert_eq!(user_version(&l), 11);
+        let rows = l.pr_seen().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, 7);
+        assert!(l.open_stretches().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+    }
+
+    fn stretch(
+        slot: SlotId,
+        session: &str,
+        first: i64,
+        last: i64,
+        ended: Option<i64>,
+    ) -> StoredStretch {
+        StoredStretch {
+            slot,
+            session: session.into(),
+            first,
+            last,
+            ended,
+        }
+    }
+
+    #[test]
+    fn put_stretch_updates_last_in_place() {
+        let l = Ledger::in_memory();
+        l.put_stretch(1, "demo-a", 100, 200).unwrap();
+        l.put_stretch(1, "demo-a", 100, 350).unwrap();
+        assert_eq!(
+            l.stretches_since(0).unwrap(),
+            vec![stretch(1, "demo-a", 100, 350, None)]
+        );
+    }
+
+    #[test]
+    fn end_stretch_sets_ended() {
+        let l = Ledger::in_memory();
+        l.put_stretch(1, "demo-a", 100, 200).unwrap();
+        l.end_stretch(1, "demo-a", 100, 300, 320).unwrap();
+        assert_eq!(
+            l.stretches_since(0).unwrap(),
+            vec![stretch(1, "demo-a", 100, 300, Some(320))]
+        );
+        // A missing row is inserted already ended.
+        l.end_stretch(2, "demo-b", 400, 450, 460).unwrap();
+        assert_eq!(
+            l.stretches_since(0).unwrap()[1],
+            stretch(2, "demo-b", 400, 450, Some(460))
+        );
+    }
+
+    #[test]
+    fn open_stretches_lists_only_unended() {
+        let l = Ledger::in_memory();
+        l.put_stretch(1, "demo-a", 100, 200).unwrap();
+        l.put_stretch(2, "demo-b", 150, 250).unwrap();
+        l.end_stretch(1, "demo-a", 100, 200, 210).unwrap();
+        assert_eq!(
+            l.open_stretches().unwrap(),
+            vec![stretch(2, "demo-b", 150, 250, None)]
+        );
+    }
+
+    #[test]
+    fn one_open_wait_per_slot() {
+        let l = Ledger::in_memory();
+        l.open_wait(1, "demo-a", 100).unwrap();
+        l.open_wait(1, "demo-a", 120).unwrap();
+        l.close_wait(1, 500).unwrap();
+        assert_eq!(
+            l.waits_since(0).unwrap(),
+            vec![StoredWait {
+                slot: 1,
+                session: "demo-a".into(),
+                start: 100,
+                end: Some(500)
+            }]
+        );
+    }
+
+    #[test]
+    fn stretches_since_filters_on_last() {
+        let l = Ledger::in_memory();
+        l.put_stretch(1, "demo-a", 100, 200).unwrap();
+        l.put_stretch(1, "demo-b", 300, 400).unwrap();
+        l.put_stretch(0, "demo-c", 500, 600).unwrap();
+        let got = l.stretches_since(300).unwrap();
+        let keys: Vec<_> = got.iter().map(|s| (s.slot, s.first)).collect();
+        assert_eq!(keys, vec![(0, 500), (1, 300)]);
+    }
+
+    #[test]
+    fn prune_deletes_old_rows_only() {
+        let l = Ledger::in_memory();
+        l.put_stretch(1, "demo-a", 100, 200).unwrap();
+        l.put_stretch(1, "demo-b", 300, 900).unwrap();
+        l.open_wait(1, "demo-a", 150).unwrap();
+        l.close_wait(1, 180).unwrap();
+        l.open_wait(2, "demo-b", 850).unwrap();
+        l.close_wait(2, 880).unwrap();
+        l.open_wait(3, "demo-c", 100).unwrap();
+        l.prune_stretches(500).unwrap();
+        let s = l.stretches_since(0).unwrap();
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].session, "demo-b");
+        let w = l.waits_since(0).unwrap();
+        let slots: Vec<_> = w.iter().map(|w| w.slot).collect();
+        // The finished old wait goes; the later one and the still-open one stay.
+        assert_eq!(slots, vec![2, 3]);
     }
 
     #[test]
