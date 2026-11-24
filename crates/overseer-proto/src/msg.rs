@@ -12,6 +12,16 @@ pub fn slot_name(id: SlotId) -> String {
     format!("S{id}")
 }
 
+/// `0m` under a minute (and for clock skew), then `5m`, `2h`, `3d`.
+pub fn age_text(secs: i64) -> String {
+    let s = secs.max(0);
+    match s {
+        0..=3599 => format!("{}m", s / 60),
+        3600..=86399 => format!("{}h", s / 3600),
+        _ => format!("{}d", s / 86400),
+    }
+}
+
 /// `1 running session` or `<n> running sessions`.
 pub fn running_sessions_count(n: usize) -> String {
     match n {
@@ -2484,5 +2494,14 @@ mod tests {
         assert_eq!(v.pending_for(2), 1);
         assert_eq!(v.pending_for(4), 1);
         assert_eq!(v.pending_for(0), 0);
+    }
+
+    #[test]
+    fn age_text_buckets() {
+        assert_eq!(age_text(-5), "0m");
+        assert_eq!(age_text(59), "0m");
+        assert_eq!(age_text(61), "1m");
+        assert_eq!(age_text(3600), "1h");
+        assert_eq!(age_text(90000), "1d");
     }
 }
