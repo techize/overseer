@@ -5,7 +5,7 @@ use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
-use overseer_proto::{Approvals, PullRequest};
+use overseer_proto::{Approvals, BuildState, PullRequest};
 use serde_json::Value;
 
 use super::sprint::{to_days, Ymd};
@@ -236,12 +236,38 @@ pub fn parse_prs(
             created: str_of(item, "created_on").and_then(|s| parse_iso_time(&s)),
             ticket: None,
             approvals: approvals(item, ai_reviewers),
-            comments: None,
+            comments: item
+                .get("comment_count")
+                .and_then(Value::as_u64)
+                .and_then(|n| u32::try_from(n).ok()),
             build: None,
-            head: None,
+            head: at(item, &["source", "commit", "hash"]),
         });
     }
     Ok(prs)
+}
+
+/// The build state of a commit from its `{"values":[...]}` statuses. Any
+/// failed or stopped build fails it, else any running build keeps it
+/// running, else it passed. Unknown states are ignored; no known state, or
+/// output that is not JSON, gives `None`.
+pub fn build_state(json: &str) -> Option<BuildState> {
+    let v: Value = serde_json::from_str(json).ok()?;
+    let mut state = None;
+    for s in v.get("values")?.as_array()? {
+        let this = match s.get("state").and_then(Value::as_str) {
+            Some("FAILED" | "STOPPED") => BuildState::Failed,
+            Some("INPROGRESS") => BuildState::Running,
+            Some("SUCCESSFUL") => BuildState::Passed,
+            _ => continue,
+        };
+        state = Some(match (state, this) {
+            (Some(BuildState::Failed), _) | (_, BuildState::Failed) => BuildState::Failed,
+            (Some(BuildState::Running), _) | (_, BuildState::Running) => BuildState::Running,
+            _ => BuildState::Passed,
+        });
+    }
+    state
 }
 
 /// The reviews in a PR's `participants`, or `None` without that list. The
@@ -395,6 +421,48 @@ pub fn parse_iso_time(s: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use overseer_proto::BuildState;
+
+    #[test]
+    fn build_state_rules() {
+        let s = |states: &[&str]| {
+            format!(
+                r#"{{"values":[{}]}}"#,
+                states
+                    .iter()
+                    .map(|x| format!(r#"{{"state":"{x}"}}"#))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        };
+        assert_eq!(
+            build_state(&s(&["SUCCESSFUL", "FAILED"])),
+            Some(BuildState::Failed)
+        );
+        assert_eq!(
+            build_state(&s(&["STOPPED", "INPROGRESS"])),
+            Some(BuildState::Failed)
+        );
+        assert_eq!(
+            build_state(&s(&["SUCCESSFUL", "INPROGRESS"])),
+            Some(BuildState::Running)
+        );
+        assert_eq!(
+            build_state(&s(&["SUCCESSFUL", "SUCCESSFUL"])),
+            Some(BuildState::Passed)
+        );
+        assert_eq!(build_state(&s(&[])), None);
+        assert_eq!(build_state(&s(&["SOMETHING_NEW"])), None);
+        assert_eq!(build_state("not json"), None);
+    }
+
+    #[test]
+    fn parse_prs_reads_comment_count_and_head() {
+        let out = r#"{"values":[{"id":7,"title":"t","comment_count":3,
+            "source":{"branch":{"name":"DEMO-1"},"commit":{"hash":"abc123"}}}]}"#;
+        let pr = &parse_prs(out, "demo-api", &[]).unwrap()[0];
+        assert_eq!((pr.comments, pr.head.as_deref()), (Some(3), Some("abc123")));
+    }
 
     fn env() -> Vec<(OsString, OsString)> {
         vec![("PATH".into(), std::env::var_os("PATH").unwrap())]
