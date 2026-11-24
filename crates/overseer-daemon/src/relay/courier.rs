@@ -582,6 +582,7 @@ mod tests {
             kind: overseer_proto::RelayKind::Note,
             drop_reason: None,
             held: None,
+            held_since: None,
         }
     }
 

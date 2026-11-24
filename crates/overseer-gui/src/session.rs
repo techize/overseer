@@ -2448,6 +2448,7 @@ mod tests {
             kind: overseer_proto::RelayKind::Note,
             drop_reason: None,
             held: held.map(Into::into),
+            held_since: None,
         }
     }
 
@@ -2918,6 +2919,9 @@ mod tests {
             created: None,
             ticket: Some("DEMO-1".into()),
             approvals: None,
+            build: None,
+            comments: None,
+            head: None,
         }];
         d.children = vec![ChildBead {
             key: "ov-3".into(),
@@ -3146,6 +3150,9 @@ mod tests {
             created,
             ticket: Some("DEMO-1".into()),
             approvals: None,
+            build: None,
+            comments: None,
+            head: None,
         }
     }
 

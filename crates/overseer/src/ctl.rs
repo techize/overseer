@@ -1525,6 +1525,7 @@ mod tests {
             kind: overseer_proto::RelayKind::Note,
             drop_reason: (state == RelayState::Dropped).then(|| "session ended".into()),
             held: held.map(Into::into),
+            held_since: None,
         };
         let v = LockView {
             claims: vec![Claim {
@@ -1787,6 +1788,7 @@ mod tests {
                     kind: overseer_proto::RelayKind::Note,
                     drop_reason: None,
                     held: None,
+                    held_since: None,
                 }],
                 flag_after_secs: 3600,
             },

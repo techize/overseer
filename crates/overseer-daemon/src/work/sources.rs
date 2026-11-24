@@ -236,6 +236,9 @@ pub fn parse_prs(
             created: str_of(item, "created_on").and_then(|s| parse_iso_time(&s)),
             ticket: None,
             approvals: approvals(item, ai_reviewers),
+            comments: None,
+            build: None,
+            head: None,
         });
     }
     Ok(prs)

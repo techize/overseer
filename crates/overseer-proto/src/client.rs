@@ -22,7 +22,7 @@
 //! behind is cut off instead: the reader stops, `inbox_overflowed` turns true
 //! and every request fails as if the daemon had hung up.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,7 +34,7 @@ use bytes::Bytes;
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::{read_frame, write_frame, Frame, Request, Response, SlotId};
+use crate::{read_frame, write_frame, Event, Frame, Request, Response, SlotId};
 
 const RETRY_EVERY: Duration = Duration::from_millis(100);
 const RETRY_FOR: Duration = Duration::from_secs(3);
@@ -129,8 +129,15 @@ impl Client {
             *writer_pending.lock().unwrap() = None;
         });
         tokio::spawn(async move {
+            let mut skipped: HashSet<String> = HashSet::new();
             while let Ok(Some(frame)) = read_frame(&mut rd).await {
                 match frame {
+                    // Newer daemon, older client: drop what we cannot read.
+                    Frame::Event(Event::Unknown { kind }) => {
+                        if skipped.insert(kind.clone()) {
+                            tracing::info!("skipping unknown event {kind}");
+                        }
+                    }
                     Frame::Response { seq, resp } => {
                         let waiter = reader_pending
                             .lock()

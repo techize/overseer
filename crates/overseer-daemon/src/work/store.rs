@@ -3712,6 +3712,9 @@ esac"#,
             created,
             ticket: ticket.map(str::to_owned),
             approvals: None,
+            build: None,
+            comments: None,
+            head: None,
         };
         s.cache().prs.insert(
             "demo-api".into(),

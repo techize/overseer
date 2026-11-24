@@ -12,6 +12,7 @@ tokio = { workspace = true, features = ["io-util", "net", "sync", "time", "rt"] 
 anyhow.workspace = true
 libc = "0.2"
 regex.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

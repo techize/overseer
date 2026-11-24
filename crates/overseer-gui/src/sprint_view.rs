@@ -1201,6 +1201,9 @@ mod tests {
             created,
             ticket: None,
             approvals: None,
+            build: None,
+            comments: None,
+            head: None,
         }
     }
 

@@ -1349,6 +1349,8 @@ fn handle_request(
             tracing::debug!("hello from {client}");
             Response::Ok
         }
+        // The attention queue arrives with a later change.
+        Request::Attention | Request::PrSeen { .. } => err("not supported yet".into()),
         Request::ListSlots => Response::Slots(manager.lock().unwrap().list()),
         Request::DaemonInfo => Response::DaemonInfo(ctx.info.clone()),
         Request::SlotScreen { id } if !valid_id(id) => err(format!("invalid slot id {id}")),
