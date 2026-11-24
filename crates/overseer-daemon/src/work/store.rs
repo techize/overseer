@@ -892,6 +892,30 @@ impl WorkStore {
         known.unwrap_or_else(|| self.guess_kind(key))
     }
 
+    /// Marks the comments on a PR as seen, using the count the last poll
+    /// read. An unknown PR, or one with no count, changes nothing.
+    pub fn mark_pr_seen(&self, repo: &str, id: u64) -> Response {
+        let count = self
+            .cache()
+            .prs
+            .get(repo)
+            .and_then(|prs| prs.iter().find(|p| p.id == id))
+            .and_then(|p| p.comments);
+        let Some(count) = count else {
+            return Response::Ok;
+        };
+        if let Err(e) = self
+            .ledger
+            .transaction(|c| ledger::mark_pr_seen_on(c, repo, id, count))
+        {
+            return Response::Error {
+                message: format!("recording the seen PR failed: {e:#}"),
+            };
+        }
+        self.announce();
+        Response::Ok
+    }
+
     fn announce(&self) {
         let _ = self.events.send(Event::WorkChanged(self.view()));
     }
@@ -1012,15 +1036,19 @@ impl WorkStore {
                 }
                 // A workspace with no active repos is a good read too.
                 let mut answered = targets.is_empty() && repos_error.is_none();
+                let mut read_repos: Vec<String> = Vec::new();
+                let mut read_prs: Vec<PullRequest> = Vec::new();
                 for ((repo, _), read) in targets.iter().zip(got) {
                     match read {
                         Ok(prs) => {
                             answered = true;
-                            let prs = prs
+                            let prs: Vec<PullRequest> = prs
                                 .into_iter()
                                 .filter(|p| self.wants_author(p))
                                 .map(|p| self.link_ticket(p))
                                 .collect();
+                            read_repos.push(repo.clone());
+                            read_prs.extend(prs.iter().cloned());
                             cache.prs.insert(repo.clone(), prs);
                         }
                         Err(e) => {
@@ -1039,6 +1067,15 @@ impl WorkStore {
                     s.at = Some(now);
                 }
                 s.message = (!errors.is_empty()).then(|| errors.join("; "));
+                drop(cache);
+                // Not part of the poll's success: the board is right without it.
+                let names: Vec<String> = targets.iter().map(|(r, _)| r.clone()).collect();
+                if let Err(e) = self
+                    .ledger
+                    .transaction(|c| ledger::record_prs_on(c, &read_prs, &read_repos, &names, now))
+                {
+                    tracing::warn!("recording seen PRs failed: {e:#}");
+                }
             }
         }
         self.regroup(unix_now());

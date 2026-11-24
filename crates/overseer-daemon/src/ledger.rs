@@ -10,8 +10,8 @@ use std::sync::Mutex;
 
 use anyhow::Result;
 use overseer_proto::msg::{
-    LockView, Notice, Plan, PlanRecord, PlanState, QueueEntry, QueueState, Report, ReportKind,
-    Sender, SlotId, Stage, Summary,
+    BuildState, LockView, Notice, Plan, PlanRecord, PlanState, PullRequest, QueueEntry, QueueState,
+    Report, ReportKind, Sender, SlotId, Stage, Summary,
 };
 use rusqlite::Connection;
 
@@ -197,7 +197,15 @@ ALTER TABLE relays ADD COLUMN drop_reason TEXT;
 UPDATE relays SET drop_reason = 'session ended'
  WHERE dropped_at IS NOT NULL AND delivered_at IS NULL";
 
-const VERSION: i64 = 9;
+/// What the user last saw of each open PR, and when each attention item on
+/// it was first noticed, so ages survive a restart.
+const V10_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS pr_seen (
+    repo TEXT NOT NULL, id INTEGER NOT NULL,
+    comments INTEGER NOT NULL, at INTEGER NOT NULL,
+    build_failed_since INTEGER, changes_since INTEGER, comments_since INTEGER,
+    PRIMARY KEY (repo, id))";
+
+const VERSION: i64 = 10;
 
 /// Reports and state changes kept per slot.
 const REPORTS_PER_SLOT: i64 = 200;
@@ -211,7 +219,7 @@ fn migrate(conn: &Connection) -> Result<()> {
     if version >= VERSION {
         return Ok(());
     }
-    let steps: [(i64, &str); 9] = [
+    let steps: [(i64, &str); 10] = [
         (1, SESSIONS_SCHEMA),
         (2, V2_SCHEMA),
         (3, V3_SCHEMA),
@@ -221,6 +229,7 @@ fn migrate(conn: &Connection) -> Result<()> {
         (7, V7_SCHEMA),
         (8, V8_SCHEMA),
         (9, V9_SCHEMA),
+        (10, V10_SCHEMA),
     ];
     let mut batch = String::from("BEGIN;\n");
     for (n, sql) in steps {
@@ -574,6 +583,113 @@ pub fn record_stages_on(conn: &Connection, seen: &[(String, Stage)], now: i64) -
     Ok(())
 }
 
+/// One PR's row in `pr_seen`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrSeen {
+    pub repo: String,
+    pub id: u64,
+    /// The comment count the user last saw.
+    pub comments: u32,
+    pub build_failed_since: Option<i64>,
+    pub changes_since: Option<i64>,
+    pub comments_since: Option<i64>,
+}
+
+/// Notes the PRs seen in one poll at `now`. A PR with no row is inserted with
+/// its current comments counted as seen. Each "since" time is kept while its
+/// condition holds, set to `now` when it starts, and cleared when it ends.
+/// New comments (more than the stored count) start `comments_since`; fewer
+/// lower the stored count and clear it; a PR that reports no count leaves
+/// both alone. Rows for repos in `read_repos` whose PR is not in `prs` are
+/// deleted; repos whose read failed are not in `read_repos`, so their rows
+/// stay. Rows for repos not in `targets` (no longer polled at all) are
+/// deleted too, since those PRs leave the board.
+pub(crate) fn record_prs_on(
+    conn: &Connection,
+    prs: &[PullRequest],
+    read_repos: &[String],
+    targets: &[String],
+    now: i64,
+) -> Result<()> {
+    for pr in prs {
+        let failed = pr.build == Some(BuildState::Failed);
+        let changes = pr.approvals.is_some_and(|a| a.changes_requested);
+        let count = pr.comments.map(i64::from);
+        conn.execute(
+            "INSERT INTO pr_seen (repo, id, comments, at, build_failed_since, changes_since)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(repo, id) DO UPDATE SET
+               build_failed_since = CASE WHEN ?5 IS NULL THEN NULL
+                 ELSE COALESCE(build_failed_since, ?5) END,
+               changes_since = CASE WHEN ?6 IS NULL THEN NULL
+                 ELSE COALESCE(changes_since, ?6) END,
+               comments_since = CASE
+                 WHEN ?7 IS NULL THEN comments_since
+                 WHEN ?7 > comments THEN COALESCE(comments_since, ?4)
+                 WHEN ?7 < comments THEN NULL
+                 ELSE comments_since END,
+               comments = CASE WHEN ?7 IS NOT NULL AND ?7 < comments THEN ?7 ELSE comments END",
+            rusqlite::params![
+                pr.repo,
+                pr.id as i64,
+                count.unwrap_or(0),
+                now,
+                failed.then_some(now),
+                changes.then_some(now),
+                count,
+            ],
+        )?;
+    }
+    let mut stmt = conn.prepare("SELECT repo, id FROM pr_seen")?;
+    let rows: Vec<(String, i64)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    drop(stmt);
+    for (repo, id) in rows {
+        let gone = if targets.contains(&repo) {
+            read_repos.contains(&repo) && !prs.iter().any(|p| p.repo == repo && p.id as i64 == id)
+        } else {
+            true
+        };
+        if gone {
+            conn.execute(
+                "DELETE FROM pr_seen WHERE repo = ?1 AND id = ?2",
+                rusqlite::params![repo, id],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Records that the user has seen `comments` comments on a PR: stores the
+/// count and clears the new-comments time.
+pub(crate) fn mark_pr_seen_on(conn: &Connection, repo: &str, id: u64, comments: u32) -> Result<()> {
+    conn.execute(
+        "UPDATE pr_seen SET comments = ?3, comments_since = NULL WHERE repo = ?1 AND id = ?2",
+        rusqlite::params![repo, id as i64, comments],
+    )?;
+    Ok(())
+}
+
+/// Every PR's seen row.
+pub(crate) fn pr_seen_on(conn: &Connection) -> Result<Vec<PrSeen>> {
+    let mut stmt = conn.prepare(
+        "SELECT repo, id, comments, build_failed_since, changes_since, comments_since
+         FROM pr_seen ORDER BY repo, id",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(PrSeen {
+            repo: r.get(0)?,
+            id: r.get::<_, i64>(1)? as u64,
+            comments: r.get(2)?,
+            build_failed_since: r.get(3)?,
+            changes_since: r.get(4)?,
+            comments_since: r.get(5)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
 /// Every ticket's recorded stage as `(stage, since, moved)`. A row with a
 /// stage name this build does not know is skipped.
 pub fn stages_on(conn: &Connection) -> Result<HashMap<String, (Stage, i64, bool)>> {
@@ -694,6 +810,11 @@ impl Ledger {
         let out = f(&tx)?;
         tx.commit()?;
         Ok(out)
+    }
+
+    /// Every PR's seen row.
+    pub fn pr_seen(&self) -> Result<Vec<PrSeen>> {
+        pr_seen_on(&self.conn())
     }
 
     /// Every work item that has a slot, as `(key, slot)`.
@@ -1879,6 +2000,128 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
     }
 
+    fn demo_pr(repo: &str, id: u64, comments: Option<u32>) -> PullRequest {
+        PullRequest {
+            repo: repo.into(),
+            id,
+            title: format!("DEMO-{id} change"),
+            branch: format!("feature/DEMO-{id}"),
+            url: None,
+            author: None,
+            created: None,
+            ticket: None,
+            approvals: None,
+            comments,
+            build: None,
+            head: None,
+        }
+    }
+
+    fn rec(l: &Ledger, prs: &[PullRequest], read: &[&str], now: i64) {
+        let read: Vec<String> = read.iter().map(|r| r.to_string()).collect();
+        l.transaction(|c| record_prs_on(c, prs, &read, &read, now))
+            .unwrap();
+    }
+
+    #[test]
+    fn pr_seen_first_sighting_records_without_new_comments() {
+        let l = Ledger::in_memory();
+        rec(&l, &[demo_pr("demo-api", 1, Some(5))], &["demo-api"], 10);
+        let rows = l.pr_seen().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].comments, 5);
+        assert_eq!(rows[0].comments_since, None);
+    }
+
+    #[test]
+    fn pr_seen_new_comments_keep_their_first_time() {
+        let l = Ledger::in_memory();
+        rec(&l, &[demo_pr("demo-api", 1, Some(5))], &["demo-api"], 5);
+        rec(&l, &[demo_pr("demo-api", 1, Some(7))], &["demo-api"], 10);
+        rec(&l, &[demo_pr("demo-api", 1, Some(8))], &["demo-api"], 20);
+        let row = &l.pr_seen().unwrap()[0];
+        assert_eq!((row.comments, row.comments_since), (5, Some(10)));
+        rec(&l, &[demo_pr("demo-api", 1, None)], &["demo-api"], 30);
+        assert_eq!(l.pr_seen().unwrap()[0].comments_since, Some(10));
+    }
+
+    #[test]
+    fn pr_seen_mark_clears_and_fewer_comments_lower_the_count() {
+        let l = Ledger::in_memory();
+        rec(&l, &[demo_pr("demo-api", 1, Some(5))], &["demo-api"], 5);
+        rec(&l, &[demo_pr("demo-api", 1, Some(8))], &["demo-api"], 10);
+        l.transaction(|c| mark_pr_seen_on(c, "demo-api", 1, 8))
+            .unwrap();
+        let row = &l.pr_seen().unwrap()[0];
+        assert_eq!((row.comments, row.comments_since), (8, None));
+        rec(&l, &[demo_pr("demo-api", 1, Some(6))], &["demo-api"], 20);
+        let row = &l.pr_seen().unwrap()[0];
+        assert_eq!((row.comments, row.comments_since), (6, None));
+    }
+
+    #[test]
+    fn pr_seen_failed_build_and_changes_since() {
+        let l = Ledger::in_memory();
+        let mut pr = demo_pr("demo-api", 1, Some(0));
+        pr.build = Some(BuildState::Failed);
+        pr.approvals = Some(overseer_proto::msg::Approvals {
+            changes_requested: true,
+            ..Default::default()
+        });
+        rec(&l, &[pr.clone()], &["demo-api"], 10);
+        rec(&l, &[pr.clone()], &["demo-api"], 20);
+        let row = &l.pr_seen().unwrap()[0];
+        assert_eq!(
+            (row.build_failed_since, row.changes_since),
+            (Some(10), Some(10))
+        );
+        pr.build = Some(BuildState::Passed);
+        pr.approvals = None;
+        rec(&l, &[pr], &["demo-api"], 30);
+        let row = &l.pr_seen().unwrap()[0];
+        assert_eq!((row.build_failed_since, row.changes_since), (None, None));
+    }
+
+    #[test]
+    fn pr_seen_rows_go_only_for_repos_that_were_read() {
+        let l = Ledger::in_memory();
+        let both = ["demo-api".to_string(), "demo-web".to_string()];
+        let prs = [
+            demo_pr("demo-api", 7, Some(1)),
+            demo_pr("demo-web", 3, Some(1)),
+        ];
+        l.transaction(|c| record_prs_on(c, &prs, &both, &both, 10))
+            .unwrap();
+        // demo-api read without PR 7; demo-web's read failed.
+        let read = ["demo-api".to_string()];
+        l.transaction(|c| record_prs_on(c, &[], &read, &both, 20))
+            .unwrap();
+        let rows = l.pr_seen().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].repo, "demo-web");
+        // demo-web is no longer a target at all.
+        l.transaction(|c| record_prs_on(c, &[], &read, &read, 30))
+            .unwrap();
+        assert!(l.pr_seen().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_v9_file_upgrades_to_v10() {
+        let path = temp_db("migrate-v10");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(&format!(
+                "{SESSIONS_SCHEMA};\n{V2_SCHEMA};\n{V3_SCHEMA};\n{V4_SCHEMA};\n{V5_SCHEMA};\n{V6_SCHEMA};\n{V7_SCHEMA};\n{V8_SCHEMA};\n{V9_SCHEMA};\nPRAGMA user_version = 9;"
+            ))
+            .unwrap();
+        }
+        let l = Ledger::open(&path).unwrap();
+        assert_eq!(user_version(&l), VERSION);
+        assert!(l.pr_seen().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+    }
+
     #[test]
     fn v8_renames_old_stage_names() {
         let path = temp_db("migrate-v8");
@@ -1936,7 +2179,7 @@ mod tests {
             .unwrap();
         }
         let l = Ledger::open(&path).unwrap();
-        assert_eq!(user_version(&l), 9);
+        assert_eq!(user_version(&l), VERSION);
         let v = l.lock_view(50, 3600).unwrap();
         let got: Vec<_> = v
             .relays
