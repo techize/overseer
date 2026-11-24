@@ -11,10 +11,10 @@ use clap::Subcommand;
 use overseer_proto::paths::{log_dir, socket_path};
 use overseer_proto::settings::{parse_text, Applies, SettingEdit, SettingsView};
 use overseer_proto::{
-    age_text, build_notice, local_hhmm, slot_name, ActivityKind, AttentionView, BoardView,
-    BrainRun, BrainView, ClaimKind, Client, DaemonInfo, ItemKind, LockView, Plan, PlanDecision,
-    PlanRecord, PlanState, QueueState, RelayState, Request, Response, SlotId, SlotInfo, SlotState,
-    WorkItem, WorkView,
+    age_text, build_notice, local_hhmm, slot_name, ActivityKind, AttentionKind, AttentionView,
+    BoardView, BrainRun, BrainView, ClaimKind, Client, DaemonInfo, ItemKind, LockView, Plan,
+    PlanDecision, PlanRecord, PlanState, QueueState, RelayState, Request, Response, SlotId,
+    SlotInfo, SlotState, WorkItem, WorkView,
 };
 
 #[derive(Subcommand)]
@@ -896,6 +896,7 @@ fn attention_lines(v: &AttentionView, now: i64) -> Vec<String> {
     }
     v.items
         .iter()
+        .filter(|i| i.kind != AttentionKind::Other)
         .map(|i| {
             let mut who = match &i.pr {
                 Some((repo, id)) => format!("{repo}#{id}"),
@@ -2029,6 +2030,20 @@ mod tests {
                 "  2h  demo-api#7 S2  build failed".to_string(),
                 "  5m  demo-api#9  2 new comments".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn attention_lines_skip_kinds_this_build_does_not_know() {
+        let v = AttentionView {
+            items: vec![
+                attention(AttentionKind::Other, Some(1), None, 1000, "from the future"),
+                attention(AttentionKind::LogGap, Some(2), None, 1000, "no log for 20m"),
+            ],
+        };
+        assert_eq!(
+            attention_lines(&v, 1000 + 300),
+            vec!["  5m  S2  no log for 20m".to_string()]
         );
     }
 

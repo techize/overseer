@@ -1365,6 +1365,8 @@ fn handle_request(
         }
         Request::PrSeen { repo, id } => store.mark_pr_seen(&repo, id),
         Request::Attention => Response::Attention(ctx.attention.current()),
+        // The timeline service arrives in a later task; until then it is empty.
+        Request::Timeline => Response::Timeline(overseer_proto::DayView::default()),
         Request::ListSlots => Response::Slots(manager.lock().unwrap().list()),
         Request::DaemonInfo => Response::DaemonInfo(ctx.info.clone()),
         Request::SlotScreen { id } if !valid_id(id) => err(format!("invalid slot id {id}")),

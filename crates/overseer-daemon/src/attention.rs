@@ -164,6 +164,8 @@ fn kind_name(kind: AttentionKind) -> &'static str {
         AttentionKind::PrBuildFailed => "pr_build_failed",
         AttentionKind::PrChangesRequested => "pr_changes_requested",
         AttentionKind::PrComments => "pr_comments",
+        AttentionKind::LogGap => "log_gap",
+        AttentionKind::Other => "other",
     }
 }
 

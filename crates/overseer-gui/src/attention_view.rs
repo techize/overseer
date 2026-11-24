@@ -3,7 +3,7 @@
 //! what a row points at, and keeps the Dock badge in step.
 
 use gpui::{div, prelude::*, px, rgb, Context, FontWeight};
-use overseer_proto::{age_text, slot_name, AttentionItem, AttentionView, SlotId};
+use overseer_proto::{age_text, slot_name, AttentionItem, AttentionKind, AttentionView, SlotId};
 
 use crate::app::{colors, open_external, OverseerApp};
 use crate::sprint_view::is_http_url;
@@ -21,7 +21,11 @@ pub struct Row {
 
 /// The items oldest first; items of the same age keep the daemon's order.
 fn oldest_first(v: &AttentionView) -> Vec<&AttentionItem> {
-    let mut items: Vec<_> = v.items.iter().collect();
+    let mut items: Vec<_> = v
+        .items
+        .iter()
+        .filter(|i| i.kind != AttentionKind::Other)
+        .collect();
     items.sort_by_key(|i| i.since);
     items
 }
@@ -259,6 +263,24 @@ mod tests {
                 row("needs_you:3", "S3", "wants to run a command", "5m"),
             ]
         );
+    }
+
+    #[test]
+    fn rows_skip_kinds_this_build_does_not_know() {
+        let v = AttentionView {
+            items: vec![
+                item("other:1", AttentionKind::Other, Some(1), None, 1000, "x"),
+                item(
+                    "log_gap:2",
+                    AttentionKind::LogGap,
+                    Some(2),
+                    None,
+                    1000,
+                    "gap",
+                ),
+            ],
+        };
+        assert_eq!(rows(&v, 1300), vec![row("log_gap:2", "S2", "gap", "5m")]);
     }
 
     #[test]
