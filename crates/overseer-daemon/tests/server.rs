@@ -5518,6 +5518,120 @@ async fn a_clear_ends_a_stretch_records_it_and_asks_for_a_part_log() {
     assert!(row["ended"].as_i64().unwrap() >= row["started"].as_i64().unwrap());
 }
 
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+/// What `read` gets from the daemon's ledger in `state_dir`, polled until
+/// `done` holds for it.
+async fn ledger_until<T: std::fmt::Debug>(
+    state_dir: &std::path::Path,
+    what: &str,
+    read: impl Fn(&overseer_daemon::ledger::Ledger) -> T,
+    done: impl Fn(&T) -> bool,
+) -> T {
+    let ledger = overseer_daemon::ledger::Ledger::open(&state_dir.join("overseer.db")).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let got = read(&ledger);
+        if done(&got) {
+            return got;
+        }
+        assert!(std::time::Instant::now() < deadline, "{what}: {got:?}");
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn stretch_rows_are_written_as_work_happens() {
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    assert_eq!(c.start(2).await, Response::Ok);
+    let in_transcript = |kind, id: &str| HookEvent {
+        session_id: Some(id.into()),
+        ..hook(2, kind)
+    };
+    c.hook(in_transcript(HookKind::SessionStart, "demo-transcript-a"))
+        .await;
+    c.hook(in_transcript(
+        HookKind::UserPromptSubmit,
+        "demo-transcript-a",
+    ))
+    .await;
+    let rows = ledger_until(
+        &d.state_dir,
+        "a running stretch row",
+        |l| l.stretches_since(0).unwrap(),
+        |r| !r.is_empty(),
+    )
+    .await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        (rows[0].slot, rows[0].session.as_str()),
+        (2, "demo-transcript-a")
+    );
+    assert_eq!(rows[0].ended, None);
+    // `/clear`: the stretch before it ends; the new one has no work yet.
+    c.hook(in_transcript(HookKind::SessionStart, "demo-transcript-b"))
+        .await;
+    let rows = ledger_until(
+        &d.state_dir,
+        "the stretch ended",
+        |l| l.stretches_since(0).unwrap(),
+        |r| r.iter().any(|s| s.ended.is_some()),
+    )
+    .await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].session, "demo-transcript-a");
+    assert!(rows[0].ended.unwrap() >= rows[0].last, "{rows:?}");
+}
+
+#[tokio::test]
+async fn idle_waits_are_written_as_they_happen() {
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    assert_eq!(c.start(2).await, Response::Ok);
+    let in_transcript = |kind| HookEvent {
+        session_id: Some("demo-transcript-a".into()),
+        ..hook(2, kind)
+    };
+    c.hook(in_transcript(HookKind::SessionStart)).await;
+    c.hook(in_transcript(HookKind::UserPromptSubmit)).await;
+    c.hook(in_transcript(HookKind::Stop)).await;
+    c.hook(HookEvent {
+        notification_type: Some("idle_prompt".into()),
+        ..in_transcript(HookKind::Notification)
+    })
+    .await;
+    let waits = ledger_until(
+        &d.state_dir,
+        "an open wait",
+        |l| l.waits_since(0).unwrap(),
+        |w| !w.is_empty(),
+    )
+    .await;
+    assert_eq!(waits.len(), 1, "{waits:?}");
+    assert_eq!(
+        (waits[0].slot, waits[0].session.as_str()),
+        (2, "demo-transcript-a")
+    );
+    assert_eq!(waits[0].end, None);
+    // The next prompt ends the wait.
+    c.hook(in_transcript(HookKind::UserPromptSubmit)).await;
+    let waits = ledger_until(
+        &d.state_dir,
+        "the wait closed",
+        |l| l.waits_since(0).unwrap(),
+        |w| w.iter().all(|x| x.end.is_some()),
+    )
+    .await;
+    assert_eq!(waits.len(), 1, "{waits:?}");
+    assert!(waits[0].end.unwrap() >= waits[0].start, "{waits:?}");
+}
+
 #[tokio::test]
 async fn sessions_start_without_the_api_tokens() {
     let dir = std::env::temp_dir().join(format!("ovs-tokens-env-{}", std::process::id()));
@@ -5738,6 +5852,70 @@ mod restart {
         assert!(snap.contains("ECHO:before"), "{snap:?}");
         c.type_line(1, "after").await;
         c.output_until(1, "ECHO:after").await;
+    }
+
+    #[tokio::test]
+    async fn restart_continues_the_running_stretch() {
+        let d = start_daemon().await;
+        let mut c = Client::connect(&d.socket).await;
+        assert_eq!(c.start(1).await, Response::Ok);
+        c.hook(HookEvent {
+            session_id: Some("demo-transcript-a".into()),
+            ..hook(1, HookKind::SessionStart)
+        })
+        .await;
+        drop(c);
+
+        let down = stop_keeping(d).await;
+        // What the last daemon stored: S1's stretch, still running; one of
+        // S3, whose session is gone, with a wait left open; and a stretch
+        // from over a week ago.
+        let now = now_secs();
+        let ledger =
+            overseer_daemon::ledger::Ledger::open(&down.state_dir.join("overseer.db")).unwrap();
+        ledger
+            .put_stretch(1, "demo-transcript-a", now - 600, now - 300)
+            .unwrap();
+        ledger
+            .put_stretch(3, "demo-transcript-c", now - 900, now - 800)
+            .unwrap();
+        ledger.open_wait(3, "demo-transcript-c", now - 850).unwrap();
+        ledger
+            .put_stretch(
+                4,
+                "demo-transcript-d",
+                now - 8 * 86400,
+                now - 8 * 86400 + 60,
+            )
+            .unwrap();
+        drop(ledger);
+        let d = start_daemon_at(down.socket.clone()).await;
+        let mut c = Client::connect(&d.socket).await;
+        c.hook(hook(1, HookKind::UserPromptSubmit)).await;
+        let rows = ledger_until(
+            &d.state_dir,
+            "S1's stretch extended",
+            |l| l.stretches_since(0).unwrap(),
+            |r| r.iter().any(|s| s.slot == 1 && s.last >= now),
+        )
+        .await;
+        let s1: Vec<_> = rows.iter().filter(|s| s.slot == 1).collect();
+        assert_eq!(s1.len(), 1, "{rows:?}");
+        assert_eq!(s1[0].first, now - 600);
+        assert_eq!(s1[0].ended, None);
+        // S3's stretch ended where its work did; the old one is gone.
+        let s3 = rows.iter().find(|s| s.slot == 3).expect("S3 row");
+        assert_eq!(s3.ended, Some(now - 800));
+        assert!(!rows.iter().any(|s| s.slot == 4), "{rows:?}");
+        let waits = ledger_until(
+            &d.state_dir,
+            "S3's wait closed",
+            |l| l.waits_since(0).unwrap(),
+            |w| w.iter().all(|x| x.end.is_some()),
+        )
+        .await;
+        assert_eq!(waits.len(), 1, "{waits:?}");
+        assert!(waits[0].end.unwrap() >= now, "{waits:?}");
     }
 
     #[tokio::test]

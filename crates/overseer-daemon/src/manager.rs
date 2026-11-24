@@ -1064,6 +1064,14 @@ impl SlotManager {
         }
     }
 
+    /// The Claude session id of the slot's running session, once known.
+    pub fn running_session(&self, id: SlotId) -> Option<String> {
+        let slots = self.slots.lock().unwrap();
+        let entry = slots.get(id as usize)?.as_ref()?;
+        let running = matches!(entry.slot.info().state, SlotState::Running { .. });
+        (running && !entry.session_id.is_empty()).then(|| entry.session_id.clone())
+    }
+
     /// The slot, if the id is valid and occupied.
     pub fn slot(&self, id: SlotId) -> Option<Arc<Slot>> {
         self.slots
