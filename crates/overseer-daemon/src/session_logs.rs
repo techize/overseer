@@ -453,6 +453,28 @@ pub fn local_day_start(t: i64) -> i64 {
     }
 }
 
+/// Unix seconds of local time `minutes` after the midnight `day_start`,
+/// read off the clock so a day with a clock change is right; 1440 is the
+/// next midnight.
+pub fn local_minute(day_start: i64, minutes: u32) -> i64 {
+    let naive = day_start + i64::from(minutes) * 60;
+    // SAFETY: localtime_r and mktime only touch the `tm` we pass them.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let time = day_start as libc::time_t;
+    if unsafe { libc::localtime_r(&time, &mut tm) }.is_null() {
+        return naive;
+    }
+    tm.tm_mday += (minutes / 1440) as libc::c_int;
+    tm.tm_hour = (minutes % 1440 / 60) as libc::c_int;
+    tm.tm_min = (minutes % 60) as libc::c_int;
+    tm.tm_sec = 0;
+    tm.tm_isdst = -1;
+    match unsafe { libc::mktime(&mut tm) } {
+        -1 => naive,
+        m => m,
+    }
+}
+
 /// Reads each log found for the run.
 pub fn read_logs(paths: &[PathBuf]) -> Vec<Log> {
     paths
@@ -592,6 +614,27 @@ mod tests {
         let (d, mins) = local_minutes(start);
         assert_eq!(mins, 0);
         assert_eq!(ymd(&d), ymd(&local_date(t)));
+    }
+
+    #[test]
+    fn local_minute_follows_the_clock_on_every_day_of_the_year() {
+        // Every day of 2026, so a clock change in the local zone is crossed.
+        let mut start = local_day_start(1_767_225_600 + 12 * 3600);
+        for _ in 0..366 {
+            let noon = local_minute(start, 12 * 60);
+            let (d, mins) = local_minutes(noon);
+            assert_eq!(mins, 12 * 60, "noon on {}", ymd(&d));
+            assert_eq!(ymd(&d), ymd(&local_date(start)));
+            let next = local_minute(start, 24 * 60);
+            assert_eq!(
+                next,
+                local_day_start(next),
+                "next midnight after {}",
+                ymd(&d)
+            );
+            assert!(next > start);
+            start = next;
+        }
     }
 
     #[test]

@@ -437,14 +437,6 @@ pub async fn run_until(
         },
     ));
     store.start_polling();
-    let attention = AttentionService::spawn(
-        ledger.clone(),
-        manager.clone(),
-        locks.clone(),
-        store.clone(),
-        events.clone(),
-        !cfg.settings.pr_author.trim().is_empty(),
-    );
     let day_timeline = TimelineService::spawn(
         ledger.clone(),
         (!cfg.settings.session_logs.is_empty()).then(|| LogSource {
@@ -455,6 +447,15 @@ pub async fn run_until(
         cfg.settings.session_log_min_mins.saturating_mul(60) as i64,
         timeline_nudge.clone(),
         events.clone(),
+    );
+    let attention = AttentionService::spawn(
+        ledger.clone(),
+        manager.clone(),
+        locks.clone(),
+        store.clone(),
+        day_timeline.clone(),
+        events.clone(),
+        !cfg.settings.pr_author.trim().is_empty(),
     );
     let plans = Arc::new(PlanCtx {
         manager: manager.clone(),

@@ -18,6 +18,7 @@ use crate::locks::LockService;
 use crate::manager::SlotManager;
 use crate::relay::courier::{NO_BOX, WORKING};
 use crate::session_logs::{hhmm, local_minutes};
+use crate::timeline_service::TimelineService;
 use crate::work::store::unix_now;
 use crate::work::WorkStore;
 
@@ -81,12 +82,15 @@ impl AttentionService {
     }
 
     /// Starts the task that keeps the list current. `author_set` is read
-    /// once: settings only take effect when the daemon restarts.
+    /// once: settings only take effect when the daemon restarts. The day
+    /// comes from `timeline`'s announcements, and from `timeline` itself
+    /// when one was missed; it is never asked to rebuild.
     pub fn spawn(
         ledger: Arc<Ledger>,
         manager: Arc<Mutex<SlotManager>>,
         locks: Arc<LockService>,
         store: Arc<WorkStore>,
+        timeline: Arc<TimelineService>,
         events: broadcast::Sender<Event>,
         author_set: bool,
     ) -> Arc<AttentionService> {
@@ -97,7 +101,7 @@ impl AttentionService {
         let mut rx = events.subscribe();
         let reread = move || (manager.lock().unwrap().list(), locks.view(), store.view());
         let (mut slots, mut lock_view, mut work) = reread();
-        let mut day = DayView::default();
+        let mut day = timeline.current();
         let task = svc.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(TICK);
@@ -117,6 +121,7 @@ impl AttentionService {
                         Ok(_) => continue,
                         Err(broadcast::error::RecvError::Lagged(_)) => {
                             (slots, lock_view, work) = reread();
+                            day = timeline.current();
                         }
                         Err(broadcast::error::RecvError::Closed) => return,
                     },

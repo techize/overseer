@@ -30,6 +30,9 @@ pub struct Inputs<'a> {
     pub check_logs: bool,
     /// A stretch with less work than this, in seconds, is never red.
     pub min_secs: i64,
+    /// Unix seconds of a local time of day: today's midnight and minutes
+    /// after it, which may reach the next midnight (1440).
+    pub minute: fn(i64, u32) -> i64,
 }
 
 /// Today's rows: one per slot with a stretch today, in slot order.
@@ -56,16 +59,18 @@ pub fn build_day(i: &Inputs) -> DayView {
 /// A log range as unix seconds: a lone start runs to now, and an end
 /// before the start runs to midnight.
 fn range_secs(i: &Inputs, (start, end): (u32, Option<u32>)) -> (i64, i64) {
-    let at = |m: u32| i.day_start + i64::from(m) * 60;
+    let at = |m: u32| (i.minute)(i.day_start, m);
     let to = match end {
         None => i.now,
-        Some(e) if e < start => i.day_start + 86_400,
+        Some(e) if e < start => at(24 * 60),
         Some(e) => at(e),
     };
     (at(start), to)
 }
 
-/// One stretch clipped to today, or `None` when it ended before today.
+/// One stretch clipped to today, or `None` when it has no work today: it
+/// ended before today, its last work was before today, or all of its time
+/// today is a long wait.
 fn build_stretch(i: &Inputs, s: &StoredStretch) -> Option<DayStretch> {
     let from = s.first.max(i.day_start);
     let to = if s.ended.is_none() {
@@ -73,7 +78,7 @@ fn build_stretch(i: &Inputs, s: &StoredStretch) -> Option<DayStretch> {
     } else {
         s.last.min(i.now)
     };
-    if to < i.day_start || to < from {
+    if s.last < i.day_start || to < from {
         return None;
     }
     let overlaps = |(a, b): (i64, i64)| a < to && b > from;
@@ -134,13 +139,18 @@ fn build_stretch(i: &Inputs, s: &StoredStretch) -> Option<DayStretch> {
         .filter(|p| p.2 == Some(SpanKind::Wait))
         .map(|p| p.1 - p.0)
         .sum();
+    if !pieces.is_empty() && pieces.iter().all(|p| p.2 == Some(SpanKind::Wait)) {
+        return None;
+    }
     let work = (to - from) - waited;
-    let uncovered = |len: i64| {
-        if !i.check_logs {
+    // Not logged yet unless there is enough work to need a log and the
+    // piece is not the running end; then short or a gap by its length.
+    let uncovered = |a: i64, b: i64| {
+        if !i.check_logs || work < i.min_secs || (running && b == to) {
             SpanKind::Unlogged
-        } else if len <= GAP_SECS {
+        } else if b - a <= GAP_SECS {
             SpanKind::Short
-        } else if running || work < i.min_secs {
+        } else if running {
             SpanKind::Unlogged
         } else {
             SpanKind::Gap
@@ -151,7 +161,7 @@ fn build_stretch(i: &Inputs, s: &StoredStretch) -> Option<DayStretch> {
         .map(|(a, b, kind)| Span {
             from: a,
             to: b,
-            kind: kind.unwrap_or_else(|| uncovered(b - a)),
+            kind: kind.unwrap_or_else(|| uncovered(a, b)),
         })
         .collect();
 
@@ -215,6 +225,12 @@ mod tests {
         waits: Vec<StoredWait>,
         logs: HashMap<SlotId, Vec<DayLog>>,
         check_logs: bool,
+        minute: fn(i64, u32) -> i64,
+    }
+
+    /// Local minutes as seconds with no clock change in the day.
+    fn plain_minute(day_start: i64, m: u32) -> i64 {
+        day_start + i64::from(m) * 60
     }
 
     impl Day {
@@ -225,6 +241,7 @@ mod tests {
                 waits: Vec::new(),
                 logs: logs(lines),
                 check_logs: true,
+                minute: plain_minute,
             }
         }
 
@@ -238,6 +255,7 @@ mod tests {
                 logs: &self.logs,
                 check_logs: self.check_logs,
                 min_secs: 900,
+                minute: self.minute,
             })
         }
 
@@ -450,5 +468,123 @@ mod tests {
         assert_eq!(v.rows.iter().map(|r| r.slot).collect::<Vec<_>>(), [0, 1]);
         let firsts: Vec<i64> = v.rows[1].stretches.iter().map(|s| s.first).collect();
         assert_eq!(firsts, [at(8, 0), at(10, 0)]);
+    }
+
+    #[test]
+    fn a_short_unlogged_stretch_is_unlogged_not_short() {
+        let d = Day::new(at(12, 0), stretch(at(9, 0), at(9, 5), true), &[]);
+        assert_eq!(spans(&d.one()), [(at(9, 0), at(9, 5), Unlogged)]);
+    }
+
+    #[test]
+    fn a_fresh_running_stretch_with_no_log_is_unlogged() {
+        let d = Day::new(at(9, 8), stretch(at(9, 0), at(9, 8), false), &[]);
+        assert_eq!(spans(&d.one()), [(at(9, 0), at(9, 8), Unlogged)]);
+    }
+
+    #[test]
+    fn the_running_end_of_a_stretch_is_unlogged_however_short() {
+        let d = Day::new(
+            at(9, 40),
+            stretch(at(9, 0), at(9, 40), false),
+            &["09:00 - 09:35"],
+        );
+        assert_eq!(
+            spans(&d.one()),
+            [
+                (at(9, 0), at(9, 35), Logged),
+                (at(9, 35), at(9, 40), Unlogged)
+            ]
+        );
+    }
+
+    #[test]
+    fn an_open_stretch_idle_since_yesterday_is_dropped() {
+        // Waiting since before midnight.
+        let mut d = Day::new(at(9, 0), stretch(-7200, -3600, false), &[]);
+        d.waits = vec![wait(-3500, None)];
+        assert!(d.build().rows.is_empty());
+        // No wait recorded: still no work today.
+        d.waits.clear();
+        assert!(d.build().rows.is_empty());
+    }
+
+    #[test]
+    fn a_stretch_that_is_only_waiting_today_is_dropped() {
+        let mut d = Day::new(at(9, 0), stretch(-3600, 0, false), &[]);
+        d.waits = vec![wait(-600, None)];
+        assert!(d.build().rows.is_empty());
+    }
+
+    #[test]
+    fn a_range_ending_before_its_start_covers_to_midnight() {
+        let d = Day::new(
+            at(23, 59),
+            stretch(at(22, 0), at(23, 50), true),
+            &["22:00 - 01:00"],
+        );
+        assert_eq!(spans(&d.one()), [(at(22, 0), at(23, 50), Logged)]);
+    }
+
+    #[test]
+    fn log_minutes_go_through_the_local_clock() {
+        // A day where the clock went back an hour at 02:00: local 09:00 is
+        // ten hours after midnight.
+        let mut d = Day::new(
+            at(12, 0),
+            stretch(at(9, 0), at(11, 0), true),
+            &["08:00 - 10:00"],
+        );
+        d.minute = |ds, m| ds + i64::from(m) * 60 + if m >= 120 { 3600 } else { 0 };
+        assert_eq!(spans(&d.one()), [(at(9, 0), at(11, 0), Logged)]);
+    }
+
+    #[test]
+    fn bracket_text_is_not_coverage() {
+        let d = Day::new(
+            at(12, 0),
+            stretch(at(8, 0), at(10, 0), true),
+            &["09:00 - 10:00 (started 08:00 - 09:00)"],
+        );
+        assert_eq!(
+            spans(&d.one()),
+            [(at(8, 0), at(9, 0), Gap), (at(9, 0), at(10, 0), Logged)]
+        );
+    }
+
+    #[test]
+    fn a_semicolon_splits_ranges() {
+        let d = Day::new(
+            at(12, 0),
+            stretch(at(9, 0), at(10, 0), true),
+            &["09:00 - 09:20; 09:40 - 10:00"],
+        );
+        assert_eq!(
+            spans(&d.one()),
+            [
+                (at(9, 0), at(9, 20), Logged),
+                (at(9, 20), at(9, 40), Gap),
+                (at(9, 40), at(10, 0), Logged)
+            ]
+        );
+    }
+
+    #[test]
+    fn an_idle_part_is_not_coverage() {
+        let d = Day::new(
+            at(12, 0),
+            stretch(at(9, 0), at(11, 0), true),
+            &["09:00 - 09:30, idle 09:30 - 11:00"],
+        );
+        assert_eq!(
+            spans(&d.one()),
+            [(at(9, 0), at(9, 30), Logged), (at(9, 30), at(11, 0), Gap)]
+        );
+    }
+
+    #[test]
+    fn a_lone_start_in_an_ended_stretch_covers_to_its_end() {
+        let d = Day::new(at(12, 0), stretch(at(9, 0), at(10, 0), true), &["~9:00"]);
+        assert_eq!(spans(&d.one()), [(at(9, 0), at(10, 0), Logged)]);
     }
 }

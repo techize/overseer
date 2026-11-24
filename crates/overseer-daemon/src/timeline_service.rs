@@ -27,10 +27,7 @@ pub struct LogSource {
     pub patterns: Vec<String>,
 }
 
-/// The logs last read, and the day (`YYYY-MM-DD`) they were read for.
-type LogCache = (String, HashMap<SlotId, Vec<DayLog>>);
-
-/// Stands in for `now` where a running stretch ends, so views that differ
+/// Stands in for `now` where an open stretch ends, so views that differ
 /// only in `now` compare equal.
 const NOW: i64 = i64::MAX;
 
@@ -50,16 +47,16 @@ impl TimelineService {
     /// `now` is not announced.
     fn update(&self, next: DayView) -> bool {
         let mut view = self.view.lock().unwrap();
-        let changed = view.day != next.day || settled(&view.rows) != settled(&next.rows);
+        let changed = view.day != next.day || settled(&view) != settled(&next);
         *view = next;
         changed
     }
 
-    /// Starts the task that keeps the day current. It rebuilds when
-    /// `nudge` is poked (a stretch or wait row was written), when a slot
-    /// changes, and every minute. Logs are read again on a nudge or the
-    /// tick, never per slot change. `logs` is `None` when the log check
-    /// is off; `min_secs` is the shortest stretch that can show a gap.
+    /// Starts the task that keeps the day current. It rebuilds and reads
+    /// the logs again when `nudge` is poked (a stretch or wait row was
+    /// written) and every minute, which also catches a wait passing thirty
+    /// minutes. `logs` is `None` when the log check is off; `min_secs` is
+    /// the shortest stretch that can show a gap.
     pub fn spawn(
         ledger: Arc<Ledger>,
         logs: Option<LogSource>,
@@ -70,40 +67,28 @@ impl TimelineService {
         let svc = Arc::new(TimelineService {
             view: Mutex::new(DayView::default()),
         });
-        // Subscribe before the first build so no change falls between the two.
-        let mut rx = events.subscribe();
         let logs = logs.map(Arc::new);
         let task = svc.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(TICK);
-            // Empty until a build succeeds, so a failed one reads again.
-            let mut cache: Option<LogCache> = None;
             loop {
                 // The first tick fires at once and builds the first view.
-                let reread_logs = tokio::select! {
-                    _ = tick.tick() => true,
-                    _ = nudge.notified() => true,
-                    ev = rx.recv() => match ev {
-                        Ok(Event::SlotChanged(_)) => false,
-                        Ok(_) => continue,
-                        Err(broadcast::error::RecvError::Lagged(_)) => false,
-                        Err(broadcast::error::RecvError::Closed) => return,
-                    },
-                };
+                tokio::select! {
+                    _ = tick.tick() => {}
+                    _ = nudge.notified() => {}
+                }
                 let (ledger, logs) = (ledger.clone(), logs.clone());
-                let cached = if reread_logs { None } else { cache.take() };
                 let built = tokio::task::spawn_blocking(move || {
-                    build(&ledger, logs.as_deref(), cached, min_secs, unix_now())
+                    build(&ledger, logs.as_deref(), min_secs, unix_now()).0
                 })
                 .await;
-                let (view, read) = match built {
-                    Ok(b) => b,
+                let view = match built {
+                    Ok(v) => v,
                     Err(e) => {
                         tracing::warn!("timeline: build failed: {e}");
                         continue;
                     }
                 };
-                cache = Some(read);
                 if task.update(view) {
                     // Nobody listening is fine.
                     let _ = events.send(Event::TimelineChanged(task.current()));
@@ -114,11 +99,13 @@ impl TimelineService {
     }
 }
 
-/// `rows` with each running stretch's ends at `now` replaced by [`NOW`].
-fn settled(rows: &[DayRow]) -> Vec<DayRow> {
-    let mut rows = rows.to_vec();
+/// The view's rows with each open stretch's ends at `now` replaced by
+/// [`NOW`]. A stretch is open when it is drawn to now: running, or waiting
+/// over thirty minutes with no end stored.
+fn settled(view: &DayView) -> Vec<DayRow> {
+    let mut rows = view.rows.clone();
     for s in rows.iter_mut().flat_map(|r| r.stretches.iter_mut()) {
-        if s.running {
+        if s.running || s.last == view.now {
             s.last = NOW;
             if let Some(span) = s.spans.last_mut() {
                 span.to = NOW;
@@ -128,16 +115,14 @@ fn settled(rows: &[DayRow]) -> Vec<DayRow> {
     rows
 }
 
-/// Today's view at `now`, and the logs it used. `cached` is reused when
-/// it is for today; otherwise each slot with a stretch today has its logs
-/// read.
+/// Today's view at `now`, and the logs it read: those of each slot with a
+/// stretch today.
 fn build(
     ledger: &Ledger,
     logs: Option<&LogSource>,
-    cached: Option<LogCache>,
     min_secs: i64,
     now: i64,
-) -> (DayView, LogCache) {
+) -> (DayView, HashMap<SlotId, Vec<DayLog>>) {
     let day = session_logs::ymd(&crate::brain::paths::local_date(now));
     let day_start = session_logs::local_day_start(now);
     let stretches = today_stretches(ledger, day_start);
@@ -145,30 +130,26 @@ fn build(
         tracing::warn!("timeline: reading waits failed: {e:#}");
         Vec::new()
     });
-    let read = match (logs, cached) {
-        (None, _) => HashMap::new(),
-        (Some(_), Some((d, c))) if d == day => c,
-        (Some(src), _) => {
-            let mut read = HashMap::new();
-            for s in &stretches {
-                read.entry(s.slot).or_insert_with(|| {
-                    session_logs::today_logs(&src.brain_dir, &src.home, &src.patterns, s.slot, now)
-                });
-            }
-            read
+    let mut read = HashMap::new();
+    if let Some(src) = logs {
+        for s in &stretches {
+            read.entry(s.slot).or_insert_with(|| {
+                session_logs::today_logs(&src.brain_dir, &src.home, &src.patterns, s.slot, now)
+            });
         }
-    };
+    }
     let view = build_day(&Inputs {
         now,
         day_start,
-        day: day.clone(),
+        day,
         stretches: &stretches,
         waits: &waits,
         logs: &read,
         check_logs: logs.is_some(),
         min_secs,
+        minute: session_logs::local_minute,
     });
-    (view, (day, read))
+    (view, read)
 }
 
 /// Stretches with work today, and any still running from before it.
@@ -239,26 +220,11 @@ mod tests {
             .put_stretch(2, "demo-a", now - 120, now - 60)
             .unwrap();
         let (_notes, src) = empty_notes();
-        let (v, (day, read)) = build(&ledger, Some(&src), None, 0, now);
-        assert_eq!(day, v.day);
+        let (v, read) = build(&ledger, Some(&src), 0, now);
         assert_eq!(read.keys().copied().collect::<Vec<_>>(), vec![2]);
         assert_eq!(v.rows.len(), 1);
-        let (_, (_, read)) = build(&ledger, None, None, 0, now);
+        let (_, read) = build(&ledger, None, 0, now);
         assert!(read.is_empty());
-    }
-
-    #[test]
-    fn a_cache_from_another_day_is_read_again() {
-        let ledger = Ledger::in_memory();
-        let now = morning();
-        ledger
-            .put_stretch(2, "demo-a", now - 120, now - 60)
-            .unwrap();
-        let (_notes, src) = empty_notes();
-        let stale = ("2000-01-01".to_string(), HashMap::new());
-        let (_, (day, read)) = build(&ledger, Some(&src), Some(stale), 0, now);
-        assert_ne!(day, "2000-01-01");
-        assert!(read.contains_key(&2), "{read:?}");
     }
 
     #[test]
@@ -270,15 +236,36 @@ mod tests {
         let svc = TimelineService {
             view: Mutex::new(DayView::default()),
         };
-        let at = |now| build(&ledger, Some(&src), None, 0, now).0;
+        let at = |now| build(&ledger, Some(&src), 0, now).0;
         assert!(svc.update(at(t0)));
         assert!(svc.current().rows[0].stretches[0].running);
         assert!(!svc.update(at(t0 + 60)));
         assert_eq!(svc.current().now, t0 + 60);
-        // Uncovered for over ten minutes: the span's kind changes.
-        assert!(svc.update(at(t0 + 700)));
+        // Uncovered for over ten minutes but still the running end: not
+        // logged yet, so no change.
+        assert!(!svc.update(at(t0 + 700)));
         // A second stretch is a change.
         ledger.put_stretch(3, "demo-b", t0, t0 + 700).unwrap();
         assert!(svc.update(at(t0 + 760)));
+    }
+
+    #[test]
+    fn a_stretch_waiting_over_thirty_minutes_does_not_resend_as_now_moves() {
+        let ledger = Ledger::in_memory();
+        let t0 = morning();
+        ledger
+            .put_stretch(2, "demo-a", t0 - 3600, t0 - 2400)
+            .unwrap();
+        ledger.open_wait(2, "demo-a", t0 - 2400).unwrap();
+        let (_notes, src) = empty_notes();
+        let svc = TimelineService {
+            view: Mutex::new(DayView::default()),
+        };
+        let at = |now| build(&ledger, Some(&src), 0, now).0;
+        assert!(svc.update(at(t0)));
+        let s = &svc.current().rows[0].stretches[0];
+        assert!(!s.running, "waiting over thirty minutes counts as ended");
+        assert!(!svc.update(at(t0 + 5)));
+        assert!(!svc.update(at(t0 + 65)));
     }
 }
