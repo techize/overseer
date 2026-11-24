@@ -41,8 +41,8 @@ use super::sprint::{
 use super::stages::Stages;
 use super::token::{find_within, jira_token, TokenKind};
 use super::{
-    active_repos, compile_pattern, group, parse_beads, parse_jira, parse_prs, parse_repos,
-    run_source, Bead, Ticket,
+    active_repos, build_state, compile_pattern, group, parse_beads, parse_jira, parse_prs,
+    parse_repos, run_source, Bead, Ticket,
 };
 use crate::brain::paths::local_date;
 use crate::config::Config;
@@ -227,13 +227,16 @@ pub const NO_BITBUCKET_EMAIL: &str =
 /// The per-repo error for a `pr_repos` folder the API cannot name.
 pub const NO_BITBUCKET_REMOTE: &str = "no Bitbucket remote";
 
-/// The open PRs of one target, as `parse_prs` reads them.
+/// The open PRs of one target, as `parse_prs` reads them. Through the API,
+/// only `author`'s PRs are kept (see [`author_matches`]), so others cost no
+/// statuses reads.
 async fn read_target(
     reader: &PrReader,
     repo: &str,
     target: &PrTarget,
     vars: &Vars,
     ai_reviewers: &[String],
+    author: &str,
 ) -> Result<Vec<PullRequest>, String> {
     let out = match (reader, target) {
         (PrReader::Command(cmd), PrTarget::Folder(dir)) => {
@@ -253,10 +256,73 @@ async fn read_target(
                 },
             };
             let (api, token) = (api.clone(), token.clone());
-            run_blocking_for("Bitbucket", move || api.open_prs(&token, &ws, &slug)).await?
+            let (repo, ai) = (repo.to_owned(), ai_reviewers.to_vec());
+            let author = author.to_owned();
+            // The statuses are read here too, one PR after another, so the
+            // per-repo limit on polls still bounds the requests.
+            return run_blocking_for("Bitbucket", move || {
+                let started = Instant::now();
+                let out = api.open_prs(&token, &ws, &slug)?;
+                let mut prs = parse_prs(&out, &repo, &ai)?;
+                prs.retain(|p| author_matches(&author, p));
+                fill_builds(&api, &token, (&ws, &slug), &mut prs, started, BUILD_BUDGET);
+                Ok(prs)
+            })
+            .await;
         }
     };
-    parse_prs(&out, repo, ai_reviewers)
+    // bb is not asked for these, so they stay unset even if its JSON has them.
+    let mut prs = parse_prs(&out, repo, ai_reviewers)?;
+    for pr in &mut prs {
+        pr.comments = None;
+        pr.head = None;
+    }
+    Ok(prs)
+}
+
+/// With `author` set (trimmed and lowercased), only that author's PRs,
+/// ignoring case.
+fn author_matches(author: &str, pr: &PullRequest) -> bool {
+    author.is_empty()
+        || pr
+            .author
+            .as_deref()
+            .is_some_and(|a| a.trim().to_lowercase() == author)
+}
+
+/// How long after a repo's PR list read starts the build states may still
+/// be read. The whole read must end inside the API timeout, so a slow
+/// Bitbucket costs build states, never the PR list.
+const BUILD_BUDGET: Duration = Duration::from_secs(20);
+
+/// Set `build` on each PR with a `head`, one statuses read after another,
+/// until `budget` has passed since `started`. The rest keep `build` as
+/// `None`, as does a PR whose statuses read fails.
+fn fill_builds(
+    api: &BitbucketApi,
+    token: &str,
+    (ws, slug): (&str, &str),
+    prs: &mut [PullRequest],
+    started: Instant,
+    budget: Duration,
+) {
+    let mut skipped = 0;
+    for pr in prs.iter_mut() {
+        let Some(head) = pr.head.clone() else {
+            continue;
+        };
+        if started.elapsed() >= budget {
+            skipped += 1;
+            continue;
+        }
+        match api.commit_statuses(token, ws, slug, &head) {
+            Ok(statuses) => pr.build = build_state(&statuses),
+            Err(e) => tracing::warn!("build state of {slug} #{}: {e}", pr.id),
+        }
+    }
+    if skipped > 0 {
+        tracing::info!("{slug}: build state not read for {skipped} PRs, out of time");
+    }
 }
 
 /// The workspace and slug of `dir`'s Bitbucket remote: `origin`, else the
@@ -448,6 +514,7 @@ async fn poll_prs(
     targets: &[(String, PrTarget)],
     vars: Arc<Vars>,
     ai_reviewers: Arc<[String]>,
+    author: Arc<str>,
 ) -> Vec<Result<Vec<PullRequest>, String>> {
     let mut results: Vec<Option<Result<Vec<PullRequest>, String>>> =
         targets.iter().map(|_| None).collect();
@@ -459,15 +526,18 @@ async fn poll_prs(
             let Some((i, (repo, target))) = next.next() else {
                 break;
             };
-            let (reader, repo, target, vars, ai) = (
+            let (reader, repo, target, vars, ai, author) = (
                 reader.clone(),
                 repo.clone(),
                 target.clone(),
                 vars.clone(),
                 ai_reviewers.clone(),
+                author.clone(),
             );
-            running
-                .spawn(async move { (i, read_target(&reader, &repo, &target, &vars, &ai).await) });
+            running.spawn(async move {
+                let read = read_target(&reader, &repo, &target, &vars, &ai, &author).await;
+                (i, read)
+            });
         }
         match running.join_next().await {
             Some(Ok((i, read))) => results[i] = Some(read),
@@ -841,6 +911,30 @@ impl WorkStore {
         known.unwrap_or_else(|| self.guess_kind(key))
     }
 
+    /// Marks the comments on a PR as seen, using the count the last poll
+    /// read. An unknown PR, or one with no count, changes nothing.
+    pub fn mark_pr_seen(&self, repo: &str, id: u64) -> Response {
+        let count = self
+            .cache()
+            .prs
+            .get(repo)
+            .and_then(|prs| prs.iter().find(|p| p.id == id))
+            .and_then(|p| p.comments);
+        let Some(count) = count else {
+            return Response::Ok;
+        };
+        if let Err(e) = self
+            .ledger
+            .transaction(|c| ledger::mark_pr_seen_on(c, repo, id, count))
+        {
+            return Response::Error {
+                message: format!("recording the seen PR failed: {e:#}"),
+            };
+        }
+        self.announce();
+        Response::Ok
+    }
+
     fn announce(&self) {
         let _ = self.events.send(Event::WorkChanged(self.view()));
     }
@@ -948,7 +1042,9 @@ impl WorkStore {
                 };
                 let repos_error = self.read_repo_list(&reader, &vars).await;
                 let targets = self.pr_targets(unix_now());
-                let got = poll_prs(&reader, &targets, vars, self.ai_reviewers.clone()).await;
+                let author: Arc<str> = self.pr_author.as_str().into();
+                let got =
+                    poll_prs(&reader, &targets, vars, self.ai_reviewers.clone(), author).await;
                 let now = unix_now();
                 let mut cache = self.cache();
                 let mut errors = Vec::new();
@@ -961,15 +1057,19 @@ impl WorkStore {
                 }
                 // A workspace with no active repos is a good read too.
                 let mut answered = targets.is_empty() && repos_error.is_none();
+                let mut read_repos: Vec<String> = Vec::new();
+                let mut read_prs: Vec<PullRequest> = Vec::new();
                 for ((repo, _), read) in targets.iter().zip(got) {
                     match read {
                         Ok(prs) => {
                             answered = true;
-                            let prs = prs
+                            let prs: Vec<PullRequest> = prs
                                 .into_iter()
                                 .filter(|p| self.wants_author(p))
                                 .map(|p| self.link_ticket(p))
                                 .collect();
+                            read_repos.push(repo.clone());
+                            read_prs.extend(prs.iter().cloned());
                             cache.prs.insert(repo.clone(), prs);
                         }
                         Err(e) => {
@@ -988,6 +1088,18 @@ impl WorkStore {
                     s.at = Some(now);
                 }
                 s.message = (!errors.is_empty()).then(|| errors.join("; "));
+                drop(cache);
+                // Not part of the poll's success: the board is right without it.
+                // After a failed repo-list read the targets lack the workspace
+                // repos, so they cannot be used to prune.
+                let names: Vec<String> = targets.iter().map(|(r, _)| r.clone()).collect();
+                let known = repos_error.is_none().then_some(names.as_slice());
+                if let Err(e) = self
+                    .ledger
+                    .transaction(|c| ledger::record_prs_on(c, &read_prs, &read_repos, known, now))
+                {
+                    tracing::warn!("recording seen PRs failed: {e:#}");
+                }
             }
         }
         self.regroup(unix_now());
@@ -1476,11 +1588,7 @@ impl WorkStore {
 
     /// With `pr_author` set, only that author's PRs, ignoring case.
     fn wants_author(&self, pr: &PullRequest) -> bool {
-        self.pr_author.is_empty()
-            || pr
-                .author
-                .as_deref()
-                .is_some_and(|a| a.trim().to_lowercase() == self.pr_author)
+        author_matches(&self.pr_author, pr)
     }
 
     /// `pr` with the first ticket key in its title, else in its branch.
@@ -2441,6 +2549,74 @@ esac"#;
     }
 
     #[tokio::test]
+    async fn the_pr_command_leaves_comments_build_and_head_unset() {
+        let dir = temp_dir("prs-cmd-extra");
+        let api = dir.join("demo-api");
+        std::fs::create_dir_all(&api).unwrap();
+        let s = store_with(|c| {
+            c.pr_repos = vec![api.clone()];
+            c.pr_command = sh(
+                r#"printf '%s' '[{"id":7,"title":"t","comment_count":4,"source":{"commit":{"hash":"abc123"}}}]'"#,
+            );
+        });
+        s.refresh(Source::Prs).await;
+        let v = s.view();
+        assert_eq!(v.prs.len(), 1);
+        let pr = &v.prs[0];
+        assert_eq!(
+            (pr.comments, pr.build, pr.head.as_deref()),
+            (None, None, None)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn pr_with_head(id: u64, head: &str) -> PullRequest {
+        let out =
+            format!(r#"{{"values":[{{"id":{id},"source":{{"commit":{{"hash":"{head}"}}}}}}]}}"#);
+        parse_prs(&out, "demo-api", &[]).unwrap().remove(0)
+    }
+
+    fn demo_api(base: &str) -> BitbucketApi {
+        BitbucketApi::new("demo@example.test").with_base(format!("{base}/2.0/"))
+    }
+
+    #[test]
+    fn no_build_budget_reads_no_statuses() {
+        use super::super::jira_api::tests::fake;
+        let (base, rx) = fake(vec![]);
+        let mut prs = vec![pr_with_head(1, "aaa"), pr_with_head(2, "bbb")];
+        fill_builds(
+            &demo_api(&base),
+            "tok",
+            ("demo-ws", "demo-api"),
+            &mut prs,
+            Instant::now(),
+            Duration::ZERO,
+        );
+        assert!(rx.try_iter().next().is_none());
+        assert!(prs.iter().all(|p| p.build.is_none()));
+    }
+
+    #[test]
+    fn a_failed_statuses_read_leaves_only_that_build_unset() {
+        use super::super::jira_api::tests::fake;
+        let ok = r#"{"values":[{"state":"SUCCESSFUL"}]}"#;
+        let (base, rx) = fake(vec![(500, "boom".into()), (200, ok.into())]);
+        let mut prs = vec![pr_with_head(1, "aaa"), pr_with_head(2, "bbb")];
+        fill_builds(
+            &demo_api(&base),
+            "tok",
+            ("demo-ws", "demo-api"),
+            &mut prs,
+            Instant::now(),
+            BUILD_BUDGET,
+        );
+        assert_eq!(rx.try_iter().count(), 2);
+        assert_eq!(prs[0].build, None);
+        assert_eq!(prs[1].build, Some(overseer_proto::BuildState::Passed));
+    }
+
+    #[tokio::test]
     async fn empty_pr_repos_is_off() {
         let s = store_with(|c| c.pr_command = sh("echo ran >&2; exit 1"));
         s.refresh(Source::Prs).await;
@@ -2680,6 +2856,87 @@ esac"#,
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn seen_row(s: &WorkStore, repo: &str, id: u64, comments: Option<u32>, at: i64) {
+        let mut pr = pr_with_head(id, "aaa");
+        pr.repo = repo.into();
+        pr.comments = comments;
+        s.ledger
+            .transaction(|c| ledger::record_prs_on(c, &[pr], &[repo.to_string()], None, at))
+            .unwrap();
+    }
+
+    fn cache_pr(s: &WorkStore, repo: &str, id: u64, comments: Option<u32>) {
+        let mut pr = pr_with_head(id, "aaa");
+        pr.repo = repo.into();
+        pr.comments = comments;
+        s.cache().prs.insert(repo.into(), vec![pr]);
+    }
+
+    #[test]
+    fn marking_an_unknown_or_uncounted_pr_changes_nothing() {
+        let s = store("");
+        seen_row(&s, "demo-api", 1, Some(2), 10);
+        seen_row(&s, "demo-api", 1, Some(5), 20);
+        cache_pr(&s, "demo-api", 1, None);
+        let before = s.ledger.pr_seen().unwrap();
+        assert!(matches!(s.mark_pr_seen("demo-web", 9), Response::Ok));
+        assert!(matches!(s.mark_pr_seen("demo-api", 1), Response::Ok));
+        assert_eq!(s.ledger.pr_seen().unwrap(), before);
+        assert_eq!(before[0].comments_since, Some(20));
+    }
+
+    #[test]
+    fn marking_a_pr_seen_records_the_count_and_announces() {
+        let s = store("");
+        let mut rx = s.events.subscribe();
+        seen_row(&s, "demo-api", 1, Some(2), 10);
+        seen_row(&s, "demo-api", 1, Some(5), 20);
+        cache_pr(&s, "demo-api", 1, Some(5));
+        assert!(matches!(s.mark_pr_seen("demo-api", 1), Response::Ok));
+        let row = &s.ledger.pr_seen().unwrap()[0];
+        assert_eq!((row.comments, row.comments_since), (Some(5), None));
+        assert!(matches!(rx.try_recv(), Ok(Event::WorkChanged(_))));
+    }
+
+    #[tokio::test]
+    async fn a_poll_records_the_prs_it_read() {
+        let dir = temp_dir("prs-seen");
+        let api = dir.join("demo-api");
+        std::fs::create_dir_all(&api).unwrap();
+        let s = store_with(|c| {
+            c.pr_repos = vec![api.clone()];
+            c.pr_command = sh(FAKE_BB);
+        });
+        s.refresh(Source::Prs).await;
+        let rows = s.ledger.pr_seen().unwrap();
+        let ids: Vec<_> = rows.iter().map(|r| r.id).collect();
+        assert_eq!(ids.len(), prs_source(&s.view()).count, "{ids:?}");
+        assert!(ids.contains(&7), "{ids:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_failed_repo_list_keeps_workspace_pr_rows() {
+        let dir = temp_dir("ws-seen-keep");
+        let api = dir.join("demo-api");
+        std::fs::create_dir_all(&api).unwrap();
+        let s = ws_store(&dir, |c| c.pr_repos = vec![api.clone()]);
+        // A workspace repo seen before a restart; its list read now fails.
+        seen_row(&s, "demo-web", 21, Some(3), 10);
+        s.refresh(Source::Prs).await;
+        let msg = prs_source(&s.view()).message.clone().unwrap_or_default();
+        assert!(msg.starts_with("repos: "), "{msg}");
+        let repos: Vec<_> = s
+            .ledger
+            .pr_seen()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.repo)
+            .collect();
+        assert!(repos.contains(&"demo-web".to_string()), "{repos:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn repo_list_failing_from_the_start_still_polls_folders() {
         let dir = temp_dir("ws-none");
@@ -2826,8 +3083,15 @@ esac"#,
             r#"{{"values":[{{"slug":"demo-api","updated_on":"{recent}"}}],"next":"{{base}}/2.0/repositories/demo-ws?page=2"}}"#
         );
         let repos2 = r#"{"values":[{"slug":"demo-old","updated_on":"2001-01-01T00:00:00Z"}]}"#;
-        let prs = r#"{"values":[{"id":7,"title":"DEMO-12 api work","author":{"display_name":"Dana Demo"}}]}"#;
-        let (base, rx) = fake(vec![(200, repos), (200, repos2.into()), (200, prs.into())]);
+        let prs = r#"{"values":[{"id":7,"title":"DEMO-12 api work","author":{"display_name":"Dana Demo"},
+            "comment_count":2,"source":{"commit":{"hash":"abc123"}}}]}"#;
+        let statuses = r#"{"values":[{"state":"SUCCESSFUL"},{"state":"FAILED"}]}"#;
+        let (base, rx) = fake(vec![
+            (200, repos),
+            (200, repos2.into()),
+            (200, prs.into()),
+            (200, statuses.into()),
+        ]);
         let mut s = ws_store(&dir, |c| {
             c.jira_email = "demo@example.test".into();
             c.pr_project = "DEMO".into();
@@ -2847,6 +3111,15 @@ esac"#,
             .map(|p| (p.repo.as_str(), p.id, p.ticket.as_deref()))
             .collect();
         assert_eq!(got, [("demo-api", 7, Some("DEMO-12"))]);
+        let pr = &v.prs[0];
+        assert_eq!(
+            (pr.comments, pr.build, pr.head.as_deref()),
+            (
+                Some(2),
+                Some(overseer_proto::BuildState::Failed),
+                Some("abc123")
+            )
+        );
         assert!(prs_source(&v).ok, "{:?}", prs_source(&v));
         assert_eq!(calls(&dir), "", "pr_command must not run");
         let seen: Vec<_> = rx.try_iter().collect();
@@ -2856,7 +3129,8 @@ esac"#,
             [
                 "/2.0/repositories/demo-ws?pagelen=100&sort=-updated_on&q=project.key%3D%22DEMO%22",
                 "/2.0/repositories/demo-ws?page=2",
-                "/2.0/repositories/demo-ws/demo-api/pullrequests?state=OPEN&pagelen=50&fields=%2Bvalues.participants",
+                "/2.0/repositories/demo-ws/demo-api/pullrequests?state=OPEN&pagelen=50&fields=%2Bvalues.participants%2C%2Bvalues.comment_count",
+                "/2.0/repositories/demo-ws/demo-api/commit/abc123/statuses?pagelen=100",
             ]
         );
         // base64("demo@example.test:bb-tok")
@@ -2895,7 +3169,47 @@ esac"#,
         assert_eq!(seen.len(), 1);
         assert_eq!(
             seen[0].path,
-            "/2.0/repositories/demo-ws/demo-web/pullrequests?state=OPEN&pagelen=50&fields=%2Bvalues.participants"
+            "/2.0/repositories/demo-ws/demo-web/pullrequests?state=OPEN&pagelen=50&fields=%2Bvalues.participants%2C%2Bvalues.comment_count"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn pr_author_reads_statuses_only_for_that_authors_prs() {
+        use super::super::jira_api::tests::fake;
+        let dir = temp_dir("bb-author");
+        let web = dir.join("demo-web");
+        git_folder(&web, "git@bitbucket.org:demo-ws/demo-web.git");
+        let prs = r#"{"values":[
+            {"id":5,"title":"Other work","author":{"display_name":"Sam Demo"},
+             "source":{"commit":{"hash":"bbb"}}},
+            {"id":7,"title":"Own work","author":{"display_name":"Dana Demo"},
+             "source":{"commit":{"hash":"aaa"}}}]}"#;
+        let statuses = r#"{"values":[{"state":"FAILED"}]}"#;
+        let (base, rx) = fake(vec![(200, prs.into()), (200, statuses.into())]);
+        let mut s = store_with(|c| {
+            c.jira_email = "demo@example.test".into();
+            c.pr_repos = vec![web.clone()];
+            c.pr_command = sh("echo ran >&2; exit 1");
+            c.pr_author = "dana demo".into();
+        });
+        use_bitbucket(
+            &mut s,
+            &dir,
+            "case \"$*\" in *overseer-bitbucket*) echo bb-tok ;; *) exit 44 ;; esac",
+            &base,
+        );
+        s.refresh(Source::Prs).await;
+        let v = s.view();
+        let got: Vec<_> = v.prs.iter().map(|p| (p.id, p.build)).collect();
+        assert_eq!(got, [(7, Some(overseer_proto::BuildState::Failed))]);
+        let paths: Vec<_> = rx.try_iter().map(|s| s.path).collect();
+        assert_eq!(
+            paths,
+            [
+                "/2.0/repositories/demo-ws/demo-web/pullrequests?state=OPEN&pagelen=50&fields=%2Bvalues.participants%2C%2Bvalues.comment_count",
+                "/2.0/repositories/demo-ws/demo-web/commit/aaa/statuses?pagelen=100",
+            ]
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3712,6 +4026,9 @@ esac"#,
             created,
             ticket: ticket.map(str::to_owned),
             approvals: None,
+            build: None,
+            comments: None,
+            head: None,
         };
         s.cache().prs.insert(
             "demo-api".into(),

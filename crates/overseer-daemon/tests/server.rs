@@ -6947,3 +6947,34 @@ mod restart {
         c.exited_event(1).await;
     }
 }
+
+#[tokio::test]
+async fn attention_lists_a_slot_that_needs_you_and_announces_it() {
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    assert_eq!(c.start(2).await, Response::Ok);
+    match c.request(Request::Attention).await {
+        Response::Attention(v) => assert!(v.items.is_empty()),
+        other => panic!("unexpected {other:?}"),
+    }
+
+    let mut note = hook(2, HookKind::Notification);
+    note.notification = Some("needs permission".into());
+    c.hook(note).await;
+    let announced = loop {
+        match c.recv().await.expect("connection closed") {
+            Frame::Event(Event::AttentionChanged(v)) if !v.items.is_empty() => break v,
+            _ => {}
+        }
+    };
+    assert_eq!(announced.items.len(), 1);
+    assert_eq!(
+        announced.items[0].kind,
+        overseer_proto::AttentionKind::NeedsYou
+    );
+    assert_eq!(announced.items[0].slot, Some(2));
+    match c.request(Request::Attention).await {
+        Response::Attention(v) => assert_eq!(v, announced),
+        other => panic!("unexpected {other:?}"),
+    }
+}

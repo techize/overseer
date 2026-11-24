@@ -31,8 +31,8 @@ use gpui::{
     Subscription, Task, Window,
 };
 use overseer_proto::{
-    BrainView, Client, CoordView, Event, Frame, LockView, Request, Response, SlotId, SlotInfo,
-    SlotState, WorkView,
+    AttentionView, BrainView, Client, CoordView, Event, Frame, LockView, Request, Response, SlotId,
+    SlotInfo, SlotState, WorkView,
 };
 
 use crate::board::Dir;
@@ -472,6 +472,8 @@ pub struct OverseerApp {
     pub(crate) brain: BrainView,
     /// S0's summary, the plans and the timeline from the daemon.
     pub(crate) coord: CoordView,
+    /// What is waiting on you, from the daemon; see `attention_view`.
+    pub(crate) attention: AttentionView,
     /// The push problem text last announced; see `push_problem_note`.
     notified_push: Option<String>,
     /// The strip's list shows while hovered, or until clicked away.
@@ -582,6 +584,7 @@ impl OverseerApp {
             locks: empty_locks(),
             brain: empty_brain(),
             coord: empty_coord(),
+            attention: AttentionView::default(),
             notified_push: None,
             brain_hover: false,
             brain_pinned: false,
@@ -669,6 +672,9 @@ impl OverseerApp {
             if result.is_ok() {
                 result = lister.request_marked(Request::CoordStatus, |_| true).await;
             }
+            if result.is_ok() {
+                result = lister.request_marked(Request::Attention, |_| true).await;
+            }
             if let Err(e) = result {
                 let _ = this.update(cx, |this, cx| {
                     this.status = Some(format!("{} ({e:#})", crate::terminal_view::LOST_DAEMON));
@@ -731,6 +737,10 @@ impl OverseerApp {
         self.status = Some(crate::terminal_view::LOST_DAEMON.into());
         self.slots_known = false;
         self.forward_slots(cx);
+        // The list is the daemon's; with it gone, nothing is known to wait.
+        // Reconnecting asks for it again.
+        self.attention = AttentionView::default();
+        crate::notify::set_dock_badge(0);
         cx.notify();
         if self.reconnecting {
             return;
@@ -856,6 +866,17 @@ impl OverseerApp {
                     crate::notify::post(&note);
                 }
                 self.coord_changed(view, cx);
+            }
+            // The list asked for on connecting and every change replace it
+            // whole; the Dock badge follows.
+            Frame::Event(Event::AttentionChanged(view))
+            | Frame::Response {
+                resp: Response::Attention(view),
+                ..
+            } => {
+                crate::notify::set_dock_badge(view.count());
+                self.attention = view;
+                cx.notify();
             }
             Frame::Event(Event::WorkChanged(view))
             | Frame::Response {
@@ -1044,6 +1065,12 @@ impl OverseerApp {
     pub(crate) fn release_item(&mut self, key: String, cx: &mut Context<Self>) {
         self.status = None;
         self.send(Request::Release { key }, cx);
+    }
+
+    /// Marks a pull request's comments and build as seen. Its attention
+    /// item goes when the daemon sends the list again, not here.
+    pub(crate) fn pr_seen(&mut self, repo: String, id: u64, cx: &mut Context<Self>) {
+        self.send(Request::PrSeen { repo, id }, cx);
     }
 
     /// Drops pending relay `id` unsent, as the user. The new state comes

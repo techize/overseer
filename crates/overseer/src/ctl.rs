@@ -11,9 +11,10 @@ use clap::Subcommand;
 use overseer_proto::paths::{log_dir, socket_path};
 use overseer_proto::settings::{parse_text, Applies, SettingEdit, SettingsView};
 use overseer_proto::{
-    build_notice, local_hhmm, slot_name, ActivityKind, BoardView, BrainRun, BrainView, ClaimKind,
-    Client, DaemonInfo, ItemKind, LockView, Plan, PlanDecision, PlanRecord, PlanState, QueueState,
-    RelayState, Request, Response, SlotId, SlotInfo, SlotState, WorkItem, WorkView,
+    age_text, build_notice, local_hhmm, slot_name, ActivityKind, AttentionView, BoardView,
+    BrainRun, BrainView, ClaimKind, Client, DaemonInfo, ItemKind, LockView, Plan, PlanDecision,
+    PlanRecord, PlanState, QueueState, RelayState, Request, Response, SlotId, SlotInfo, SlotState,
+    WorkItem, WorkView,
 };
 
 #[derive(Subcommand)]
@@ -136,6 +137,12 @@ pub enum CtlCmd {
     /// The notes writer: commit queue, last backup and sync, push trouble.
     Brain {
         /// Print the raw BrainView as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// What is waiting on you: approvals, stuck relays, failing or commented PRs.
+    Attention {
+        /// Print the raw AttentionView as JSON.
         #[arg(long)]
         json: bool,
     },
@@ -882,6 +889,29 @@ async fn run_settings(
     Ok(())
 }
 
+/// `{age:>4}  {who}  {text}`, one line per item, longest waiting first as the daemon sorts them.
+fn attention_lines(v: &AttentionView, now: i64) -> Vec<String> {
+    if v.items.is_empty() {
+        return vec!["Nothing waiting on you.".to_string()];
+    }
+    v.items
+        .iter()
+        .map(|i| {
+            let mut who = match &i.pr {
+                Some((repo, id)) => format!("{repo}#{id}"),
+                None => String::new(),
+            };
+            if let Some(s) = i.slot {
+                if !who.is_empty() {
+                    who.push(' ');
+                }
+                who.push_str(&slot_name(s));
+            }
+            format!("{:>4}  {who}  {}", age_text(now - i.since), i.text)
+        })
+        .collect()
+}
+
 /// The pending plan, then the newest five others.
 fn plans_to_list(plans: &[PlanRecord]) -> Vec<&PlanRecord> {
     let pending = plans.iter().filter(|p| p.state == PlanState::Pending);
@@ -1333,6 +1363,20 @@ pub async fn run(cmd: CtlCmd) -> anyhow::Result<()> {
             Response::Error { message } => bail!("{message}"),
             other => bail!("unexpected reply: {other:?}"),
         },
+        CtlCmd::Attention { json } => match client.request(Request::Attention).await? {
+            Response::Attention(v) => {
+                if json {
+                    println!("{}", serde_json::to_string(&v)?);
+                } else {
+                    for l in attention_lines(&v, now_secs()) {
+                        println!("{l}");
+                    }
+                }
+                Ok(())
+            }
+            Response::Error { message } => bail!("{message}"),
+            other => bail!("unexpected reply: {other:?}"),
+        },
         CtlCmd::Plan { json, action } => run_plan(&client, json, action).await,
         CtlCmd::Settings { json, action } => run_settings(&client, json, action).await,
         CtlCmd::Summary { text } => print_brain_text(
@@ -1502,7 +1546,7 @@ mod tests {
             ]
         );
     }
-    use overseer_proto::ReportKind;
+    use overseer_proto::{AttentionItem, AttentionKind, ReportKind};
 
     #[derive(clap::Parser)]
     struct Cli {
@@ -1525,6 +1569,7 @@ mod tests {
             kind: overseer_proto::RelayKind::Note,
             drop_reason: (state == RelayState::Dropped).then(|| "session ended".into()),
             held: held.map(Into::into),
+            held_since: None,
         };
         let v = LockView {
             claims: vec![Claim {
@@ -1787,6 +1832,7 @@ mod tests {
                     kind: overseer_proto::RelayKind::Note,
                     drop_reason: None,
                     held: None,
+                    held_since: None,
                 }],
                 flag_after_secs: 3600,
             },
@@ -1929,5 +1975,75 @@ mod tests {
                 "Plan 7  approved {at} (edited)  proposed {at}\n  Ship the widget\n  S3 demo lane  items DEMO-12, ov-3  targets repo:demo-api:main  worktree /srv/demo-api DEMO-12\n    rule: Do not deploy before S2 merges\n  warning: S3 is running; it will be told to work in /x but not moved\n  S3: assigned DEMO-12, ov-3"
             )
         );
+    }
+
+    fn attention(
+        kind: AttentionKind,
+        slot: Option<SlotId>,
+        pr: Option<(&str, u64)>,
+        since: i64,
+        text: &str,
+    ) -> AttentionItem {
+        AttentionItem {
+            key: "k".into(),
+            kind,
+            slot,
+            pr: pr.map(|(r, id)| (r.to_string(), id)),
+            url: None,
+            since,
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn attention_lines_format() {
+        let v = AttentionView {
+            items: vec![
+                attention(
+                    AttentionKind::NeedsYou,
+                    Some(3),
+                    None,
+                    1000,
+                    "wants to run a command",
+                ),
+                attention(
+                    AttentionKind::PrBuildFailed,
+                    Some(2),
+                    Some(("demo-api", 7)),
+                    1000 - 7200,
+                    "build failed",
+                ),
+                attention(
+                    AttentionKind::PrComments,
+                    None,
+                    Some(("demo-api", 9)),
+                    1000,
+                    "2 new comments",
+                ),
+            ],
+        };
+        assert_eq!(
+            attention_lines(&v, 1000 + 300),
+            vec![
+                "  5m  S3  wants to run a command".to_string(),
+                "  2h  demo-api#7 S2  build failed".to_string(),
+                "  5m  demo-api#9  2 new comments".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn attention_lines_say_when_nothing_waits() {
+        assert_eq!(
+            attention_lines(&AttentionView::default(), 0),
+            vec!["Nothing waiting on you.".to_string()]
+        );
+    }
+
+    #[test]
+    fn ctl_attention_parses_with_json_flag() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["x", "attention", "--json"]).unwrap();
+        assert!(matches!(cli.cmd, CtlCmd::Attention { json: true }));
     }
 }

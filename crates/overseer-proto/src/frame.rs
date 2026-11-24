@@ -4,7 +4,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::msg::{Event, Request, Response, SlotId};
+use crate::msg::{Event, Request, Response, SlotId, EVENT_TYPES};
 
 /// Largest accepted frame body (kind byte plus payload), 8 MiB.
 pub const MAX_FRAME: usize = 8 * 1024 * 1024;
@@ -131,9 +131,22 @@ fn decode(kind: u8, payload: &[u8]) -> io::Result<Frame> {
                 resp: r.resp,
             })
         }
-        KIND_EVENT => Ok(Frame::Event(
-            serde_json::from_slice(payload).map_err(invalid)?,
-        )),
+        KIND_EVENT => match serde_json::from_slice::<Event>(payload) {
+            Ok(ev) => Ok(Frame::Event(ev)),
+            Err(e) => {
+                // A type this build lacks is skipped; a known type with a bad
+                // body is still an error.
+                let kind = serde_json::from_slice::<serde_json::Value>(payload)
+                    .ok()
+                    .and_then(|v| v.get("type")?.as_str().map(str::to_owned));
+                match kind {
+                    Some(kind) if !EVENT_TYPES.contains(&kind.as_str()) => {
+                        Ok(Frame::Event(Event::Unknown { kind }))
+                    }
+                    _ => Err(invalid(e)),
+                }
+            }
+        },
         KIND_OUTPUT | KIND_INPUT => {
             let (id, data) = payload
                 .split_first()
@@ -189,4 +202,22 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Option<Fr
     let mut body = vec![0u8; len];
     r.read_exact(&mut body).await?;
     decode(body[0], &body[1..]).map(Some)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unknown_event_type_decodes_as_unknown() {
+        let f = decode(KIND_EVENT, br#"{"type":"FromTheFuture","data":{"x":1}}"#).unwrap();
+        assert_eq!(
+            f,
+            Frame::Event(Event::Unknown {
+                kind: "FromTheFuture".into()
+            })
+        );
+        // A known type with a bad body is still an error.
+        assert!(decode(KIND_EVENT, br#"{"type":"WorkChanged","data":5}"#).is_err());
+    }
 }

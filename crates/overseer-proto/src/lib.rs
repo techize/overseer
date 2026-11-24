@@ -17,12 +17,12 @@ pub use frame::{
     read_frame, undecodable_request, write_frame, Frame, UndecodableRequest, MAX_FRAME,
 };
 pub use msg::{
-    owned_by_message, owner_in_refusal, running_sessions_count, running_sessions_text, slot_name,
-    Activity, ActivityKind, Approvals, BashCheck, BoardView, BrainRun, BrainView, ChildBead, Claim,
-    ClaimKind, CoordView, DaemonInfo, Event, HookEvent, HookKind, ItemDetail, ItemKind, LockView,
-    NotesRemote, Notice, Plan, PlanDecision, PlanRecord, PlanSlot, PlanState, PlanTarget,
-    PlanWorktree, PullRequest, QueueEntry, QueueState, Relay, RelayKind, RelayState, Report,
-    ReportKind, Request, Response, Sender, SlotId, SlotInfo, SlotState, SourceStatus, SprintDay,
-    Stage, Summary, TokenKind, Wait, WorkItem, WorkView, WriteCheck, CHECK_ENV, JIRA_OFF, PRS_OFF,
-    UNKNOWN_STATUS,
+    age_text, owned_by_message, owner_in_refusal, running_sessions_count, running_sessions_text,
+    slot_name, Activity, ActivityKind, Approvals, AttentionItem, AttentionKind, AttentionView,
+    BashCheck, BoardView, BrainRun, BrainView, BuildState, ChildBead, Claim, ClaimKind, CoordView,
+    DaemonInfo, Event, HookEvent, HookKind, ItemDetail, ItemKind, LockView, NotesRemote, Notice,
+    Plan, PlanDecision, PlanRecord, PlanSlot, PlanState, PlanTarget, PlanWorktree, PullRequest,
+    QueueEntry, QueueState, Relay, RelayKind, RelayState, Report, ReportKind, Request, Response,
+    Sender, SlotId, SlotInfo, SlotState, SourceStatus, SprintDay, Stage, Summary, TokenKind, Wait,
+    WorkItem, WorkView, WriteCheck, CHECK_ENV, EVENT_TYPES, JIRA_OFF, PRS_OFF, UNKNOWN_STATUS,
 };

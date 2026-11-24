@@ -969,6 +969,7 @@ impl OverseerApp {
         let top = row([1, 2, 3], self, cx);
         let bottom = row([4, 5, 6], self, cx);
         let pr_panel = self.render_pr_panel(now, cx);
+        let attention = self.render_attention(now, cx);
         let kanban = self.render_kanban(now, cx);
         div()
             .key_context("Board")
@@ -1085,6 +1086,7 @@ impl OverseerApp {
                     .text_color(rgb(colors::ORANGE))
                     .child(text)
             }))
+            .child(attention)
             // The coordinator panel with the open PRs to its right; the
             // PR panel wraps below in a window too narrow for both.
             .child(
@@ -1355,6 +1357,7 @@ mod tests {
             kind: overseer_proto::RelayKind::Note,
             drop_reason: None,
             held: None,
+            held_since: None,
         }
     }
 

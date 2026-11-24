@@ -12,6 +12,16 @@ pub fn slot_name(id: SlotId) -> String {
     format!("S{id}")
 }
 
+/// `0m` under a minute (and for clock skew), then `5m`, `2h`, `3d`.
+pub fn age_text(secs: i64) -> String {
+    let s = secs.max(0);
+    match s {
+        0..=3599 => format!("{}m", s / 60),
+        3600..=86399 => format!("{}h", s / 3600),
+        _ => format!("{}d", s / 86400),
+    }
+}
+
 /// `1 running session` or `<n> running sessions`.
 pub fn running_sessions_count(n: usize) -> String {
     match n {
@@ -273,6 +283,23 @@ pub struct PullRequest {
     /// list participants (`bb` does not).
     #[serde(default)]
     pub approvals: Option<Approvals>,
+    /// The comment count the source reports, `None` when it does not.
+    #[serde(default)]
+    pub comments: Option<u32>,
+    /// The latest build on the source branch, `None` when unknown.
+    #[serde(default)]
+    pub build: Option<BuildState>,
+    /// The head commit hash, to tell a new push from a seen one.
+    #[serde(default)]
+    pub head: Option<String>,
+}
+
+/// How a pull request's latest build stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BuildState {
+    Passed,
+    Failed,
+    Running,
 }
 
 /// The reviews on a pull request, not counting its author's own.
@@ -489,6 +516,9 @@ pub struct Relay {
     /// Why a pending relay is waiting, e.g. `session is working`. Filled by
     /// the courier.
     pub held: Option<String>,
+    /// Unix seconds the relay started waiting to be delivered.
+    #[serde(default)]
+    pub held_since: Option<i64>,
 }
 
 impl Relay {
@@ -568,6 +598,13 @@ pub struct BashCheck {
 pub enum Request {
     Hello {
         client: String,
+    },
+    /// The attention queue.
+    Attention,
+    /// Mark a pull request's current comments and build as seen.
+    PrSeen {
+        repo: String,
+        id: u64,
     },
     ListSlots,
     StartSlot {
@@ -1151,6 +1188,7 @@ pub struct DaemonInfo {
 #[serde(tag = "type", content = "data")]
 pub enum Response {
     Ok,
+    Attention(AttentionView),
     Slots(Vec<SlotInfo>),
     Error {
         message: String,
@@ -1204,10 +1242,150 @@ pub enum Event {
     LocksChanged(LockView),
     BrainChanged(BrainView),
     CoordChanged(CoordView),
+    AttentionChanged(AttentionView),
+    /// An event type this build does not know, built only by the decoder so
+    /// a newer daemon cannot break an older client. Never sent.
+    #[serde(skip)]
+    Unknown {
+        kind: String,
+    },
+}
+
+/// The `type` names `Event` serializes to. The frame decoder uses it to tell
+/// an event from the future from a damaged one.
+pub const EVENT_TYPES: &[&str] = &[
+    "SlotChanged",
+    "WorkChanged",
+    "LocksChanged",
+    "BrainChanged",
+    "CoordChanged",
+    "AttentionChanged",
+];
+
+/// Why something is on the attention queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttentionKind {
+    NeedsYou,
+    Waiting,
+    RelayStuck,
+    Notice,
+    PrBuildFailed,
+    PrChangesRequested,
+    PrComments,
+}
+
+/// One thing that wants your attention.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AttentionItem {
+    /// Stable across refreshes, e.g. `needs_you:3`.
+    pub key: String,
+    pub kind: AttentionKind,
+    pub slot: Option<SlotId>,
+    /// Repo and id of the pull request, for the PR kinds.
+    pub pr: Option<(String, u64)>,
+    pub url: Option<String>,
+    /// Unix seconds it started wanting attention.
+    pub since: i64,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AttentionView {
+    pub items: Vec<AttentionItem>,
+}
+
+impl AttentionView {
+    pub fn count(&self) -> usize {
+        self.items.len()
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn old_pull_request_and_relay_json_still_read() {
+        let pr: PullRequest = serde_json::from_str(
+            r#"{"repo":"demo-api","id":7,"title":"t","branch":"DEMO-1","url":null,"author":null,"created":null,"ticket":null}"#,
+        )
+        .unwrap();
+        assert_eq!((pr.comments, pr.build, pr.head), (None, None, None));
+        let r: Relay = serde_json::from_str(
+            r#"{"id":1,"at":2,"from":{"type":"You"},"to":3,"text":"hi","state":"Pending","delivered_at":null,"held":null}"#,
+        )
+        .unwrap();
+        assert_eq!(r.held_since, None);
+    }
+
+    #[test]
+    fn attention_changed_round_trips() {
+        let v = AttentionView {
+            items: vec![AttentionItem {
+                key: "needs_you:3".into(),
+                kind: AttentionKind::NeedsYou,
+                slot: Some(3),
+                pr: None,
+                url: None,
+                since: 100,
+                text: "permission prompt".into(),
+            }],
+        };
+        let ev = Event::AttentionChanged(v.clone());
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains(r#""kind":"needs_you""#), "{json}");
+        let back: Event = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ev);
+        assert_eq!(v.count(), 1);
+    }
+
+    #[test]
+    fn every_event_variant_has_a_listed_type_name() {
+        let events = [
+            Event::SlotChanged(SlotInfo {
+                id: 1,
+                label: String::new(),
+                cwd: None,
+                command: None,
+                state: SlotState::Empty,
+                cols: 80,
+                rows: 24,
+                activity: None,
+                session_note: None,
+                held: false,
+            }),
+            Event::WorkChanged(view()),
+            Event::LocksChanged(lock_view()),
+            Event::BrainChanged(brain_view()),
+            Event::CoordChanged(coord()),
+            Event::AttentionChanged(AttentionView::default()),
+        ];
+        for ev in events {
+            let v: serde_json::Value = serde_json::to_value(&ev).unwrap();
+            let name = v["type"].as_str().unwrap().to_string();
+            assert!(EVENT_TYPES.contains(&name.as_str()), "{name} not listed");
+        }
+        assert_eq!(EVENT_TYPES.len(), 6);
+        assert!(serde_json::to_string(&Event::Unknown { kind: "x".into() }).is_err());
+    }
+
+    #[test]
+    fn attention_requests_round_trip() {
+        for req in [
+            Request::Attention,
+            Request::PrSeen {
+                repo: "demo-api".into(),
+                id: 7,
+            },
+        ] {
+            let back: Request =
+                serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+            assert_eq!(back, req);
+        }
+        let resp = Response::Attention(AttentionView::default());
+        let back: Response = serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
+        assert_eq!(back, resp);
+    }
+
     #[test]
     fn approvals_ready_rule_and_badge() {
         let a = |human, ai, changes_requested| Approvals {
@@ -1765,6 +1943,7 @@ mod tests {
                 kind,
                 drop_reason: Some("replaced by plan 20's kickoff".into()),
                 held: None,
+                held_since: None,
             };
             let json = serde_json::to_string(&relay).unwrap();
             assert_eq!(serde_json::from_str::<Relay>(&json).unwrap(), relay);
@@ -1851,6 +2030,7 @@ mod tests {
             kind: RelayKind::Note,
             drop_reason: None,
             held: None,
+            held_since: None,
         };
         LockView {
             claims: vec![claim()],
@@ -2314,5 +2494,14 @@ mod tests {
         assert_eq!(v.pending_for(2), 1);
         assert_eq!(v.pending_for(4), 1);
         assert_eq!(v.pending_for(0), 0);
+    }
+
+    #[test]
+    fn age_text_buckets() {
+        assert_eq!(age_text(-5), "0m");
+        assert_eq!(age_text(59), "0m");
+        assert_eq!(age_text(61), "1m");
+        assert_eq!(age_text(3600), "1h");
+        assert_eq!(age_text(90000), "1d");
     }
 }

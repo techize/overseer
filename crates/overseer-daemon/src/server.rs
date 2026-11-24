@@ -18,6 +18,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc, watch, Notify};
 use tokio::task::{JoinHandle, JoinSet};
 
+use crate::attention::AttentionService;
 use crate::brain::{BrainContext, BrainOptions, BrainService, WRITER_OFF};
 use crate::coord::plan::PlanCtx;
 use crate::coord::CoordService;
@@ -321,7 +322,7 @@ pub async fn run_until(
     let log_events = events.subscribe();
     let state_dir = cfg.state_dir.clone();
     let holder_program = cfg.holder_program;
-    let mut mgr = SlotManager::new(cfg.default_command, events)
+    let mut mgr = SlotManager::new(cfg.default_command, events.clone())
         .with_env(env.clone())
         .with_session_note(cfg.settings.session_note.clone())
         .with_launch(
@@ -432,6 +433,14 @@ pub async fn run_until(
         },
     ));
     store.start_polling();
+    let attention = AttentionService::spawn(
+        ledger.clone(),
+        manager.clone(),
+        locks.clone(),
+        store.clone(),
+        events.clone(),
+        !cfg.settings.pr_author.trim().is_empty(),
+    );
     let plans = Arc::new(PlanCtx {
         manager: manager.clone(),
         store: store.clone(),
@@ -464,6 +473,7 @@ pub async fn run_until(
                             brain: brain.clone(),
                             info: info.clone(),
                             settings: settings.clone(),
+                            attention: attention.clone(),
                         },
                         shutdown.clone(),
                         env.clone(),
@@ -899,6 +909,7 @@ struct Services {
     brain: Option<Arc<BrainService>>,
     info: Arc<DaemonInfo>,
     settings: Arc<SettingsCtx>,
+    attention: Arc<AttentionService>,
 }
 
 async fn handle_conn(
@@ -918,6 +929,7 @@ async fn handle_conn(
         brain,
         info,
         settings,
+        attention,
     } = services;
     let (mut rd, mut wr) = stream.into_split();
     let (out_tx, mut out_rx) = mpsc::channel::<Frame>(OUTBOUND_QUEUE);
@@ -1024,6 +1036,7 @@ async fn handle_conn(
                         brain: brain.as_ref(),
                         info: &info,
                         settings: &settings,
+                        attention: &attention,
                     };
                     handle_frame(f, &ctx, &outbox, &shutdown, &mut streams)
                 }
@@ -1068,6 +1081,7 @@ struct Ctx<'a> {
     brain: Option<&'a Arc<BrainService>>,
     info: &'a DaemonInfo,
     settings: &'a Arc<SettingsCtx>,
+    attention: &'a Arc<AttentionService>,
 }
 
 fn handle_frame(
@@ -1349,6 +1363,8 @@ fn handle_request(
             tracing::debug!("hello from {client}");
             Response::Ok
         }
+        Request::PrSeen { repo, id } => store.mark_pr_seen(&repo, id),
+        Request::Attention => Response::Attention(ctx.attention.current()),
         Request::ListSlots => Response::Slots(manager.lock().unwrap().list()),
         Request::DaemonInfo => Response::DaemonInfo(ctx.info.clone()),
         Request::SlotScreen { id } if !valid_id(id) => err(format!("invalid slot id {id}")),

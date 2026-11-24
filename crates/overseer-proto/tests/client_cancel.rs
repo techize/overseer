@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use overseer_proto::{read_frame, write_frame, Client, Event, Frame, Request, Response, SlotId};
 use overseer_proto::{SlotInfo, SlotState};
+use tokio::io::AsyncWriteExt;
 use tokio::net::UnixListener;
 use tokio::time::timeout;
 
@@ -205,4 +206,40 @@ async fn declined_marked_request_is_never_sent() {
     assert!(timeout(Duration::from_millis(100), rx.recv())
         .await
         .is_err());
+}
+
+#[tokio::test]
+async fn unknown_events_are_skipped_and_the_connection_lives() {
+    let path = sock("unknown");
+    let listener = UnixListener::bind(&path).unwrap();
+    tokio::spawn(async move {
+        let (mut s, _) = listener.accept().await.unwrap();
+        // An event type from a newer daemon, as raw wire bytes (kind 2).
+        let body = br#"{"type":"FromTheFuture","data":{"x":1}}"#;
+        let mut raw = ((body.len() + 1) as u32).to_be_bytes().to_vec();
+        raw.push(2);
+        raw.extend_from_slice(body);
+        s.write_all(&raw).await.unwrap();
+        write_frame(&mut s, &Frame::Event(info(4))).await.unwrap();
+        while let Ok(Some(frame)) = read_frame(&mut s).await {
+            if let Frame::Request { seq, .. } = frame {
+                let resp = Response::Ok;
+                write_frame(&mut s, &Frame::Response { seq, resp })
+                    .await
+                    .unwrap();
+            }
+        }
+    });
+    let client = Client::connect(&path).await.unwrap();
+    let mut rx = client.subscribe();
+    let first = timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("no frame")
+        .unwrap();
+    assert_eq!(first, Frame::Event(info(4)));
+    let r = timeout(Duration::from_secs(2), client.request(Request::ListSlots))
+        .await
+        .expect("request timed out")
+        .unwrap();
+    assert_eq!(r, Response::Ok);
 }

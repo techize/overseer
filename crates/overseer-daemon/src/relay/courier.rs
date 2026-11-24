@@ -56,12 +56,12 @@ const STALE_HEADER: &str =
 const LOGGED_ROWS: usize = 12;
 
 const NOT_RUNNING: &str = "slot is not running";
-const WORKING: &str = "session is working";
+pub(crate) const WORKING: &str = "session is working";
 /// The hold reason for a slot at a prompt. The board shows it as
 /// `waiting at a prompt for <user>`: see `held_text`.
 pub(crate) const AT_PROMPT: &str = "waiting at a prompt";
 const TYPED: &str = "input box has text";
-const NO_BOX: &str = "input box not found";
+pub(crate) const NO_BOX: &str = "input box not found";
 /// A slot attached after a restart, before the redraw its rebuilt screen
 /// needs has arrived: the screen cannot be read yet.
 const REDRAWING: &str = "screen is being redrawn";
@@ -582,6 +582,7 @@ mod tests {
             kind: overseer_proto::RelayKind::Note,
             drop_reason: None,
             held: None,
+            held_since: None,
         }
     }
 

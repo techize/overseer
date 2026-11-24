@@ -210,6 +210,7 @@ fn relay_row(r: &Row) -> rusqlite::Result<Relay> {
         kind: relay_kind_from(r.get(0)?, kind.as_deref(), r.get(9)?),
         drop_reason: r.get(10)?,
         held: None,
+        held_since: None,
     })
 }
 

@@ -69,13 +69,31 @@ impl BitbucketApi {
     }
 
     /// The open pull requests of `workspace/slug`, with their participants
-    /// so approvals can be counted. Blocking.
+    /// so approvals can be counted, and their comment counts. Blocking.
     pub fn open_prs(&self, token: &str, workspace: &str, slug: &str) -> Result<String, String> {
         let url = format!(
-            "{}repositories/{}/{}/pullrequests?state=OPEN&pagelen=50&fields=%2Bvalues.participants",
+            "{}repositories/{}/{}/pullrequests?state=OPEN&pagelen=50&fields=%2Bvalues.participants%2C%2Bvalues.comment_count",
             self.base,
             encode(workspace),
             encode(slug)
+        );
+        self.all_pages(token, url)
+    }
+
+    /// The build statuses of commit `hash` in `workspace/slug`. Blocking.
+    pub fn commit_statuses(
+        &self,
+        token: &str,
+        workspace: &str,
+        slug: &str,
+        hash: &str,
+    ) -> Result<String, String> {
+        let url = format!(
+            "{}repositories/{}/{}/commit/{}/statuses?pagelen=100",
+            self.base,
+            encode(workspace),
+            encode(slug),
+            encode(hash)
         );
         self.all_pages(token, url)
     }
@@ -268,7 +286,7 @@ mod tests {
         let p1 = r#"{"values":[{"id":7,"title":"DEMO-12 widget","source":{"branch":{"name":"feature/DEMO-12"}},
             "author":{"display_name":"Dana Demo"},"links":{"html":{"href":"https://bitbucket.org/demo-ws/demo-api/pull-requests/7"}},
             "participants":[{"user":{"display_name":"Robin Demo"},"approved":true,"state":"approved"}]}],
-            "next":"{base}/2.0/repositories/demo-ws/demo-api/pullrequests?state=OPEN&pagelen=50&fields=%2Bvalues.participants&page=2"}"#;
+            "next":"{base}/2.0/repositories/demo-ws/demo-api/pullrequests?state=OPEN&pagelen=50&fields=%2Bvalues.participants%2C%2Bvalues.comment_count&page=2"}"#;
         let p2 = r#"{"values":[{"id":8,"title":"Tidy logs"}],"page":2}"#;
         let (base, rx) = fake(vec![(200, p1.into()), (200, p2.into())]);
         let out = api(&base).open_prs("tok", "demo-ws", "demo-api").unwrap();
@@ -282,11 +300,25 @@ mod tests {
         let seen: Vec<_> = rx.try_iter().collect();
         assert_eq!(
             seen[0].path,
-            "/2.0/repositories/demo-ws/demo-api/pullrequests?state=OPEN&pagelen=50&fields=%2Bvalues.participants"
+            "/2.0/repositories/demo-ws/demo-api/pullrequests?state=OPEN&pagelen=50&fields=%2Bvalues.participants%2C%2Bvalues.comment_count"
         );
         assert_eq!(
             seen[1].path,
-            "/2.0/repositories/demo-ws/demo-api/pullrequests?state=OPEN&pagelen=50&fields=%2Bvalues.participants&page=2"
+            "/2.0/repositories/demo-ws/demo-api/pullrequests?state=OPEN&pagelen=50&fields=%2Bvalues.participants%2C%2Bvalues.comment_count&page=2"
+        );
+    }
+
+    #[test]
+    fn commit_statuses_reads_the_head_commit() {
+        let body = r#"{"values":[{"state":"SUCCESSFUL"}]}"#;
+        let (base, rx) = fake(vec![(200, body.into())]);
+        let out = api(&base)
+            .commit_statuses("tok", "demo-ws", "demo-api", "abc123")
+            .unwrap();
+        assert_eq!(values(&out).len(), 1);
+        assert_eq!(
+            rx.recv().unwrap().path,
+            "/2.0/repositories/demo-ws/demo-api/commit/abc123/statuses?pagelen=100"
         );
     }
 

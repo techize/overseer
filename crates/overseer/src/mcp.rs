@@ -1151,6 +1151,9 @@ mod tests {
                 created: None,
                 ticket: None,
                 approvals: None,
+                build: None,
+                comments: None,
+                head: None,
             }],
             children: vec![overseer_proto::ChildBead {
                 key: "ov-3".into(),
@@ -1361,6 +1364,7 @@ mod tests {
             kind: RelayKind::Note,
             drop_reason: None,
             held: None,
+            held_since: None,
         };
         let v = LockView {
             claims: vec![],
