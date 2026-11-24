@@ -600,7 +600,8 @@ pub struct PrSeen {
 /// condition holds, set to `now` when it starts, and cleared when it ends.
 /// New comments (more than the stored count) start `comments_since`; fewer
 /// lower the stored count and clear it; a PR that reports no count leaves
-/// both alone. Rows for repos in `read_repos` whose PR is not in `prs` are
+/// both alone. Likewise a PR whose build or approvals could not be read
+/// keeps that time as it was, so a poll that missed them does not reset it. Rows for repos in `read_repos` whose PR is not in `prs` are
 /// deleted; repos whose read failed are not in `read_repos`, so their rows
 /// stay. With `targets` (every repo polled this time), rows for repos not in
 /// it are deleted too, since those PRs leave the board. Pass `None` when the
@@ -621,9 +622,11 @@ pub(crate) fn record_prs_on(
             "INSERT INTO pr_seen (repo, id, comments, at, build_failed_since, changes_since)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(repo, id) DO UPDATE SET
-               build_failed_since = CASE WHEN ?5 IS NULL THEN NULL
+               build_failed_since = CASE WHEN NOT ?8 THEN build_failed_since
+                 WHEN ?5 IS NULL THEN NULL
                  ELSE COALESCE(build_failed_since, ?5) END,
-               changes_since = CASE WHEN ?6 IS NULL THEN NULL
+               changes_since = CASE WHEN NOT ?9 THEN changes_since
+                 WHEN ?6 IS NULL THEN NULL
                  ELSE COALESCE(changes_since, ?6) END,
                comments_since = CASE
                  WHEN ?7 IS NULL THEN comments_since
@@ -639,6 +642,8 @@ pub(crate) fn record_prs_on(
                 failed.then_some(now),
                 changes.then_some(now),
                 count,
+                pr.build.is_some(),
+                pr.approvals.is_some(),
             ],
         )?;
     }
@@ -2078,7 +2083,33 @@ mod tests {
             (Some(10), Some(10))
         );
         pr.build = Some(BuildState::Passed);
+        pr.approvals = Some(overseer_proto::msg::Approvals::default());
+        rec(&l, &[pr], &["demo-api"], 30);
+        let row = &l.pr_seen().unwrap()[0];
+        assert_eq!((row.build_failed_since, row.changes_since), (None, None));
+    }
+
+    #[test]
+    fn pr_seen_unknown_build_and_approvals_keep_their_since() {
+        let l = Ledger::in_memory();
+        let mut pr = demo_pr("demo-api", 1, Some(0));
+        pr.build = Some(BuildState::Failed);
+        pr.approvals = Some(overseer_proto::msg::Approvals {
+            changes_requested: true,
+            ..Default::default()
+        });
+        rec(&l, &[pr.clone()], &["demo-api"], 10);
+        // A poll that could not read the build or the approvals.
+        pr.build = None;
         pr.approvals = None;
+        rec(&l, &[pr.clone()], &["demo-api"], 20);
+        let row = &l.pr_seen().unwrap()[0];
+        assert_eq!(
+            (row.build_failed_since, row.changes_since),
+            (Some(10), Some(10))
+        );
+        pr.build = Some(BuildState::Passed);
+        pr.approvals = Some(overseer_proto::msg::Approvals::default());
         rec(&l, &[pr], &["demo-api"], 30);
         let row = &l.pr_seen().unwrap()[0];
         assert_eq!((row.build_failed_since, row.changes_since), (None, None));

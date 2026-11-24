@@ -246,7 +246,8 @@ fn notice_items(i: &Inputs, out: &mut Vec<AttentionItem>) {
 
 /// Items for one of your PRs, each timed by when Overseer first saw its
 /// condition. A PR with no seen row, or a condition with no time, raises
-/// nothing.
+/// nothing. A build or approvals list this poll could not read counts as
+/// unchanged.
 fn pr_items(i: &Inputs, pr: &PullRequest, out: &mut Vec<AttentionItem>) {
     let slot = slot_of_pr(pr, i.branches);
     if !i.author_set && slot.is_none() {
@@ -268,14 +269,16 @@ fn pr_items(i: &Inputs, pr: &PullRequest, out: &mut Vec<AttentionItem>) {
             });
         }
     };
-    if pr.build == Some(BuildState::Failed) {
+    // An unread build or approvals list trusts the row, whose time the
+    // ledger keeps until a poll reads them again.
+    if pr.build.is_none_or(|b| b == BuildState::Failed) {
         push(
             AttentionKind::PrBuildFailed,
             seen.build_failed_since,
             "build failed".into(),
         );
     }
-    if pr.approvals.is_some_and(|a| a.changes_requested) {
+    if pr.approvals.is_none_or(|a| a.changes_requested) {
         push(
             AttentionKind::PrChangesRequested,
             seen.changes_since,
@@ -809,13 +812,37 @@ mod tests {
     }
 
     #[test]
+    fn pr_items_trust_the_row_while_build_or_approvals_are_unknown() {
+        let mut w = World::new();
+        // A poll that could not read the build or the approvals.
+        w.work = work(vec![], vec![], vec![pr("demo-api", 3, "feature/z")]);
+        w.seen = vec![PrSeen {
+            build_failed_since: Some(40),
+            changes_since: Some(50),
+            ..seen("demo-api", 3)
+        }];
+        let items = w.derive();
+        let got: Vec<_> = items.iter().map(|i| (i.key.as_str(), i.since)).collect();
+        assert_eq!(
+            got,
+            [
+                ("pr_build_failed:demo-api#3", 40),
+                ("pr_changes_requested:demo-api#3", 50)
+            ]
+        );
+
+        // A known passing build and no changes requested clear them.
+        w.work.prs[0].build = Some(BuildState::Passed);
+        w.work.prs[0].approvals = Some(Approvals::default());
+        assert!(w.derive().is_empty());
+    }
+
+    #[test]
     fn bb_prs_with_no_counts_raise_nothing() {
         let mut w = World::new();
         w.work = work(vec![], vec![], vec![pr("demo-api", 4, "feature/y")]);
         w.seen = vec![PrSeen {
             comments: 0,
-            build_failed_since: Some(1),
-            changes_since: Some(1),
             comments_since: Some(1),
             ..seen("demo-api", 4)
         }];
