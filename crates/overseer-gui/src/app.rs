@@ -987,6 +987,9 @@ impl OverseerApp {
                 self.send(req, cx);
             }
         }
+        if let Some(conv) = self.convs.get_mut(id as usize) {
+            conv.activity_changed(info.activity.as_ref());
+        }
         self.slots[id as usize] = info;
         self.forward_slots(cx);
         if self.screen == Screen::Session(id) && !self.modal_open() {
@@ -1189,17 +1192,21 @@ impl OverseerApp {
         }
     }
 
-    /// Interrupts `slot`'s session.
+    /// Interrupts `slot`'s session, when Stop is offered.
     pub(crate) fn interrupt(&mut self, slot: SlotId, cx: &mut Context<Self>) {
-        if let Some(conv) = self.convs.get_mut(slot as usize) {
-            conv.status = None;
-            self.send_conv(slot, Request::Interrupt { slot }, None, cx);
+        let working = crate::conversation_view::is_working(self.slots.get(slot as usize));
+        let Some(conv) = self.convs.get_mut(slot as usize) else {
+            return;
+        };
+        if let Some(req) = conv.stop_request(working) {
+            self.send_conv(slot, req, None, cx);
         }
     }
 
     /// Sends a conversation request; the slot's status shows how it went
-    /// wrong. `sent` is the draft this request carries. A Reply or Answer
-    /// holds the slot's next one until it is answered.
+    /// wrong. `sent` is the draft this request carries. Each holds the
+    /// slot's next one until it is answered; a stop that went through holds
+    /// Stop until the slot's activity changes.
     fn send_conv(
         &mut self,
         slot: SlotId,
@@ -1207,7 +1214,7 @@ impl OverseerApp {
         sent: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        let holds = matches!(req, Request::Reply { .. } | Request::Answer { .. });
+        let stop = matches!(req, Request::Interrupt { .. });
         let client = self.client.clone();
         cx.spawn(async move |this, cx| {
             let reply = client.request(req).await;
@@ -1215,10 +1222,17 @@ impl OverseerApp {
                 let Some(conv) = this.convs.get_mut(slot as usize) else {
                     return;
                 };
-                if holds {
-                    conv.sending = false;
-                }
+                conv.sending = false;
                 match reply {
+                    Ok(Response::Ok) if stop => {
+                        let activity = this
+                            .slots
+                            .get(slot as usize)
+                            .and_then(|i| i.activity.clone());
+                        if let Some(conv) = this.convs.get_mut(slot as usize) {
+                            conv.stopped = Some(activity);
+                        }
+                    }
                     Ok(Response::Ok) => {
                         if sent.as_ref().is_some_and(|s| *s == conv.draft.text) {
                             conv.draft = Default::default();

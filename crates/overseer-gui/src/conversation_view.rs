@@ -8,7 +8,9 @@ use overseer_proto::msg::{
     Answer, ConvEntry, ConvKind, ConversationView, PromptInfo, PromptShown, Question,
     QuestionAnswer,
 };
-use overseer_proto::{ActivityKind, AttentionKind, AttentionView, Request, SlotId, SlotInfo};
+use overseer_proto::{
+    Activity, ActivityKind, AttentionKind, AttentionView, Request, SlotId, SlotInfo,
+};
 
 use gpui::{
     div, prelude::*, px, rgb, AnyElement, Context, Div, ElementId, FontWeight, KeyDownEvent,
@@ -36,9 +38,13 @@ pub struct Conv {
     /// Counts the events pushed for this slot, so a full view asked for
     /// before the latest one can be told apart; see `answered`.
     pub events: u64,
-    /// A Reply or Answer is on its way: another is not sent until it is
-    /// answered.
+    /// A Reply, Answer or Interrupt is on its way: another is not sent
+    /// until it is answered.
     pub sending: bool,
+    /// A stop went through while the slot's activity was this. No hook
+    /// follows an Esc, so the slot still reads as working: Stop stays
+    /// hidden until the activity changes.
+    pub stopped: Option<Option<Activity>>,
     /// A full view is on its way, asked for at this count; another is not
     /// asked for until it lands. See `ask`.
     pub asking: Option<u64>,
@@ -59,6 +65,7 @@ impl Conv {
             status: None,
             events: 0,
             sending: false,
+            stopped: None,
             asking: None,
         }
     }
@@ -145,6 +152,38 @@ impl Conv {
             prompt: self.view.prompt.as_ref().map(|p| p.id.clone()),
             text: self.draft.text.clone(),
         })
+    }
+
+    /// Whether Stop is offered for a slot that reads as `working`: not
+    /// while a send is on its way, nor after a stop until the slot's
+    /// activity changes.
+    pub fn can_stop(&self, working: bool) -> bool {
+        working && !self.sending && self.stopped.is_none()
+    }
+
+    /// The request that stops the slot, when Stop is offered. A request
+    /// returned counts as on its way.
+    pub fn stop_request(&mut self, working: bool) -> Option<Request> {
+        if !self.can_stop(working) {
+            return None;
+        }
+        self.sending = true;
+        self.status = None;
+        Some(Request::Interrupt {
+            slot: self.view.slot,
+        })
+    }
+
+    /// The slot's activity is now `activity`: a stop made at another one
+    /// no longer hides Stop.
+    pub fn activity_changed(&mut self, activity: Option<&Activity>) {
+        if self
+            .stopped
+            .as_ref()
+            .is_some_and(|at| at.as_ref() != activity)
+        {
+            self.stopped = None;
+        }
     }
 
     /// The request that answers the open prompt, if there is one and no
@@ -441,7 +480,7 @@ pub fn choice_buttons(plan: bool) -> &'static [&'static str] {
     }
 }
 
-fn is_working(info: Option<&SlotInfo>) -> bool {
+pub(crate) fn is_working(info: Option<&SlotInfo>) -> bool {
     info.and_then(|i| i.activity.as_ref())
         .is_some_and(|a| a.kind == ActivityKind::Working)
 }
@@ -578,7 +617,7 @@ impl OverseerApp {
                 }
             }
             ReplyKey::Send => self.send_reply(slot, cx),
-            ReplyKey::Escape if working => self.interrupt(slot, cx),
+            ReplyKey::Escape if conv.can_stop(working) => self.interrupt(slot, cx),
             ReplyKey::Escape => window.focus(&self.board_focus),
         }
         cx.stop_propagation();
@@ -870,7 +909,7 @@ impl OverseerApp {
                     .truncate()
                     .child("Enter sends · Shift+Enter new line · Cmd+\\ hides"),
             )
-            .children(working.then(|| {
+            .children(conv.can_stop(working).then(|| {
                 pane_button("conv-stop", "Stop", true, false)
                     .on_click(cx.listener(move |this, _, _, cx| this.interrupt(slot, cx)))
             }))
@@ -919,7 +958,7 @@ impl OverseerApp {
 mod tests {
     use super::*;
     use overseer_proto::msg::Prompt;
-    use overseer_proto::{Activity, AttentionItem, SlotState};
+    use overseer_proto::{AttentionItem, SlotState};
 
     fn entry(text: &str) -> ConvEntry {
         ConvEntry {
@@ -1274,6 +1313,36 @@ mod tests {
         // Losing the connection does not forget it.
         c.clear();
         assert!(c.sending);
+    }
+
+    #[test]
+    fn stop_is_held_while_sending_and_after_a_stop() {
+        let working = |since| Activity {
+            kind: ActivityKind::Working,
+            since,
+            now_doing: None,
+            reason: None,
+            idle_wait: false,
+        };
+        let mut c = Conv::new(2);
+        assert!(!c.can_stop(false));
+        assert_eq!(c.stop_request(false), None);
+        // A reply on its way: no Stop, so its Esc cannot land after it.
+        c.draft.set("go");
+        c.view.session = "demo-s".into();
+        assert!(c.reply_request().is_some());
+        assert_eq!(c.stop_request(true), None);
+        c.sending = false;
+        assert_eq!(c.stop_request(true), Some(Request::Interrupt { slot: 2 }));
+        assert_eq!(c.stop_request(true), None, "a second Esc");
+        // Stopped at this activity: held while it stays.
+        c.sending = false;
+        c.stopped = Some(Some(working(10)));
+        c.activity_changed(Some(&working(10)));
+        assert!(!c.can_stop(true));
+        // Working again from a new turn: offered.
+        c.activity_changed(Some(&working(20)));
+        assert!(c.can_stop(true));
     }
 
     #[test]
