@@ -1,7 +1,7 @@
 //! The sprint kanban and open-PR panel models: pure functions from a
 //! `WorkView` (and the clock, passed in as `now`) to what the board draws.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use gpui::{
     canvas, div, prelude::*, px, relative, rgb, rgba, ClickEvent, Context, CursorStyle, ElementId,
@@ -366,9 +366,11 @@ pub struct PrRow {
     pub age: Option<String>,
     pub tone: AgeTone,
     pub url: Option<String>,
-    /// The Running or Resumable slot that owns the PR's ticket: a click
-    /// opens it.
-    pub slot: Option<SlotId>,
+    /// The slots whose checkout is on the PR's repo and head branch, lowest
+    /// first; with none, the Running or Resumable slot that owns the PR's
+    /// ticket. Each shows as a mark that opens it, and a click on the row
+    /// opens the first.
+    pub slots: Vec<SlotId>,
     /// `1H 1AI`, or empty with no approvals or no participants read.
     pub approvals: String,
     /// Approved enough to merge.
@@ -392,10 +394,59 @@ fn live_owner(view: &WorkView, slots: &[SlotInfo], ticket: &str) -> Option<SlotI
         .map(|i| i.id)
 }
 
+/// A slot's checkout: its repo name and branch.
+pub type SlotBranch = (SlotId, (String, String));
+
+/// The repo and branch of each Running or Resumable slot's folder, read
+/// with `read` (`overseer_proto::git::repo_branch` outside tests). Slots
+/// with no folder, or one outside a repo or on a detached HEAD, are left
+/// out.
+pub fn slot_branches(
+    slots: &[SlotInfo],
+    read: impl Fn(&Path) -> Option<(String, String)>,
+) -> Vec<SlotBranch> {
+    slots
+        .iter()
+        .filter(|s| {
+            matches!(
+                s.state,
+                SlotState::Running { .. } | SlotState::Resumable { .. }
+            )
+        })
+        .filter_map(|s| Some((s.id, read(s.cwd.as_deref()?)?)))
+        .collect()
+}
+
+/// The open PRs whose repo and head branch are `on`, for a slot's header.
+pub fn slot_prs<'a>(view: &'a WorkView, on: &(String, String)) -> Vec<&'a PullRequest> {
+    view.prs
+        .iter()
+        .filter(|p| p.repo == on.0 && p.branch == on.1)
+        .collect()
+}
+
+/// The slots on `pr`'s repo and head branch, lowest first.
+fn branch_slots(pr: &PullRequest, branches: &[SlotBranch]) -> Vec<SlotId> {
+    let mut ids: Vec<SlotId> = branches
+        .iter()
+        .filter(|(_, (repo, branch))| *repo == pr.repo && *branch == pr.branch)
+        .map(|(id, _)| *id)
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
 /// Open PRs ready to merge first, then oldest first (no date last), at
-/// most 8, and how many are left. A row is linked to its ticket's owner
-/// while that slot is Running or Resumable.
-pub fn pr_rows(view: &WorkView, slots: &[SlotInfo], now: i64) -> (Vec<PrRow>, usize) {
+/// most 8, and how many are left. A row is linked to every slot on its
+/// branch, or else to its ticket's owner while that slot is Running or
+/// Resumable.
+pub fn pr_rows(
+    view: &WorkView,
+    slots: &[SlotInfo],
+    branches: &[SlotBranch],
+    now: i64,
+) -> (Vec<PrRow>, usize) {
     let mut prs: Vec<_> = view.prs.iter().collect();
     prs.sort_by_key(|p| (!pr_ready(p), p.created.is_none(), p.created));
     let more = prs.len().saturating_sub(MAX_PR_ROWS);
@@ -410,7 +461,18 @@ pub fn pr_rows(view: &WorkView, slots: &[SlotInfo], now: i64) -> (Vec<PrRow>, us
             age: p.created.map(|c| age_text(now - c)),
             tone: p.created.map_or(AgeTone::Unknown, |c| pr_age_tone(now - c)),
             url: p.url.clone(),
-            slot: p.ticket.as_deref().and_then(|t| live_owner(view, slots, t)),
+            slots: {
+                let on = branch_slots(p, branches);
+                if on.is_empty() {
+                    p.ticket
+                        .as_deref()
+                        .and_then(|t| live_owner(view, slots, t))
+                        .into_iter()
+                        .collect()
+                } else {
+                    on
+                }
+            },
             approvals: p.approvals.map(|a| a.badge()).unwrap_or_default(),
             ready: pr_ready(p),
             changes: p.approvals.is_some_and(|a| a.changes_requested),
@@ -854,7 +916,8 @@ impl OverseerApp {
         if !pr_panel_shown(&self.work) {
             return None;
         }
-        let (rows, more) = pr_rows(&self.work, &self.slots, now);
+        let branches = slot_branches(&self.slots, overseer_proto::git::repo_branch);
+        let (rows, more) = pr_rows(&self.work, &self.slots, &branches, now);
         let empty = rows.is_empty();
         let note = pr_source_note(&self.work);
         let answered = pr_answered(&self.work);
@@ -865,7 +928,7 @@ impl OverseerApp {
                 let tone = tone_color(r.tone);
                 let word = tone_word(r.tone);
                 let url = r.url.clone().filter(|u| is_http_url(u));
-                let slot = r.slot;
+                let slot = r.slots.first().copied();
                 let (repo, pr_id) = (r.repo.clone(), r.id);
                 div()
                     .id(("pr-row", n))
@@ -892,14 +955,24 @@ impl OverseerApp {
                         r.ticket
                             .map(|t| div().flex_none().text_color(rgb(colors::ACCENT)).child(t)),
                     )
-                    .children(r.slot.map(|s| {
+                    .children(r.slots.iter().map(|&s| {
                         div()
+                            .id(ElementId::Name(format!("pr-slot-{n}-{s}").into()))
                             .flex_none()
                             .px_1()
                             .rounded(px(4.))
                             .bg(rgb(colors::ACCENT_BG))
                             .text_color(rgb(colors::ACCENT))
+                            .cursor_pointer()
+                            .hover(|d| d.bg(rgb(colors::CARD_HOVER)))
                             .child(slot_name(s))
+                            // This slot, not the row's first one.
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                if !this.modal_open() {
+                                    this.go_session(s, window, cx);
+                                }
+                            }))
                     }))
                     .child(
                         div()
@@ -938,7 +1011,7 @@ impl OverseerApp {
                             .text_color(rgb(tone))
                             .child(a)
                     }))
-                    .when(url.is_some() || r.slot.is_some(), |d| {
+                    .when(url.is_some() || slot.is_some(), |d| {
                         d.cursor_pointer()
                             .hover(|s| s.bg(rgb(colors::CARD_HOVER)))
                             .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
@@ -1457,7 +1530,7 @@ mod tests {
             with(4, 1, 0, false),
             with(5, 0, 0, false),
         ];
-        let (rows, _) = pr_rows(&v, &[], now);
+        let (rows, _) = pr_rows(&v, &[], &[], now);
         let ids: Vec<_> = rows.iter().map(|r| r.id).collect();
         assert_eq!(ids, [1, 3, 5, 4, 2]);
         assert!(rows[0].ready && !rows[0].changes);
@@ -1477,7 +1550,7 @@ mod tests {
             .map(|i| pr(i, Some(now - i as i64 * 86_400)))
             .collect();
         v.prs.push(pr(10, None));
-        let (rows, more) = pr_rows(&v, &[], now);
+        let (rows, more) = pr_rows(&v, &[], &[], now);
         assert_eq!((rows.len(), more), (8, 2));
         assert_eq!(rows[0].id, 9);
         assert_eq!(rows[0].tone, AgeTone::Old);
@@ -1487,6 +1560,7 @@ mod tests {
                 prs: vec![pr(1, None), pr(2, Some(now))],
                 ..view(vec![])
             },
+            &[],
             &[],
             now,
         );
@@ -1531,14 +1605,110 @@ mod tests {
             session_id: "demo-session".into(),
             at: 0,
         };
-        let (rows, _) = pr_rows(&v, &slots, now);
-        let linked: Vec<_> = rows.iter().map(|r| (r.id, r.slot)).collect();
+        let (rows, _) = pr_rows(&v, &slots, &[], now);
+        let linked: Vec<_> = rows
+            .iter()
+            .map(|r| (r.id, r.slots.first().copied()))
+            .collect();
         // Oldest first: PR 5 has no ticket, 4 is unowned, 3's owner is
         // Resumable, 2's owner exited, 1's owner is Running.
         assert_eq!(
             linked,
             [(5, None), (4, None), (3, Some(5)), (2, None), (1, Some(3))]
         );
+    }
+
+    fn on(repo: &str, branch: &str) -> (String, String) {
+        (repo.to_string(), branch.to_string())
+    }
+
+    #[test]
+    fn pr_rows_mark_every_slot_on_the_pr_branch() {
+        let now = 86_400;
+        let mut v = view(vec![]);
+        let at = |id, repo: &str, branch: &str| PullRequest {
+            repo: repo.into(),
+            branch: branch.into(),
+            ..pr(id, Some(now - id as i64))
+        };
+        v.prs = vec![
+            at(1, "demo-api", "feature/DEMO-1"),
+            at(2, "demo-api", "feature/DEMO-2"),
+            at(3, "demo-web", "feature/DEMO-1"),
+        ];
+        // Two slots on PR 1's branch, one on main; demo-web's PR has the
+        // same branch name in another repo, so it matches no slot.
+        let branches = vec![
+            (4, on("demo-api", "feature/DEMO-1")),
+            (1, on("demo-api", "feature/DEMO-1")),
+            (2, on("demo-api", "main")),
+        ];
+        let (rows, _) = pr_rows(&v, &[], &branches, now);
+        let marks: Vec<_> = rows.iter().map(|r| (r.id, r.slots.clone())).collect();
+        assert_eq!(marks, [(3, vec![]), (2, vec![]), (1, vec![1, 4])]);
+    }
+
+    #[test]
+    fn a_branch_match_wins_over_the_ticket_owner() {
+        let now = 86_400;
+        let mut t = ticket("DEMO-1", Stage::InProgress, None);
+        t.owner = Some(3);
+        let mut v = view(vec![t]);
+        let mut p = pr(1, Some(now));
+        p.ticket = Some("DEMO-1".into());
+        v.prs = vec![p];
+        let mut slots = crate::app::empty_slots();
+        slots[3].state = SlotState::Running { pid: 1, since: 0 };
+        let branches = vec![(2, on("demo-api", "demo-branch"))];
+        let (rows, _) = pr_rows(&v, &slots, &branches, now);
+        assert_eq!(rows[0].slots, [2]);
+        let (rows, _) = pr_rows(&v, &slots, &[], now);
+        assert_eq!(rows[0].slots, [3]);
+    }
+
+    #[test]
+    fn slot_branches_read_only_live_slots_with_a_folder() {
+        let mut slots = crate::app::empty_slots();
+        for s in &mut slots {
+            s.cwd = Some(PathBuf::from(format!("/demo/{}", s.id)));
+        }
+        slots[1].state = SlotState::Running { pid: 1, since: 0 };
+        slots[2].state = SlotState::Resumable {
+            session_id: "demo-session".into(),
+            at: 0,
+        };
+        slots[3].state = SlotState::Exited { code: None, at: 0 };
+        slots[4].state = SlotState::Running { pid: 2, since: 0 };
+        slots[4].cwd = None;
+        slots[5].state = SlotState::Running { pid: 3, since: 0 };
+        let read = |p: &std::path::Path| {
+            (p != std::path::Path::new("/demo/5")).then(|| on("demo-api", &p.display().to_string()))
+        };
+        assert_eq!(
+            slot_branches(&slots, read),
+            [
+                (1, on("demo-api", "/demo/1")),
+                (2, on("demo-api", "/demo/2"))
+            ]
+        );
+    }
+
+    #[test]
+    fn slot_prs_are_the_prs_on_its_branch() {
+        let mut v = view(vec![]);
+        let at = |id, repo: &str, branch: &str| PullRequest {
+            repo: repo.into(),
+            branch: branch.into(),
+            ..pr(id, None)
+        };
+        v.prs = vec![
+            at(7, "demo-api", "feature/DEMO-1"),
+            at(8, "demo-web", "feature/DEMO-1"),
+            at(9, "demo-api", "feature/DEMO-1"),
+        ];
+        let ids = |b: &(String, String)| slot_prs(&v, b).iter().map(|p| p.id).collect::<Vec<_>>();
+        assert_eq!(ids(&on("demo-api", "feature/DEMO-1")), [7, 9]);
+        assert!(ids(&on("demo-api", "main")).is_empty());
     }
 
     #[test]

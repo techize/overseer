@@ -23,7 +23,8 @@ use overseer_proto::{
     SourceStatus, WorkItem, WorkView, PRS_OFF,
 };
 
-use crate::app::{colors, OverseerApp};
+use crate::app::{colors, open_external, OverseerApp};
+use crate::sprint_view::{is_http_url, slot_branches, slot_prs};
 
 // ---------------------------------------------------------------------------
 // Pure logic
@@ -819,6 +820,23 @@ impl OverseerApp {
         let empty = m.tone == Tone::Empty;
         let selected = self.selected == id;
         let edge = edge_color(m.tone);
+        // The open PRs on this slot's branch, each a link to its page.
+        let prs: Vec<(String, u64, Option<String>)> =
+            slot_branches(std::slice::from_ref(info), overseer_proto::git::repo_branch)
+                .first()
+                .map(|(_, on)| {
+                    slot_prs(&self.work, on)
+                        .into_iter()
+                        .map(|p| {
+                            (
+                                p.repo.clone(),
+                                p.id,
+                                p.url.clone().filter(|u| is_http_url(u)),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
         div()
             .id(("card", id as usize))
             .flex_1()
@@ -867,6 +885,26 @@ impl OverseerApp {
                             .flex()
                             .flex_none()
                             .gap_2()
+                            .children(prs.into_iter().map(|(repo, pr_id, url)| {
+                                div()
+                                    .id(gpui::ElementId::Name(
+                                        format!("card-pr-{id}-{repo}-{pr_id}").into(),
+                                    ))
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(colors::ACCENT))
+                                    .child(format!("PR #{pr_id}"))
+                                    .when_some(url, |d, url| {
+                                        d.cursor_pointer()
+                                            .hover(|s| s.underline())
+                                            // Not also the card behind it.
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                open_external(url.clone(), "the pull request");
+                                                this.pr_seen(repo.clone(), pr_id, cx);
+                                            }))
+                                    })
+                            }))
                             .children(empty.then(|| {
                                 div()
                                     .id(("card-assign", id as usize))
