@@ -2,6 +2,7 @@
 //! events and the tool calls its transcript records.
 
 use std::collections::VecDeque;
+use std::time::Instant;
 
 use overseer_proto::msg::{HookEvent, HookKind, Prompt, PromptInfo, PromptShown};
 
@@ -28,6 +29,8 @@ pub struct PromptState {
     started: VecDeque<Started>,
     /// Numbers the ids of prompts that came with no `tool_use_id`.
     counter: u64,
+    /// When the open prompt opened.
+    opened: Option<Instant>,
 }
 
 /// A tool call the transcript started.
@@ -102,6 +105,7 @@ impl PromptState {
         if next == self.open {
             return false;
         }
+        self.opened = next.is_some().then(Instant::now);
         self.open = next;
         true
     }
@@ -158,6 +162,11 @@ impl PromptState {
     /// The prompt the session is waiting on.
     pub fn open(&self) -> Option<&Prompt> {
         self.open.as_ref()
+    }
+
+    /// When the open prompt opened.
+    pub fn opened(&self) -> Option<Instant> {
+        self.open.as_ref().and(self.opened)
     }
 
     /// Drops prompt `id` if it is the open one, as when the screen shows
@@ -637,6 +646,21 @@ mod tests {
         assert!(s.on_hook(&note));
         assert!(s.on_tools(&[finished("tu-3")]));
         assert!(s.open().is_none());
+    }
+
+    #[test]
+    fn a_prompt_keeps_the_time_it_opened() {
+        let mut s = PromptState::new();
+        assert_eq!(s.opened(), None);
+        assert!(s.on_hook(&question("tu-1")));
+        let at = s.opened().unwrap();
+        // The same prompt again is not a new one.
+        assert!(!s.on_hook(&question("tu-1")));
+        assert_eq!(s.opened(), Some(at));
+        assert!(s.on_hook(&question("tu-2")));
+        assert!(s.opened().unwrap() >= at);
+        assert!(s.on_hook(&ev(HookKind::Stop)));
+        assert_eq!(s.opened(), None);
     }
 
     #[test]
