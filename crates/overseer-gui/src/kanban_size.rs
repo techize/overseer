@@ -2,6 +2,9 @@
 //! below the session cards; dragging its bottom edge sets a fixed height,
 //! kept as `kanban_height` in `<state dir>/gui.toml`; a double click on the
 //! edge goes back to filling.
+//!
+//! The same file keeps `pane_hidden`, whether the board's conversation
+//! pane is hidden; a file without it reads as shown.
 
 use std::path::{Path, PathBuf};
 
@@ -14,6 +17,24 @@ pub const MIN: f32 = 180.;
 struct GuiState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     kanban_height: Option<f32>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pane_hidden: bool,
+}
+
+/// What `path` holds, or the defaults when it is missing or unreadable.
+fn read(path: &Path) -> GuiState {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| toml::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+fn write(path: &Path, state: &GuiState) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let text = toml::to_string(state).map_err(std::io::Error::other)?;
+    std::fs::write(path, text)
 }
 
 /// Where the GUI keeps its own small state.
@@ -24,21 +45,29 @@ pub fn path() -> PathBuf {
 /// The saved height at `path`, or `None` (fill) when the file is missing,
 /// unreadable or holds no usable height.
 pub fn load_from(path: &Path) -> Option<f32> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let state: GuiState = toml::from_str(&text).ok()?;
-    state.kanban_height.filter(|h| h.is_finite() && *h >= MIN)
+    read(path)
+        .kanban_height
+        .filter(|h| h.is_finite() && *h >= MIN)
 }
 
 /// Saves `height` to `path`; `None` removes it, so the kanban fills.
 pub fn save_to(path: &Path, height: Option<f32>) -> std::io::Result<()> {
-    let state = GuiState {
-        kanban_height: height.map(|h| h.max(MIN).round()),
-    };
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let text = toml::to_string(&state).map_err(std::io::Error::other)?;
-    std::fs::write(path, text)
+    let mut state = read(path);
+    state.kanban_height = height.map(|h| h.max(MIN).round());
+    write(path, &state)
+}
+
+/// Whether the conversation pane was left hidden; shown when `path` is
+/// missing, unreadable or does not say.
+pub fn pane_hidden_from(path: &Path) -> bool {
+    read(path).pane_hidden
+}
+
+/// Saves whether the conversation pane is hidden, keeping the height.
+pub fn save_pane_hidden(path: &Path, hidden: bool) -> std::io::Result<()> {
+    let mut state = read(path);
+    state.pane_hidden = hidden;
+    write(path, &state)
 }
 
 /// The height while dragging: the pointer moved from `start_y` to `y`
@@ -75,6 +104,29 @@ mod tests {
         assert_eq!(load_from(&p), None);
         std::fs::write(&p, "not toml [").unwrap();
         assert_eq!(load_from(&p), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pane_hidden_is_remembered() {
+        let dir = std::env::temp_dir().join(format!("ovp-{}", std::process::id()));
+        let p = dir.join("gui.toml");
+        // No file, or one from before the pane: shown.
+        assert!(!pane_hidden_from(&p));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&p, "kanban_height = 400.0\n").unwrap();
+        assert!(!pane_hidden_from(&p));
+        save_pane_hidden(&p, true).unwrap();
+        assert!(pane_hidden_from(&p));
+        // Each setting keeps the other.
+        assert_eq!(load_from(&p), Some(400.));
+        save_to(&p, Some(500.)).unwrap();
+        assert!(pane_hidden_from(&p));
+        save_pane_hidden(&p, false).unwrap();
+        assert!(!pane_hidden_from(&p));
+        assert_eq!(load_from(&p), Some(500.));
+        std::fs::write(&p, "not toml [").unwrap();
+        assert!(!pane_hidden_from(&p));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

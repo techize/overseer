@@ -249,6 +249,24 @@ pub fn tilde(path: &Path, home: Option<&Path>) -> String {
     path.display().to_string()
 }
 
+/// What a click on a session card does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CardPress {
+    Select,
+    Open,
+}
+
+/// With the conversation pane shown, a single click selects the card (the
+/// pane follows it) and a double click opens it; with the pane hidden every
+/// click opens, as before the pane.
+pub fn card_press(pane_shown: bool, clicks: usize) -> CardPress {
+    if pane_shown && clicks != 2 {
+        CardPress::Select
+    } else {
+        CardPress::Open
+    }
+}
+
 /// `S1` or `S1 · label`.
 pub fn slot_title(info: &SlotInfo) -> String {
     let name = slot_name(info.id);
@@ -940,7 +958,18 @@ impl OverseerApp {
             }))
             .cursor_pointer()
             .hover(|s| s.bg(rgb(colors::CARD_HOVER)))
-            .on_click(cx.listener(move |this, _, window, cx| this.open_card(id, window, cx)))
+            .on_click(cx.listener(
+                move |this, ev: &gpui::ClickEvent, window, cx| match card_press(
+                    !this.pane_hidden,
+                    ev.click_count(),
+                ) {
+                    CardPress::Select => {
+                        this.select(id, cx);
+                        cx.notify();
+                    }
+                    CardPress::Open => this.open_card(id, window, cx),
+                },
+            ))
     }
 
     pub(crate) fn render_board(
@@ -1233,7 +1262,11 @@ impl OverseerApp {
                             .min_w(px(0.))
                             .truncate()
                             .text_color(rgb(colors::MUTED))
-                            .child("Click a card or press Enter to open it · A assigns work · Cmd+0 to Cmd+6 open a session · Cmd+N starts the selected slot · L shows the locks"),
+                            .child(if self.pane_hidden {
+                                "Click a card or press Enter to open it · A assigns work · Cmd+0 to Cmd+6 open a session · Cmd+N starts the selected slot · L shows the locks"
+                            } else {
+                                "Click a card to select it, double-click or Enter opens it · A assigns work · Cmd+0 to Cmd+6 open a session · Cmd+N starts the selected slot · L shows the locks"
+                            }),
                     )
                     .child(
                         div()
@@ -2239,6 +2272,16 @@ mod tests {
         assert_eq!(running_count(&slots), 2);
         assert_eq!(header_count(2), "2 running");
         assert_eq!(header_count(0), "none running");
+    }
+
+    #[test]
+    fn click_selects_when_the_pane_shows_and_opens_when_hidden() {
+        assert_eq!(card_press(true, 1), CardPress::Select);
+        assert_eq!(card_press(true, 2), CardPress::Open);
+        assert_eq!(card_press(true, 3), CardPress::Select);
+        // Hidden, every click opens, as before the pane.
+        assert_eq!(card_press(false, 1), CardPress::Open);
+        assert_eq!(card_press(false, 2), CardPress::Open);
     }
 
     #[test]

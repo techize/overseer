@@ -15,9 +15,13 @@
 //!   Locks view.
 //! - `Cmd+,` and the app menu's Settings item open the Settings view
 //!   anywhere navigation works.
+//! - `Tab` on the board or in the conversation pane's reply box selects the
+//!   next waiting slot; `Cmd+\` on the board or in the pane hides or shows
+//!   the pane. Neither is bound anywhere else, so the dialogs keep Tab.
 //!
 //! The routing is GPUI's keymap with the contexts `Overseer` (window),
-//! `Board`, `Session`, `Terminal`, `Locks`, `StartDialog`, `Picker`,
+//! `Board`, `Conversation` (the pane beside the board), `ConvReply` (its
+//! reply box), `Session`, `Terminal`, `Locks`, `StartDialog`, `Picker`,
 //! `PlanView` and `Settings`;
 //! `key_bindings` is tested against GPUI's `Keymap` directly.
 
@@ -27,7 +31,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    actions, div, prelude::*, rgb, App, Context, Entity, FocusHandle, Focusable, KeyBinding,
+    actions, div, prelude::*, px, rgb, App, Context, Entity, FocusHandle, Focusable, KeyBinding,
     Subscription, Task, Window,
 };
 use overseer_proto::msg::{Answer, ConversationView};
@@ -113,6 +117,8 @@ actions!(
         OpenPlan,
         GoLocks,
         OpenSettings,
+        NextWaiting,
+        TogglePane,
     ]
 );
 
@@ -178,6 +184,10 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("a", AssignSelected, Some("Board")),
         KeyBinding::new("p", OpenPlan, Some("Board")),
         KeyBinding::new("l", GoLocks, Some("Board")),
+        // The pane is beside the board, not in it, so its reply box gets
+        // none of the board's plain keys; Tab is the one it shares.
+        KeyBinding::new("tab", NextWaiting, Some("Board || ConvReply")),
+        KeyBinding::new("cmd-\\", TogglePane, Some("Board || Conversation")),
         KeyBinding::new("cmd-q", Quit, None),
     ]
 }
@@ -484,7 +494,16 @@ pub struct OverseerApp {
     /// `timeline_view`.
     pub(crate) timeline: DayView,
     /// Each slot's conversation, draft and picked answers, by slot id.
-    pub convs: Vec<Conv>,
+    pub(crate) convs: Vec<Conv>,
+    /// The conversation pane beside the board is hidden; kept in `gui.toml`.
+    pub(crate) pane_hidden: bool,
+    /// The pane's reply box.
+    pub(crate) reply_focus: FocusHandle,
+    /// The pane's entries, kept at the bottom as they grow unless scrolled up.
+    pub(crate) pane_scroll: gpui::ScrollHandle,
+    /// The slot, session and entry count the pane last drew, so new entries
+    /// can be told from a redraw.
+    pub(crate) pane_seen: (SlotId, String, usize),
     /// The Today panel shows its bars, not just its one line.
     pub(crate) timeline_open: bool,
     /// The push problem text last announced; see `push_problem_note`.
@@ -600,6 +619,10 @@ impl OverseerApp {
             attention: AttentionView::default(),
             timeline: DayView::default(),
             convs: empty_convs(),
+            pane_hidden: crate::kanban_size::pane_hidden_from(&crate::kanban_size::path()),
+            reply_focus: cx.focus_handle(),
+            pane_scroll: gpui::ScrollHandle::new(),
+            pane_seen: (SlotId::MAX, String::new(), 0),
             timeline_open: false,
             notified_push: None,
             brain_hover: false,
@@ -913,7 +936,7 @@ impl OverseerApp {
                 self.timeline = view;
                 cx.notify();
             }
-            Frame::Event(Event::ConversationChanged(view)) => self.conversation_changed(view, cx),
+            Frame::Event(Event::ConversationChanged(view)) => self.conversation_pushed(view, cx),
             Frame::Event(Event::WorkChanged(view))
             | Frame::Response {
                 resp: Response::Work(view),
@@ -1086,15 +1109,14 @@ impl OverseerApp {
         }
     }
 
-    /// Takes in a slot's conversation from the daemon, whether pushed or
-    /// asked for. When it does not fit what the slot holds, asks for the
-    /// whole of it again.
-    fn conversation_changed(&mut self, view: ConversationView, cx: &mut Context<Self>) {
+    /// Takes in a slot's conversation the daemon pushed. When it does not
+    /// fit what the slot holds, asks for the whole of it again.
+    fn conversation_pushed(&mut self, view: ConversationView, cx: &mut Context<Self>) {
         let slot = view.slot;
         let Some(conv) = self.convs.get_mut(slot as usize) else {
             return;
         };
-        if !conv.apply(view) {
+        if !conv.pushed(view) {
             self.request_conversation(slot, cx);
         }
         cx.notify();
@@ -1102,12 +1124,25 @@ impl OverseerApp {
 
     /// Asks the daemon for `slot`'s whole conversation. An error reply is
     /// left alone: a slot with nothing running has no conversation to show.
-    pub fn request_conversation(&mut self, slot: SlotId, cx: &mut Context<Self>) {
+    /// A reply that an event pushed meanwhile may have overtaken is dropped
+    /// and asked for again; one that does not fit is asked for again too.
+    pub(crate) fn request_conversation(&mut self, slot: SlotId, cx: &mut Context<Self>) {
+        let Some(asked) = self.convs.get(slot as usize).map(Conv::asked) else {
+            return;
+        };
         let client = self.client.clone();
         cx.spawn(async move |this, cx| {
             let reply = client.request(Request::Conversation { slot }).await;
             let _ = this.update(cx, |this, cx| match reply {
-                Ok(Response::Conversation(view)) => this.conversation_changed(view, cx),
+                Ok(Response::Conversation(view)) => {
+                    let Some(conv) = this.convs.get_mut(slot as usize) else {
+                        return;
+                    };
+                    if conv.answered(asked, view) != Some(true) {
+                        this.request_conversation(slot, cx);
+                    }
+                    cx.notify();
+                }
                 Ok(_) => {}
                 Err(e) => {
                     this.status = Some(format!("{} ({e:#})", crate::terminal_view::LOST_DAEMON));
@@ -1121,7 +1156,7 @@ impl OverseerApp {
     /// Sends `slot`'s draft to its session. The draft is cleared once the
     /// daemon says `Ok`, unless it was edited meanwhile; a refusal such as
     /// `S2 moved on, not sent` shows in the slot's status.
-    pub fn send_reply(&mut self, slot: SlotId, cx: &mut Context<Self>) {
+    pub(crate) fn send_reply(&mut self, slot: SlotId, cx: &mut Context<Self>) {
         let Some(conv) = self.convs.get_mut(slot as usize) else {
             return;
         };
@@ -1134,8 +1169,9 @@ impl OverseerApp {
         self.send_conv(slot, req, Some(sent), cx);
     }
 
-    /// Answers `slot`'s open prompt, if it has one.
-    pub fn send_answer(&mut self, slot: SlotId, answer: Answer, cx: &mut Context<Self>) {
+    /// Answers `slot`'s open prompt, if it has one and nothing else is on
+    /// its way.
+    pub(crate) fn send_answer(&mut self, slot: SlotId, answer: Answer, cx: &mut Context<Self>) {
         let Some(conv) = self.convs.get_mut(slot as usize) else {
             return;
         };
@@ -1146,7 +1182,7 @@ impl OverseerApp {
     }
 
     /// Interrupts `slot`'s session.
-    pub fn interrupt(&mut self, slot: SlotId, cx: &mut Context<Self>) {
+    pub(crate) fn interrupt(&mut self, slot: SlotId, cx: &mut Context<Self>) {
         if let Some(conv) = self.convs.get_mut(slot as usize) {
             conv.status = None;
             self.send_conv(slot, Request::Interrupt { slot }, None, cx);
@@ -1154,7 +1190,8 @@ impl OverseerApp {
     }
 
     /// Sends a conversation request; the slot's status shows how it went
-    /// wrong. `sent` is the draft this request carries.
+    /// wrong. `sent` is the draft this request carries. A Reply or Answer
+    /// holds the slot's next one until it is answered.
     fn send_conv(
         &mut self,
         slot: SlotId,
@@ -1162,6 +1199,7 @@ impl OverseerApp {
         sent: Option<String>,
         cx: &mut Context<Self>,
     ) {
+        let holds = matches!(req, Request::Reply { .. } | Request::Answer { .. });
         let client = self.client.clone();
         cx.spawn(async move |this, cx| {
             let reply = client.request(req).await;
@@ -1169,6 +1207,9 @@ impl OverseerApp {
                 let Some(conv) = this.convs.get_mut(slot as usize) else {
                     return;
                 };
+                if holds {
+                    conv.sending = false;
+                }
                 match reply {
                     Ok(Response::Ok) => {
                         if sent.as_ref().is_some_and(|s| *s == conv.draft.text) {
@@ -2125,9 +2166,23 @@ impl Render for OverseerApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let now = now_secs();
         let screen = match self.screen {
-            Screen::Board | Screen::Session(_) => {
+            Screen::Board | Screen::Session(_) if self.pane_hidden => {
                 self.render_board(now, window, cx).into_any_element()
             }
+            // The pane beside the board, not inside it, so the reply box's
+            // key context stack has no Board.
+            Screen::Board | Screen::Session(_) => div()
+                .size_full()
+                .flex()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .h_full()
+                        .child(self.render_board(now, window, cx)),
+                )
+                .child(self.render_conversation(window, cx))
+                .into_any_element(),
             Screen::Locks => self.render_locks(now, window, cx).into_any_element(),
         };
         // Beside the board, never inside it, so the terminal's key context
@@ -2151,6 +2206,8 @@ impl Render for OverseerApp {
             .on_action(cx.listener(|this, _: &GoS4, w, cx| this.go_session(4, w, cx)))
             .on_action(cx.listener(|this, _: &GoS5, w, cx| this.go_session(5, w, cx)))
             .on_action(cx.listener(|this, _: &GoS6, w, cx| this.go_session(6, w, cx)))
+            .on_action(cx.listener(|this, _: &NextWaiting, _, cx| this.next_waiting_slot(cx)))
+            .on_action(cx.listener(|this, _: &TogglePane, window, cx| this.toggle_pane(window, cx)))
             .on_action(cx.listener(|this, _: &StartSession, window, cx| {
                 if let Some(id) = start_target(this.screen, this.selected, &this.slots) {
                     this.open_dialog(id, window, cx);
@@ -2678,6 +2735,48 @@ mod tests {
         ] {
             assert_eq!(routed(d, SETTINGS), None, "{d}");
         }
+    }
+
+    #[test]
+    fn the_pane_keys() {
+        const REPLY: &[&str] = &["Overseer", "Conversation", "ConvReply"];
+        // Tab jumps from the board and the reply box, and nowhere else: the
+        // dialogs, Settings, the picker and the terminal keep it.
+        assert_eq!(routed("tab", BOARD), Some("overseer::NextWaiting"));
+        assert_eq!(routed("tab", REPLY), Some("overseer::NextWaiting"));
+        for ctx in [TERMINAL, CHROME, DIALOG, PICKER, PLAN, SETTINGS] {
+            assert_eq!(routed("tab", ctx), None, "{ctx:?}");
+        }
+        for ctx in [BOARD, REPLY] {
+            assert_eq!(
+                routed("cmd-\\", ctx),
+                Some("overseer::TogglePane"),
+                "{ctx:?}"
+            );
+        }
+        for ctx in [TERMINAL, DIALOG, PICKER, PLAN, SETTINGS] {
+            assert_eq!(routed("cmd-\\", ctx), None, "{ctx:?}");
+        }
+        // The board's plain keys stay out of the reply box, which takes
+        // Enter, Esc and typing itself.
+        for k in [
+            "a",
+            "r",
+            "p",
+            "l",
+            "n",
+            "left",
+            "up",
+            "enter",
+            "shift-enter",
+            "escape",
+            "shift-tab",
+            "cmd-v",
+            "cmd-a",
+        ] {
+            assert_eq!(routed(k, REPLY), None, "{k}");
+        }
+        assert_eq!(routed("cmd-3", REPLY), Some("overseer::GoS3"));
     }
 
     #[test]
