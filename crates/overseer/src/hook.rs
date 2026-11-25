@@ -592,6 +592,30 @@ mod tests {
     }
 
     #[test]
+    fn permission_request_detail_matches_its_tool_use_events() {
+        // The daemon ties a permission prompt to its call by tool and detail.
+        for input in [
+            r#"{"command":"rm -rf /tmp/demo/target\nls"}"#,
+            r#"{"file_path":"/tmp/demo/a.rs"}"#,
+            r#"{"url":"https://demo.example.test"}"#,
+        ] {
+            let json = format!(r#"{{"tool_name":"Bash","tool_input":{input}}}"#);
+            let of = |event| parse_hook(event, "S1", json.as_bytes()).unwrap().detail;
+            let asked = of("PermissionRequest");
+            assert_eq!(asked, of("PreToolUse"), "{input}");
+            assert_eq!(asked, of("PostToolUse"), "{input}");
+        }
+        let json = br#"{"tool_name":"Bash","tool_input":{"command":"rm -rf /tmp/demo/target"}}"#;
+        assert_eq!(
+            parse_hook("PermissionRequest", "S1", json)
+                .unwrap()
+                .detail
+                .as_deref(),
+            Some("rm -rf /tmp/demo/target")
+        );
+    }
+
+    #[test]
     fn exit_plan_mode_carries_the_plan() {
         let json = br#"{"tool_name":"ExitPlanMode","tool_input":{"plan":"1. do it"}}"#;
         let ev = parse_hook("PermissionRequest", "S1", json).unwrap();

@@ -22,6 +22,11 @@ use crate::manager::{SlotManager, SLOT_COUNT};
 /// Entries kept per slot; older ones are dropped.
 pub const KEEP: usize = 200;
 
+/// How far past [`KEEP`] a slot may grow before it is trimmed back, so a
+/// long session costs a full send once per this many entries, not on every
+/// line.
+const SLACK: usize = KEEP / 4;
+
 /// How often a running slot's transcript is read with no hook to prompt it.
 const POLL: Duration = Duration::from_secs(1);
 
@@ -199,13 +204,14 @@ impl ConversationService {
                     .map(PathBuf::from)
                     .filter(|p| view.path.as_ref() != Some(p));
                 if session.is_some() || path.is_some() {
-                    if let Some(session) = session {
-                        view.session = session.clone();
-                        // The old file was the old session's.
-                        view.path = None;
-                    }
-                    if let Some(path) = path {
-                        view.path = Some(path);
+                    match session {
+                        // The new session's file is the one it reports, even
+                        // the same as before; none reported is unknown.
+                        Some(session) => {
+                            view.session = session.clone();
+                            view.path = ev.transcript_path.as_ref().map(PathBuf::from);
+                        }
+                        None => view.path = path,
                     }
                     view.generation += 1;
                     view.entries.clear();
@@ -351,11 +357,14 @@ impl ConversationService {
     }
 }
 
-/// Adds entries, dropping the oldest past [`KEEP`]. A drop makes the next
-/// send a full one, since the app's indices no longer match.
+/// Adds entries. Past [`KEEP`] and [`SLACK`] the oldest are dropped down
+/// to [`KEEP`], as they are when one read alone brings more than [`KEEP`].
+/// A drop makes the next send a full one, since the app's indices no longer
+/// match.
 fn append(view: &mut SlotView, entries: Vec<ConvEntry>) {
+    let read = entries.len();
     view.entries.extend(entries);
-    if view.entries.len() > KEEP {
+    if view.entries.len() > KEEP + SLACK || read > KEEP {
         let extra = view.entries.len() - KEEP;
         view.entries.drain(..extra);
         view.sent.full = true;
@@ -376,22 +385,20 @@ fn read_new(path: &Path, tail: &mut Tail) -> Read {
     };
     let read = (|| {
         let restarted = file.metadata()?.len() < tail.offset();
-        if restarted {
-            *tail = Tail::new();
-        }
-        file.seek(SeekFrom::Start(tail.offset()))?;
+        let from = if restarted { 0 } else { tail.offset() };
+        file.seek(SeekFrom::Start(from))?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
-        let mut entries = tail.feed(&bytes);
-        // Only the last ones are kept; a long first read need not hold more.
-        if entries.len() > KEEP {
-            entries.drain(..entries.len() - KEEP);
-        }
-        std::io::Result::Ok((restarted, entries))
+        std::io::Result::Ok((restarted, bytes))
     })();
+    // The tail starts over only once the file was read, so a failed read
+    // leaves it where it was.
     match read {
-        Ok((true, entries)) => Read::Restarted(entries),
-        Ok((false, entries)) => Read::More(entries),
+        Ok((true, bytes)) => {
+            *tail = Tail::new();
+            Read::Restarted(tail.feed(&bytes))
+        }
+        Ok((false, bytes)) => Read::More(tail.feed(&bytes)),
         Err(e) => {
             tracing::warn!("conversation: {} not read: {e}", path.display());
             Read::Missing
@@ -561,14 +568,75 @@ mod tests {
         assert_eq!(texts(&now)[0], "line 301");
         assert_eq!(texts(&now)[KEEP - 1], "line 500");
         sent(&mut f.rx);
-        // One more drops the oldest, so the app gets the whole view again.
+        // The next lines are appends while within the slack.
         add(&path, &["line 501"]);
+        f.svc.refresh(2).await;
+        let views = sent(&mut f.rx);
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].entries_from, KEEP);
+        assert_eq!(texts(&views[0].entries), ["line 501"]);
+        let more: Vec<String> = (502..=550).map(|n| format!("line {n}")).collect();
+        let refs: Vec<&str> = more.iter().map(String::as_str).collect();
+        add(&path, &refs);
+        f.svc.refresh(2).await;
+        let views = sent(&mut f.rx);
+        assert_eq!(views[0].entries_from, KEEP + 1);
+        assert_eq!(f.svc.current(2).entries.len(), KEEP + SLACK);
+        // One past the slack trims back to KEEP: the whole view is sent.
+        add(&path, &["line 551"]);
         f.svc.refresh(2).await;
         let views = sent(&mut f.rx);
         assert_eq!(views.len(), 1);
         assert_eq!(views[0].entries_from, 0);
         assert_eq!(views[0].entries.len(), KEEP);
-        assert_eq!(texts(&views[0].entries)[KEEP - 1], "line 501");
+        assert_eq!(texts(&views[0].entries)[0], "line 352");
+        assert_eq!(texts(&views[0].entries)[KEEP - 1], "line 551");
+    }
+
+    #[tokio::test]
+    async fn a_new_session_in_the_same_file_keeps_the_path() {
+        let mut f = fixture();
+        let path = f.dir.path().join("one.jsonl");
+        write(&path, &["hello"]);
+        f.svc.hook(&hook(HookKind::SessionStart, &path));
+        f.svc.refresh(2).await;
+        sent(&mut f.rx);
+        let next = HookEvent {
+            session_id: Some("demo-next".into()),
+            ..hook(HookKind::SessionStart, &path)
+        };
+        f.svc.hook(&next);
+        f.svc.refresh(2).await;
+        let views = sent(&mut f.rx);
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].entries_from, 0);
+        assert_eq!(views[0].session, "demo-next");
+        assert_eq!(texts(&views[0].entries), ["hello"]);
+        assert_eq!(
+            f.ledger.transcript(2).unwrap(),
+            Some(("demo-next".to_string(), path))
+        );
+    }
+
+    #[test]
+    fn a_failed_read_keeps_where_the_tail_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("one.jsonl");
+        let body: String = (0..200).map(|n| line(&format!("line {n}"))).collect();
+        std::fs::write(&path, &body).unwrap();
+        let mut tail = Tail::new();
+        assert!(matches!(read_new(&path, &mut tail), Read::More(e) if e.len() == 200));
+        let offset = tail.offset();
+        // A directory opens but does not read, and is shorter than the
+        // offset: the read fails and the tail is untouched.
+        let cut = dir.path().join("cut");
+        std::fs::create_dir(&cut).unwrap();
+        assert!(std::fs::metadata(&cut).unwrap().len() < offset);
+        assert!(matches!(read_new(&cut, &mut tail), Read::Missing));
+        assert_eq!(tail.offset(), offset);
+        // Once the file reads, a shorter one starts over.
+        write(&path, &["new"]);
+        assert!(matches!(read_new(&path, &mut tail), Read::Restarted(e) if e.len() == 1));
     }
 
     #[tokio::test]
@@ -619,9 +687,10 @@ mod tests {
         f.svc.hook(&hook(HookKind::SessionStart, &path));
         f.svc.refresh(2).await;
         sent(&mut f.rx);
+        // As Claude Code sends it: no tool_use_id.
         let ask = HookEvent {
             tool: Some("Bash".into()),
-            tool_use_id: Some("tu-1".into()),
+            detail: Some("rm -rf /tmp/demo/target".into()),
             prompt: Some(PromptInfo::Permission {
                 tool: "Bash".into(),
                 summary: "rm -rf /tmp/demo/target".into(),
@@ -635,7 +704,7 @@ mod tests {
         assert_eq!(views[0].entries_from, 1);
         assert!(views[0].entries.is_empty());
         let open = views[0].prompt.clone().unwrap();
-        assert_eq!(open.id, "tu-1");
+        assert_eq!(open.id, "n1");
         assert!(matches!(open.info, PromptShown::Known(_)));
         assert_eq!(f.svc.open_prompt(2), Some(open));
     }
