@@ -259,13 +259,28 @@ pub fn reply_placeholder(conv: &Conv) -> String {
     }
 }
 
+/// Whether the slot waits on a prompt the pane cannot show: one the daemon
+/// could not read, or none at all while the slot's `activity` says it needs
+/// you (a dialog no hook names, as Claude Code's folder trust question).
+/// An idle wait for the next message is not a prompt.
+pub fn unseen_prompt(conv: &Conv, activity: Option<&Activity>) -> bool {
+    match conv.view.prompt.as_ref().map(|p| &p.info) {
+        Some(PromptShown::Unknown | PromptShown::Known(PromptInfo::Other)) => true,
+        Some(_) => false,
+        None => activity.is_some_and(|a| a.kind == ActivityKind::NeedsYou && !a.idle_wait),
+    }
+}
+
 /// Whether the reply box takes text: not at a prompt the pane cannot show,
 /// which the daemon refuses anyway.
-pub fn reply_enabled(conv: &Conv) -> bool {
-    !matches!(
-        conv.view.prompt.as_ref().map(|p| &p.info),
-        Some(PromptShown::Unknown | PromptShown::Known(PromptInfo::Other))
-    )
+pub fn reply_enabled(conv: &Conv, activity: Option<&Activity>) -> bool {
+    !unseen_prompt(conv, activity)
+}
+
+/// Whether a user entry is Claude Code's note that Esc stopped the turn,
+/// which the pane shows as a note, not as something the user said.
+pub fn interrupt_note(text: &str) -> bool {
+    text.starts_with("[Request interrupted by user")
 }
 
 /// What a key in the reply box means.
@@ -480,6 +495,11 @@ pub fn choice_buttons(plan: bool) -> &'static [&'static str] {
     }
 }
 
+/// The slot's activity, if it reports one.
+pub(crate) fn activity_of(info: Option<&SlotInfo>) -> Option<&Activity> {
+    info.and_then(|i| i.activity.as_ref())
+}
+
 pub(crate) fn is_working(info: Option<&SlotInfo>) -> bool {
     info.and_then(|i| i.activity.as_ref())
         .is_some_and(|a| a.kind == ActivityKind::Working)
@@ -544,6 +564,11 @@ fn text_element(text: &str, font: &str) -> Div {
 
 fn entry_element(e: &ConvEntry, font: &str) -> Option<AnyElement> {
     Some(match &e.kind {
+        ConvKind::User { text } if interrupt_note(text) => div()
+            .text_xs()
+            .text_color(rgb(colors::MUTED))
+            .child("interrupted")
+            .into_any_element(),
         ConvKind::User { text } => div()
             .p_2()
             .rounded(px(6.))
@@ -596,12 +621,17 @@ impl OverseerApp {
 
     fn on_reply_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let slot = self.selected;
-        let working = is_working(self.slots.get(slot as usize));
+        let info = self.slots.get(slot as usize);
+        let working = is_working(info);
+        let enabled = self
+            .convs
+            .get(slot as usize)
+            .is_some_and(|c| reply_enabled(c, activity_of(info)));
         let Some(conv) = self.convs.get_mut(slot as usize) else {
             return;
         };
         let ks = &ev.keystroke;
-        let key = if reply_enabled(conv) {
+        let key = if enabled {
             reply_key(&mut conv.draft, ks)
         } else if ks.key == "escape" {
             ReplyKey::Escape
@@ -631,7 +661,10 @@ impl OverseerApp {
         conv: &Conv,
         cx: &mut Context<Self>,
     ) -> Option<Stateful<Div>> {
-        let prompt = conv.view.prompt.as_ref()?;
+        let activity = activity_of(self.slots.get(slot as usize));
+        let Some(prompt) = conv.view.prompt.as_ref() else {
+            return unseen_prompt(conv, activity).then(|| self.cant_show(slot, cx));
+        };
         let font = self.theme.font_family.as_str();
         let sending = conv.sending;
         // Kept to a height, so many questions cannot push the reply box away.
@@ -762,19 +795,37 @@ impl OverseerApp {
                     )
                 })
             }
-            PromptShown::Known(PromptInfo::Other) | PromptShown::Unknown => area
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(rgb(colors::ORANGE))
-                        .child("waiting on a prompt Overseer can't show"),
-                )
-                .child(div().flex().child(
-                    pane_button("conv-prompt-open", "Open session", true, false).on_click(
-                        cx.listener(move |this, _, window, cx| this.open_card(slot, window, cx)),
-                    ),
-                )),
+            PromptShown::Known(PromptInfo::Other) | PromptShown::Unknown => {
+                return Some(self.cant_show(slot, cx));
+            }
         })
+    }
+
+    /// Says the slot waits on a prompt the pane cannot show, with a button
+    /// to open its session.
+    fn cant_show(&self, slot: SlotId, cx: &mut Context<Self>) -> Stateful<Div> {
+        div()
+            .id("conv-prompt")
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_2()
+            .rounded(px(6.))
+            .bg(rgb(colors::CARD))
+            .border_1()
+            .border_color(rgb(colors::ORANGE))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(colors::ORANGE))
+                    .child("waiting on a prompt Overseer can't show"),
+            )
+            .child(div().flex().child(
+                pane_button("conv-prompt-open", "Open session", true, false).on_click(
+                    cx.listener(move |this, _, window, cx| this.open_card(slot, window, cx)),
+                ),
+            ))
     }
 
     /// The selected slot's conversation: header, entries, the open prompt,
@@ -839,7 +890,8 @@ impl OverseerApp {
             .iter()
             .filter_map(|e| entry_element(e, font))
             .collect();
-        let empty = entries.is_empty().then(|| {
+        let unseen = unseen_prompt(conv, activity_of(info));
+        let empty = (entries.is_empty() && !unseen).then(|| {
             div()
                 .text_sm()
                 .text_color(rgb(colors::MUTED))
@@ -862,7 +914,7 @@ impl OverseerApp {
             .children(empty)
             .children(entries);
         let prompt = self.render_prompt(slot, conv, cx);
-        let enabled = reply_enabled(conv);
+        let enabled = !unseen;
         let draft = &conv.draft;
         let shown: AnyElement = if draft.text.is_empty() {
             let placeholder = reply_placeholder(conv);
@@ -1288,15 +1340,62 @@ mod tests {
             subagent: false,
             info: PromptShown::Unknown,
         };
-        assert!(reply_enabled(&with_prompt(3, None)));
-        assert!(reply_enabled(&with_prompt(3, Some(permission_prompt("p")))));
-        assert!(!reply_enabled(&with_prompt(3, Some(unknown))));
+        assert!(reply_enabled(&with_prompt(3, None), None));
+        assert!(reply_enabled(
+            &with_prompt(3, Some(permission_prompt("p"))),
+            None
+        ));
+        assert!(!reply_enabled(&with_prompt(3, Some(unknown)), None));
         let other = Prompt {
             id: "p".into(),
             subagent: false,
             info: PromptShown::Known(PromptInfo::Other),
         };
-        assert!(!reply_enabled(&with_prompt(3, Some(other))));
+        assert!(!reply_enabled(&with_prompt(3, Some(other)), None));
+    }
+
+    fn needs_you(idle_wait: bool) -> Activity {
+        Activity {
+            kind: ActivityKind::NeedsYou,
+            since: 0,
+            now_doing: None,
+            reason: Some("Claude asks whether to trust this folder".into()),
+            idle_wait,
+        }
+    }
+
+    #[test]
+    fn a_slot_that_needs_you_with_no_prompt_shown_waits_on_one_it_cannot_show() {
+        // The folder trust dialog: no session or history yet, no prompt.
+        let fresh = Conv::new(4);
+        let needs = needs_you(false);
+        assert!(unseen_prompt(&fresh, Some(&needs)));
+        assert!(!reply_enabled(&fresh, Some(&needs)));
+        // With history, the same.
+        let mut talked = Conv::new(4);
+        let mut ev = view("s4", 0, &["hello"]);
+        ev.slot = 4;
+        talked.apply(ev);
+        assert!(unseen_prompt(&talked, Some(&needs)));
+        // A prompt the pane shows is not one, nor is an idle wait, nor work.
+        let shown = with_prompt(4, Some(permission_prompt("p")));
+        assert!(!unseen_prompt(&shown, Some(&needs)));
+        assert!(reply_enabled(&shown, Some(&needs)));
+        assert!(!unseen_prompt(&fresh, Some(&needs_you(true))));
+        assert!(!unseen_prompt(&fresh, None));
+        let working = Activity {
+            kind: ActivityKind::Working,
+            ..needs_you(false)
+        };
+        assert!(!unseen_prompt(&talked, Some(&working)));
+    }
+
+    #[test]
+    fn interrupt_notes_are_told_from_what_the_user_said() {
+        assert!(interrupt_note("[Request interrupted by user]"));
+        assert!(interrupt_note("[Request interrupted by user for tool use]"));
+        assert!(!interrupt_note("why was the request interrupted by user?"));
+        assert!(!interrupt_note("fix DEMO-1"));
     }
 
     #[test]
@@ -1461,6 +1560,6 @@ mod tests {
         }
         let c = with_prompt(2, Some(p));
         assert_eq!(reply_placeholder(&c), "No, and tell it instead");
-        assert!(reply_enabled(&c));
+        assert!(reply_enabled(&c, None));
     }
 }

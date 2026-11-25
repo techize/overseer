@@ -1168,9 +1168,15 @@ impl OverseerApp {
     /// daemon says `Ok`, unless it was edited meanwhile; a refusal such as
     /// `S2 moved on, not sent` shows in the slot's status.
     pub(crate) fn send_reply(&mut self, slot: SlotId, cx: &mut Context<Self>) {
+        let activity =
+            crate::conversation_view::activity_of(self.slots.get(slot as usize)).cloned();
         let Some(conv) = self.convs.get_mut(slot as usize) else {
             return;
         };
+        // Not at a prompt the pane cannot show: the session is answered there.
+        if !crate::conversation_view::reply_enabled(conv, activity.as_ref()) {
+            return;
+        }
         let Some(req) = conv.reply_request() else {
             cx.notify();
             return;
