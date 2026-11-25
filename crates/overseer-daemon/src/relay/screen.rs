@@ -38,13 +38,17 @@ fn row_cells(snap: &Snapshot, row: usize) -> &[overseer_term::Cell] {
     &snap.cells[row * snap.cols..(row + 1) * snap.cols]
 }
 
-/// A rule row: at least 80 percent of its non-blank cells, and at least half
-/// the width, are `─`.
+/// A rule row: at least half the width is `─`, and the row starts or
+/// ends with one, so a session name may sit at either end of it however
+/// long it is (#102). Prose and table borders (`├──┤`) do not start
+/// with a bare `─`.
 fn is_rule(snap: &Snapshot, row: usize) -> bool {
     let cells = row_cells(snap, row);
-    let non_blank = cells.iter().filter(|c| !c.ch.is_whitespace()).count();
     let rules = cells.iter().filter(|c| c.ch == RULE).count();
-    rules > 0 && rules * 2 >= snap.cols && rules * 5 >= non_blank * 4
+    let mut shown = cells.iter().map(|c| c.ch).filter(|c| !c.is_whitespace());
+    let first = shown.next();
+    let last = shown.next_back().or(first);
+    rules * 2 >= snap.cols && (first == Some(RULE) || last == Some(RULE))
 }
 
 /// The column just after the prompt mark (`>` or `❯`, after blanks and an
@@ -67,18 +71,33 @@ fn after_prompt_mark(cells: &[overseer_term::Cell]) -> Option<usize> {
     }
 }
 
-/// Classify Claude Code's input box on `snap`.
+/// Classify Claude Code's input box on `snap`. The box is the rows after
+/// a rule that start with the prompt mark, up to the next rule. Claude
+/// Code may draw no rule under it (#102); the box then ends at the first
+/// blank row.
 pub fn input_box(snap: &Snapshot) -> InputBox {
     let mut rules = (0..snap.rows).rev().filter(|&r| is_rule(snap, r));
-    let (Some(lower), Some(upper)) = (rules.next(), rules.next()) else {
+    let Some(last) = rules.next() else {
         return InputBox::NotFound;
     };
-    let first = upper + 1;
-    if first >= lower {
-        return InputBox::NotFound;
-    }
-    let Some(start) = after_prompt_mark(row_cells(snap, first)) else {
-        return InputBox::NotFound;
+    let starts_box = |rule: usize| {
+        let first = rule + 1;
+        let start = (first < snap.rows)
+            .then(|| after_prompt_mark(row_cells(snap, first)))
+            .flatten()?;
+        Some((first, start))
+    };
+    let blank = |row: usize| row_cells(snap, row).iter().all(|c| c.ch.is_whitespace());
+    let (first, start, lower) = if let Some((first, start)) = starts_box(last) {
+        let end = (first + 1..snap.rows)
+            .find(|&r| blank(r))
+            .unwrap_or(snap.rows);
+        (first, start, end)
+    } else {
+        match rules.next().and_then(starts_box) {
+            Some((first, start)) if first < last => (first, start, last),
+            _ => return InputBox::NotFound,
+        }
     };
     let in_box = || {
         (first..lower).flat_map(move |row| {
@@ -295,6 +314,69 @@ mod tests {
         assert_eq!(classify(&draw(&lines), cols as u16), InputBox::Empty);
         lines[3] = "\u{276F}\u{00A0}run the demo-api tests".to_string();
         assert_eq!(classify(&draw(&lines), cols as u16), InputBox::Typed);
+    }
+
+    #[test]
+    fn a_long_session_name_in_the_top_rule_is_found() {
+        // #102: a 180-column slot with a long name; the name leaves less
+        // than four fifths of the row as rule.
+        let cols = 180;
+        let name = " S2 DEMO-12364 demo-api check, split the logs and three fixes ";
+        let titled = format!("{}{name}", rule(cols - name.chars().count()));
+        let mut lines = vec![
+            "\u{273B} Brewed for 1m 41s \u{00B7} done 2:50 PM".to_string(),
+            String::new(),
+        ];
+        lines.push(titled);
+        lines.push("\u{276F}\u{00A0}".to_string());
+        lines.push(rule(cols));
+        lines.push("  -- INSERT -- \u{23F5}\u{23F5} auto mode on (shift+tab to cycle)".to_string());
+        assert_eq!(classify(&draw(&lines), cols as u16), InputBox::Empty);
+        lines[3] = "\u{276F}\u{00A0}run the demo-api tests".to_string();
+        assert_eq!(classify(&draw(&lines), cols as u16), InputBox::Typed);
+    }
+
+    #[test]
+    fn a_box_with_no_rule_below_is_found() {
+        // #102: with background shells running, the box has a titled rule
+        // above the prompt and none below; a blank row, then the status.
+        let cols = 180;
+        let name = " S3 DEMO-12364 demo-api check, split + 3 fixes";
+        let titled = format!("{}{name}", rule(cols - name.chars().count()));
+        let mut lines = vec![
+            "\u{276F} yes to close".to_string(),
+            String::new(),
+            "  \u{23BF}  Interrupted \u{00B7} What should Claude do instead?".to_string(),
+            String::new(),
+        ];
+        lines.push(titled);
+        lines.push("\u{276F} ".to_string());
+        lines.push(String::new());
+        lines.push("  Ctx: 149K/1000K (14%) | Wed 25 Nov 15:02 | +131/-10".to_string());
+        lines.push(
+            "  \u{23F5}\u{23F5} auto mode on \u{00B7} 2 shells \u{00B7} \u{2193} to manage"
+                .to_string(),
+        );
+        assert_eq!(classify(&draw(&lines), cols as u16), InputBox::Empty);
+        lines[5] = "\u{276F} close as did not recur".to_string();
+        assert_eq!(classify(&draw(&lines), cols as u16), InputBox::Typed);
+        // A second line of input, before the blank row, is input too.
+        lines[5] = "\u{276F} ".to_string();
+        lines[6] = "  and the second line".to_string();
+        lines.insert(7, String::new());
+        assert_eq!(classify(&draw(&lines), cols as u16), InputBox::Typed);
+    }
+
+    #[test]
+    fn a_dialog_under_a_titled_rule_is_not_found() {
+        let cols = 120;
+        let name = " S3 DEMO-12 demo-api";
+        let mut lines = vec![format!("{}{name}", rule(cols - name.chars().count()))];
+        lines.push("Bash command".to_string());
+        lines.push("  kubectl apply -f demo-api.yaml".to_string());
+        lines.push("\u{276F} 1. Yes".to_string());
+        lines.push("  2. No".to_string());
+        assert_eq!(classify(&draw(&lines), cols as u16), InputBox::NotFound);
     }
 
     #[test]
