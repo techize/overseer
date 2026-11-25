@@ -601,6 +601,8 @@ pub enum Request {
     },
     /// The attention queue.
     Attention,
+    /// Today's timeline of what each slot did and where its log has gaps.
+    Timeline,
     /// Mark a pull request's current comments and build as seen.
     PrSeen {
         repo: String,
@@ -1189,6 +1191,7 @@ pub struct DaemonInfo {
 pub enum Response {
     Ok,
     Attention(AttentionView),
+    Timeline(DayView),
     Slots(Vec<SlotInfo>),
     Error {
         message: String,
@@ -1243,6 +1246,7 @@ pub enum Event {
     BrainChanged(BrainView),
     CoordChanged(CoordView),
     AttentionChanged(AttentionView),
+    TimelineChanged(DayView),
     /// An event type this build does not know, built only by the decoder so
     /// a newer daemon cannot break an older client. Never sent.
     #[serde(skip)]
@@ -1260,6 +1264,7 @@ pub const EVENT_TYPES: &[&str] = &[
     "BrainChanged",
     "CoordChanged",
     "AttentionChanged",
+    "TimelineChanged",
 ];
 
 /// Why something is on the attention queue.
@@ -1273,6 +1278,12 @@ pub enum AttentionKind {
     PrBuildFailed,
     PrChangesRequested,
     PrComments,
+    /// A session ran for a while with nothing written to its log.
+    LogGap,
+    /// A kind this build does not know, so a newer daemon cannot break an
+    /// older client. Clients leave these out of what they show.
+    #[serde(other)]
+    Other,
 }
 
 /// One thing that wants your attention.
@@ -1296,8 +1307,89 @@ pub struct AttentionView {
 }
 
 impl AttentionView {
+    /// How many items to badge: kinds this build does not know are left out.
     pub fn count(&self) -> usize {
-        self.items.len()
+        self.items
+            .iter()
+            .filter(|i| i.kind != AttentionKind::Other)
+            .count()
+    }
+}
+
+/// What one kind of stretch of time on the timeline was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpanKind {
+    /// Covered by the session log.
+    Logged,
+    /// Nothing in the log for longer than the flag threshold.
+    Gap,
+    /// Running with no log to compare against.
+    Unlogged,
+    /// A long wait cut out of the stretch, drawn as a thin line.
+    Wait,
+    /// Uncovered but short enough not to flag; drawn as logged, with the
+    /// hover `short gap, not flagged`.
+    Short,
+    /// A kind this build does not know, so a newer daemon cannot break an
+    /// older client. Clients draw and list nothing for it.
+    #[serde(other)]
+    Other,
+}
+
+/// A stretch of one kind, in unix seconds.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Span {
+    pub from: i64,
+    pub to: i64,
+    pub kind: SpanKind,
+}
+
+/// One run of a session in a slot, with how its time was spent.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DayStretch {
+    pub session: String,
+    pub first: i64,
+    pub last: i64,
+    /// Still going now.
+    pub running: bool,
+    pub spans: Vec<Span>,
+    /// The log files the spans were read from.
+    pub logs: Vec<String>,
+}
+
+/// Everything one slot did today.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DayRow {
+    pub slot: SlotId,
+    pub stretches: Vec<DayStretch>,
+}
+
+/// The day timeline: one row per slot that ran today.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DayView {
+    /// Local date, `YYYY-MM-DD`.
+    pub day: String,
+    /// Unix seconds the day starts.
+    pub start: i64,
+    /// Unix seconds when this view was built.
+    pub now: i64,
+    pub rows: Vec<DayRow>,
+}
+
+impl DayView {
+    /// The gap spans for a slot, in time order.
+    pub fn gaps(&self, slot: SlotId) -> Vec<&Span> {
+        let mut gaps: Vec<&Span> = self
+            .rows
+            .iter()
+            .filter(|r| r.slot == slot)
+            .flat_map(|r| r.stretches.iter())
+            .flat_map(|s| s.spans.iter())
+            .filter(|sp| sp.kind == SpanKind::Gap)
+            .collect();
+        gaps.sort_by_key(|sp| sp.from);
+        gaps
     }
 }
 
@@ -1315,6 +1407,107 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.held_since, None);
+    }
+
+    fn demo_day() -> DayView {
+        DayView {
+            day: "2026-11-24".into(),
+            start: 1000,
+            now: 9000,
+            rows: vec![DayRow {
+                slot: 2,
+                stretches: vec![DayStretch {
+                    session: "demo-session".into(),
+                    first: 1000,
+                    last: 8000,
+                    running: true,
+                    spans: vec![
+                        Span {
+                            from: 1000,
+                            to: 2000,
+                            kind: SpanKind::Logged,
+                        },
+                        Span {
+                            from: 2000,
+                            to: 3000,
+                            kind: SpanKind::Gap,
+                        },
+                        Span {
+                            from: 3000,
+                            to: 4000,
+                            kind: SpanKind::Unlogged,
+                        },
+                        Span {
+                            from: 4000,
+                            to: 5000,
+                            kind: SpanKind::Wait,
+                        },
+                        Span {
+                            from: 5000,
+                            to: 5200,
+                            kind: SpanKind::Short,
+                        },
+                    ],
+                    logs: vec!["demo-ws/a.jsonl".into()],
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn day_view_round_trips() {
+        let v = demo_day();
+        let ev = Event::TimelineChanged(v.clone());
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains(r#""kind":"gap""#), "{json}");
+        let back: Event = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ev);
+        assert_eq!(v.gaps(2).len(), 1);
+        assert_eq!(v.gaps(2)[0].from, 2000);
+        assert!(v.gaps(3).is_empty());
+    }
+
+    #[test]
+    fn timeline_request_and_response_round_trip() {
+        let req = Request::Timeline;
+        let back: Request = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        assert_eq!(back, req);
+        let resp = Response::Timeline(demo_day());
+        let back: Response = serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
+        assert_eq!(back, resp);
+    }
+
+    #[test]
+    fn attention_kind_log_gap_is_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&AttentionKind::LogGap).unwrap(),
+            "\"log_gap\""
+        );
+    }
+
+    #[test]
+    fn unknown_attention_kind_reads_as_other() {
+        assert_eq!(
+            serde_json::from_str::<AttentionKind>("\"from_the_future\"").unwrap(),
+            AttentionKind::Other
+        );
+        let v: AttentionView = serde_json::from_str(
+            r#"{"items":[{"key":"k","kind":"from_the_future","slot":null,"pr":null,"url":null,"since":1,"text":"t"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(v.items[0].kind, AttentionKind::Other);
+    }
+
+    #[test]
+    fn unknown_span_kind_reads_as_other() {
+        let sp: Span =
+            serde_json::from_str(r#"{"from":1,"to":2,"kind":"from_the_future"}"#).unwrap();
+        assert_eq!(sp.kind, SpanKind::Other);
+    }
+
+    #[test]
+    fn event_types_lists_timeline_changed() {
+        assert!(EVENT_TYPES.contains(&"TimelineChanged"));
     }
 
     #[test]
@@ -1339,6 +1532,23 @@ mod tests {
     }
 
     #[test]
+    fn attention_count_skips_kinds_this_build_does_not_know() {
+        let item = |kind| AttentionItem {
+            key: "k".into(),
+            kind,
+            slot: Some(1),
+            pr: None,
+            url: None,
+            since: 1,
+            text: "t".into(),
+        };
+        let v = AttentionView {
+            items: vec![item(AttentionKind::Other), item(AttentionKind::LogGap)],
+        };
+        assert_eq!(v.count(), 1);
+    }
+
+    #[test]
     fn every_event_variant_has_a_listed_type_name() {
         let events = [
             Event::SlotChanged(SlotInfo {
@@ -1358,13 +1568,14 @@ mod tests {
             Event::BrainChanged(brain_view()),
             Event::CoordChanged(coord()),
             Event::AttentionChanged(AttentionView::default()),
+            Event::TimelineChanged(DayView::default()),
         ];
         for ev in events {
             let v: serde_json::Value = serde_json::to_value(&ev).unwrap();
             let name = v["type"].as_str().unwrap().to_string();
             assert!(EVENT_TYPES.contains(&name.as_str()), "{name} not listed");
         }
-        assert_eq!(EVENT_TYPES.len(), 6);
+        assert_eq!(EVENT_TYPES.len(), 7);
         assert!(serde_json::to_string(&Event::Unknown { kind: "x".into() }).is_err());
     }
 
@@ -1372,6 +1583,7 @@ mod tests {
     fn attention_requests_round_trip() {
         for req in [
             Request::Attention,
+            Request::Timeline,
             Request::PrSeen {
                 repo: "demo-api".into(),
                 id: 7,

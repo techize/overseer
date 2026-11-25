@@ -205,7 +205,8 @@ pub fn local_minutes(t: i64) -> (LocalDate, u32) {
     (local_date(t), mins)
 }
 
-fn ymd(d: &LocalDate) -> String {
+/// A local date as `YYYY-MM-DD`.
+pub fn ymd(d: &LocalDate) -> String {
     format!("{:04}-{:02}-{:02}", d.year, d.month, d.day)
 }
 
@@ -357,6 +358,26 @@ fn fill(pattern: &str, d: &LocalDate, slot: SlotId) -> String {
         .replace("{slot}", &format!("s{slot}"))
 }
 
+/// The files `patterns` (vault-relative globs) match for day `d` and
+/// `slot`, each once, in the order found.
+fn matching(
+    brain: &Path,
+    home: &Path,
+    patterns: &[String],
+    d: &LocalDate,
+    slot: SlotId,
+) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = Vec::new();
+    for p in patterns {
+        for path in glob(&fill(p, d, slot), brain, home) {
+            if !found.contains(&path) {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
 /// The logs the run wrote: files matching `patterns` (vault-relative globs)
 /// for the days it ran on, changed since it started, in name order.
 /// A minute's slack on the start allows for clock rounding.
@@ -370,19 +391,88 @@ pub fn find_logs(brain: &Path, home: &Path, patterns: &[String], run: &Run) -> V
         std::time::UNIX_EPOCH + std::time::Duration::from_secs((run.started - 60).max(0) as u64);
     let mut found: Vec<PathBuf> = Vec::new();
     for d in &days {
-        for p in patterns {
-            for path in glob(&fill(p, d, run.slot), brain, home) {
-                let fresh = std::fs::metadata(&path)
-                    .and_then(|m| m.modified())
-                    .is_ok_and(|t| t >= since);
-                if fresh && !found.contains(&path) {
-                    found.push(path);
-                }
+        for path in matching(brain, home, patterns, d, run.slot) {
+            let fresh = std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .is_ok_and(|t| t >= since);
+            if fresh && !found.contains(&path) {
+                found.push(path);
             }
         }
     }
     found.sort();
     found
+}
+
+/// One of a slot's logs for today: its file stem and the work ranges on
+/// its `**Time**` line, minutes after midnight.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DayLog {
+    pub name: String,
+    pub ranges: Vec<(u32, Option<u32>)>,
+}
+
+/// Every log `patterns` match for `slot` on `now`'s local day, however
+/// long ago it was changed, in name order.
+pub fn today_logs(
+    brain: &Path,
+    home: &Path,
+    patterns: &[String],
+    slot: SlotId,
+    now: i64,
+) -> Vec<DayLog> {
+    let mut paths = matching(brain, home, patterns, &local_date(now), slot);
+    paths.sort();
+    paths
+        .iter()
+        .filter_map(|p| {
+            let text = std::fs::read_to_string(p).ok()?;
+            Some(DayLog {
+                name: p.file_stem()?.to_string_lossy().into_owned(),
+                ranges: time_ranges(split_frontmatter(&text).1),
+            })
+        })
+        .collect()
+}
+
+/// Unix seconds of local midnight at the start of `t`'s day.
+pub fn local_day_start(t: i64) -> i64 {
+    // SAFETY: localtime_r and mktime only touch the `tm` we pass them.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let time = t as libc::time_t;
+    if unsafe { libc::localtime_r(&time, &mut tm) }.is_null() {
+        return t - t.rem_euclid(86_400);
+    }
+    tm.tm_hour = 0;
+    tm.tm_min = 0;
+    tm.tm_sec = 0;
+    tm.tm_isdst = -1;
+    match unsafe { libc::mktime(&mut tm) } {
+        -1 => t - t.rem_euclid(86_400),
+        m => m,
+    }
+}
+
+/// Unix seconds of local time `minutes` after the midnight `day_start`,
+/// read off the clock so a day with a clock change is right; 1440 is the
+/// next midnight.
+pub fn local_minute(day_start: i64, minutes: u32) -> i64 {
+    let naive = day_start + i64::from(minutes) * 60;
+    // SAFETY: localtime_r and mktime only touch the `tm` we pass them.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let time = day_start as libc::time_t;
+    if unsafe { libc::localtime_r(&time, &mut tm) }.is_null() {
+        return naive;
+    }
+    tm.tm_mday += (minutes / 1440) as libc::c_int;
+    tm.tm_hour = (minutes % 1440 / 60) as libc::c_int;
+    tm.tm_min = (minutes % 60) as libc::c_int;
+    tm.tm_sec = 0;
+    tm.tm_isdst = -1;
+    match unsafe { libc::mktime(&mut tm) } {
+        -1 => naive,
+        m => m,
+    }
 }
 
 /// Reads each log found for the run.
@@ -514,5 +604,68 @@ mod tests {
         );
         // Past midnight the minutes are not compared.
         assert!(problems(&late, 23 * 60, 30, false).is_empty());
+    }
+
+    #[test]
+    fn local_day_start_is_local_midnight() {
+        let t = 1_795_000_000; // a fixed moment in November 2026
+        let start = local_day_start(t);
+        assert!(start <= t && t - start < 25 * 3600);
+        let (d, mins) = local_minutes(start);
+        assert_eq!(mins, 0);
+        assert_eq!(ymd(&d), ymd(&local_date(t)));
+    }
+
+    #[test]
+    fn local_minute_follows_the_clock_on_every_day_of_the_year() {
+        // Every day of 2026, so a clock change in the local zone is crossed.
+        let mut start = local_day_start(1_767_225_600 + 12 * 3600);
+        for _ in 0..366 {
+            let noon = local_minute(start, 12 * 60);
+            let (d, mins) = local_minutes(noon);
+            assert_eq!(mins, 12 * 60, "noon on {}", ymd(&d));
+            assert_eq!(ymd(&d), ymd(&local_date(start)));
+            let next = local_minute(start, 24 * 60);
+            assert_eq!(
+                next,
+                local_day_start(next),
+                "next midnight after {}",
+                ymd(&d)
+            );
+            assert!(next > start);
+            start = next;
+        }
+    }
+
+    #[test]
+    fn today_logs_ignores_modified_time() {
+        let brain = tempfile::tempdir().unwrap();
+        let now = 1_795_000_000;
+        let d = local_date(now);
+        let dir = brain.path().join("Sessions");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mine = dir.join(format!("{}-s1-demo.md", ymd(&d)));
+        std::fs::write(&mine, "# DEMO-1\n\n**Time**: 09:00 - 10:00\n").unwrap();
+        let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&mine)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        std::fs::write(
+            dir.join(format!("{}-s2-demo.md", ymd(&d))),
+            "**Time**: 11:00 - 12:00\n",
+        )
+        .unwrap();
+        let patterns = ["Sessions/{yyyy}-{mm}-{dd}-{slot}-*.md".to_string()];
+        let found = today_logs(brain.path(), brain.path(), &patterns, 1, now);
+        assert_eq!(
+            found,
+            [DayLog {
+                name: format!("{}-s1-demo", ymd(&d)),
+                ranges: vec![(9 * 60, Some(10 * 60))],
+            }]
+        );
     }
 }

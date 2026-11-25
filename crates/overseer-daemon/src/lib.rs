@@ -20,6 +20,8 @@ pub mod session_logs;
 pub mod settings;
 pub mod slot;
 pub mod stretches;
+pub mod timeline;
+pub mod timeline_service;
 pub mod trust;
 pub mod vt;
 pub mod work;

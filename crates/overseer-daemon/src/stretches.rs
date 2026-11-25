@@ -8,8 +8,8 @@
 //! or turn end to its last. A `SessionStart` with a new transcript id ends
 //! the stretch before it, and so does the session's end.
 //!
-//! Kept in memory: a daemon restart loses the open stretch's start, and the
-//! stretch then counts from its next event.
+//! Tracked in memory and stored in the ledger as it goes: a daemon restart
+//! seeds the open stretch back from its row, so it keeps its start.
 
 use overseer_proto::{HookKind, SlotId};
 use std::collections::HashMap;
@@ -80,6 +80,24 @@ impl Stretches {
         ended
     }
 
+    /// The slot's open stretch, if it has had any work.
+    pub fn open(&self, slot: SlotId) -> Option<Stretch> {
+        let (session, times) = self.open.get(&slot)?;
+        times.map(|(first, last)| Stretch {
+            slot,
+            session: session.clone(),
+            first,
+            last,
+        })
+    }
+
+    /// Puts back a stored stretch that is still running, so its next work
+    /// extends it rather than starting a new one.
+    pub fn seed(&mut self, s: &Stretch) {
+        self.open
+            .insert(s.slot, (s.session.clone(), Some((s.first, s.last))));
+    }
+
     /// The slot's session ended: its open stretch, if it had any work.
     pub fn ended(&mut self, slot: SlotId) -> Option<Stretch> {
         let (session, times) = self.open.remove(&slot)?;
@@ -136,6 +154,40 @@ mod tests {
             })
         );
         assert_eq!(s.ended(2), None);
+    }
+
+    #[test]
+    fn open_reports_the_running_stretch() {
+        let mut s = Stretches::default();
+        s.seen(&ev(2, "a", HookKind::SessionStart, 100));
+        assert_eq!(s.open(2), None, "no work yet");
+        s.seen(&ev(2, "a", HookKind::UserPromptSubmit, 110));
+        s.seen(&ev(2, "a", HookKind::Stop, 150));
+        assert_eq!(
+            s.open(2),
+            Some(Stretch {
+                slot: 2,
+                session: "a".into(),
+                first: 110,
+                last: 150
+            })
+        );
+        assert_eq!(s.open(3), None);
+        s.ended(2);
+        assert_eq!(s.open(2), None);
+    }
+
+    #[test]
+    fn seeded_stretch_is_extended_not_restarted() {
+        let mut s = Stretches::default();
+        s.seed(&Stretch {
+            slot: 2,
+            session: "a".into(),
+            first: 100,
+            last: 200,
+        });
+        assert_eq!(s.seen(&ev(2, "a", HookKind::Stop, 300)), None);
+        assert_eq!(s.open(2).map(|x| (x.first, x.last)), Some((100, 300)));
     }
 
     #[test]

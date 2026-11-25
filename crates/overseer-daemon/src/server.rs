@@ -30,6 +30,7 @@ use crate::manager::{valid_id, Attachment, SlotManager};
 use crate::relay::courier::Courier;
 use crate::settings::SettingsFiles;
 use crate::slot::CatchUp;
+use crate::timeline_service::{LogSource, TimelineService};
 use crate::work::store::{unix_now, KickoffFacts};
 use crate::work::token::{save_token, token_status};
 use crate::work::WorkStore;
@@ -369,6 +370,8 @@ pub async fn run_until(
     }
     let (seen_tx, seen_rx) = mpsc::unbounded_channel();
     manager.lock().unwrap().feed_stretches(seen_tx);
+    // Poked whenever a stretch or wait row is written.
+    let timeline_nudge = Arc::new(Notify::new());
     if let Some(b) = &brain {
         {
             let (manager, store, ledger) = (manager.clone(), store.clone(), ledger.clone());
@@ -430,14 +433,27 @@ pub async fn run_until(
             patterns: cfg.settings.session_logs.clone(),
             runs_file: cfg.settings.slot_runs.clone(),
             min_secs: cfg.settings.session_log_min_mins.saturating_mul(60) as i64,
+            timeline_nudge: timeline_nudge.clone(),
         },
     ));
     store.start_polling();
+    let day_timeline = TimelineService::spawn(
+        ledger.clone(),
+        (!cfg.settings.session_logs.is_empty()).then(|| LogSource {
+            brain_dir: cfg.settings.brain_dir.clone(),
+            home: crate::config::home_from_env(),
+            patterns: cfg.settings.session_logs.clone(),
+        }),
+        cfg.settings.session_log_min_mins.saturating_mul(60) as i64,
+        timeline_nudge.clone(),
+        events.clone(),
+    );
     let attention = AttentionService::spawn(
         ledger.clone(),
         manager.clone(),
         locks.clone(),
         store.clone(),
+        day_timeline.clone(),
         events.clone(),
         !cfg.settings.pr_author.trim().is_empty(),
     );
@@ -474,6 +490,7 @@ pub async fn run_until(
                             info: info.clone(),
                             settings: settings.clone(),
                             attention: attention.clone(),
+                            timeline: day_timeline.clone(),
                         },
                         shutdown.clone(),
                         env.clone(),
@@ -589,28 +606,194 @@ struct LogCheck {
     /// Shorter runs are not checked: a session stopped at once has
     /// nothing to log.
     min_secs: i64,
+    /// Poked after each stretch or wait row written.
+    timeline_nudge: Arc<Notify>,
+}
+
+/// Stretch rows older than this are deleted at daemon start.
+const STRETCH_KEEP_SECS: i64 = 7 * 86400;
+/// A running stretch's row is written again once its last work has moved
+/// on this far.
+const STRETCH_WRITE_SECS: i64 = 60;
+
+/// The slots' stretches and idle waits, and what of them the ledger has.
+#[derive(Default)]
+struct Tracker {
+    stretches: crate::stretches::Stretches,
+    /// Per slot, the open stretch as last written: session, first, last.
+    written: std::collections::HashMap<SlotId, (String, i64, i64)>,
+    /// Slots with a wait open in the ledger.
+    waiting: std::collections::HashSet<SlotId>,
+}
+
+impl Tracker {
+    /// Picks up from what the last daemon stored: old rows go, a stretch
+    /// whose slot still runs its transcript carries on, and any other
+    /// ends at its last work. Waits of slots no longer running close now.
+    fn reconcile(&mut self, c: &LogCheck, now: i64) {
+        if let Err(e) = c.ledger.prune_stretches(now - STRETCH_KEEP_SECS) {
+            tracing::warn!("old stretches not pruned: {e:#}");
+        }
+        let open = c.ledger.open_stretches().unwrap_or_else(|e| {
+            tracing::warn!("open stretches not read: {e:#}");
+            Vec::new()
+        });
+        for row in open {
+            let s = crate::stretches::Stretch {
+                slot: row.slot,
+                session: row.session,
+                first: row.first,
+                last: row.last,
+            };
+            let running = c.manager.lock().unwrap().running_session(s.slot);
+            if running.as_deref() == Some(s.session.as_str()) {
+                // Two open rows for one transcript: the earlier one ends.
+                if let Some(before) = self.stretches.open(s.slot) {
+                    self.end(c, &before, before.last);
+                }
+                self.stretches.seed(&s);
+                self.written
+                    .insert(s.slot, (s.session.clone(), s.first, s.last));
+            } else {
+                self.end(c, &s, s.last);
+            }
+        }
+        let waits = c.ledger.waits_since(i64::MAX).unwrap_or_else(|e| {
+            tracing::warn!("open waits not read: {e:#}");
+            Vec::new()
+        });
+        for w in waits.into_iter().filter(|w| w.end.is_none()) {
+            if c.manager.lock().unwrap().running_session(w.slot).is_some() {
+                self.waiting.insert(w.slot);
+            } else {
+                store_wait_end(c, w.slot, now);
+            }
+        }
+    }
+
+    /// Takes in one hook event: a stretch it ended is stored and checked,
+    /// and the slot's open stretch is stored when it is new or has moved on.
+    async fn seen(&mut self, c: &LogCheck, s: &crate::stretches::Seen) {
+        if let Some(done) = self.stretches.seen(s) {
+            self.end(c, &done, s.at);
+            stretch_ended(c, &done, true).await;
+        }
+        let Some(open) = self.stretches.open(s.slot) else {
+            return;
+        };
+        let stored = self
+            .written
+            .get(&s.slot)
+            .is_some_and(|(session, first, last)| {
+                *session == open.session
+                    && *first == open.first
+                    && open.last - last < STRETCH_WRITE_SECS
+            });
+        if stored {
+            return;
+        }
+        match c
+            .ledger
+            .put_stretch(open.slot, &open.session, open.first, open.last)
+        {
+            Ok(()) => {
+                self.written
+                    .insert(open.slot, (open.session, open.first, open.last));
+                c.timeline_nudge.notify_one();
+            }
+            Err(e) => tracing::warn!("S{} stretch not stored: {e:#}", open.slot),
+        }
+    }
+
+    /// Stores `s` as ended at `ended`.
+    fn end(&mut self, c: &LogCheck, s: &crate::stretches::Stretch, ended: i64) {
+        if self
+            .written
+            .get(&s.slot)
+            .is_some_and(|(session, first, _)| *session == s.session && *first == s.first)
+        {
+            self.written.remove(&s.slot);
+        }
+        match c
+            .ledger
+            .end_stretch(s.slot, &s.session, s.first, s.last, ended)
+        {
+            Ok(()) => c.timeline_nudge.notify_one(),
+            Err(e) => tracing::warn!("S{} stretch end not stored: {e:#}", s.slot),
+        }
+    }
+
+    /// Opens or closes the slot's idle wait from its new state: an idle
+    /// wait opens one when its activity starts; anything else, or the
+    /// slot exiting, closes it.
+    fn slot_changed(&mut self, c: &LogCheck, info: &overseer_proto::SlotInfo) {
+        let activity = info.activity.as_ref();
+        let idle_wait =
+            activity.filter(|a| a.kind == overseer_proto::ActivityKind::Idle && a.idle_wait);
+        match (&info.state, idle_wait) {
+            (SlotState::Running { .. }, Some(a)) => {
+                if self.waiting.contains(&info.id) {
+                    return;
+                }
+                let session = self
+                    .stretches
+                    .open(info.id)
+                    .map(|s| s.session)
+                    .or_else(|| c.manager.lock().unwrap().running_session(info.id))
+                    .unwrap_or_default();
+                match c.ledger.open_wait(info.id, &session, a.since) {
+                    Ok(()) => {
+                        self.waiting.insert(info.id);
+                        c.timeline_nudge.notify_one();
+                    }
+                    Err(e) => tracing::warn!("S{} wait not stored: {e:#}", info.id),
+                }
+            }
+            (SlotState::Exited { at, .. }, _) => self.close_wait(c, info.id, *at),
+            (_, _) => {
+                let end = activity.map_or_else(unix_now, |a| a.since);
+                self.close_wait(c, info.id, end);
+            }
+        }
+    }
+
+    /// Closes the slot's wait at `end`, if it has one open.
+    fn close_wait(&mut self, c: &LogCheck, slot: SlotId, end: i64) {
+        if self.waiting.remove(&slot) {
+            store_wait_end(c, slot, end);
+        }
+    }
+}
+
+/// Ends the wait the ledger has open for `slot` at `end`.
+fn store_wait_end(c: &LogCheck, slot: SlotId, end: i64) {
+    match c.ledger.close_wait(slot, end) {
+        Ok(()) => c.timeline_nudge.notify_one(),
+        Err(e) => tracing::warn!("S{slot} wait end not stored: {e:#}"),
+    }
 }
 
 /// Checks a slot's session logs each time its session really ends, and
 /// tracks each transcript's stretch of work: one a `/clear` ends is
 /// recorded, its logs are checked and the slot is told to log the next
-/// stretch apart (#80).
+/// stretch apart (#80). Stretches and idle waits are stored in the ledger
+/// as they happen, for the day timeline (#84).
 async fn watch_session_logs(
     mut events: broadcast::Receiver<Event>,
     mut seen: mpsc::UnboundedReceiver<crate::stretches::Seen>,
     c: LogCheck,
 ) {
-    let mut stretches = crate::stretches::Stretches::default();
+    let mut t = Tracker::default();
+    t.reconcile(&c, unix_now());
     loop {
         tokio::select! {
             s = seen.recv() => {
                 let Some(s) = s else { return };
-                if let Some(done) = stretches.seen(&s) {
-                    stretch_ended(&c, &done, true).await;
-                }
+                t.seen(&c, &s).await;
             }
             ev = events.recv() => match ev {
                 Ok(Event::SlotChanged(info)) => {
+                    t.slot_changed(&c, &info);
                     let SlotState::Exited { at, .. } = info.state else {
                         continue;
                     };
@@ -620,11 +803,10 @@ async fn watch_session_logs(
                     }
                     // Events still queued belong to the session that ended.
                     while let Ok(s) = seen.try_recv() {
-                        if let Some(done) = stretches.seen(&s) {
-                            stretch_ended(&c, &done, true).await;
-                        }
+                        t.seen(&c, &s).await;
                     }
-                    if let Some(done) = stretches.ended(info.id) {
+                    if let Some(done) = t.stretches.ended(info.id) {
+                        t.end(&c, &done, at);
                         stretch_ended(&c, &done, false).await;
                     }
                     check_session_logs(&c, info.id, at).await;
@@ -910,6 +1092,7 @@ struct Services {
     info: Arc<DaemonInfo>,
     settings: Arc<SettingsCtx>,
     attention: Arc<AttentionService>,
+    timeline: Arc<TimelineService>,
 }
 
 async fn handle_conn(
@@ -930,6 +1113,7 @@ async fn handle_conn(
         info,
         settings,
         attention,
+        timeline,
     } = services;
     let (mut rd, mut wr) = stream.into_split();
     let (out_tx, mut out_rx) = mpsc::channel::<Frame>(OUTBOUND_QUEUE);
@@ -1037,6 +1221,7 @@ async fn handle_conn(
                         info: &info,
                         settings: &settings,
                         attention: &attention,
+                        timeline: &timeline,
                     };
                     handle_frame(f, &ctx, &outbox, &shutdown, &mut streams)
                 }
@@ -1082,6 +1267,7 @@ struct Ctx<'a> {
     info: &'a DaemonInfo,
     settings: &'a Arc<SettingsCtx>,
     attention: &'a Arc<AttentionService>,
+    timeline: &'a Arc<TimelineService>,
 }
 
 fn handle_frame(
@@ -1365,6 +1551,7 @@ fn handle_request(
         }
         Request::PrSeen { repo, id } => store.mark_pr_seen(&repo, id),
         Request::Attention => Response::Attention(ctx.attention.current()),
+        Request::Timeline => Response::Timeline(ctx.timeline.current()),
         Request::ListSlots => Response::Slots(manager.lock().unwrap().list()),
         Request::DaemonInfo => Response::DaemonInfo(ctx.info.clone()),
         Request::SlotScreen { id } if !valid_id(id) => err(format!("invalid slot id {id}")),
