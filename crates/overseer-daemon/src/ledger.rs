@@ -216,7 +216,12 @@ CREATE TABLE IF NOT EXISTS stretch_waits (
     start INTEGER NOT NULL, end INTEGER,
     PRIMARY KEY (slot, start))";
 
-const VERSION: i64 = 11;
+/// The transcript file of each slot's current session, so a restart can
+/// read a running slot's conversation again from the start.
+const V12_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS slot_transcripts (
+    slot INTEGER PRIMARY KEY, session TEXT, path TEXT)";
+
+const VERSION: i64 = 12;
 
 /// Reports and state changes kept per slot.
 const REPORTS_PER_SLOT: i64 = 200;
@@ -230,7 +235,7 @@ fn migrate(conn: &Connection) -> Result<()> {
     if version >= VERSION {
         return Ok(());
     }
-    let steps: [(i64, &str); 11] = [
+    let steps: [(i64, &str); 12] = [
         (1, SESSIONS_SCHEMA),
         (2, V2_SCHEMA),
         (3, V3_SCHEMA),
@@ -242,6 +247,7 @@ fn migrate(conn: &Connection) -> Result<()> {
         (9, V9_SCHEMA),
         (10, V10_SCHEMA),
         (11, V11_SCHEMA),
+        (12, V12_SCHEMA),
     ];
     let mut batch = String::from("BEGIN;\n");
     for (n, sql) in steps {
@@ -975,6 +981,36 @@ impl Ledger {
         conn.execute("DELETE FROM stretches WHERE last < ?1", [before])?;
         conn.execute("DELETE FROM stretch_waits WHERE end < ?1", [before])?;
         Ok(())
+    }
+
+    /// Records the transcript of `slot`'s current session, replacing the
+    /// one before.
+    pub fn put_transcript(&self, slot: SlotId, session: &str, path: &Path) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO slot_transcripts (slot, session, path) VALUES (?1, ?2, ?3)
+             ON CONFLICT (slot) DO UPDATE SET session = excluded.session, path = excluded.path",
+            rusqlite::params![slot, session, path.to_string_lossy()],
+        )?;
+        Ok(())
+    }
+
+    /// The session and transcript path last recorded for `slot`.
+    pub fn transcript(&self, slot: SlotId) -> Result<Option<(String, PathBuf)>> {
+        let found = self.conn().query_row(
+            "SELECT session, path FROM slot_transcripts WHERE slot = ?1",
+            [slot],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    PathBuf::from(r.get::<_, String>(1)?),
+                ))
+            },
+        );
+        match found {
+            Ok(row) => Ok(Some(row)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Every work item that has a slot, as `(key, slot)`.
@@ -2351,11 +2387,47 @@ mod tests {
             .unwrap();
         }
         let l = Ledger::open(&path).unwrap();
-        assert_eq!(user_version(&l), 11);
+        assert_eq!(user_version(&l), VERSION);
         let rows = l.pr_seen().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, 7);
         assert!(l.open_stretches().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn v11_ledger_upgrades_to_v12() {
+        let path = temp_db("migrate-v12");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(&format!(
+                "{SESSIONS_SCHEMA};\n{V2_SCHEMA};\n{V3_SCHEMA};\n{V4_SCHEMA};\n{V5_SCHEMA};\n{V6_SCHEMA};\n{V7_SCHEMA};\n{V8_SCHEMA};\n{V9_SCHEMA};\n{V10_SCHEMA};\n{V11_SCHEMA};\nPRAGMA user_version = 11;"
+            ))
+            .unwrap();
+            conn.execute(
+                "INSERT INTO stretches (slot, session, first, last) VALUES (2, 'demo-a', 10, 20)",
+                [],
+            )
+            .unwrap();
+        }
+        let l = Ledger::open(&path).unwrap();
+        assert_eq!(user_version(&l), 12);
+        assert_eq!(l.open_stretches().unwrap().len(), 1);
+        assert_eq!(l.transcript(2).unwrap(), None);
+        let first = Path::new("/tmp/demo/one.jsonl");
+        l.put_transcript(2, "demo-a", first).unwrap();
+        assert_eq!(
+            l.transcript(2).unwrap(),
+            Some(("demo-a".to_string(), first.to_path_buf()))
+        );
+        // An upsert: the next session replaces the row.
+        let second = Path::new("/tmp/demo/two.jsonl");
+        l.put_transcript(2, "demo-b", second).unwrap();
+        assert_eq!(
+            l.transcript(2).unwrap(),
+            Some(("demo-b".to_string(), second.to_path_buf()))
+        );
         let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
     }
 

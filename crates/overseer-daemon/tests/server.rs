@@ -7352,3 +7352,50 @@ async fn timeline_changed_is_sent_when_a_stretch_starts() {
         other => panic!("unexpected {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn a_hooked_transcript_is_followed_and_answered() {
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    assert_eq!(c.start(2).await, Response::Ok);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("demo-session.jsonl");
+    std::fs::write(
+        &path,
+        "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"fix DEMO-1\"}}\n",
+    )
+    .unwrap();
+    let in_transcript = |slot, kind| HookEvent {
+        session_id: Some("demo-session".into()),
+        transcript_path: Some(path.to_string_lossy().into_owned()),
+        ..hook(slot, kind)
+    };
+    c.hook(in_transcript(2, HookKind::SessionStart)).await;
+    let announced = timeout(WAIT * 2, async {
+        loop {
+            match c.recv().await.expect("connection closed") {
+                Frame::Event(Event::ConversationChanged(v)) if v.slot == 2 => return v,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("no conversation event");
+    assert_eq!(announced.entries_from, 0);
+    assert_eq!(announced.entries.len(), 1);
+    assert_eq!(announced.session, "demo-session");
+    match c.request(Request::Conversation { slot: 2 }).await {
+        Response::Conversation(v) => assert_eq!(v, announced),
+        other => panic!("unexpected {other:?}"),
+    }
+    // A slot that is not running does not follow its hooks.
+    c.hook(in_transcript(4, HookKind::SessionStart)).await;
+    match c.request(Request::Conversation { slot: 4 }).await {
+        Response::Conversation(v) => assert!(v.entries.is_empty() && v.session.is_empty()),
+        other => panic!("unexpected {other:?}"),
+    }
+    assert!(matches!(
+        c.request(Request::Conversation { slot: 99 }).await,
+        Response::Error { .. }
+    ));
+}
