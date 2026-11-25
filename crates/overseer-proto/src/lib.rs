@@ -3,6 +3,7 @@
 pub mod build;
 pub mod client;
 pub mod frame;
+pub mod git;
 pub mod msg;
 pub mod paths;
 pub mod settings;
