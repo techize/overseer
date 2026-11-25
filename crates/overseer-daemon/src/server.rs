@@ -810,11 +810,13 @@ async fn watch_session_logs(
                     while let Ok(s) = seen.try_recv() {
                         t.seen(&c, &s).await;
                     }
+                    let mut worked_until = None;
                     if let Some(done) = t.stretches.ended(info.id) {
                         t.end(&c, &done, at);
                         stretch_ended(&c, &done, false).await;
+                        worked_until = Some(done.last);
                     }
-                    check_session_logs(&c, info.id, at).await;
+                    check_session_logs(&c, info.id, at, worked_until).await;
                 }
                 Ok(_) => {}
                 // A missed exit is not checked: the next one is.
@@ -870,6 +872,7 @@ async fn stretch_ended(c: &LogCheck, s: &crate::stretches::Stretch, cleared: boo
         slot: s.slot,
         started: s.first,
         ended: s.last,
+        worked_until: Some(s.last),
     };
     let file = logs::runs_file(&c.runs_file, &run);
     let record = runs_record(c);
@@ -882,7 +885,9 @@ async fn stretch_ended(c: &LogCheck, s: &crate::stretches::Stretch, cleared: boo
     }
 }
 
-async fn check_session_logs(c: &LogCheck, slot: SlotId, ended: i64) {
+/// `worked_until` is the last work seen in the session, when its final
+/// stretch is known: the logs need cover only up to there.
+async fn check_session_logs(c: &LogCheck, slot: SlotId, ended: i64, worked_until: Option<i64>) {
     use crate::session_logs as logs;
     if c.patterns.is_empty() {
         return;
@@ -902,6 +907,7 @@ async fn check_session_logs(c: &LogCheck, slot: SlotId, ended: i64) {
         slot,
         started,
         ended,
+        worked_until,
     };
     let file = logs::runs_file(&c.runs_file, &run);
     let record = runs_record(c);
