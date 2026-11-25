@@ -149,11 +149,48 @@ fn tail(file: &str) -> String {
 }
 
 /// Reads, replaces once and writes atomically, all under the file's lock.
+/// An empty `old` creates `path` with `new` and refuses a file that is
+/// already there, so a new sprint dashboard can be made the same way
+/// an existing one is edited (#94).
 pub async fn edit_file(path: &Path, old: &str, new: &str, locks: &FileLocks) -> Result<(), String> {
     let _g = locks.lock(path).await;
+    if old.is_empty() {
+        return create_file(path, new);
+    }
     let file = std::fs::read_to_string(path).map_err(|e| format!("cannot read file: {e}"))?;
     let next = replace_once(&file, old, new)?;
     write_atomic(path, &next).map_err(|e| format!("cannot write file: {e}"))
+}
+
+/// Writes `text` to a file that must not exist yet. The text goes to a
+/// temporary file first and is hard-linked into place, so the file
+/// appears whole and a file made meanwhile is never overwritten.
+fn create_file(path: &Path, text: &str) -> Result<(), String> {
+    use std::io::Write;
+    let exists = "the file already exists; read it and give old_text to change it";
+    if path.exists() {
+        return Err(exists.into());
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("cannot create the folder: {e}"))?;
+    }
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".overseer-tmp");
+    let tmp = path.with_file_name(name);
+    let run = || -> io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::hard_link(&tmp, path)
+    };
+    let out = run();
+    let _ = std::fs::remove_file(&tmp);
+    match out {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(exists.into()),
+        Err(e) => Err(format!("cannot write file: {e}")),
+    }
 }
 
 #[cfg(test)]
@@ -204,6 +241,24 @@ mod tests {
         let out = append_section(DOC, "Work Log", "a \u{2014} b");
         assert!(out.contains("a - b"));
         assert!(!out.contains('\u{2014}'));
+    }
+
+    #[tokio::test]
+    async fn empty_old_text_creates_a_missing_file_only() {
+        let dir = std::env::temp_dir().join(format!("overseer-create-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("sprint-26-02/SPRINT-DASHBOARD.md");
+        let locks = FileLocks::new();
+        edit_file(&path, "", "# Sprint 26-02\n", &locks)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "# Sprint 26-02\n");
+        let e = edit_file(&path, "", "other", &locks).await.unwrap_err();
+        assert!(e.starts_with("the file already exists"), "{e}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "# Sprint 26-02\n");
+        let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap()).unwrap().collect();
+        assert_eq!(leftovers.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

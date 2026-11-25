@@ -4357,7 +4357,7 @@ fn verdict(resp: Response) -> (Option<String>, Option<String>) {
 }
 
 const JOURNAL: &str = "06-Daily/2026/11-November/2026-11-13-journal.md";
-const JOURNAL_DENY: &str = "06-Daily/2026/11-November/2026-11-13-journal.md is a shared notes file. Use append_journal for the journal or edit_shared_file for an exact replacement.";
+const JOURNAL_DENY: &str = "06-Daily/2026/11-November/2026-11-13-journal.md is a shared notes file. Use append_journal for the journal or edit_shared_file for an exact replacement, or with an empty old_text to create a new file.";
 
 #[tokio::test]
 async fn vault_write_checks_deny_shared_files_and_git_and_rewrite_bd() {
