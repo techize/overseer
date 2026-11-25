@@ -30,12 +30,14 @@ use gpui::{
     actions, div, prelude::*, rgb, App, Context, Entity, FocusHandle, Focusable, KeyBinding,
     Subscription, Task, Window,
 };
+use overseer_proto::msg::{Answer, ConversationView};
 use overseer_proto::{
     AttentionView, BrainView, Client, CoordView, DayView, Event, Frame, LockView, Request,
     Response, SlotId, SlotInfo, SlotState, WorkView,
 };
 
 use crate::board::Dir;
+use crate::conversation_view::{Conv, SLOT_COUNT};
 use crate::daemon_info::DaemonKnown;
 use crate::locks_view::LocksState;
 use crate::picker::{Picker, PickerEvent};
@@ -437,8 +439,12 @@ fn app_settings(path: &std::path::Path) -> Result<(Theme, String), String> {
     Ok((theme, crate::terminal_view::editor_from_toml(&text)))
 }
 
+pub(crate) fn empty_convs() -> Vec<Conv> {
+    (0..SLOT_COUNT as SlotId).map(Conv::new).collect()
+}
+
 pub(crate) fn empty_slots() -> Vec<SlotInfo> {
-    (0..7)
+    (0..SLOT_COUNT as SlotId)
         .map(|id| SlotInfo {
             id,
             label: String::new(),
@@ -477,6 +483,8 @@ pub struct OverseerApp {
     /// Today's sessions on a shared time axis, from the daemon; see
     /// `timeline_view`.
     pub(crate) timeline: DayView,
+    /// Each slot's conversation, draft and picked answers, by slot id.
+    pub convs: Vec<Conv>,
     /// The Today panel shows its bars, not just its one line.
     pub(crate) timeline_open: bool,
     /// The push problem text last announced; see `push_problem_note`.
@@ -591,6 +599,7 @@ impl OverseerApp {
             coord: empty_coord(),
             attention: AttentionView::default(),
             timeline: DayView::default(),
+            convs: empty_convs(),
             timeline_open: false,
             notified_push: None,
             brain_hover: false,
@@ -638,6 +647,7 @@ impl OverseerApp {
             refreshing_work: false,
         };
         app.probe_daemon(cx);
+        app.request_conversation(app.selected, cx);
         app
     }
 
@@ -751,6 +761,9 @@ impl OverseerApp {
         // Reconnecting asks for it again.
         self.attention = AttentionView::default();
         self.timeline = DayView::default();
+        for conv in &mut self.convs {
+            conv.clear();
+        }
         crate::notify::set_dock_badge(0);
         cx.notify();
         if self.reconnecting {
@@ -815,6 +828,7 @@ impl OverseerApp {
         }
         self._events = Self::listen(window, cx);
         Self::ask_for_lists(client, cx);
+        self.request_conversation(self.selected, cx);
         cx.notify();
     }
 
@@ -899,6 +913,7 @@ impl OverseerApp {
                 self.timeline = view;
                 cx.notify();
             }
+            Frame::Event(Event::ConversationChanged(view)) => self.conversation_changed(view, cx),
             Frame::Event(Event::WorkChanged(view))
             | Frame::Response {
                 resp: Response::Work(view),
@@ -1056,6 +1071,115 @@ impl OverseerApp {
                         this.status = Some(format!("{} ({e:#})", crate::terminal_view::LOST_DAEMON))
                     }
                     Ok(_) => {}
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Selects `id`, and asks for its conversation when that is a change.
+    pub(crate) fn select(&mut self, id: SlotId, cx: &mut Context<Self>) {
+        if self.selected != id {
+            self.selected = id;
+            self.request_conversation(id, cx);
+        }
+    }
+
+    /// Takes in a slot's conversation from the daemon, whether pushed or
+    /// asked for. When it does not fit what the slot holds, asks for the
+    /// whole of it again.
+    fn conversation_changed(&mut self, view: ConversationView, cx: &mut Context<Self>) {
+        let slot = view.slot;
+        let Some(conv) = self.convs.get_mut(slot as usize) else {
+            return;
+        };
+        if !conv.apply(view) {
+            self.request_conversation(slot, cx);
+        }
+        cx.notify();
+    }
+
+    /// Asks the daemon for `slot`'s whole conversation. An error reply is
+    /// left alone: a slot with nothing running has no conversation to show.
+    pub fn request_conversation(&mut self, slot: SlotId, cx: &mut Context<Self>) {
+        let client = self.client.clone();
+        cx.spawn(async move |this, cx| {
+            let reply = client.request(Request::Conversation { slot }).await;
+            let _ = this.update(cx, |this, cx| match reply {
+                Ok(Response::Conversation(view)) => this.conversation_changed(view, cx),
+                Ok(_) => {}
+                Err(e) => {
+                    this.status = Some(format!("{} ({e:#})", crate::terminal_view::LOST_DAEMON));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Sends `slot`'s draft to its session. The draft is cleared once the
+    /// daemon says `Ok`, unless it was edited meanwhile; a refusal such as
+    /// `S2 moved on, not sent` shows in the slot's status.
+    pub fn send_reply(&mut self, slot: SlotId, cx: &mut Context<Self>) {
+        let Some(conv) = self.convs.get_mut(slot as usize) else {
+            return;
+        };
+        let Some(req) = conv.reply_request() else {
+            cx.notify();
+            return;
+        };
+        let sent = conv.draft.text.clone();
+        cx.notify();
+        self.send_conv(slot, req, Some(sent), cx);
+    }
+
+    /// Answers `slot`'s open prompt, if it has one.
+    pub fn send_answer(&mut self, slot: SlotId, answer: Answer, cx: &mut Context<Self>) {
+        let Some(conv) = self.convs.get_mut(slot as usize) else {
+            return;
+        };
+        if let Some(req) = conv.answer_request(answer) {
+            conv.status = None;
+            self.send_conv(slot, req, None, cx);
+        }
+    }
+
+    /// Interrupts `slot`'s session.
+    pub fn interrupt(&mut self, slot: SlotId, cx: &mut Context<Self>) {
+        if let Some(conv) = self.convs.get_mut(slot as usize) {
+            conv.status = None;
+            self.send_conv(slot, Request::Interrupt { slot }, None, cx);
+        }
+    }
+
+    /// Sends a conversation request; the slot's status shows how it went
+    /// wrong. `sent` is the draft this request carries.
+    fn send_conv(
+        &mut self,
+        slot: SlotId,
+        req: Request,
+        sent: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let client = self.client.clone();
+        cx.spawn(async move |this, cx| {
+            let reply = client.request(req).await;
+            let _ = this.update(cx, |this, cx| {
+                let Some(conv) = this.convs.get_mut(slot as usize) else {
+                    return;
+                };
+                match reply {
+                    Ok(Response::Ok) => {
+                        if sent.as_ref().is_some_and(|s| *s == conv.draft.text) {
+                            conv.draft = Default::default();
+                        }
+                    }
+                    Ok(Response::Error { message }) => conv.status = Some(message),
+                    Ok(other) => conv.status = Some(format!("unexpected reply: {other:?}")),
+                    Err(e) => {
+                        conv.status = Some(format!("{} ({e:#})", crate::terminal_view::LOST_DAEMON))
+                    }
                 }
                 cx.notify();
             });
@@ -1789,7 +1913,7 @@ impl OverseerApp {
 
     pub(crate) fn go_board(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Screen::Session(id) = self.screen {
-            self.selected = id;
+            self.select(id, cx);
         }
         self.set_screen(Screen::Board, cx);
         self.focus_when_ready = None;
@@ -1799,7 +1923,7 @@ impl OverseerApp {
 
     pub(crate) fn go_session(&mut self, id: SlotId, window: &mut Window, cx: &mut Context<Self>) {
         self.set_screen(Screen::Session(id), cx);
-        self.selected = id;
+        self.select(id, cx);
         match self.ensure_terminal(id, window, cx) {
             Some(view) => {
                 self.focus_when_ready = None;
@@ -1939,7 +2063,7 @@ impl OverseerApp {
     }
 
     pub(crate) fn open_card(&mut self, id: SlotId, window: &mut Window, cx: &mut Context<Self>) {
-        self.selected = id;
+        self.select(id, cx);
         match card_click(&self.slots[id as usize]) {
             CardClick::Open(id) => self.go_session(id, window, cx),
             CardClick::Start(id) => self.open_dialog(id, window, cx),
@@ -1947,7 +2071,7 @@ impl OverseerApp {
     }
 
     pub(crate) fn move_selection(&mut self, dir: Dir, cx: &mut Context<Self>) {
-        self.selected = crate::board::move_selection(self.selected, dir);
+        self.select(crate::board::move_selection(self.selected, dir), cx);
         cx.notify();
     }
 

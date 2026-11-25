@@ -20,7 +20,7 @@ pub struct Row {
 }
 
 /// The items oldest first; items of the same age keep the daemon's order.
-fn oldest_first(v: &AttentionView) -> Vec<&AttentionItem> {
+pub(crate) fn oldest_first(v: &AttentionView) -> Vec<&AttentionItem> {
     let mut items: Vec<_> = v
         .items
         .iter()
