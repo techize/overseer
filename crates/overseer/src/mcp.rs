@@ -135,12 +135,12 @@ fn tools() -> Value {
         },
         {
             "name": "edit_shared_file",
-            "description": "Replace one exact piece of text in a shared notes file (a sprint dashboard, a journal) and commit it. `old_text` must occur exactly once; if the file has changed since you read it the edit fails and shows you the current text.",
+            "description": "Replace one exact piece of text in a shared notes file (a sprint dashboard, a journal) and commit it. `old_text` must occur exactly once; if the file has changed since you read it the edit fails and shows you the current text. To create a shared file that does not exist yet, give an empty `old_text` and the whole file as `new_text`; that fails if the file is already there.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "The shared file, relative to the notes folder or absolute."},
-                    "old_text": {"type": "string", "description": "The exact text to replace. It must occur once."},
+                    "old_text": {"type": "string", "description": "The exact text to replace. It must occur once. Empty to create a new file."},
                     "new_text": {"type": "string", "description": "What to put there."}
                 },
                 "required": ["path", "old_text", "new_text"]

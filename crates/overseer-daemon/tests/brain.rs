@@ -362,7 +362,7 @@ async fn commit_refuses_another_slots_folder_and_shared_files() {
     assert_eq!(
         error(&r),
         format!(
-            "{journal} is a shared notes file. Use append_journal for the journal or edit_shared_file for an exact replacement."
+            "{journal} is a shared notes file. Use append_journal for the journal or edit_shared_file for an exact replacement, or with an empty old_text to create a new file."
         )
     );
     let r = svc
@@ -387,7 +387,7 @@ async fn commit_refuses_another_slots_folder_and_shared_files() {
     assert_eq!(
         svc.check_write(&check(vec![PathBuf::from(journal)]), &owners()),
         Some(format!(
-            "{journal} is a shared notes file. Use append_journal for the journal or edit_shared_file for an exact replacement."
+            "{journal} is a shared notes file. Use append_journal for the journal or edit_shared_file for an exact replacement, or with an empty old_text to create a new file."
         ))
     );
     assert_eq!(
@@ -483,6 +483,33 @@ async fn edit_shared_replaces_once_and_commits() {
         .edit_shared(Sender::Slot { slot: 3 }, "README.md", "vault", "x")
         .await;
     assert!(error(&r).contains("not a shared notes file"), "{r:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_shared_with_empty_old_text_creates_a_new_dashboard() {
+    let v = Vault::new("create");
+    let rel = "Sprints/sprint-26-02/SPRINT-DASHBOARD.md";
+    let svc = v.service(Arc::new(Ledger::in_memory()), v.options());
+    let r = svc
+        .edit_shared(Sender::Slot { slot: 3 }, rel, "", "# Sprint 26-02\n")
+        .await;
+    assert!(text(&r).contains("committed"), "{r:?}");
+    assert_eq!(
+        std::fs::read_to_string(v.vault.join(rel)).unwrap(),
+        "# Sprint 26-02\n"
+    );
+    let subject = sh(&v.vault, &["log", "-1", "--format=%s"]);
+    assert_eq!(subject.trim(), "S3: add SPRINT-DASHBOARD.md");
+    let files = sh(&v.vault, &["show", "--name-only", "--format=", "HEAD"]);
+    assert_eq!(files.trim(), rel);
+    let r = svc
+        .edit_shared(Sender::Slot { slot: 3 }, rel, "", "# Other\n")
+        .await;
+    assert!(error(&r).starts_with("the file already exists"), "{r:?}");
+    assert_eq!(
+        std::fs::read_to_string(v.vault.join(rel)).unwrap(),
+        "# Sprint 26-02\n"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1795,7 +1822,7 @@ async fn bash_copies_into_a_folder_are_judged_by_the_file_that_lands() {
     assert_eq!(check("cp x.md .", &v.vault), None);
     assert_eq!(check("cp x.md ./Sprints", &v.vault), None);
     // The same copy is denied when the file that lands is shared or owned.
-    let shared = format!("{SHARED_DASH} is a shared notes file. Use append_journal for the journal or edit_shared_file for an exact replacement.");
+    let shared = format!("{SHARED_DASH} is a shared notes file. Use append_journal for the journal or edit_shared_file for an exact replacement, or with an empty old_text to create a new file.");
     assert_eq!(
         check(
             &format!("cp /tmp/SPRINT-DASHBOARD.md {vault}/Sprints/sprint-26-01/"),

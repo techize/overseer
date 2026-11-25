@@ -65,7 +65,7 @@ const GIT_DENY: &str = "use the commit_2ndbrain tool; Overseer commits and pushe
 const BD_COMPOUND_DENY: &str = "Overseer: run bd writes on their own, without $(...), backticks, redirects or env prefixes, so the daemon can run them under the notes folder lock";
 
 fn deny_shared(rel: &str) -> String {
-    format!("{rel} is a shared notes file. Use append_journal for the journal or edit_shared_file for an exact replacement.")
+    format!("{rel} is a shared notes file. Use append_journal for the journal or edit_shared_file for an exact replacement, or with an empty old_text to create a new file.")
 }
 
 fn deny_owned(rel: &str, slot: SlotId, what: &str, user: &str) -> String {
@@ -474,7 +474,7 @@ impl BrainService {
             depth < segs.len() && (depth == 0 || shared_match(&[segs[..depth].join("/")], folder))
         });
         if holds_shared {
-            return Some(format!("{} holds shared notes files. Use append_journal for the journal or edit_shared_file for an exact replacement.", if folder.is_empty() { "the notes folder" } else { folder }));
+            return Some(format!("{} holds shared notes files. Use append_journal for the journal or edit_shared_file for an exact replacement, or with an empty old_text to create a new file.", if folder.is_empty() { "the notes folder" } else { folder }));
         }
         let cs = canon(&self.cfg.current_session);
         let root = canon(&self.cfg.brain).join(folder);
@@ -748,6 +748,7 @@ impl BrainService {
     }
 
     /// Replaces the one occurrence of `old` in a shared file and commits it.
+    /// An empty `old` creates the file instead and fails if it exists.
     pub async fn edit_shared(&self, from: Sender, rel: &str, old: &str, new: &str) -> Response {
         let err = |message: String| Response::Error { message };
         let rel = match vault_rel(&self.cfg.brain, None, Path::new(rel), &self.opts.home) {
@@ -767,7 +768,8 @@ impl BrainService {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| rel.clone());
-        let message = format!("{}edit {name}", prefix(from));
+        let verb = if old.is_empty() { "add" } else { "edit" };
+        let message = format!("{}{verb} {name}", prefix(from));
         self.enqueue(from, vec![rel], message).await
     }
 
