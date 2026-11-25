@@ -4,6 +4,7 @@ pub mod activity;
 pub mod attention;
 pub mod brain;
 pub mod config;
+pub mod conversation;
 pub mod coord;
 pub mod env;
 pub mod holder;

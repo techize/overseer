@@ -1,0 +1,259 @@
+//! Turns Claude Code transcript lines into conversation entries. Pure: the
+//! caller reads the file and feeds the bytes.
+
+use overseer_proto::msg::{ConvEntry, ConvKind};
+use serde_json::Value;
+
+use crate::work::sources::parse_iso_time;
+
+/// User text starting with one of these is Claude Code plumbing, not the user.
+const SKIPPED_PREFIXES: [&str; 3] = ["<system-reminder>", "<command-", "<local-command-"];
+
+/// Tool input keys that make a good one-line summary, best first.
+const SUMMARY_KEYS: [&str; 5] = ["command", "file_path", "pattern", "description", "url"];
+
+/// Longest tool summary, in characters.
+const SUMMARY_MAX: usize = 80;
+
+/// Follows a transcript file as it grows. Feed it the new bytes; it hands back
+/// the entries from every complete line.
+#[derive(Debug, Default)]
+pub struct Tail {
+    offset: u64,
+    partial: Vec<u8>,
+}
+
+impl Tail {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Bytes consumed from the file so far, including any held back as an
+    /// unfinished line. Resume reading here.
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// Takes the next bytes of the file. An unterminated last line waits for
+    /// its newline. Lines that are not JSON, or not a shape we know, are skipped.
+    pub fn feed(&mut self, bytes: &[u8]) -> Vec<ConvEntry> {
+        self.offset += bytes.len() as u64;
+        self.partial.extend_from_slice(bytes);
+        let mut out = Vec::new();
+        let mut start = 0;
+        while let Some(i) = self.partial[start..].iter().position(|&b| b == b'\n') {
+            let mut line = &self.partial[start..start + i];
+            start += i + 1;
+            if let Some(stripped) = line.strip_suffix(b"\r") {
+                line = stripped;
+            }
+            if let Ok(value) = serde_json::from_slice::<Value>(line) {
+                out.extend(entry_of(&value));
+            }
+        }
+        self.partial.drain(..start);
+        out
+    }
+}
+
+/// The entries one transcript line carries. Side chains, meta lines, thinking,
+/// tool results and every other line type give nothing.
+pub fn entry_of(line: &Value) -> Vec<ConvEntry> {
+    if flag(line, "isSidechain") || flag(line, "isMeta") {
+        return Vec::new();
+    }
+    let at = line
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(parse_iso_time)
+        .unwrap_or(0);
+    let content = line.pointer("/message/content");
+    let kinds = match line.get("type").and_then(Value::as_str) {
+        Some("user") => user_kinds(content),
+        Some("assistant") => assistant_kinds(content),
+        _ => Vec::new(),
+    };
+    kinds
+        .into_iter()
+        .map(|kind| ConvEntry { at, kind })
+        .collect()
+}
+
+fn flag(line: &Value, key: &str) -> bool {
+    line.get(key).and_then(Value::as_bool).unwrap_or(false)
+}
+
+fn skipped(text: &str) -> bool {
+    SKIPPED_PREFIXES.iter().any(|p| text.starts_with(p))
+}
+
+fn user_kinds(content: Option<&Value>) -> Vec<ConvKind> {
+    let texts: Vec<&str> = match content {
+        Some(Value::String(s)) => vec![s.as_str()],
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .collect(),
+        _ => Vec::new(),
+    };
+    let kept: Vec<&str> = texts.into_iter().filter(|t| !skipped(t)).collect();
+    if kept.is_empty() {
+        return Vec::new();
+    }
+    vec![ConvKind::User {
+        text: kept.join("\n\n"),
+    }]
+}
+
+fn assistant_kinds(content: Option<&Value>) -> Vec<ConvKind> {
+    let Some(Value::Array(blocks)) = content else {
+        return Vec::new();
+    };
+    blocks
+        .iter()
+        .filter_map(|b| match b.get("type").and_then(Value::as_str)? {
+            "text" => Some(ConvKind::Assistant {
+                text: b.get("text").and_then(Value::as_str)?.to_string(),
+            }),
+            "tool_use" => Some(ConvKind::Tool {
+                name: b.get("name").and_then(Value::as_str)?.to_string(),
+                summary: summary_of(b.get("input")),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+fn summary_of(input: Option<&Value>) -> String {
+    let Some(input) = input else {
+        return String::new();
+    };
+    SUMMARY_KEYS
+        .iter()
+        .find_map(|k| input.get(k).and_then(Value::as_str))
+        .map(|s| {
+            let first = s.lines().next().unwrap_or("").trim();
+            first.chars().take(SUMMARY_MAX).collect()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FIXTURE: &str = concat!(
+        r#"{"type":"user","timestamp":"2026-11-25T10:00:00Z","message":{"role":"user","content":"fix DEMO-1 in demo-api"}}"#,
+        "\n",
+        r#"{"type":"assistant","timestamp":"2026-11-25T10:00:05Z","message":{"role":"assistant","content":[{"type":"text","text":"On it."},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo test\n--quiet"}}]}}"#,
+        "\n",
+    );
+
+    fn kinds(entries: &[ConvEntry]) -> Vec<ConvKind> {
+        entries.iter().map(|e| e.kind.clone()).collect()
+    }
+
+    #[test]
+    fn user_and_assistant_text_become_entries() {
+        let mut tail = Tail::new();
+        let got = tail.feed(FIXTURE.as_bytes());
+        assert_eq!(got[0].at, 1_795_600_800);
+        assert_eq!(got[1].at, 1_795_600_805);
+        assert_eq!(
+            kinds(&got)[..2],
+            [
+                ConvKind::User {
+                    text: "fix DEMO-1 in demo-api".into()
+                },
+                ConvKind::Assistant {
+                    text: "On it.".into()
+                },
+            ]
+        );
+        assert_eq!(tail.offset(), FIXTURE.len() as u64);
+    }
+
+    #[test]
+    fn tool_calls_fold_to_one_line() {
+        let got = Tail::new().feed(FIXTURE.as_bytes());
+        assert_eq!(
+            got[2].kind,
+            ConvKind::Tool {
+                name: "Bash".into(),
+                summary: "cargo test".into()
+            }
+        );
+        let long = "x".repeat(200);
+        let v = serde_json::json!({"type":"assistant","message":{"content":[
+            {"type":"tool_use","name":"Read","input":{"file_path":"/tmp/demo/a.rs"}},
+            {"type":"tool_use","name":"Task","input":{"prompt":"p"}},
+            {"type":"tool_use","name":"Bash","input":{"command":long}}]}});
+        let got = entry_of(&v);
+        assert_eq!(got[0].at, 0);
+        assert_eq!(
+            got[0].kind,
+            ConvKind::Tool {
+                name: "Read".into(),
+                summary: "/tmp/demo/a.rs".into()
+            }
+        );
+        assert_eq!(
+            got[1].kind,
+            ConvKind::Tool {
+                name: "Task".into(),
+                summary: String::new()
+            }
+        );
+        let ConvKind::Tool { summary, .. } = &got[2].kind else {
+            panic!("not a tool");
+        };
+        assert_eq!(summary.chars().count(), 80);
+    }
+
+    #[test]
+    fn sidechain_meta_thinking_and_reminders_are_left_out() {
+        let side = r#"{"type":"user","isSidechain":true,"message":{"content":"hi"}}"#;
+        let meta = r#"{"type":"user","isMeta":true,"message":{"content":"hi"}}"#;
+        let think =
+            r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"hmm"}]}}"#;
+        let remind =
+            r#"{"type":"user","message":{"content":"<system-reminder>x</system-reminder>"}}"#;
+        let cmd = r#"{"type":"user","message":{"content":[{"type":"text","text":"<command-name>/demo</command-name>"},{"type":"text","text":"<local-command-stdout>ok"}]}}"#;
+        let other = r#"{"type":"summary","summary":"demo-ws"}"#;
+        let mixed = r#"{"type":"user","message":{"content":[{"type":"text","text":"<system-reminder>x"},{"type":"text","text":"real"},{"type":"text","text":"more"}]}}"#;
+        let input = [side, meta, think, remind, cmd, other, mixed].join("\n") + "\n";
+        let got = Tail::new().feed(input.as_bytes());
+        assert_eq!(
+            kinds(&got),
+            [ConvKind::User {
+                text: "real\n\nmore".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn tool_results_are_left_out() {
+        let line = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#;
+        assert!(entry_of(&serde_json::from_str(line).unwrap()).is_empty());
+    }
+
+    #[test]
+    fn a_partial_last_line_waits_for_its_newline() {
+        let line = FIXTURE.lines().next().unwrap();
+        let (a, b) = line.split_at(30);
+        let mut tail = Tail::new();
+        assert!(tail.feed(a.as_bytes()).is_empty());
+        assert_eq!(tail.offset(), 30);
+        let got = tail.feed(format!("{b}\r\n").as_bytes());
+        assert_eq!(got.len(), 1);
+        assert_eq!(tail.offset(), line.len() as u64 + 2);
+    }
+
+    #[test]
+    fn a_bad_line_is_skipped() {
+        let input = format!("not json\n{{\"type\":5}}\n[1]\n{}", FIXTURE);
+        let got = Tail::new().feed(input.as_bytes());
+        assert_eq!(got.len(), 3);
+    }
+}
