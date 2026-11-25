@@ -221,7 +221,12 @@ CREATE TABLE IF NOT EXISTS stretch_waits (
 const V12_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS slot_transcripts (
     slot INTEGER PRIMARY KEY, session TEXT, path TEXT)";
 
-const VERSION: i64 = 12;
+/// Rows the user dismissed from the attention list, with the `since` and
+/// `text` they had, so the row stays hidden until either changes.
+const V13_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS attention_dismissed (
+    key TEXT PRIMARY KEY, since INTEGER NOT NULL, text TEXT NOT NULL)";
+
+const VERSION: i64 = 13;
 
 /// Reports and state changes kept per slot.
 const REPORTS_PER_SLOT: i64 = 200;
@@ -235,7 +240,7 @@ fn migrate(conn: &Connection) -> Result<()> {
     if version >= VERSION {
         return Ok(());
     }
-    let steps: [(i64, &str); 12] = [
+    let steps: [(i64, &str); 13] = [
         (1, SESSIONS_SCHEMA),
         (2, V2_SCHEMA),
         (3, V3_SCHEMA),
@@ -248,6 +253,7 @@ fn migrate(conn: &Connection) -> Result<()> {
         (10, V10_SCHEMA),
         (11, V11_SCHEMA),
         (12, V12_SCHEMA),
+        (13, V13_SCHEMA),
     ];
     let mut batch = String::from("BEGIN;\n");
     for (n, sql) in steps {
@@ -1011,6 +1017,43 @@ impl Ledger {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Records that the user dismissed the attention row `key` as it was at
+    /// `since` with `text`, replacing an earlier dismissal of the same key.
+    pub fn dismiss_attention(&self, key: &str, since: i64, text: &str) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO attention_dismissed (key, since, text) VALUES (?1, ?2, ?3)
+             ON CONFLICT (key) DO UPDATE SET since = excluded.since, text = excluded.text",
+            rusqlite::params![key, since, text],
+        )?;
+        Ok(())
+    }
+
+    /// Every dismissal, as `(key, since, text)`.
+    pub fn attention_dismissed(&self) -> Result<Vec<(String, i64, String)>> {
+        let conn = self.conn();
+        let mut stmt =
+            conn.prepare("SELECT key, since, text FROM attention_dismissed ORDER BY key")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Deletes the dismissals whose key is not in `live`, so a row that
+    /// went away and later comes back is not hidden by an old entry.
+    pub fn prune_attention_dismissed(&self, live: &[&str]) -> Result<()> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let keys: Vec<String> = {
+            let mut stmt = tx.prepare("SELECT key FROM attention_dismissed")?;
+            let rows = stmt.query_map([], |r| r.get(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        for key in keys.iter().filter(|k| !live.contains(&k.as_str())) {
+            tx.execute("DELETE FROM attention_dismissed WHERE key = ?1", [key])?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Every work item that has a slot, as `(key, slot)`.
@@ -2412,7 +2455,7 @@ mod tests {
             .unwrap();
         }
         let l = Ledger::open(&path).unwrap();
-        assert_eq!(user_version(&l), 12);
+        assert_eq!(user_version(&l), VERSION);
         assert_eq!(l.open_stretches().unwrap().len(), 1);
         assert_eq!(l.transcript(2).unwrap(), None);
         let first = Path::new("/tmp/demo/one.jsonl");
@@ -2429,6 +2472,65 @@ mod tests {
             Some(("demo-b".to_string(), second.to_path_buf()))
         );
         let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn v12_ledger_upgrades_to_v13_with_attention_dismissed() {
+        let path = temp_db("migrate-v13");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(&format!(
+                "{SESSIONS_SCHEMA};\n{V2_SCHEMA};\n{V3_SCHEMA};\n{V4_SCHEMA};\n{V5_SCHEMA};\n{V6_SCHEMA};\n{V7_SCHEMA};\n{V8_SCHEMA};\n{V9_SCHEMA};\n{V10_SCHEMA};\n{V11_SCHEMA};\n{V12_SCHEMA};\nPRAGMA user_version = 12;"
+            ))
+            .unwrap();
+            conn.execute(
+                "INSERT INTO slot_transcripts (slot, session, path) VALUES (2, 'demo-a', '/tmp/demo/a.jsonl')",
+                [],
+            )
+            .unwrap();
+        }
+        let l = Ledger::open(&path).unwrap();
+        assert_eq!(user_version(&l), 13);
+        assert!(l.transcript(2).unwrap().is_some());
+        assert!(l.attention_dismissed().unwrap().is_empty());
+        l.dismiss_attention("needs_you:2", 100, "permission prompt")
+            .unwrap();
+        drop(l);
+        // Dismissals survive a reopen.
+        let l = Ledger::open(&path).unwrap();
+        assert_eq!(
+            l.attention_dismissed().unwrap(),
+            [(
+                "needs_you:2".to_string(),
+                100,
+                "permission prompt".to_string()
+            )]
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn dismissing_again_replaces_and_prune_keeps_live_keys() {
+        let l = Ledger::in_memory();
+        l.dismiss_attention("needs_you:1", 10, "one").unwrap();
+        l.dismiss_attention("notice:2", 20, "two").unwrap();
+        l.dismiss_attention("needs_you:1", 30, "three").unwrap();
+        assert_eq!(
+            l.attention_dismissed().unwrap(),
+            [
+                ("needs_you:1".to_string(), 30, "three".to_string()),
+                ("notice:2".to_string(), 20, "two".to_string()),
+            ]
+        );
+        l.prune_attention_dismissed(&["notice:2", "log_gap:4"])
+            .unwrap();
+        assert_eq!(
+            l.attention_dismissed().unwrap(),
+            [("notice:2".to_string(), 20, "two".to_string())]
+        );
+        l.prune_attention_dismissed(&[]).unwrap();
+        assert!(l.attention_dismissed().unwrap().is_empty());
     }
 
     fn stretch(

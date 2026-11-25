@@ -1579,6 +1579,12 @@ fn handle_request(
         }
         Request::PrSeen { repo, id } => store.mark_pr_seen(&repo, id),
         Request::Attention => Response::Attention(ctx.attention.current()),
+        Request::DismissAttention { key, since, text } => {
+            match ctx.attention.dismiss(&key, since, &text) {
+                Ok(()) => Response::Ok,
+                Err(e) => err(format!("dismissing {key} failed: {e:#}")),
+            }
+        }
         Request::Timeline => Response::Timeline(ctx.timeline.current()),
         Request::Conversation { slot } if !valid_id(slot) => err(format!("invalid slot id {slot}")),
         Request::Conversation { slot } => Response::Conversation(ctx.conversation.current(slot)),

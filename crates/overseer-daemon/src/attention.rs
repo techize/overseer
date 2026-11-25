@@ -5,13 +5,13 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use overseer_proto::{
     ActivityKind, AttentionItem, AttentionKind, AttentionView, BuildState, DayView, Event,
     LockView, PullRequest, RelayState, SlotId, SlotInfo, SlotState, WorkView,
 };
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Notify};
 
 use crate::ledger::{Ledger, PrSeen};
 use crate::locks::LockService;
@@ -57,18 +57,97 @@ pub fn derive(i: &Inputs) -> Vec<AttentionItem> {
     items
 }
 
+/// Marks the rows the user dismissed. A dismissal holds only while the
+/// row's `since` and `text` are what they were when it was dismissed, so a
+/// new occurrence or a changed text shows the row again.
+pub fn apply_dismissals(items: &mut [AttentionItem], dismissed: &[(String, i64, String)]) {
+    for item in items {
+        item.dismissed = dismissed.iter().any(|(key, since, text)| {
+            *key == item.key && *since == item.since && *text == item.text
+        });
+    }
+}
+
+/// The dismissed keys that are no longer in the list, to delete.
+pub fn stale_dismissals<'a>(
+    items: &[AttentionItem],
+    dismissed: &'a [(String, i64, String)],
+) -> Vec<&'a str> {
+    dismissed
+        .iter()
+        .map(|(key, _, _)| key.as_str())
+        .filter(|key| !items.iter().any(|i| i.key == *key))
+        .collect()
+}
+
 /// How often the list is rederived with no event, so a wait that only
 /// ripens with time still shows up.
 const TICK: Duration = Duration::from_secs(30);
 
+/// How long after start the list may be incomplete: pull requests and the
+/// day's gaps are read in the background, so until then a dismissed row
+/// missing from the list is not yet a reason to drop its dismissal.
+const PRUNE_AFTER: Duration = Duration::from_secs(300);
+
 /// Holds the current attention list and announces it when it changes.
 pub struct AttentionService {
     view: Mutex<AttentionView>,
+    ledger: Arc<Ledger>,
+    events: broadcast::Sender<Event>,
+    /// Poked to rederive the list now rather than at the next tick.
+    nudge: Notify,
 }
 
 impl AttentionService {
+    fn new(ledger: Arc<Ledger>, events: broadcast::Sender<Event>) -> AttentionService {
+        AttentionService {
+            view: Mutex::new(AttentionView::default()),
+            ledger,
+            events,
+            nudge: Notify::new(),
+        }
+    }
+
     pub fn current(&self) -> AttentionView {
         self.view.lock().unwrap().clone()
+    }
+
+    /// Hides the row `key` while its `since` and `text` stay as given. The
+    /// current list is marked and announced at once, and the task is asked
+    /// to rederive it so nothing it derived meanwhile undoes the mark.
+    pub fn dismiss(&self, key: &str, since: i64, text: &str) -> anyhow::Result<()> {
+        self.ledger.dismiss_attention(key, since, text)?;
+        let dismissed = self.ledger.attention_dismissed()?;
+        let mut items = self.current().items;
+        apply_dismissals(&mut items, &dismissed);
+        if self.update(items) {
+            // Nobody listening is fine.
+            let _ = self.events.send(Event::AttentionChanged(self.current()));
+        }
+        self.nudge.notify_one();
+        Ok(())
+    }
+
+    /// Marks `items` with the stored dismissals and, once the list can be
+    /// trusted to be whole, deletes the dismissals of rows that went away.
+    fn mark_dismissed(&self, items: &mut [AttentionItem], prune: bool) {
+        let dismissed = match self.ledger.attention_dismissed() {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("attention: reading dismissals failed: {e:#}");
+                return;
+            }
+        };
+        apply_dismissals(items, &dismissed);
+        if !prune {
+            return;
+        }
+        let live: Vec<&str> = items.iter().map(|i| i.key.as_str()).collect();
+        if !stale_dismissals(items, &dismissed).is_empty() {
+            if let Err(e) = self.ledger.prune_attention_dismissed(&live) {
+                tracing::warn!("attention: pruning dismissals failed: {e:#}");
+            }
+        }
     }
 
     /// Stores the list; true only when it differs from the last one.
@@ -94,9 +173,8 @@ impl AttentionService {
         events: broadcast::Sender<Event>,
         author_set: bool,
     ) -> Arc<AttentionService> {
-        let svc = Arc::new(AttentionService {
-            view: Mutex::new(AttentionView::default()),
-        });
+        let svc = Arc::new(AttentionService::new(ledger.clone(), events.clone()));
+        let started = Instant::now();
         // Subscribe before seeding so no change falls between the two.
         let mut rx = events.subscribe();
         let reread = move || (manager.lock().unwrap().list(), locks.view(), store.view());
@@ -108,6 +186,7 @@ impl AttentionService {
             loop {
                 tokio::select! {
                     _ = tick.tick() => {}
+                    _ = task.nudge.notified() => {}
                     ev = rx.recv() => match ev {
                         Ok(Event::SlotChanged(info)) => {
                             match slots.iter_mut().find(|s| s.id == info.id) {
@@ -134,7 +213,7 @@ impl AttentionService {
                     .iter()
                     .filter_map(|s| Some((s.id, repo_branch(s.cwd.as_deref()?)?)))
                     .collect();
-                let items = derive(&Inputs {
+                let mut items = derive(&Inputs {
                     slots: &slots,
                     locks: &lock_view,
                     work: &work,
@@ -144,6 +223,7 @@ impl AttentionService {
                     day: &day,
                     now: unix_now(),
                 });
+                task.mark_dismissed(&mut items, started.elapsed() >= PRUNE_AFTER);
                 if task.update(items) {
                     // Nobody listening is fine.
                     let _ = events.send(Event::AttentionChanged(task.current()));
@@ -163,6 +243,7 @@ fn item(kind: AttentionKind, slot: SlotId, since: i64, text: &str) -> AttentionI
         url: None,
         since,
         text: one_line(text),
+        dismissed: false,
     }
 }
 
@@ -318,6 +399,7 @@ fn pr_items(i: &Inputs, pr: &PullRequest, out: &mut Vec<AttentionItem>) {
                 url: pr.url.clone(),
                 since,
                 text: one_line(&format!("{}: {what}", pr.title)),
+                dismissed: false,
             });
         }
     };
@@ -688,9 +770,7 @@ mod tests {
 
     #[test]
     fn update_reports_only_changes() {
-        let svc = AttentionService {
-            view: Mutex::new(AttentionView::default()),
-        };
+        let svc = AttentionService::new(Arc::new(Ledger::in_memory()), broadcast::channel(4).0);
         let one = |since| vec![item(AttentionKind::NeedsYou, 1, since, "needs you")];
         assert!(svc.update(one(10)));
         assert!(!svc.update(one(10)));
@@ -698,6 +778,92 @@ mod tests {
         assert_eq!(svc.current().items, one(20));
         assert!(svc.update(Vec::new()));
         assert!(!svc.update(Vec::new()));
+    }
+
+    fn dismissal(key: &str, since: i64, text: &str) -> (String, i64, String) {
+        (key.into(), since, text.into())
+    }
+
+    #[test]
+    fn a_dismissal_hides_the_row_only_while_since_and_text_match() {
+        let mut items = vec![
+            item(AttentionKind::NeedsYou, 1, 100, "permission prompt"),
+            item(AttentionKind::NeedsYou, 2, 100, "permission prompt"),
+        ];
+        let d = vec![dismissal("needs_you:1", 100, "permission prompt")];
+        apply_dismissals(&mut items, &d);
+        assert!(items[0].dismissed);
+        assert!(!items[1].dismissed);
+
+        // A new occurrence of the same key has a new since: it comes back.
+        let mut again = vec![item(AttentionKind::NeedsYou, 1, 200, "permission prompt")];
+        apply_dismissals(&mut again, &d);
+        assert!(!again[0].dismissed);
+
+        // Same since, changed text (more notices, a new gap): it comes back.
+        let mut more = vec![item(AttentionKind::NeedsYou, 1, 100, "another prompt")];
+        apply_dismissals(&mut more, &d);
+        assert!(!more[0].dismissed);
+
+        // A row marked before is unmarked once nothing matches it.
+        apply_dismissals(&mut items, &[]);
+        assert!(items.iter().all(|i| !i.dismissed));
+    }
+
+    #[test]
+    fn stale_dismissals_are_the_keys_no_longer_listed() {
+        let items = vec![item(AttentionKind::Notice, 3, 100, "one notice")];
+        let d = vec![
+            dismissal("notice:3", 50, "older text"),
+            dismissal("needs_you:1", 100, "permission prompt"),
+        ];
+        assert_eq!(stale_dismissals(&items, &d), ["needs_you:1"]);
+        assert!(stale_dismissals(&items, &d[..1]).is_empty());
+    }
+
+    #[test]
+    fn mark_dismissed_prunes_only_when_asked() {
+        let ledger = Arc::new(Ledger::in_memory());
+        let svc = AttentionService::new(ledger.clone(), broadcast::channel(4).0);
+        ledger
+            .dismiss_attention("needs_you:1", 100, "gone")
+            .unwrap();
+        ledger
+            .dismiss_attention("notice:3", 100, "one notice")
+            .unwrap();
+        let mut items = vec![item(AttentionKind::Notice, 3, 100, "one notice")];
+
+        svc.mark_dismissed(&mut items, false);
+        assert!(items[0].dismissed);
+        assert_eq!(ledger.attention_dismissed().unwrap().len(), 2);
+
+        svc.mark_dismissed(&mut items, true);
+        assert!(items[0].dismissed);
+        assert_eq!(
+            ledger.attention_dismissed().unwrap(),
+            [dismissal("notice:3", 100, "one notice")]
+        );
+    }
+
+    #[test]
+    fn dismiss_marks_the_current_list_and_announces_it() {
+        let ledger = Arc::new(Ledger::in_memory());
+        let (tx, mut rx) = broadcast::channel(4);
+        let svc = AttentionService::new(ledger.clone(), tx);
+        let row = item(AttentionKind::NeedsYou, 1, 100, "permission prompt");
+        svc.update(vec![row.clone()]);
+        svc.dismiss(&row.key, row.since, &row.text).unwrap();
+        assert!(svc.current().items[0].dismissed);
+        assert_eq!(svc.current().count(), 0);
+        match rx.try_recv() {
+            Ok(Event::AttentionChanged(v)) => assert!(v.items[0].dismissed),
+            other => panic!("unexpected {other:?}"),
+        }
+        // Stored, so the next derivation keeps it hidden.
+        assert_eq!(
+            ledger.attention_dismissed().unwrap(),
+            [dismissal("needs_you:1", 100, "permission prompt")]
+        );
     }
 
     #[test]

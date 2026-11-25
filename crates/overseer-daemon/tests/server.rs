@@ -7383,6 +7383,71 @@ async fn attention_lists_a_slot_that_needs_you_and_announces_it() {
 }
 
 #[tokio::test]
+async fn dismissing_an_attention_row_marks_it_and_announces_the_list() {
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    assert_eq!(c.start(2).await, Response::Ok);
+    let mut note = hook(2, HookKind::Notification);
+    note.notification = Some("needs permission".into());
+    c.hook(note).await;
+    let row = loop {
+        match c.recv().await.expect("connection closed") {
+            Frame::Event(Event::AttentionChanged(v)) if !v.items.is_empty() => {
+                break v.items[0].clone()
+            }
+            _ => {}
+        }
+    };
+    assert!(!row.dismissed);
+
+    // A dismissal for another occurrence (an older since) hides nothing.
+    assert_eq!(
+        c.request(Request::DismissAttention {
+            key: row.key.clone(),
+            since: row.since - 1,
+            text: row.text.clone(),
+        })
+        .await,
+        Response::Ok
+    );
+    match c.request(Request::Attention).await {
+        Response::Attention(v) => {
+            assert!(!v.items[0].dismissed);
+            assert_eq!(v.count(), 1);
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+
+    assert_eq!(
+        c.request(Request::DismissAttention {
+            key: row.key.clone(),
+            since: row.since,
+            text: row.text.clone(),
+        })
+        .await,
+        Response::Ok
+    );
+    let announced = loop {
+        match c.recv().await.expect("connection closed") {
+            Frame::Event(Event::AttentionChanged(v)) if v.items.iter().any(|i| i.dismissed) => {
+                break v
+            }
+            _ => {}
+        }
+    };
+    assert_eq!(announced.items.len(), 1);
+    assert_eq!(announced.items[0].key, row.key);
+    assert_eq!(announced.count(), 0);
+    match c.request(Request::Attention).await {
+        Response::Attention(v) => {
+            assert!(v.items[0].dismissed);
+            assert_eq!(v.count(), 0);
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn timeline_request_answers_today() {
     let d = start_daemon().await;
     let mut c = Client::connect(&d.socket).await;

@@ -1049,7 +1049,7 @@ impl OverseerApp {
     }
 
     /// Sends `req`, showing an error reply in the status line.
-    fn send(&mut self, req: Request, cx: &mut Context<Self>) {
+    pub(crate) fn send(&mut self, req: Request, cx: &mut Context<Self>) {
         let client = self.client.clone();
         let restart_slot = match &req {
             Request::StopSlot { id } => Some(*id),
