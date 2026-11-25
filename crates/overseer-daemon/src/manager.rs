@@ -1,5 +1,6 @@
 //! The seven slots (S0 to S6) and their lifecycle.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -146,7 +147,13 @@ pub struct SlotManager {
     /// The program run as `<program> hold <state_dir>` to keep each
     /// session's terminal; `None` runs sessions in the daemon itself.
     holder: Option<PathBuf>,
+    /// One per slot, held for the whole of any typing into it (a relay, an
+    /// answer, a reply, an interrupt), so two senders never interleave.
+    key_locks: Mutex<HashMap<SlotId, KeyLock>>,
 }
+
+/// Held while typing into one slot.
+pub type KeyLock = Arc<tokio::sync::Mutex<()>>;
 
 /// A slot as the ledger left it: no process, but remembered.
 struct Restored {
@@ -261,7 +268,19 @@ impl SlotManager {
             restored: Default::default(),
             session_note: None,
             holder: None,
+            key_locks: Default::default(),
         }
+    }
+
+    /// The slot's key lock, held for the whole of any typing into it. Never
+    /// hold the manager's lock while waiting for it.
+    pub fn key_lock(&self, id: SlotId) -> KeyLock {
+        self.key_locks
+            .lock()
+            .unwrap()
+            .entry(id)
+            .or_default()
+            .clone()
     }
 
     /// Picks up the sessions the last daemon left. First the holders in

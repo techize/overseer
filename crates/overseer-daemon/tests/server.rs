@@ -3956,6 +3956,51 @@ async fn one_line_relay_is_typed_without_bracketed_paste() {
     c.all_delivered(2).await;
 }
 
+/// A reply from the board goes into the session the pane showed, as a
+/// paste and Return; one made in another session is refused untyped, and
+/// Stop types Esc.
+#[tokio::test]
+async fn a_board_reply_and_stop_reach_the_shown_session() {
+    let stub = box_stub("board-reply");
+    let d = start_daemon_with(temp_socket(), stub.env()).await;
+    let mut c = Client::connect(&d.socket).await;
+    c.start_stub(2, &stub).await;
+    c.hook(HookEvent {
+        session_id: Some("demo-session".into()),
+        ..hook(2, HookKind::SessionStart)
+    })
+    .await;
+    let reply = |session: &str, text: &str| Request::Reply {
+        slot: 2,
+        session: session.into(),
+        prompt: None,
+        text: text.into(),
+    };
+    assert_eq!(
+        c.request(reply("demo-other", "hello")).await,
+        Response::Error {
+            message: "S2 moved on, not sent".into()
+        }
+    );
+    assert_eq!(
+        c.request(reply("demo-session", "hello")).await,
+        Response::Ok
+    );
+    assert_eq!(stub.read_until(&pasted("hello")).await, pasted("hello"));
+    assert_eq!(
+        c.request(Request::Interrupt { slot: 2 }).await,
+        Response::Ok
+    );
+    let want = format!("{}\x1b", pasted("hello"));
+    assert_eq!(stub.read_until(&want).await, want);
+    assert_eq!(
+        c.request(Request::Interrupt { slot: 3 }).await,
+        Response::Error {
+            message: "S3 is not running, not sent".into()
+        }
+    );
+}
+
 // Session end: a slot's waits, unused grants and pending relays belong to
 // the session in it and go when that session ends, however it ends.
 
