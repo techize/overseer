@@ -44,6 +44,10 @@ pub struct Run {
     pub slot: SlotId,
     pub started: i64,
     pub ended: i64,
+    /// The last work seen in the run, when known. A session left idle at
+    /// its prompt ends later than its work did, and the logs need only
+    /// cover the work (#106).
+    pub worked_until: Option<i64>,
 }
 
 /// The `**Time**` line: an optional list marker, then the rest of the line.
@@ -153,10 +157,12 @@ fn has_value(fm: &str, key: &str) -> bool {
         if !blank(v) {
             return true;
         }
-        // A block list: the indented `- item` lines that follow.
+        // A block list: the `- item` lines that follow, indented or not
+        // (PyYAML writes them flush with the key, #105). Any other line at
+        // the key's level is the next key.
         for next in lines.by_ref() {
             let t = next.trim_start();
-            if next.len() == t.len() && !t.is_empty() {
+            if next.len() == t.len() && !t.is_empty() && !t.starts_with('-') {
                 break;
             }
             if let Some(item) = t.strip_prefix('-') {
@@ -273,8 +279,10 @@ fn join_and(parts: &[&str]) -> String {
 pub fn notice(run: &Run, logs: &[Log], runs_file: Option<&str>) -> Option<String> {
     let (sd, start) = local_minutes(run.started);
     let (ed, end) = local_minutes(run.ended);
-    let same_day = ymd(&sd) == ymd(&ed);
-    let found = problems(logs, start, end, same_day);
+    // The logs are checked against the last work, not the idle tail.
+    let (wd, worked) = local_minutes(run.worked_until.unwrap_or(run.ended).min(run.ended));
+    let same_day = ymd(&sd) == ymd(&ed) && ymd(&sd) == ymd(&wd);
+    let found = problems(logs, start, worked, same_day);
     if found.is_empty() {
         return None;
     }
@@ -525,6 +533,25 @@ mod tests {
     }
 
     #[test]
+    fn highlights_in_any_list_style_count() {
+        let fm = |h: &str| parse(&format!("---\noutcome: shipped\n{h}---\n")).highlights;
+        // Unindented, as PyYAML's safe_dump writes it (#105).
+        assert!(fm(
+            "highlights:\n- 'first item'\n- second item\nlowlights: []\n"
+        ));
+        assert!(fm("highlights:\n- second item\n"));
+        assert!(fm("highlights:\n  - \"first item\"\n"));
+        // A folded item over several lines.
+        assert!(fm(
+            "highlights:\n- >-\n  a long item\n  over two lines\nlowlights: []\n"
+        ));
+        assert!(fm("highlights:\n  - |\n    kept as written\n"));
+        // Still empty: blank items in either style, or the next key.
+        assert!(!fm("highlights:\n-\n- ''\nlowlights:\n- slow\n"));
+        assert!(!fm("highlights:\nlowlights:\n- slow\n"));
+    }
+
+    #[test]
     fn every_work_range_on_the_time_line_counts() {
         let m = |h: u32, mm: u32| h * 60 + mm;
         assert_eq!(
@@ -589,6 +616,36 @@ mod tests {
             ["2026-11-20-s1-demo.md has no **Time** header"]
         );
         assert_eq!(problems(&[], 0, 60, true), ["no session log was written"]);
+    }
+
+    #[test]
+    fn the_idle_tail_after_the_last_work_is_not_uncovered() {
+        // #106: work 08:04 to 15:47, then idle at the prompt until 16:08.
+        let day = local_day_start(1_795_000_000);
+        let at = |h: i64, m: i64| day + h * 3600 + m * 60;
+        let logs = [log(
+            "2026-11-25-s2-demo",
+            "---\noutcome: shipped\nhighlights: [x]\n---\n**Time**: 08:04 - 15:46\n",
+        )];
+        let mut run = Run {
+            slot: 2,
+            started: at(8, 4),
+            ended: at(16, 8),
+            worked_until: Some(at(15, 47)),
+        };
+        assert_eq!(notice(&run, &logs, None), None);
+        // Work that really went on past the logs is still flagged, at the
+        // last work's time.
+        run.worked_until = Some(at(16, 5));
+        let text = notice(&run, &logs, None).unwrap();
+        assert!(text.contains("(08:04-16:08)"), "{text}");
+        assert!(
+            text.contains("the logs end at 15:46 but work went on until 16:05"),
+            "{text}"
+        );
+        // With no work seen, the run's end stands.
+        run.worked_until = None;
+        assert!(notice(&run, &logs, None).unwrap().contains("until 16:08"));
     }
 
     #[test]
