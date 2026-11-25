@@ -9,6 +9,7 @@ use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use overseer_proto::msg::{PromptInfo, Question};
 use overseer_proto::{
     paths, spool, BashCheck, Client, HookEvent, HookKind, Request, Response, SlotId, WriteCheck,
     CHECK_ENV,
@@ -31,6 +32,8 @@ fn kind(name: &str) -> Option<HookKind> {
         "Notification" => HookKind::Notification,
         "Stop" => HookKind::Stop,
         "PostToolUse" => HookKind::PostToolUse,
+        "PreToolUse" => HookKind::PreToolUse,
+        "PermissionRequest" => HookKind::PermissionRequest,
         _ => return None,
     })
 }
@@ -51,9 +54,66 @@ fn detail(input: &serde_json::Value) -> Option<String> {
     Some(line.chars().take(DETAIL_MAX).collect())
 }
 
+/// What the session is asking, for the events that carry a prompt: an
+/// `AskUserQuestion` call (seen at `PreToolUse`) or a `PermissionRequest`.
+/// Any other event, or a tool that is not `AskUserQuestion` at `PreToolUse`,
+/// has none.
+pub fn prompt_of(event: &str, json: &serde_json::Value) -> Option<PromptInfo> {
+    let tool = json.get("tool_name")?.as_str()?;
+    let input = json.get("tool_input").unwrap_or(&serde_json::Value::Null);
+    match event {
+        "PreToolUse" if tool == "AskUserQuestion" => {
+            let text = |q: &serde_json::Value, k: &str| {
+                q.get(k)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_owned()
+            };
+            let questions = input
+                .get("questions")?
+                .as_array()?
+                .iter()
+                .map(|q| Question {
+                    header: text(q, "header"),
+                    question: text(q, "question"),
+                    options: q
+                        .get("options")
+                        .and_then(|o| o.as_array())
+                        .map(|o| {
+                            o.iter()
+                                .filter_map(|o| Some(o.get("label")?.as_str()?.to_owned()))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    multi: q
+                        .get("multiSelect")
+                        .and_then(|m| m.as_bool())
+                        .unwrap_or(false),
+                })
+                .collect();
+            Some(PromptInfo::Question { questions })
+        }
+        "PermissionRequest" => Some(PromptInfo::Permission {
+            tool: tool.to_owned(),
+            summary: detail(input).unwrap_or_else(|| tool.to_owned()),
+            plan: (tool == "ExitPlanMode")
+                .then(|| input.get("plan")?.as_str().map(String::from))
+                .flatten(),
+        }),
+        _ => None,
+    }
+}
+
+/// True for a `PreToolUse` that only reports a question: the daemon is
+/// never asked to decide it and the hook prints nothing.
+fn is_question(json: &serde_json::Value) -> bool {
+    json.get("tool_name").and_then(|t| t.as_str()) == Some("AskUserQuestion")
+}
+
 /// Empty stdin is a valid event (only slot and kind are needed); non-empty
 /// stdin that is not a JSON object is not.
 pub fn parse_hook(event: &str, slot_env: &str, stdin: &[u8]) -> Option<HookEvent> {
+    let event_name = event;
     let event = kind(event)?;
     let slot = slot(slot_env)?;
     let json: serde_json::Value = if stdin.iter().all(u8::is_ascii_whitespace) {
@@ -73,8 +133,8 @@ pub fn parse_hook(event: &str, slot_env: &str, stdin: &[u8]) -> Option<HookEvent
         notification_type: text("notification_type"),
         run: std::env::var("OVERSEER_RUN").ok(),
         agent_id: text("agent_id"),
-        transcript_path: None,
-        prompt: None,
+        transcript_path: text("transcript_path"),
+        prompt: prompt_of(event_name, &json),
     })
 }
 
@@ -186,8 +246,8 @@ fn runtime() -> Option<tokio::runtime::Runtime> {
 
 /// Asks the daemon about a Bash command or file write and prints its deny
 /// or rewrite decision if it gives one. A missing, slow or confused daemon means allow.
-fn pre_tool_use(slot_env: &str) {
-    let stdin = read_stdin();
+fn pre_tool_use(slot_env: &str, stdin: &[u8]) {
+    let stdin = stdin.to_vec();
     let Some(check) = parse_pre_tool_use(slot_env, &stdin, |k| std::env::var(k).ok()) else {
         return;
     };
@@ -220,11 +280,18 @@ pub fn run(event: &str) {
     let Ok(slot_env) = std::env::var("OVERSEER_SLOT") else {
         return;
     };
-    if event == "PreToolUse" {
-        pre_tool_use(&slot_env);
-        return;
-    }
     let stdin = read_stdin();
+    // An `AskUserQuestion` is only reported, like any other event; every
+    // other PreToolUse is a lock or write check.
+    if event == "PreToolUse" {
+        let asks = serde_json::from_slice::<serde_json::Value>(&stdin)
+            .ok()
+            .is_some_and(|j| is_question(&j));
+        if !asks {
+            pre_tool_use(&slot_env, &stdin);
+            return;
+        }
+    }
     let Some(ev) = parse_hook(event, &slot_env, &stdin) else {
         return;
     };
@@ -464,6 +531,92 @@ mod tests {
     fn bad_json_gives_none() {
         assert!(parse_hook("Stop", "S1", b"not json").is_none());
         assert!(parse_hook("Bogus", "S1", b"{}").is_none());
+    }
+
+    #[test]
+    fn transcript_path_is_forwarded() {
+        let ev = parse_hook("Stop", "S1", br#"{"transcript_path":"/tmp/demo/t.jsonl"}"#).unwrap();
+        assert_eq!(ev.transcript_path.as_deref(), Some("/tmp/demo/t.jsonl"));
+        assert_eq!(
+            parse_hook("Stop", "S1", b"{}").unwrap().transcript_path,
+            None
+        );
+    }
+
+    fn ask_json() -> serde_json::Value {
+        serde_json::json!({
+            "tool_name": "AskUserQuestion",
+            "tool_input": {"questions": [
+                {"header": "Target", "question": "Which service?", "multiSelect": true,
+                 "options": [{"label": "demo-api", "description": "x"}, {"label": "demo-ws"}]},
+                {"header": "Mode", "question": "How?", "options": [{"label": "fast"}]}
+            ]}
+        })
+    }
+
+    #[test]
+    fn ask_user_question_becomes_a_question_prompt() {
+        let ev = parse_hook("PreToolUse", "S1", ask_json().to_string().as_bytes()).unwrap();
+        assert_eq!(ev.event, HookKind::PreToolUse);
+        let Some(PromptInfo::Question { questions }) = ev.prompt else {
+            panic!("not a question");
+        };
+        assert_eq!(questions.len(), 2);
+        assert_eq!(questions[0].header, "Target");
+        assert_eq!(questions[0].question, "Which service?");
+        assert_eq!(questions[0].options, ["demo-api", "demo-ws"]);
+        assert!(questions[0].multi);
+        assert_eq!(questions[1].options, ["fast"]);
+        assert!(!questions[1].multi);
+    }
+
+    #[test]
+    fn permission_request_becomes_a_permission_prompt() {
+        let json = br#"{"tool_name":"Bash","tool_input":{"command":"rm -rf target"}}"#;
+        let ev = parse_hook("PermissionRequest", "S1", json).unwrap();
+        assert_eq!(ev.event, HookKind::PermissionRequest);
+        assert_eq!(
+            ev.prompt,
+            Some(PromptInfo::Permission {
+                tool: "Bash".into(),
+                summary: "rm -rf target".into(),
+                plan: None
+            })
+        );
+        let bare = br#"{"tool_name":"mcp__demo__go","tool_input":{}}"#;
+        let ev = parse_hook("PermissionRequest", "S1", bare).unwrap();
+        let Some(PromptInfo::Permission { summary, .. }) = ev.prompt else {
+            panic!("not a permission");
+        };
+        assert_eq!(summary, "mcp__demo__go");
+    }
+
+    #[test]
+    fn exit_plan_mode_carries_the_plan() {
+        let json = br#"{"tool_name":"ExitPlanMode","tool_input":{"plan":"1. do it"}}"#;
+        let ev = parse_hook("PermissionRequest", "S1", json).unwrap();
+        let Some(PromptInfo::Permission { tool, plan, .. }) = ev.prompt else {
+            panic!("not a permission");
+        };
+        assert_eq!(tool, "ExitPlanMode");
+        assert_eq!(plan.as_deref(), Some("1. do it"));
+    }
+
+    #[test]
+    fn other_events_carry_no_prompt() {
+        let json = br#"{"tool_name":"Bash","tool_input":{"command":"ls"}}"#;
+        assert_eq!(parse_hook("PostToolUse", "S1", json).unwrap().prompt, None);
+        let ev = parse_hook("PreToolUse", "S1", json).unwrap();
+        assert_eq!(ev.prompt, None);
+    }
+
+    #[test]
+    fn pre_tool_use_for_ask_user_question_prints_nothing() {
+        let bytes = ask_json().to_string();
+        assert!(is_question(&ask_json()));
+        assert!(!is_question(&serde_json::json!({"tool_name":"Bash"})));
+        // No daemon check is made for it, so there is no decision to print.
+        assert!(parse_pre_tool_use("S1", bytes.as_bytes(), |_| None).is_none());
     }
 
     #[test]
