@@ -4001,6 +4001,45 @@ async fn a_board_reply_and_stop_reach_the_shown_session() {
     );
 }
 
+/// A relay queued while the board replies to the same slot waits for the
+/// reply to be typed whole, then goes in a paste of its own.
+#[tokio::test]
+async fn a_relay_and_a_board_reply_at_once_go_in_whole_one_after_the_other() {
+    let stub = box_stub("board-and-relay");
+    let d = start_daemon_with(temp_socket(), stub.env()).await;
+    let mut c = Client::connect(&d.socket).await;
+    c.start_stub(2, &stub).await;
+    c.hook(HookEvent {
+        session_id: Some("demo-session".into()),
+        ..hook(2, HookKind::SessionStart)
+    })
+    .await;
+    // The reply goes first and is not waited for; the relay follows at once.
+    c.seq += 1;
+    let reply_seq = c.seq;
+    c.send(Frame::Request {
+        seq: reply_seq,
+        req: Request::Reply {
+            slot: 2,
+            session: "demo-session".into(),
+            prompt: None,
+            text: "from the board".into(),
+        },
+    })
+    .await;
+    assert_eq!(c.relay(None, 2, "hello").await, queued_for(2));
+    let both = format!("{}{}", pasted("from the board"), pasted(HELLO));
+    assert_eq!(stub.read_until(&both).await, both);
+    c.all_delivered(2).await;
+    let replied = loop {
+        match c.recv().await.expect("connection closed") {
+            Frame::Response { seq, resp } if seq == reply_seq => break resp,
+            _ => {}
+        }
+    };
+    assert_eq!(replied, Response::Ok);
+}
+
 // Session end: a slot's waits, unused grants and pending relays belong to
 // the session in it and go when that session ends, however it ends.
 

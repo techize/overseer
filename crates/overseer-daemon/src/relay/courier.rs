@@ -72,6 +72,9 @@ const JUST_SENT: &str = "just delivered, waiting for the session";
 /// Without bracketed paste every newline is an Enter, and a later one could
 /// land on a prompt the first one brought up.
 pub(crate) const NO_BRACKETS: &str = "bracketed paste is off";
+/// The board is typing into the slot (an answer, reply or stop): the
+/// relay goes on a later look, once it is done.
+pub(crate) const TYPING: &str = "the board is typing";
 /// The ledger could not claim the batch for a paste.
 const CLAIM_FAILED: &str = "relays could not be claimed";
 
@@ -419,6 +422,13 @@ impl Courier {
                 return Err(why);
             }
         };
+        // Never waited for: the round serves every slot in turn. The screen
+        // is read under the lock, so it shows what the board just typed, and
+        // nothing else types into the slot until this Return is in.
+        let lock = self.manager.lock().unwrap().key_lock(id);
+        let Ok(_typing) = lock.try_lock() else {
+            return Err(TYPING);
+        };
         let (at_prompt, working_hook) = (held == Some(AT_PROMPT), held == Some(WORKING));
         if !at_prompt {
             watch.answered = None;
@@ -427,11 +437,6 @@ impl Courier {
             watch.quiet = None;
         }
         let slot = slot.ok_or(NOT_RUNNING)?;
-        // Nothing else types into the slot until this Return is in, and the
-        // screen is read under the lock, so it shows what an answer or a
-        // reply just typed. Waits between looks are not under it.
-        let lock = self.manager.lock().unwrap().key_lock(id);
-        let _typing = lock.lock().await;
         // The live screen, not a replay of the ring: the ring loses the box's
         // rules once it wraps, as they are drawn only once (#21).
         let (snap, modes) = slot.screen();

@@ -4,4 +4,5 @@
 pub mod keys;
 pub mod parse;
 pub mod prompt;
+pub mod send;
 pub mod service;
