@@ -38,11 +38,27 @@ pub enum ToolEvent {
     Finished { id: String },
 }
 
+/// User text Claude Code writes when Esc stops a turn, alone or with
+/// " for tool use" after it.
+pub const INTERRUPTED: &str = "[Request interrupted by user";
+
+/// Where a main-conversation line leaves the turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Turn {
+    /// The user's prompt: a turn starts.
+    Began,
+    /// The turn is over: it ended (`end_turn`, or the `turn_duration` line
+    /// after it) or was interrupted.
+    Ended,
+}
+
 /// What some bytes of a transcript held.
 #[derive(Debug, Default, PartialEq)]
 pub struct Fed {
     pub entries: Vec<ConvEntry>,
     pub tools: Vec<ToolEvent>,
+    /// The last line that began or ended a turn, if any did.
+    pub turn: Option<Turn>,
 }
 
 /// Follows a transcript file as it grows. Feed it the new bytes; it hands back
@@ -85,6 +101,7 @@ impl Tail {
             if let Ok(value) = serde_json::from_slice::<Value>(line) {
                 out.entries.extend(entry_of(&value));
                 out.tools.extend(tools_of(&value));
+                out.turn = turn_of(&value).or(out.turn);
             }
         }
         self.partial.drain(..start);
@@ -143,6 +160,34 @@ pub fn tools_of(line: &Value) -> Vec<ToolEvent> {
         .collect()
 }
 
+/// Whether one transcript line begins or ends a main-conversation turn. A
+/// user line with text is a prompt, unless the text is the interrupt note
+/// or Claude Code plumbing; a tool result alone is neither.
+pub fn turn_of(line: &Value) -> Option<Turn> {
+    if flag(line, "isSidechain") || flag(line, "isMeta") || flag(line, "isCompactSummary") {
+        return None;
+    }
+    match line.get("type").and_then(Value::as_str)? {
+        "user" => {
+            let texts = user_texts(line.pointer("/message/content"));
+            if texts.iter().any(|t| t.starts_with(INTERRUPTED)) {
+                Some(Turn::Ended)
+            } else {
+                texts
+                    .iter()
+                    .any(|t| !skipped(t) && !t.trim().is_empty())
+                    .then_some(Turn::Began)
+            }
+        }
+        "assistant" => (line.pointer("/message/stop_reason").and_then(Value::as_str)
+            == Some("end_turn"))
+        .then_some(Turn::Ended),
+        "system" => (line.get("subtype").and_then(Value::as_str) == Some("turn_duration"))
+            .then_some(Turn::Ended),
+        _ => None,
+    }
+}
+
 fn flag(line: &Value, key: &str) -> bool {
     line.get(key).and_then(Value::as_bool).unwrap_or(false)
 }
@@ -151,8 +196,9 @@ fn skipped(text: &str) -> bool {
     SKIPPED_PREFIXES.iter().any(|p| text.starts_with(p))
 }
 
-fn user_kinds(content: Option<&Value>) -> Vec<ConvKind> {
-    let texts: Vec<&str> = match content {
+/// The text of a user line's content: the string, or its text blocks.
+fn user_texts(content: Option<&Value>) -> Vec<&str> {
+    match content {
         Some(Value::String(s)) => vec![s.as_str()],
         Some(Value::Array(blocks)) => blocks
             .iter()
@@ -160,8 +206,11 @@ fn user_kinds(content: Option<&Value>) -> Vec<ConvKind> {
             .filter_map(|b| b.get("text").and_then(Value::as_str))
             .collect(),
         _ => Vec::new(),
-    };
-    let kept: Vec<&str> = texts
+    }
+}
+
+fn user_kinds(content: Option<&Value>) -> Vec<ConvKind> {
+    let kept: Vec<&str> = user_texts(content)
         .into_iter()
         .filter(|t| !skipped(t) && !t.trim().is_empty())
         .collect();
@@ -351,6 +400,65 @@ mod tests {
                 "{line}"
             );
         }
+    }
+
+    #[test]
+    fn prompts_begin_turns_and_ends_or_interrupts_close_them() {
+        let lines = [
+            (
+                r#"{"type":"user","message":{"content":"write a long poem"}}"#,
+                Some(Turn::Began),
+            ),
+            (
+                r#"{"type":"user","message":{"content":[{"type":"text","text":"[Request interrupted by user]"}]}}"#,
+                Some(Turn::Ended),
+            ),
+            (
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1"},{"type":"text","text":"[Request interrupted by user for tool use]"}]}}"#,
+                Some(Turn::Ended),
+            ),
+            (
+                r#"{"type":"assistant","message":{"stop_reason":"end_turn","content":[{"type":"text","text":"Done."}]}}"#,
+                Some(Turn::Ended),
+            ),
+            (
+                r#"{"type":"system","subtype":"turn_duration","isSidechain":false}"#,
+                Some(Turn::Ended),
+            ),
+            (
+                r#"{"type":"assistant","message":{"stop_reason":"tool_use","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}]}}"#,
+                None,
+            ),
+            (
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1"}]}}"#,
+                None,
+            ),
+            (
+                r#"{"type":"user","isSidechain":true,"message":{"content":"hi"}}"#,
+                None,
+            ),
+            (
+                r#"{"type":"user","isMeta":true,"message":{"content":"hi"}}"#,
+                None,
+            ),
+            (
+                r#"{"type":"user","message":{"content":"<system-reminder>x"}}"#,
+                None,
+            ),
+            (r#"{"type":"system","subtype":"stop_hook_summary"}"#, None),
+        ];
+        for (line, want) in lines {
+            assert_eq!(
+                turn_of(&serde_json::from_str(line).unwrap()),
+                want,
+                "{line}"
+            );
+        }
+        // The last mark of a read is the one kept.
+        let input = format!("{}\n{}\n", lines[0].0, lines[1].0);
+        assert_eq!(Tail::new().read(input.as_bytes()).turn, Some(Turn::Ended));
+        let input = format!("{}\n{}\n{}\n", lines[1].0, lines[0].0, lines[5].0);
+        assert_eq!(Tail::new().read(input.as_bytes()).turn, Some(Turn::Began));
     }
 
     #[test]

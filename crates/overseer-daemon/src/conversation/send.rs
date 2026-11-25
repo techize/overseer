@@ -53,8 +53,9 @@ struct SlotNow {
     session: Option<String>,
     /// The prompt its conversation is waiting on.
     prompt: Option<Prompt>,
-    /// A hook said it is working.
-    working: bool,
+    /// A hook said it is working and its transcript shows the turn in
+    /// progress (see `ConversationService::turn_open`).
+    in_turn: bool,
 }
 
 /// One slot the board types into. Every send checks the slot's state, takes
@@ -103,9 +104,10 @@ pub fn typist(
             session: running_session
                 .filter(|s| running && conversation.session(slot).as_ref() == Some(s)),
             prompt: conversation.open_prompt(slot),
-            working: info
+            in_turn: info
                 .activity
-                .is_some_and(|a| a.kind == ActivityKind::Working),
+                .is_some_and(|a| a.kind == ActivityKind::Working)
+                && conversation.turn_open(slot),
         }
     });
     Ok(Typist {
@@ -251,9 +253,11 @@ impl Typist {
         Ok(now)
     }
 
-    /// Types `text` as the user's next message. A session that is working
-    /// or at a prompt is stopped with Esc first (at a permission prompt that
-    /// answers No), and the text goes once the screen shows the empty box.
+    /// Types `text` as the user's next message. A session in a turn (even
+    /// one streaming its reply, whose screen shows no working line) or at a
+    /// prompt is stopped with Esc first (at a permission prompt that answers
+    /// No), and the text goes once the screen shows the empty box and the
+    /// turn is over.
     async fn reply(&self, session: &str, prompt: Option<&str>, text: &str) -> Result<(), String> {
         let text = strip_controls(text);
         if text.trim().is_empty() {
@@ -263,7 +267,7 @@ impl Typist {
         let _typing = self.lock.lock().await;
         let now = self.reply_check(session, prompt)?;
         let screen = self.keys.screen();
-        let stop = now.working
+        let stop = now.in_turn
             || now.prompt.is_some()
             || screen.as_ref().is_some_and(|(s, _)| shows_working(s));
         let Some((snap, modes)) = screen else {
@@ -317,7 +321,9 @@ impl Typist {
     }
 
     /// Waits for the screen to show the empty input box with no working
-    /// line, up to `stop_within`. The screen's modes when it does; else the
+    /// line, and for the turn to be over, up to `stop_within`. A streaming
+    /// session looks at rest already, so only the transcript's interrupt
+    /// says the Esc landed. The screen's modes when it does; else the
     /// refusal, which names text left in the box.
     async fn stopped(&self) -> Result<TermModes, String> {
         let deadline = tokio::time::Instant::now() + self.timing.stop_within;
@@ -325,7 +331,10 @@ impl Typist {
             tokio::time::sleep(self.timing.poll).await;
             let screen = self.keys.screen();
             if let Some((snap, modes)) = &screen {
-                if input_box(snap) == InputBox::Empty && !shows_working(snap) {
+                if input_box(snap) == InputBox::Empty
+                    && !shows_working(snap)
+                    && !(self.now)().in_turn
+                {
                     return Ok(*modes);
                 }
             }
@@ -359,8 +368,11 @@ impl Typist {
     }
 
     /// Types Esc, which stops a working session or answers a prompt No.
-    /// Only while the screen shows the working line or a prompt is open: a
-    /// second Esc at a stopped session opens Claude Code's rewind picker.
+    /// Only while the screen shows the working line, a prompt is open with
+    /// its dialog in place of the input box, or the turn is in progress (a
+    /// session streaming its reply shows no working line): a second Esc at
+    /// a stopped session opens Claude Code's rewind picker. No hook follows
+    /// an Esc, so the transcript's interrupt is what ends the turn.
     async fn interrupt(&self) -> Result<(), String> {
         if !(self.now)().running {
             return Err(not_running(self.slot));
@@ -370,11 +382,12 @@ impl Typist {
         if !now.running {
             return Err(not_running(self.slot));
         }
-        let working = self
-            .keys
-            .screen()
-            .is_some_and(|(snap, _)| shows_working(&snap));
-        if !working && now.prompt.is_none() {
+        let stoppable = self.keys.screen().is_some_and(|(snap, _)| {
+            shows_working(&snap)
+                || (now.prompt.is_some() && input_box(&snap) == InputBox::NotFound)
+                || now.in_turn
+        });
+        if !stoppable {
             return Err(self.refusal("is not working"));
         }
         self.keys
@@ -467,7 +480,10 @@ mod tests {
         running: bool,
         session: Option<String>,
         prompt: Option<Prompt>,
-        working: bool,
+        /// The turn is in progress, until an Esc is typed when
+        /// `esc_ends_turn` (as the transcript then records the interrupt).
+        in_turn: bool,
+        esc_ends_turn: bool,
     }
 
     fn at_rest() -> State {
@@ -475,7 +491,8 @@ mod tests {
             running: true,
             session: Some("demo-s".into()),
             prompt: None,
-            working: false,
+            in_turn: false,
+            esc_ends_turn: true,
         }
     }
 
@@ -496,17 +513,19 @@ mod tests {
             }
         });
         let state = state.clone();
+        let typed = fake.clone();
         Typist {
             slot: 2,
             keys: fake.clone(),
             lock: KeyLock::default(),
             now: Box::new(move || {
                 let s = state.lock().unwrap().clone();
+                let stopped = s.esc_ends_turn && typed.typed().iter().any(|k| k == b"\x1b");
                 SlotNow {
                     running: s.running,
                     session: s.session,
                     prompt: s.prompt,
-                    working: s.working,
+                    in_turn: s.in_turn && !stopped,
                 }
             }),
             forget,
@@ -603,7 +622,7 @@ mod tests {
         let fake = FakeSlot::showing(Some(screen(None, true, true)));
         fake.when(b"\x1b", idle());
         let state = Arc::new(Mutex::new(State {
-            working: true,
+            in_turn: true,
             ..at_rest()
         }));
         let t = fake_typist(&fake, &state);
@@ -618,7 +637,7 @@ mod tests {
     async fn a_slot_that_does_not_stop_gets_no_reply() {
         let fake = FakeSlot::showing(Some(screen(None, true, true)));
         let state = Arc::new(Mutex::new(State {
-            working: true,
+            in_turn: true,
             ..at_rest()
         }));
         let t = fake_typist(&fake, &state);
@@ -850,7 +869,7 @@ mod tests {
         let fake = FakeSlot::showing(Some(screen(Some("queued draft"), true, true)));
         fake.when(b"\x1b", Some(screen(Some("queued draft"), false, true)));
         let state = Arc::new(Mutex::new(State {
-            working: true,
+            in_turn: true,
             ..at_rest()
         }));
         let t = fake_typist(&fake, &state);
@@ -862,14 +881,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn interrupt_needs_the_working_line_or_a_prompt() {
+    async fn interrupt_needs_the_working_line_a_prompt_or_a_turn() {
         // Stopped by an earlier Esc: no hook says so, so the slot still
-        // reads as working, but the screen shows it at rest.
+        // reads as working, but the transcript has the interrupt and the
+        // screen shows it at rest.
         let fake = FakeSlot::showing(idle());
-        let state = Arc::new(Mutex::new(State {
-            working: true,
-            ..at_rest()
-        }));
+        let state = Arc::new(Mutex::new(at_rest()));
         let t = fake_typist(&fake, &state);
         assert_eq!(
             t.handle(Request::Interrupt { slot: 2 }).await,
@@ -888,6 +905,118 @@ mod tests {
         let t = fake_typist(&fake, &at_permission("p1"));
         assert_eq!(t.handle(Request::Interrupt { slot: 2 }).await, Response::Ok);
         assert_eq!(fake.typed(), chunks(&[b"\x1b"]));
+    }
+
+    /// Claude Code 2.1.328 streaming its reply: the text so far, then the
+    /// empty input box with the cursor and the status line, and no working
+    /// line.
+    fn streaming() -> Screen {
+        let rule = "\u{2500}".repeat(COLS as usize);
+        let out = format!(
+            "\x1b[2J\x1b[H\x1b[?2004h\u{23fa} The Long Way Home\r\n\r\n  The morning comes in quiet, gold\r\n\r\n{rule}\r\n\u{276f} \x1b[7m \x1b[0m\r\n{rule}\r\n  demo-api \u{b7} DEMO-12"
+        );
+        Some(screen_of(out.as_bytes(), COLS, 12))
+    }
+
+    #[test]
+    fn the_streaming_screen_shows_no_working_line() {
+        let (snap, _) = streaming().unwrap();
+        assert!(!shows_working(&snap));
+        assert_eq!(input_box(&snap), InputBox::Empty);
+    }
+
+    #[tokio::test]
+    async fn interrupt_stops_a_slot_streaming_its_reply() {
+        let fake = FakeSlot::showing(streaming());
+        let state = Arc::new(Mutex::new(State {
+            in_turn: true,
+            ..at_rest()
+        }));
+        let t = fake_typist(&fake, &state);
+        assert_eq!(t.handle(Request::Interrupt { slot: 2 }).await, Response::Ok);
+        assert_eq!(fake.typed(), chunks(&[b"\x1b"]));
+        // Once the interrupt is recorded, a second Stop types nothing.
+        assert_eq!(
+            t.handle(Request::Interrupt { slot: 2 }).await,
+            error("S2 is not working, not sent")
+        );
+        assert_eq!(fake.typed().len(), 1);
+        // Nor while the turn is open but the screen cannot be read.
+        let blind = FakeSlot::showing(None);
+        let t = fake_typist(&blind, &state);
+        assert_eq!(
+            t.handle(Request::Interrupt { slot: 2 }).await,
+            error("S2 is not working, not sent")
+        );
+        assert!(blind.typed().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_reply_to_a_streaming_slot_stops_it_first() {
+        let fake = FakeSlot::showing(streaming());
+        let state = Arc::new(Mutex::new(State {
+            in_turn: true,
+            ..at_rest()
+        }));
+        let t = fake_typist(&fake, &state);
+        assert_eq!(
+            t.handle(reply("demo-s", None, "shorter")).await,
+            Response::Ok
+        );
+        assert_eq!(
+            fake.typed(),
+            chunks(&[b"\x1b", b"\x1b[200~shorter\x1b[201~", b"\r"])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reply_waits_for_the_turn_to_end_after_esc() {
+        // The Esc did not land: the turn is still open, though the screen
+        // looks at rest. The reply is not pasted into a streaming session.
+        let fake = FakeSlot::showing(streaming());
+        let state = Arc::new(Mutex::new(State {
+            in_turn: true,
+            esc_ends_turn: false,
+            ..at_rest()
+        }));
+        let t = fake_typist(&fake, &state);
+        assert_eq!(
+            t.handle(reply("demo-s", None, "shorter")).await,
+            error("S2 did not stop, not sent")
+        );
+        assert_eq!(fake.typed(), chunks(&[b"\x1b"]));
+    }
+
+    #[tokio::test]
+    async fn a_reply_after_an_interrupt_types_no_second_esc() {
+        // The hooks still say working, but the transcript has the
+        // interrupt: the session is at rest, and Esc there could open the
+        // rewind picker.
+        let fake = FakeSlot::showing(idle());
+        let t = fake_typist(&fake, &Arc::new(Mutex::new(at_rest())));
+        assert_eq!(t.handle(reply("demo-s", None, "next")).await, Response::Ok);
+        assert_eq!(fake.typed(), chunks(&[b"\x1b[200~next\x1b[201~", b"\r"]));
+    }
+
+    #[tokio::test]
+    async fn a_reply_at_a_dialog_with_no_prompt_is_refused() {
+        // A dialog the hooks never named, as Claude Code's folder trust
+        // question: no prompt is open and the box is gone.
+        let fake = FakeSlot::showing(Some(screen_of(
+            b"Accessing workspace:\r\n  /tmp/demo-ws\r\n  1. Yes, I trust this folder\r\n  2. No, exit\r\n",
+            COLS,
+            12,
+        )));
+        let t = fake_typist(&fake, &Arc::new(Mutex::new(at_rest())));
+        assert_eq!(
+            t.handle(reply("demo-s", None, "1")).await,
+            error("S2 shows no input box, not sent")
+        );
+        assert_eq!(
+            t.handle(Request::Interrupt { slot: 2 }).await,
+            error("S2 is not working, not sent")
+        );
+        assert!(fake.typed().is_empty());
     }
 
     #[tokio::test]

@@ -135,7 +135,9 @@ reply box:
   today.
 - *Prompts the pane cannot show* (other dialogs Claude Code draws, MCP
   elicitation): the pane says `waiting on a prompt Overseer can't show`
-  with an Open session button, and Send is refused there (my call).
+  with an Open session button, and Send is refused there (my call). This
+  holds whenever the slot needs you and no prompt is shown, with or
+  without history, as at Claude Code's folder trust question.
 - A prompt clears when the next hook event for that slot arrives that ends
   it: PostToolUse with the prompt's `tool_use_id` (not just the same tool
   name, since parallel calls can finish while a dialog is open),
@@ -161,7 +163,13 @@ it pastes and Returns at once. At an open permission prompt the pane
 shows the reply box as `No, and tell it instead`: Send types Esc (which
 answers No) and then the text, the same as Claude Code's own "No, and
 tell Claude what to do differently" (my call, following the user's stop
-then send). A separate Stop button types Esc alone. The
+then send). A separate Stop button types Esc alone. "Working" here is the
+turn in progress: the hooks say working and the transcript has recorded
+neither the end of the turn nor an interrupt since the last prompt. While
+Claude streams its reply the screen shows no working line, so the screen
+alone cannot tell; and no hook follows an Esc, so the transcript's
+`[Request interrupted by user]` is what says a stop landed. A stop then
+send waits for that too before it pastes. The
 text stays in the box until the daemon reports it sent, so a refused send
 loses nothing.
 

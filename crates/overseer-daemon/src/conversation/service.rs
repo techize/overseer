@@ -17,7 +17,7 @@ use overseer_term::Snapshot;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::MissedTickBehavior;
 
-use super::parse::{Fed, Tail};
+use super::parse::{Fed, Tail, Turn};
 use super::prompt::PromptState;
 use crate::ledger::Ledger;
 use crate::manager::{SlotManager, SLOT_COUNT};
@@ -75,6 +75,9 @@ struct SlotView {
     /// The open permission whose screen looked answered, and on how many
     /// polls in a row.
     answered_looks: Option<(String, u8)>,
+    /// The transcript's last mark began a turn, or a prompt was submitted
+    /// since: no end of the turn or interrupt has been recorded after it.
+    turn_open: bool,
 }
 
 /// What the app was last sent of a slot.
@@ -244,6 +247,7 @@ impl ConversationService {
                     view.generation += 1;
                     view.entries.clear();
                     view.prompt.clear();
+                    view.turn_open = false;
                     view.sent.full = true;
                     if let (Some(path), false) = (&view.path, view.session.is_empty()) {
                         view.store = Some((view.session.clone(), path.clone()));
@@ -251,6 +255,9 @@ impl ConversationService {
                     read = true;
                     reset = true;
                 }
+            }
+            if ev.event == HookKind::UserPromptSubmit && ev.agent_id.is_none() {
+                view.turn_open = true;
             }
             let changed = view.prompt.on_hook(ev);
             let asked =
@@ -324,15 +331,12 @@ impl ConversationService {
         if view.generation == generation {
             match read {
                 Read::Missing => {}
-                Read::More(fed) => {
-                    append(view, fed.entries);
-                    view.prompt.on_tools(&fed.tools);
-                }
+                Read::More(fed) => apply_fed(view, fed),
                 Read::Restarted(fed) => {
                     view.entries.clear();
+                    view.turn_open = false;
                     view.sent.full = true;
-                    append(view, fed.entries);
-                    view.prompt.on_tools(&fed.tools);
+                    apply_fed(view, fed);
                 }
             }
         }
@@ -435,10 +439,29 @@ impl ConversationService {
         views.get(&slot)?.prompt.open().cloned()
     }
 
+    /// Whether the slot's transcript shows a turn in progress: a prompt with
+    /// no end of the turn or interrupt recorded after it. With the hooks
+    /// saying the slot works, it is still working even when the screen
+    /// shows no working line (as while Claude streams its reply); after an
+    /// Esc, which no hook follows, it is not.
+    pub fn turn_open(&self, slot: SlotId) -> bool {
+        let views = self.views.lock().unwrap();
+        views.get(&slot).is_some_and(|v| v.turn_open)
+    }
+
     /// The session the slot's conversation is from, once known.
     pub fn session(&self, slot: SlotId) -> Option<String> {
         let views = self.views.lock().unwrap();
         Some(views.get(&slot)?.session.clone()).filter(|s| !s.is_empty())
+    }
+}
+
+/// Takes in what a read found: its entries, tool calls and turn mark.
+fn apply_fed(view: &mut SlotView, fed: Fed) {
+    append(view, fed.entries);
+    view.prompt.on_tools(&fed.tools);
+    if let Some(turn) = fed.turn {
+        view.turn_open = turn == Turn::Began;
     }
 }
 
@@ -959,6 +982,63 @@ mod tests {
         let views = sent(&mut f.rx);
         assert_eq!(views.len(), 1);
         assert_eq!(views[0].prompt, None);
+    }
+
+    fn append_json(path: &Path, v: serde_json::Value) {
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(format!("{v}\n").as_bytes())
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_turn_is_open_from_a_prompt_to_its_end_or_interrupt() {
+        let f = fixture();
+        let path = f.dir.path().join("one.jsonl");
+        write(&path, &["write a long poem"]);
+        f.svc.hook(&hook(HookKind::SessionStart, &path));
+        assert!(!f.svc.turn_open(2));
+        f.svc.refresh(2).await;
+        // Streaming: nothing after the prompt yet.
+        assert!(f.svc.turn_open(2));
+        append_json(
+            &path,
+            serde_json::json!({"type":"user","message":{"content":[
+                {"type":"text","text":"[Request interrupted by user]"}]}}),
+        );
+        f.svc.refresh(2).await;
+        assert!(!f.svc.turn_open(2));
+        // A prompt submitted opens it before the transcript has the line.
+        f.svc.hook(&hook(HookKind::UserPromptSubmit, &path));
+        assert!(f.svc.turn_open(2));
+        add(&path, &["and another"]);
+        append_json(
+            &path,
+            serde_json::json!({"type":"assistant","message":{"stop_reason":"end_turn",
+                "content":[{"type":"text","text":"Done."}]}}),
+        );
+        f.svc.refresh(2).await;
+        assert!(!f.svc.turn_open(2));
+        // A subagent's prompt says nothing of the main turn.
+        let sub = HookEvent {
+            agent_id: Some("demo-agent".into()),
+            ..hook(HookKind::UserPromptSubmit, &path)
+        };
+        f.svc.hook(&sub);
+        assert!(!f.svc.turn_open(2));
+        // A new session starts closed.
+        add(&path, &["one more"]);
+        f.svc.refresh(2).await;
+        assert!(f.svc.turn_open(2));
+        let next = HookEvent {
+            session_id: Some("demo-next".into()),
+            transcript_path: None,
+            ..hook(HookKind::SessionStart, &path)
+        };
+        f.svc.hook(&next);
+        assert!(!f.svc.turn_open(2));
     }
 
     #[tokio::test]
