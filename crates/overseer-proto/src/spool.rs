@@ -82,6 +82,8 @@ mod tests {
             notification_type: None,
             run: Some("run-1".into()),
             agent_id: None,
+            transcript_path: None,
+            prompt: None,
         }
     }
 

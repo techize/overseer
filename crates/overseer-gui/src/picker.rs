@@ -84,6 +84,7 @@ pub fn rows(view: &WorkView, filter: &str) -> Vec<PickerRow> {
 }
 
 /// What a key or click in the picker asks the view to do.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum PickerAction {
     /// Nothing for the picker; let the key go on.

@@ -12,6 +12,13 @@ use overseer_proto::{Activity, ActivityKind, HookEvent, HookKind};
 /// not `NeedsYou`: Claude sends one about a minute after every turn, and
 /// after an Esc interrupt, which fires no `Stop`.
 pub fn apply(prev: Option<&Activity>, ev: &HookEvent, now: i64) -> Option<Activity> {
+    // These carry a prompt or a tool about to run, not a change of state.
+    if matches!(
+        ev.event,
+        HookKind::PreToolUse | HookKind::PermissionRequest | HookKind::Other
+    ) {
+        return prev.cloned();
+    }
     let idle_wait = ev.event == HookKind::Notification && is_idle_wait(ev);
     let (kind, now_doing, reason) = match ev.event {
         HookKind::Notification if idle_wait => (ActivityKind::Idle, None, None),
@@ -25,6 +32,9 @@ pub fn apply(prev: Option<&Activity>, ev: &HookEvent, now: i64) -> Option<Activi
         }
         HookKind::Notification => (ActivityKind::NeedsYou, None, ev.notification.clone()),
         HookKind::Stop | HookKind::SessionStart => (ActivityKind::Idle, None, None),
+        HookKind::PreToolUse | HookKind::PermissionRequest | HookKind::Other => {
+            unreachable!("returned above")
+        }
     };
     let since = match prev {
         Some(p) if p.kind == kind => p.since,
@@ -68,6 +78,8 @@ mod tests {
             notification_type: None,
             run: None,
             agent_id: None,
+            transcript_path: None,
+            prompt: None,
         }
     }
 
@@ -78,6 +90,19 @@ mod tests {
             now_doing: None,
             reason: None,
             idle_wait: false,
+        }
+    }
+
+    #[test]
+    fn new_hook_kinds_leave_activity_alone() {
+        let prev = act(ActivityKind::Working, 5);
+        for kind in [
+            HookKind::PreToolUse,
+            HookKind::PermissionRequest,
+            HookKind::Other,
+        ] {
+            assert_eq!(apply(Some(&prev), &ev(kind), 9), Some(prev.clone()));
+            assert_eq!(apply(None, &ev(kind), 9), None);
         }
     }
 

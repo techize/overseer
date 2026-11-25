@@ -1552,6 +1552,11 @@ fn handle_request(
         Request::PrSeen { repo, id } => store.mark_pr_seen(&repo, id),
         Request::Attention => Response::Attention(ctx.attention.current()),
         Request::Timeline => Response::Timeline(ctx.timeline.current()),
+        // Replaced when the conversation tailer and the reply path land.
+        Request::Conversation { .. }
+        | Request::Answer { .. }
+        | Request::Reply { .. }
+        | Request::Interrupt { .. } => err("not yet".into()),
         Request::ListSlots => Response::Slots(manager.lock().unwrap().list()),
         Request::DaemonInfo => Response::DaemonInfo(ctx.info.clone()),
         Request::SlotScreen { id } if !valid_id(id) => err(format!("invalid slot id {id}")),

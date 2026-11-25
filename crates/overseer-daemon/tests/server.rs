@@ -944,6 +944,8 @@ fn hook(slot: u8, event: HookKind) -> HookEvent {
         notification_type: None,
         run: None,
         agent_id: None,
+        transcript_path: None,
+        prompt: None,
     }
 }
 
