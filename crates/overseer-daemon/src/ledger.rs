@@ -1039,17 +1039,12 @@ impl Ledger {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Deletes the dismissals whose key is not in `live`, so a row that
-    /// went away and later comes back is not hidden by an old entry.
-    pub fn prune_attention_dismissed(&self, live: &[&str]) -> Result<()> {
+    /// Deletes the dismissals of `keys`, rows that went away, so one that
+    /// later comes back is not hidden by an old entry.
+    pub fn delete_attention_dismissed(&self, keys: &[&str]) -> Result<()> {
         let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
-        let keys: Vec<String> = {
-            let mut stmt = tx.prepare("SELECT key FROM attention_dismissed")?;
-            let rows = stmt.query_map([], |r| r.get(0))?;
-            rows.collect::<rusqlite::Result<_>>()?
-        };
-        for key in keys.iter().filter(|k| !live.contains(&k.as_str())) {
+        for key in keys {
             tx.execute("DELETE FROM attention_dismissed WHERE key = ?1", [key])?;
         }
         tx.commit()?;
@@ -2511,7 +2506,7 @@ mod tests {
     }
 
     #[test]
-    fn dismissing_again_replaces_and_prune_keeps_live_keys() {
+    fn dismissing_again_replaces_and_delete_takes_only_the_keys_given() {
         let l = Ledger::in_memory();
         l.dismiss_attention("needs_you:1", 10, "one").unwrap();
         l.dismiss_attention("notice:2", 20, "two").unwrap();
@@ -2523,13 +2518,15 @@ mod tests {
                 ("notice:2".to_string(), 20, "two".to_string()),
             ]
         );
-        l.prune_attention_dismissed(&["notice:2", "log_gap:4"])
+        l.delete_attention_dismissed(&["needs_you:1", "log_gap:4"])
             .unwrap();
         assert_eq!(
             l.attention_dismissed().unwrap(),
             [("notice:2".to_string(), 20, "two".to_string())]
         );
-        l.prune_attention_dismissed(&[]).unwrap();
+        l.delete_attention_dismissed(&[]).unwrap();
+        assert_eq!(l.attention_dismissed().unwrap().len(), 1);
+        l.delete_attention_dismissed(&["notice:2"]).unwrap();
         assert!(l.attention_dismissed().unwrap().is_empty());
     }
 

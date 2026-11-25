@@ -59,6 +59,20 @@ pub fn rows(v: &AttentionView, now: i64) -> Vec<Row> {
         .collect()
 }
 
+/// Clears the mark `attention_dismiss` put on a row when the daemon refused
+/// the dismissal, if the row is still the one dismissed. True when a mark
+/// was cleared.
+pub fn undismiss(v: &mut AttentionView, key: &str, since: i64, text: &str) -> bool {
+    let mut cleared = false;
+    for i in &mut v.items {
+        if i.dismissed && i.key == key && i.since == since && i.text == text {
+            i.dismissed = false;
+            cleared = true;
+        }
+    }
+    cleared
+}
+
 /// The Dock badge: nothing at zero, else the count.
 pub fn badge_label(count: usize) -> Option<String> {
     (count > 0).then(|| count.to_string())
@@ -118,7 +132,8 @@ impl OverseerApp {
     }
 
     /// Hides the row `key` as it is now. The daemon stores it and sends the
-    /// list again; the row is marked here too so it goes at once.
+    /// list again; the row is marked here too so it goes at once, and comes
+    /// back if the daemon refuses (see `send`).
     pub(crate) fn attention_dismiss(&mut self, key: &str, cx: &mut Context<Self>) {
         if self.modal_open() {
             return;
@@ -352,6 +367,29 @@ mod tests {
         assert_eq!(rows(&v, 1300), vec![row("log_gap:2", "S2", "gap", "5m")]);
         assert_eq!(oldest_first(&v).len(), 1);
         assert_eq!(v.count(), 1);
+    }
+
+    #[test]
+    fn a_refused_dismissal_shows_the_row_again() {
+        let mut gone = item(
+            "needs_you:3",
+            AttentionKind::NeedsYou,
+            Some(3),
+            None,
+            1000,
+            "prompt",
+        );
+        gone.dismissed = true;
+        let mut v = AttentionView { items: vec![gone] };
+        assert_eq!(v.count(), 0);
+        // A newer list already replaced the row: nothing to clear.
+        assert!(!undismiss(&mut v, "needs_you:3", 999, "prompt"));
+        assert!(!undismiss(&mut v, "needs_you:3", 1000, "another"));
+        assert_eq!(v.count(), 0);
+        assert!(undismiss(&mut v, "needs_you:3", 1000, "prompt"));
+        assert_eq!(v.count(), 1);
+        assert_eq!(rows(&v, 1300).len(), 1);
+        assert!(!undismiss(&mut v, "needs_you:3", 1000, "prompt"));
     }
 
     #[test]

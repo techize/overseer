@@ -1055,6 +1055,12 @@ impl OverseerApp {
             Request::StopSlot { id } => Some(*id),
             _ => None,
         };
+        let undismiss = match &req {
+            Request::DismissAttention { key, since, text } => {
+                Some((key.clone(), *since, text.clone()))
+            }
+            _ => None,
+        };
         cx.spawn(async move |this, cx| {
             let result = client.request(req).await;
             let _ = this.update(cx, |this, cx| {
@@ -1067,6 +1073,13 @@ impl OverseerApp {
                     // A failed stop abandons its restart.
                     if let Some(id) = restart_slot {
                         this.restarts.remove(&id);
+                    }
+                    // A refused dismissal shows its row again.
+                    if let Some((key, since, text)) = &undismiss {
+                        if crate::attention_view::undismiss(&mut this.attention, key, *since, text)
+                        {
+                            crate::notify::set_dock_badge(this.attention.count());
+                        }
                     }
                     this.status = Some(e);
                     cx.notify();
