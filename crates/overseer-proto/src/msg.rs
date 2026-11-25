@@ -726,6 +726,13 @@ pub enum Request {
     },
     /// The attention queue.
     Attention,
+    /// Hide the attention row `key` while its `since` and `text` stay as
+    /// given. A new occurrence or a changed text shows it again.
+    DismissAttention {
+        key: String,
+        since: i64,
+        text: String,
+    },
     /// Today's timeline of what each slot did and where its log has gaps.
     Timeline,
     /// Mark a pull request's current comments and build as seen.
@@ -1450,6 +1457,10 @@ pub struct AttentionItem {
     /// Unix seconds it started wanting attention.
     pub since: i64,
     pub text: String,
+    /// The user dismissed this row as it is now. Still sent so a client can
+    /// list it, but left out of the badge and the board's panel.
+    #[serde(default)]
+    pub dismissed: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1458,11 +1469,12 @@ pub struct AttentionView {
 }
 
 impl AttentionView {
-    /// How many items to badge: kinds this build does not know are left out.
+    /// How many items to badge: kinds this build does not know and
+    /// dismissed rows are left out.
     pub fn count(&self) -> usize {
         self.items
             .iter()
-            .filter(|i| i.kind != AttentionKind::Other)
+            .filter(|i| i.kind != AttentionKind::Other && !i.dismissed)
             .count()
     }
 }
@@ -1672,6 +1684,7 @@ mod tests {
                 url: None,
                 since: 100,
                 text: "permission prompt".into(),
+                dismissed: false,
             }],
         };
         let ev = Event::AttentionChanged(v.clone());
@@ -1692,11 +1705,39 @@ mod tests {
             url: None,
             since: 1,
             text: "t".into(),
+            dismissed: false,
         };
         let v = AttentionView {
             items: vec![item(AttentionKind::Other), item(AttentionKind::LogGap)],
         };
         assert_eq!(v.count(), 1);
+    }
+
+    #[test]
+    fn attention_count_skips_dismissed_rows() {
+        let item = |key: &str, dismissed| AttentionItem {
+            key: key.into(),
+            kind: AttentionKind::NeedsYou,
+            slot: Some(1),
+            pr: None,
+            url: None,
+            since: 1,
+            text: "t".into(),
+            dismissed,
+        };
+        let v = AttentionView {
+            items: vec![item("a", true), item("b", false), item("c", true)],
+        };
+        assert_eq!(v.count(), 1);
+    }
+
+    #[test]
+    fn attention_item_without_dismissed_reads_as_not_dismissed() {
+        let v: AttentionView = serde_json::from_str(
+            r#"{"items":[{"key":"k","kind":"needs_you","slot":1,"pr":null,"url":null,"since":1,"text":"t"}]}"#,
+        )
+        .unwrap();
+        assert!(!v.items[0].dismissed);
     }
 
     #[test]
@@ -1739,6 +1780,11 @@ mod tests {
             Request::PrSeen {
                 repo: "demo-api".into(),
                 id: 7,
+            },
+            Request::DismissAttention {
+                key: "needs_you:3".into(),
+                since: 100,
+                text: "permission prompt".into(),
             },
         ] {
             let back: Request =

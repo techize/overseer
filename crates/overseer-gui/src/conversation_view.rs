@@ -1182,6 +1182,7 @@ mod tests {
             url: None,
             since,
             text: "needs you".into(),
+            dismissed: false,
         }
     }
 
@@ -1207,6 +1208,21 @@ mod tests {
         assert_eq!(next_waiting(&attention, &slots, &cs, 4), Some(5));
         // From a slot that is not waiting, the first.
         assert_eq!(next_waiting(&attention, &slots, &cs, 1), Some(5));
+    }
+
+    #[test]
+    fn a_dismissed_item_loses_its_place_but_its_slot_still_waits() {
+        // S5 waited longest but its row is dismissed: S2 comes first, and
+        // S5 still follows by id as a slot that needs you.
+        let slots: Vec<_> = (0..7).map(|i| slot(i, i == 2 || i == 5)).collect();
+        let mut gone = needs_item(5, 100);
+        gone.dismissed = true;
+        let attention = AttentionView {
+            items: vec![needs_item(2, 200), gone],
+        };
+        let cs = convs();
+        assert_eq!(next_waiting(&attention, &slots, &cs, 1), Some(2));
+        assert_eq!(next_waiting(&attention, &slots, &cs, 2), Some(5));
     }
 
     #[test]

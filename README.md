@@ -508,8 +508,10 @@ trimming):
   relays, notices, and pull requests with a failed build, changes requested
   or new comments. The Dock icon shows the count. Click a session row to open
   it; a pull request row opens the PR and marks it seen, as clicking it in the
-  Open PRs panel does. `overseer ctl attention` prints the same list (`--json`
-  for scripts).
+  Open PRs panel does. The x on a hovered row dismisses it, also from the
+  Dock count, until it changes: a new occurrence or a new text brings it
+  back. `overseer ctl attention` prints the same list (`--json` for scripts,
+  `--all` to list dismissed rows too).
 - The `Today` panel sits below it and folds to one line, `Today: no gaps`
   or `Today: 2 gaps`. Click the line to open one bar per session on a shared
   time axis: green is covered by a session log, red is a stretch of more

@@ -145,6 +145,9 @@ pub enum CtlCmd {
         /// Print the raw AttentionView as JSON.
         #[arg(long)]
         json: bool,
+        /// Also list the rows you dismissed on the board, marked.
+        #[arg(long)]
+        all: bool,
     },
     /// Today's timeline: each slot's stretches, with the gaps in the session log.
     Timeline {
@@ -896,11 +899,12 @@ async fn run_settings(
 }
 
 /// `{age:>4}  {who}  {text}`, one line per item, longest waiting first as the daemon sorts them.
-fn attention_lines(v: &AttentionView, now: i64) -> Vec<String> {
+/// Dismissed rows are left out, or with `all` listed with `(dismissed)`.
+fn attention_lines(v: &AttentionView, now: i64, all: bool) -> Vec<String> {
     let known: Vec<_> = v
         .items
         .iter()
-        .filter(|i| i.kind != AttentionKind::Other)
+        .filter(|i| i.kind != AttentionKind::Other && (all || !i.dismissed))
         .collect();
     if known.is_empty() {
         return vec!["Nothing waiting on you.".to_string()];
@@ -918,7 +922,8 @@ fn attention_lines(v: &AttentionView, now: i64) -> Vec<String> {
                 }
                 who.push_str(&slot_name(s));
             }
-            format!("{:>4}  {who}  {}", age_text(now - i.since), i.text)
+            let mark = if i.dismissed { "  (dismissed)" } else { "" };
+            format!("{:>4}  {who}  {}{mark}", age_text(now - i.since), i.text)
         })
         .collect()
 }
@@ -1421,12 +1426,12 @@ pub async fn run(cmd: CtlCmd) -> anyhow::Result<()> {
             Response::Error { message } => bail!("{message}"),
             other => bail!("unexpected reply: {other:?}"),
         },
-        CtlCmd::Attention { json } => match client.request(Request::Attention).await? {
+        CtlCmd::Attention { json, all } => match client.request(Request::Attention).await? {
             Response::Attention(v) => {
                 if json {
                     println!("{}", serde_json::to_string(&v)?);
                 } else {
-                    for l in attention_lines(&v, now_secs()) {
+                    for l in attention_lines(&v, now_secs(), all) {
                         println!("{l}");
                     }
                 }
@@ -2064,7 +2069,38 @@ mod tests {
             url: None,
             since,
             text: text.into(),
+            dismissed: false,
         }
+    }
+
+    #[test]
+    fn attention_lines_leave_out_dismissed_rows_unless_all() {
+        let mut gone = attention(AttentionKind::NeedsYou, Some(3), None, 1000, "prompt");
+        gone.dismissed = true;
+        let v = AttentionView {
+            items: vec![
+                gone,
+                attention(AttentionKind::LogGap, Some(2), None, 1000, "no log for 20m"),
+            ],
+        };
+        assert_eq!(
+            attention_lines(&v, 1300, false),
+            vec!["  5m  S2  no log for 20m".to_string()]
+        );
+        assert_eq!(
+            attention_lines(&v, 1300, true),
+            vec![
+                "  5m  S3  prompt  (dismissed)".to_string(),
+                "  5m  S2  no log for 20m".to_string(),
+            ]
+        );
+        let only_dismissed = AttentionView {
+            items: vec![v.items[0].clone()],
+        };
+        assert_eq!(
+            attention_lines(&only_dismissed, 1300, false),
+            vec!["Nothing waiting on you.".to_string()]
+        );
     }
 
     #[test]
@@ -2095,7 +2131,7 @@ mod tests {
             ],
         };
         assert_eq!(
-            attention_lines(&v, 1000 + 300),
+            attention_lines(&v, 1000 + 300, false),
             vec![
                 "  5m  S3  wants to run a command".to_string(),
                 "  2h  demo-api#7 S2  build failed".to_string(),
@@ -2113,7 +2149,7 @@ mod tests {
             ],
         };
         assert_eq!(
-            attention_lines(&v, 1000 + 300),
+            attention_lines(&v, 1000 + 300, false),
             vec!["  5m  S2  no log for 20m".to_string()]
         );
     }
@@ -2130,7 +2166,7 @@ mod tests {
             )],
         };
         assert_eq!(
-            attention_lines(&v, 1300),
+            attention_lines(&v, 1300, false),
             vec!["Nothing waiting on you.".to_string()]
         );
     }
@@ -2138,7 +2174,7 @@ mod tests {
     #[test]
     fn attention_lines_say_when_nothing_waits() {
         assert_eq!(
-            attention_lines(&AttentionView::default(), 0),
+            attention_lines(&AttentionView::default(), 0, false),
             vec!["Nothing waiting on you.".to_string()]
         );
     }
@@ -2147,7 +2183,21 @@ mod tests {
     fn ctl_attention_parses_with_json_flag() {
         use clap::Parser;
         let cli = Cli::try_parse_from(["x", "attention", "--json"]).unwrap();
-        assert!(matches!(cli.cmd, CtlCmd::Attention { json: true }));
+        assert!(matches!(
+            cli.cmd,
+            CtlCmd::Attention {
+                json: true,
+                all: false
+            }
+        ));
+        let cli = Cli::try_parse_from(["x", "attention", "--all"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            CtlCmd::Attention {
+                json: false,
+                all: true
+            }
+        ));
     }
 
     #[test]

@@ -3,7 +3,9 @@
 //! what a row points at, and keeps the Dock badge in step.
 
 use gpui::{div, prelude::*, px, rgb, Context, FontWeight};
-use overseer_proto::{age_text, slot_name, AttentionItem, AttentionKind, AttentionView, SlotId};
+use overseer_proto::{
+    age_text, slot_name, AttentionItem, AttentionKind, AttentionView, Request, SlotId,
+};
 
 use crate::app::{colors, open_external, OverseerApp};
 use crate::sprint_view::is_http_url;
@@ -20,11 +22,12 @@ pub struct Row {
 }
 
 /// The items oldest first; items of the same age keep the daemon's order.
+/// Kinds this build does not know and rows the user dismissed are left out.
 pub(crate) fn oldest_first(v: &AttentionView) -> Vec<&AttentionItem> {
     let mut items: Vec<_> = v
         .items
         .iter()
-        .filter(|i| i.kind != AttentionKind::Other)
+        .filter(|i| i.kind != AttentionKind::Other && !i.dismissed)
         .collect();
     items.sort_by_key(|i| i.since);
     items
@@ -54,6 +57,20 @@ pub fn rows(v: &AttentionView, now: i64) -> Vec<Row> {
             age: age_text(now - i.since),
         })
         .collect()
+}
+
+/// Clears the mark `attention_dismiss` put on a row when the daemon refused
+/// the dismissal, if the row is still the one dismissed. True when a mark
+/// was cleared.
+pub fn undismiss(v: &mut AttentionView, key: &str, since: i64, text: &str) -> bool {
+    let mut cleared = false;
+    for i in &mut v.items {
+        if i.dismissed && i.key == key && i.since == since && i.text == text {
+            i.dismissed = false;
+            cleared = true;
+        }
+    }
+    cleared
 }
 
 /// The Dock badge: nothing at zero, else the count.
@@ -114,6 +131,27 @@ impl OverseerApp {
         }
     }
 
+    /// Hides the row `key` as it is now. The daemon stores it and sends the
+    /// list again; the row is marked here too so it goes at once, and comes
+    /// back if the daemon refuses (see `send`).
+    pub(crate) fn attention_dismiss(&mut self, key: &str, cx: &mut Context<Self>) {
+        if self.modal_open() {
+            return;
+        }
+        let Some(item) = self.attention.items.iter_mut().find(|i| i.key == key) else {
+            return;
+        };
+        item.dismissed = true;
+        let req = Request::DismissAttention {
+            key: item.key.clone(),
+            since: item.since,
+            text: item.text.clone(),
+        };
+        crate::notify::set_dock_badge(self.attention.count());
+        self.send(req, cx);
+        cx.notify();
+    }
+
     pub(crate) fn render_attention(&self, now: i64, cx: &mut Context<Self>) -> impl IntoElement {
         let rows = rows(&self.attention, now);
         let panel = div()
@@ -141,8 +179,10 @@ impl OverseerApp {
             .enumerate()
             .map(|(n, r)| {
                 let key = r.key;
+                let dismiss_key = key.clone();
                 div()
                     .id(("attention-row", n))
+                    .group("attention-row")
                     .flex()
                     .items_center()
                     .gap_2()
@@ -172,6 +212,22 @@ impl OverseerApp {
                             .flex_none()
                             .text_color(rgb(colors::MUTED))
                             .child(r.age),
+                    )
+                    .child(
+                        div()
+                            .id(("attention-dismiss", n))
+                            .flex_none()
+                            .px_1()
+                            .text_color(rgb(colors::MUTED))
+                            .invisible()
+                            .group_hover("attention-row", |s| s.visible())
+                            .hover(|s| s.text_color(rgb(colors::TEXT)))
+                            .child("\u{d7}")
+                            // Not also the row's own click behind it.
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.attention_dismiss(&dismiss_key, cx)
+                            })),
                     )
             })
             .collect();
@@ -203,6 +259,7 @@ mod tests {
             url: pr.map(|(r, id)| format!("https://example.test/{r}/pull-requests/{id}")),
             since,
             text: text.to_string(),
+            dismissed: false,
         }
     }
 
@@ -281,6 +338,58 @@ mod tests {
             ],
         };
         assert_eq!(rows(&v, 1300), vec![row("log_gap:2", "S2", "gap", "5m")]);
+    }
+
+    #[test]
+    fn rows_leave_out_dismissed_items() {
+        let mut gone = item(
+            "needs_you:3",
+            AttentionKind::NeedsYou,
+            Some(3),
+            None,
+            1000,
+            "prompt",
+        );
+        gone.dismissed = true;
+        let v = AttentionView {
+            items: vec![
+                gone,
+                item(
+                    "log_gap:2",
+                    AttentionKind::LogGap,
+                    Some(2),
+                    None,
+                    1000,
+                    "gap",
+                ),
+            ],
+        };
+        assert_eq!(rows(&v, 1300), vec![row("log_gap:2", "S2", "gap", "5m")]);
+        assert_eq!(oldest_first(&v).len(), 1);
+        assert_eq!(v.count(), 1);
+    }
+
+    #[test]
+    fn a_refused_dismissal_shows_the_row_again() {
+        let mut gone = item(
+            "needs_you:3",
+            AttentionKind::NeedsYou,
+            Some(3),
+            None,
+            1000,
+            "prompt",
+        );
+        gone.dismissed = true;
+        let mut v = AttentionView { items: vec![gone] };
+        assert_eq!(v.count(), 0);
+        // A newer list already replaced the row: nothing to clear.
+        assert!(!undismiss(&mut v, "needs_you:3", 999, "prompt"));
+        assert!(!undismiss(&mut v, "needs_you:3", 1000, "another"));
+        assert_eq!(v.count(), 0);
+        assert!(undismiss(&mut v, "needs_you:3", 1000, "prompt"));
+        assert_eq!(v.count(), 1);
+        assert_eq!(rows(&v, 1300).len(), 1);
+        assert!(!undismiss(&mut v, "needs_you:3", 1000, "prompt"));
     }
 
     #[test]
