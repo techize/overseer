@@ -172,13 +172,14 @@ pub fn first_prompt(
 }
 
 /// The hook events Overseer listens to.
-const HOOK_EVENTS: [&str; 6] = [
+const HOOK_EVENTS: [&str; 7] = [
     "SessionStart",
     "UserPromptSubmit",
     "Notification",
     "Stop",
     "PostToolUse",
     "PreToolUse",
+    "PermissionRequest",
 ];
 
 /// The tool matcher and timeout (seconds) of each hook. `PreToolUse` is the
@@ -186,8 +187,11 @@ const HOOK_EVENTS: [&str; 6] = [
 /// room; it runs for Bash and the file-writing tools.
 fn hook_shape(event: &str) -> (Option<&'static str>, u64) {
     match event {
-        "PostToolUse" => (Some("*"), 2),
-        "PreToolUse" => (Some("Bash|Edit|Write|MultiEdit|NotebookEdit"), 5),
+        "PostToolUse" | "PermissionRequest" => (Some("*"), 2),
+        "PreToolUse" => (
+            Some("Bash|Edit|Write|MultiEdit|NotebookEdit|AskUserQuestion"),
+            5,
+        ),
         _ => (None, 2),
     }
 }
@@ -571,13 +575,13 @@ mod tests {
     }
 
     #[test]
-    fn settings_file_has_six_hooks() {
+    fn settings_file_has_seven_hooks() {
         let dir = temp("settings");
         let bin = Path::new("/Applications/My App/overseer");
         let f = write_slot_files(&dir, 3, "api", bin, &RoleDirs::default(), None).unwrap();
         let v = json(&f.settings);
         let hooks = v["hooks"].as_object().unwrap();
-        assert_eq!(hooks.len(), 6);
+        assert_eq!(hooks.len(), 7);
         for ev in HOOK_EVENTS {
             let entry = &hooks[ev][0];
             let h = &entry["hooks"][0];
@@ -587,12 +591,15 @@ mod tests {
                 format!("'/Applications/My App/overseer' hook {ev}")
             );
             match ev {
-                "PostToolUse" => {
+                "PostToolUse" | "PermissionRequest" => {
                     assert_eq!(entry["matcher"], "*");
                     assert_eq!(h["timeout"], 2);
                 }
                 "PreToolUse" => {
-                    assert_eq!(entry["matcher"], "Bash|Edit|Write|MultiEdit|NotebookEdit");
+                    assert_eq!(
+                        entry["matcher"],
+                        "Bash|Edit|Write|MultiEdit|NotebookEdit|AskUserQuestion"
+                    );
                     assert_eq!(h["timeout"], 5);
                 }
                 _ => {
@@ -605,6 +612,28 @@ mod tests {
         assert!(role.contains("You are S3 of an Overseer team"), "{role}");
         assert!(role.contains("working on api."), "{role}");
         assert!(f.settings.ends_with("slots/S3/settings.json"));
+    }
+
+    #[test]
+    fn permission_request_hook_is_registered_for_all_tools() {
+        let dir = temp("permreq");
+        let f =
+            write_slot_files(&dir, 1, "api", Path::new("/o"), &RoleDirs::default(), None).unwrap();
+        let entry = &json(&f.settings)["hooks"]["PermissionRequest"][0];
+        assert_eq!(entry["matcher"], "*");
+        assert_eq!(entry["hooks"][0]["timeout"], 2);
+    }
+
+    #[test]
+    fn ask_user_question_is_in_the_pre_tool_use_matcher() {
+        let dir = temp("askq");
+        let f =
+            write_slot_files(&dir, 1, "api", Path::new("/o"), &RoleDirs::default(), None).unwrap();
+        let m = json(&f.settings)["hooks"]["PreToolUse"][0]["matcher"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(m.split('|').any(|t| t == "AskUserQuestion"), "{m}");
     }
 
     #[test]

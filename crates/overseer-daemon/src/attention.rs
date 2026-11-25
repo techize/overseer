@@ -829,6 +829,14 @@ mod tests {
     }
 
     #[test]
+    fn a_relay_waiting_on_the_board_typing_is_never_stuck() {
+        let mut w = World::new();
+        w.slots = vec![slot(4, act(ActivityKind::Idle, NOW - 900))];
+        w.locks = locks(vec![relay(7, 4, crate::relay::courier::TYPING, NOW - 900)]);
+        assert!(w.derive().is_empty());
+    }
+
+    #[test]
     fn relay_stuck_working_while_idle_is_the_58_case() {
         let mut w = World::new();
         w.locks = locks(vec![relay(1, 6, WORKING, NOW - 500)]);

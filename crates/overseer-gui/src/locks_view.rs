@@ -158,6 +158,7 @@ pub fn locks_strip(view: &LockView) -> String {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, PartialEq)]
 pub enum LocksAction {
     Redraw,

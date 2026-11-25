@@ -19,12 +19,13 @@
 //! Each change in why a slot's relays wait is logged, and a box that cannot
 //! be found logs the bottom of the screen, so a stuck relay can be traced.
 
+use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use overseer_proto::msg::{slot_name, Sender};
 use overseer_proto::{Activity, ActivityKind, Event, Relay, SlotId, SlotInfo, SlotState};
-use overseer_term::encode_paste;
+use overseer_term::{encode_paste, Snapshot, TermModes};
 use tokio::sync::{broadcast, Notify};
 use tokio::time::Instant;
 
@@ -33,12 +34,13 @@ use crate::ledger::Ledger;
 use crate::locks::table::{claim_batch_on, claim_stale_on, pending_relays_on, unclaim_on};
 use crate::locks::LockService;
 use crate::manager::{SlotManager, SLOT_COUNT};
+use crate::slot::Slot;
 use crate::work::store::unix_now;
 
 /// How often slots with pending relays are looked at again.
 const TICK: Duration = Duration::from_secs(1);
 /// Between the paste and its Return, as for a kickoff.
-const RETURN_DELAY: Duration = Duration::from_millis(100);
+pub(crate) const RETURN_DELAY: Duration = Duration::from_millis(100);
 /// After a delivery the slot is left alone until its activity changes or
 /// this passes, so one idle state never gets two pastes.
 const COOLDOWN: Duration = Duration::from_secs(10);
@@ -69,9 +71,56 @@ const REDRAWING: &str = "screen is being redrawn";
 const JUST_SENT: &str = "just delivered, waiting for the session";
 /// Without bracketed paste every newline is an Enter, and a later one could
 /// land on a prompt the first one brought up.
-const NO_BRACKETS: &str = "bracketed paste is off";
+pub(crate) const NO_BRACKETS: &str = "bracketed paste is off";
+/// The board is typing into the slot (an answer, reply or stop): the
+/// relay goes on a later look, once it is done.
+pub(crate) const TYPING: &str = "the board is typing";
 /// The ledger could not claim the batch for a paste.
 const CLAIM_FAILED: &str = "relays could not be claimed";
+
+/// What typing into a slot needs: its keys and its live screen.
+pub(crate) trait Keyboard: Send + Sync {
+    fn write(&self, data: &[u8]) -> io::Result<()>;
+    /// The live screen and its modes, or `None` while it cannot be read:
+    /// a slot attached after a restart, before its redraw has arrived.
+    fn screen(&self) -> Option<(Snapshot, TermModes)>;
+}
+
+impl Keyboard for Slot {
+    fn write(&self, data: &[u8]) -> io::Result<()> {
+        Slot::write(self, data)
+    }
+
+    fn screen(&self) -> Option<(Snapshot, TermModes)> {
+        (!self.redraw_pending()).then(|| Slot::screen(self))
+    }
+}
+
+/// How a paste and its Return went.
+pub(crate) enum Pasted {
+    Whole,
+    /// The text is in the box, but its Return was not written.
+    NoReturn(io::Error),
+}
+
+/// Types `paste`, then Return `return_delay` later: how a relay or a reply
+/// goes in. The caller holds the slot's key lock. `Err` when the paste
+/// itself was not written.
+pub(crate) async fn paste_then_return(
+    keys: Arc<dyn Keyboard>,
+    paste: Vec<u8>,
+    return_delay: Duration,
+) -> io::Result<Pasted> {
+    let writer = keys.clone();
+    tokio::task::spawn_blocking(move || writer.write(&paste))
+        .await
+        .map_err(io::Error::other)??;
+    tokio::time::sleep(return_delay).await;
+    Ok(match keys.write(b"\r") {
+        Ok(()) => Pasted::Whole,
+        Err(e) => Pasted::NoReturn(e),
+    })
+}
 
 /// Whether a slot in `state` doing `activity` may be typed into now, else
 /// why not. `redraw_pending` is the slot's [`crate::slot::Slot::redraw_pending`].
@@ -120,12 +169,22 @@ fn speaks_for_itself(text: &str) -> bool {
     digits > 0 && rest[digits..].starts_with(" has released")
 }
 
-/// `text` without C0 control characters other than newline and tab, so a
-/// relay can never type a key such as Escape or Ctrl-C.
+/// `text` without control characters other than newline and tab, so a
+/// relay can never type a key such as Escape, Ctrl-C or Delete.
 pub fn strip_controls(text: &str) -> String {
     text.chars()
-        .filter(|&c| c >= ' ' || c == '\n' || c == '\t')
+        .filter(|&c| (c >= ' ' && c != '\x7f') || c == '\n' || c == '\t')
         .collect()
+}
+
+/// The bytes that type `text` with `modes`. Without bracketed paste a Tab
+/// is a key (it switches Claude Code's mode), so it goes as spaces.
+pub fn typed_paste(text: &str, modes: &TermModes) -> Vec<u8> {
+    if modes.bracketed_paste {
+        encode_paste(text, modes)
+    } else {
+        encode_paste(&text.replace('\t', "    "), modes)
+    }
 }
 
 /// The text typed into slot `to` for `relays`, one paragraph each.
@@ -373,6 +432,13 @@ impl Courier {
                 return Err(why);
             }
         };
+        // Never waited for: the round serves every slot in turn. The screen
+        // is read under the lock, so it shows what the board just typed, and
+        // nothing else types into the slot until this Return is in.
+        let lock = self.manager.lock().unwrap().key_lock(id);
+        let Ok(_typing) = lock.try_lock() else {
+            return Err(TYPING);
+        };
         let (at_prompt, working_hook) = (held == Some(AT_PROMPT), held == Some(WORKING));
         if !at_prompt {
             watch.answered = None;
@@ -458,18 +524,18 @@ impl Courier {
             return Err(NO_BRACKETS);
         }
         self.locks.set_held(id, None);
-        let paste = encode_paste(&text, &modes);
-        let writer = slot.clone();
-        let wrote = tokio::task::spawn_blocking(move || writer.write(&paste)).await;
-        if let Ok(Err(e)) | Err(e) = wrote.map_err(std::io::Error::other) {
-            tracing::warn!("relay to {} not written: {e}", slot_name(id));
-            self.unclaim(id, &ids);
-            return Err(NOT_RUNNING);
-        }
-        tokio::time::sleep(RETURN_DELAY).await;
-        // The text is in the box now; without its Return it still went.
-        if let Err(e) = slot.write(b"\r") {
-            tracing::warn!("relay to {} not submitted: {e}", slot_name(id));
+        let paste = typed_paste(&text, &modes);
+        match paste_then_return(slot.clone(), paste, RETURN_DELAY).await {
+            Ok(Pasted::Whole) => {}
+            // The text is in the box now; without its Return it still went.
+            Ok(Pasted::NoReturn(e)) => {
+                tracing::warn!("relay to {} not submitted: {e}", slot_name(id));
+            }
+            Err(e) => {
+                tracing::warn!("relay to {} not written: {e}", slot_name(id));
+                self.unclaim(id, &ids);
+                return Err(NOT_RUNNING);
+            }
         }
         tracing::info!("{} relay(s) delivered to {}", ids.len(), slot_name(id));
         Ok(true)
@@ -662,9 +728,20 @@ mod tests {
     fn strip_controls_keeps_only_newline_and_tab() {
         assert_eq!(
             strip_controls("a\x1b[201~b\x03c\r\nd\te\x00\x7f"),
-            "a[201~bc\nd\te\x7f"
+            "a[201~bc\nd\te"
         );
         assert_eq!(strip_controls("plain text"), "plain text");
+    }
+
+    #[test]
+    fn a_tab_is_typed_as_spaces_without_bracketed_paste() {
+        let plain = TermModes::default();
+        assert_eq!(typed_paste("a\tb", &plain), b"a    b");
+        let bracketed = TermModes {
+            bracketed_paste: true,
+            ..TermModes::default()
+        };
+        assert_eq!(typed_paste("a\tb", &bracketed), b"\x1b[200~a\tb\x1b[201~");
     }
 
     #[test]

@@ -20,6 +20,8 @@ use tokio::task::{JoinHandle, JoinSet};
 
 use crate::attention::AttentionService;
 use crate::brain::{BrainContext, BrainOptions, BrainService, WRITER_OFF};
+use crate::conversation::send::typist;
+use crate::conversation::service::ConversationService;
 use crate::coord::plan::PlanCtx;
 use crate::coord::CoordService;
 use crate::env::{BaseEnv, EnvSource};
@@ -353,6 +355,8 @@ pub async fn run_until(
         session_over_rest(&coord, &store, slot, unix_now());
     }
     let manager: Manager = Arc::new(Mutex::new(mgr));
+    // Before the spooled hooks, so a new transcript among them is followed.
+    let conversation = ConversationService::spawn(ledger.clone(), manager.clone(), events.clone());
     // Hooks that found no daemon were spooled. They come after the restore,
     // so what happened while down wins over the saved activity; an event of
     // a run that is no longer there is dropped by the same run check as a
@@ -363,7 +367,7 @@ pub async fn run_until(
                 tracing::info!("applying {} hook events spooled while down", events.len());
             }
             for ev in &events {
-                apply_hook(&manager, &locks, ev);
+                apply_hook(&manager, &locks, &conversation, ev);
             }
         }
         Err(e) => tracing::warn!("hook spool not read: {e:#}"),
@@ -491,6 +495,7 @@ pub async fn run_until(
                             settings: settings.clone(),
                             attention: attention.clone(),
                             timeline: day_timeline.clone(),
+                            conversation: conversation.clone(),
                         },
                         shutdown.clone(),
                         env.clone(),
@@ -1093,6 +1098,7 @@ struct Services {
     settings: Arc<SettingsCtx>,
     attention: Arc<AttentionService>,
     timeline: Arc<TimelineService>,
+    conversation: Arc<ConversationService>,
 }
 
 async fn handle_conn(
@@ -1114,6 +1120,7 @@ async fn handle_conn(
         settings,
         attention,
         timeline,
+        conversation,
     } = services;
     let (mut rd, mut wr) = stream.into_split();
     let (out_tx, mut out_rx) = mpsc::channel::<Frame>(OUTBOUND_QUEUE);
@@ -1222,6 +1229,7 @@ async fn handle_conn(
                         settings: &settings,
                         attention: &attention,
                         timeline: &timeline,
+                        conversation: &conversation,
                     };
                     handle_frame(f, &ctx, &outbox, &shutdown, &mut streams)
                 }
@@ -1268,6 +1276,7 @@ struct Ctx<'a> {
     settings: &'a Arc<SettingsCtx>,
     attention: &'a Arc<AttentionService>,
     timeline: &'a Arc<TimelineService>,
+    conversation: &'a Arc<ConversationService>,
 }
 
 fn handle_frame(
@@ -1427,6 +1436,25 @@ fn handle_frame(
                 outbox.send(Frame::Response { seq, resp });
             });
         }
+        // Typing into a slot waits on its key lock and its screen, so it is
+        // answered from a task.
+        Frame::Request {
+            seq,
+            req:
+                req @ (Request::Answer { slot, .. }
+                | Request::Reply { slot, .. }
+                | Request::Interrupt { slot }),
+        } => {
+            let typist = typist(manager, ctx.conversation, slot);
+            let outbox = outbox.clone();
+            store.spawn(async move {
+                let resp = match typist {
+                    Ok(t) => t.handle(req).await,
+                    Err(message) => Response::Error { message },
+                };
+                outbox.send(Frame::Response { seq, resp });
+            });
+        }
         Frame::Request { seq, req } => {
             let is_shutdown = matches!(req, Request::Shutdown | Request::StopAll);
             // Each of these can queue a relay or make one deliverable.
@@ -1552,6 +1580,13 @@ fn handle_request(
         Request::PrSeen { repo, id } => store.mark_pr_seen(&repo, id),
         Request::Attention => Response::Attention(ctx.attention.current()),
         Request::Timeline => Response::Timeline(ctx.timeline.current()),
+        Request::Conversation { slot } if !valid_id(slot) => err(format!("invalid slot id {slot}")),
+        Request::Conversation { slot } => Response::Conversation(ctx.conversation.current(slot)),
+        // Answered in `handle_frame` from a task of their own (they wait on
+        // the key lock and the screen); this arm only keeps the match whole.
+        Request::Answer { .. } | Request::Reply { .. } | Request::Interrupt { .. } => {
+            err("typing requests are answered by the connection".into())
+        }
         Request::ListSlots => Response::Slots(manager.lock().unwrap().list()),
         Request::DaemonInfo => Response::DaemonInfo(ctx.info.clone()),
         Request::SlotScreen { id } if !valid_id(id) => err(format!("invalid slot id {id}")),
@@ -1832,17 +1867,29 @@ fn handle_request(
         // Always Ok: a hook runs inside Claude and must never see a failure
         // because of the daemon's state.
         Request::Hook(ev) => {
-            apply_hook(manager, locks, &ev);
+            apply_hook(manager, locks, ctx.conversation, &ev);
             Response::Ok
         }
     }
 }
 
-/// Applies one hook event to its slot and to the lock table. Shared by the
-/// `Hook` request and the replay of the events spooled while the daemon was
-/// down.
-fn apply_hook(manager: &Manager, locks: &LockService, ev: &HookEvent) {
-    manager.lock().unwrap().hook(ev);
+/// Applies one hook event to its slot, to the lock table and, when it is of
+/// the slot's current run, to its conversation. Shared by the `Hook`
+/// request and the replay of the events spooled while the daemon was down.
+fn apply_hook(
+    manager: &Manager,
+    locks: &LockService,
+    conversation: &ConversationService,
+    ev: &HookEvent,
+) {
+    let applies = {
+        let m = manager.lock().unwrap();
+        m.hook(ev);
+        m.hook_applies(ev)
+    };
+    if applies {
+        conversation.hook(ev);
+    }
     locks.on_hook(ev, unix_now());
 }
 

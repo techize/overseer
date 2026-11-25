@@ -1,5 +1,6 @@
 //! The seven slots (S0 to S6) and their lifecycle.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -109,6 +110,15 @@ impl Entry {
     }
 }
 
+/// Whether a hook event belongs to the entry's current run. Events for a
+/// slot that is not running are dropped, and so is a late event from the
+/// run before (killed, then started again). An event with no run is from a
+/// hook older than the token, or a hand-run `overseer hook`: applied.
+fn applies(entry: &Entry, ev: &HookEvent) -> bool {
+    matches!(entry.slot.info().state, SlotState::Running { .. })
+        && !ev.run.as_deref().is_some_and(|run| run != entry.slot.run())
+}
+
 type Slots = Arc<Mutex<[Option<Entry>; SLOT_COUNT]>>;
 
 pub struct SlotManager {
@@ -137,7 +147,13 @@ pub struct SlotManager {
     /// The program run as `<program> hold <state_dir>` to keep each
     /// session's terminal; `None` runs sessions in the daemon itself.
     holder: Option<PathBuf>,
+    /// One per slot, held for the whole of any typing into it (a relay, an
+    /// answer, a reply, an interrupt), so two senders never interleave.
+    key_locks: Mutex<HashMap<SlotId, KeyLock>>,
 }
+
+/// Held while typing into one slot.
+pub type KeyLock = Arc<tokio::sync::Mutex<()>>;
 
 /// A slot as the ledger left it: no process, but remembered.
 struct Restored {
@@ -252,7 +268,19 @@ impl SlotManager {
             restored: Default::default(),
             session_note: None,
             holder: None,
+            key_locks: Default::default(),
         }
+    }
+
+    /// The slot's key lock, held for the whole of any typing into it. Never
+    /// hold the manager's lock while waiting for it.
+    pub fn key_lock(&self, id: SlotId) -> KeyLock {
+        self.key_locks
+            .lock()
+            .unwrap()
+            .entry(id)
+            .or_default()
+            .clone()
     }
 
     /// Picks up the sessions the last daemon left. First the holders in
@@ -830,13 +858,7 @@ impl SlotManager {
         let Some(entry) = slots.get_mut(ev.slot as usize).and_then(Option::as_mut) else {
             return;
         };
-        if !matches!(entry.slot.info().state, SlotState::Running { .. }) {
-            return;
-        }
-        // A late event from the run before (killed, then started again) must
-        // not set this run's activity. An event with no run is from a hook
-        // older than the token, or a hand-run `overseer hook`: applied.
-        if ev.run.as_deref().is_some_and(|run| run != entry.slot.run()) {
+        if !applies(entry, ev) {
             return;
         }
         // A subagent's or teammate's events describe its own work, not the
@@ -1062,6 +1084,17 @@ impl SlotManager {
             session_note: None,
             held: false,
         }
+    }
+
+    /// True when a hook event belongs to the slot's current run: the slot is
+    /// running and the event is not from the run before. Subagent events are
+    /// not filtered here.
+    pub fn hook_applies(&self, ev: &HookEvent) -> bool {
+        let slots = self.slots.lock().unwrap();
+        slots
+            .get(ev.slot as usize)
+            .and_then(Option::as_ref)
+            .is_some_and(|entry| applies(entry, ev))
     }
 
     /// The Claude session id of the slot's running session, once known.

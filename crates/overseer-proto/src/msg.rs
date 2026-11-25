@@ -119,6 +119,14 @@ pub enum HookKind {
     Notification,
     Stop,
     PostToolUse,
+    /// Fires before a tool runs; carries the question for `AskUserQuestion`.
+    PreToolUse,
+    /// Claude is asking permission to run a tool.
+    PermissionRequest,
+    /// A hook this build does not know, so a newer hook cannot break an
+    /// older daemon.
+    #[serde(other)]
+    Other,
 }
 
 /// What `overseer hook` tells the daemon about one hook call. Every field
@@ -146,6 +154,123 @@ pub struct HookEvent {
     /// or teammate rather than the main conversation.
     #[serde(default)]
     pub agent_id: Option<String>,
+    /// Path of the session's transcript file, as Claude reported it.
+    #[serde(default)]
+    pub transcript_path: Option<String>,
+    /// The question or permission prompt this event carries, if any.
+    #[serde(default)]
+    pub prompt: Option<PromptInfo>,
+}
+
+/// What a session is asking you, as the hook saw it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum PromptInfo {
+    /// An `AskUserQuestion` call.
+    Question { questions: Vec<Question> },
+    /// A permission request for a tool. `plan` is the plan text when the
+    /// tool is exiting plan mode.
+    Permission {
+        tool: String,
+        summary: String,
+        plan: Option<String>,
+    },
+    /// A prompt kind this build does not know.
+    #[serde(other)]
+    Other,
+}
+
+/// One question in an `AskUserQuestion` call.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Question {
+    pub header: String,
+    pub question: String,
+    pub options: Vec<String>,
+    /// More than one option may be picked.
+    pub multi: bool,
+}
+
+/// One line of a slot's conversation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConvEntry {
+    /// Unix seconds.
+    pub at: i64,
+    pub kind: ConvKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum ConvKind {
+    User {
+        text: String,
+    },
+    Assistant {
+        text: String,
+    },
+    Tool {
+        name: String,
+        summary: String,
+    },
+    /// An entry kind this build does not know. Clients leave it out.
+    #[serde(other)]
+    Other,
+}
+
+/// What the board can show of a prompt.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "shown")]
+pub enum PromptShown {
+    Known(PromptInfo),
+    /// A prompt Overseer cannot show, or a kind this build does not know;
+    /// answer it in the terminal.
+    #[serde(other)]
+    Unknown,
+}
+
+/// A prompt the session is waiting on.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Prompt {
+    pub id: String,
+    /// Raised inside a subagent rather than the main conversation.
+    pub subagent: bool,
+    pub info: PromptShown,
+}
+
+/// A slot's conversation: the entries from `entries_from` on, and the prompt
+/// it is waiting on, if any.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConversationView {
+    pub slot: SlotId,
+    pub session: String,
+    pub entries_from: usize,
+    pub entries: Vec<ConvEntry>,
+    pub prompt: Option<Prompt>,
+}
+
+/// Your answer to a prompt.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum Answer {
+    /// The permission option at this index.
+    Permission { choice: usize },
+    /// One answer per question, in order.
+    Questions { answers: Vec<QuestionAnswer> },
+    /// An answer kind this build does not know.
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum QuestionAnswer {
+    /// The options picked, by index.
+    Options { picked: Vec<usize> },
+    /// Free text instead of an option.
+    Other { text: String },
+    /// An answer kind this build does not know. Distinct from `Other`
+    /// above, which is free text.
+    #[serde(other)]
+    Unrecognised,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -644,6 +769,29 @@ pub enum Request {
     StopAll,
     /// A Claude Code hook event, relayed by `overseer hook`.
     Hook(HookEvent),
+    /// The slot's conversation in full, answered `Response::Conversation`.
+    Conversation {
+        slot: SlotId,
+    },
+    /// Answers the slot's pending prompt `prompt`.
+    Answer {
+        slot: SlotId,
+        prompt: String,
+        answer: Answer,
+    },
+    /// Types `text` into the slot's session, if it is still `session` and
+    /// still waiting on `prompt`.
+    Reply {
+        slot: SlotId,
+        session: String,
+        #[serde(default)]
+        prompt: Option<String>,
+        text: String,
+    },
+    /// Sends the slot's session an interrupt.
+    Interrupt {
+        slot: SlotId,
+    },
     /// The cached work-item list with owners, source health and notices.
     ListWorkItems,
     /// Re-reads the sources now instead of waiting for the next poll.
@@ -1192,6 +1340,7 @@ pub enum Response {
     Ok,
     Attention(AttentionView),
     Timeline(DayView),
+    Conversation(ConversationView),
     Slots(Vec<SlotInfo>),
     Error {
         message: String,
@@ -1247,6 +1396,7 @@ pub enum Event {
     CoordChanged(CoordView),
     AttentionChanged(AttentionView),
     TimelineChanged(DayView),
+    ConversationChanged(ConversationView),
     /// An event type this build does not know, built only by the decoder so
     /// a newer daemon cannot break an older client. Never sent.
     #[serde(skip)]
@@ -1265,6 +1415,7 @@ pub const EVENT_TYPES: &[&str] = &[
     "CoordChanged",
     "AttentionChanged",
     "TimelineChanged",
+    "ConversationChanged",
 ];
 
 /// Why something is on the attention queue.
@@ -1569,13 +1720,14 @@ mod tests {
             Event::CoordChanged(coord()),
             Event::AttentionChanged(AttentionView::default()),
             Event::TimelineChanged(DayView::default()),
+            Event::ConversationChanged(demo_view()),
         ];
         for ev in events {
             let v: serde_json::Value = serde_json::to_value(&ev).unwrap();
             let name = v["type"].as_str().unwrap().to_string();
             assert!(EVENT_TYPES.contains(&name.as_str()), "{name} not listed");
         }
-        assert_eq!(EVENT_TYPES.len(), 7);
+        assert_eq!(EVENT_TYPES.len(), 8);
         assert!(serde_json::to_string(&Event::Unknown { kind: "x".into() }).is_err());
     }
 
@@ -1909,9 +2061,165 @@ mod tests {
             notification_type: None,
             run: None,
             agent_id: None,
+            transcript_path: None,
+            prompt: None,
         });
         let back: Request = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
         assert_eq!(back, req);
+    }
+
+    fn demo_view() -> ConversationView {
+        ConversationView {
+            slot: 2,
+            session: "demo-session".into(),
+            entries_from: 0,
+            entries: vec![
+                ConvEntry {
+                    at: 10,
+                    kind: ConvKind::User {
+                        text: "fix DEMO-1".into(),
+                    },
+                },
+                ConvEntry {
+                    at: 11,
+                    kind: ConvKind::Tool {
+                        name: "Bash".into(),
+                        summary: "cargo test".into(),
+                    },
+                },
+            ],
+            prompt: Some(Prompt {
+                id: "p1".into(),
+                subagent: false,
+                info: PromptShown::Known(PromptInfo::Question {
+                    questions: vec![Question {
+                        header: "Pick".into(),
+                        question: "Which?".into(),
+                        options: vec!["a".into(), "b".into()],
+                        multi: true,
+                    }],
+                }),
+            }),
+        }
+    }
+
+    #[test]
+    fn conversation_types_round_trip() {
+        fn rt<T: Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug>(v: T) {
+            let back: T = serde_json::from_str(&serde_json::to_string(&v).unwrap()).unwrap();
+            assert_eq!(back, v);
+        }
+        for req in [
+            Request::Conversation { slot: 2 },
+            Request::Answer {
+                slot: 2,
+                prompt: "p1".into(),
+                answer: Answer::Permission { choice: 1 },
+            },
+            Request::Answer {
+                slot: 2,
+                prompt: "p1".into(),
+                answer: Answer::Questions {
+                    answers: vec![
+                        QuestionAnswer::Options { picked: vec![0, 1] },
+                        QuestionAnswer::Other {
+                            text: "neither".into(),
+                        },
+                    ],
+                },
+            },
+            Request::Reply {
+                slot: 2,
+                session: "demo-session".into(),
+                prompt: Some("p1".into()),
+                text: "go on".into(),
+            },
+            Request::Reply {
+                slot: 2,
+                session: "demo-session".into(),
+                prompt: None,
+                text: "hi".into(),
+            },
+            Request::Interrupt { slot: 2 },
+        ] {
+            rt(req);
+        }
+        rt(Event::ConversationChanged(demo_view()));
+        rt(Response::Conversation(demo_view()));
+        rt(Prompt {
+            id: "p2".into(),
+            subagent: true,
+            info: PromptShown::Unknown,
+        });
+        rt(PromptInfo::Permission {
+            tool: "Bash".into(),
+            summary: "rm -rf demo".into(),
+            plan: Some("the plan".into()),
+        });
+        assert!(EVENT_TYPES.contains(&"ConversationChanged"));
+    }
+
+    #[test]
+    fn old_hook_event_json_still_reads() {
+        let ev: HookEvent = serde_json::from_str(
+            r#"{"slot":1,"event":"Stop","session_id":"abc","tool":null,"detail":null,"notification":null}"#,
+        )
+        .unwrap();
+        assert_eq!(ev.transcript_path, None);
+        assert_eq!(ev.prompt, None);
+    }
+
+    #[test]
+    fn unknown_hook_kind_reads_as_other() {
+        let ev: HookEvent = serde_json::from_str(
+            r#"{"slot":1,"event":"SubagentStop","session_id":null,"tool":null,"detail":null,"notification":null}"#,
+        )
+        .unwrap();
+        assert_eq!(ev.event, HookKind::Other);
+    }
+
+    #[test]
+    fn unknown_conv_kind_reads_as_other() {
+        let e: ConvEntry =
+            serde_json::from_str(r#"{"at":5,"kind":{"kind":"Thinking","text":"hm"}}"#).unwrap();
+        assert_eq!(e.kind, ConvKind::Other);
+    }
+
+    #[test]
+    fn unknown_answer_kinds_read_as_other() {
+        let a: Answer = serde_json::from_str(r#"{"kind":"Future","x":1}"#).unwrap();
+        assert_eq!(a, Answer::Other);
+        let q: QuestionAnswer = serde_json::from_str(r#"{"kind":"Future","x":1}"#).unwrap();
+        assert_eq!(q, QuestionAnswer::Unrecognised);
+    }
+
+    #[test]
+    fn unknown_prompt_shown_reads_as_unknown() {
+        let p: PromptShown = serde_json::from_str(r#"{"shown":"Future"}"#).unwrap();
+        assert_eq!(p, PromptShown::Unknown);
+        let p: PromptShown = serde_json::from_str(r#"{"shown":"Future","x":1}"#).unwrap();
+        assert_eq!(p, PromptShown::Unknown);
+    }
+
+    #[test]
+    fn reply_without_prompt_reads_as_none() {
+        let r: Request =
+            serde_json::from_str(r#"{"type":"Reply","slot":1,"session":"s","text":"hi"}"#).unwrap();
+        assert_eq!(
+            r,
+            Request::Reply {
+                slot: 1,
+                session: "s".into(),
+                prompt: None,
+                text: "hi".into()
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_prompt_info_reads_as_other() {
+        let p: PromptInfo = serde_json::from_str(r#"{"kind":"Elicitation","x":1}"#).unwrap();
+        assert_eq!(p, PromptInfo::Other);
     }
 
     #[test]

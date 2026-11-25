@@ -15,9 +15,13 @@
 //!   Locks view.
 //! - `Cmd+,` and the app menu's Settings item open the Settings view
 //!   anywhere navigation works.
+//! - `Tab` on the board or in the conversation pane's reply box selects the
+//!   next waiting slot; `Cmd+\` on the board or in the pane hides or shows
+//!   the pane. Neither is bound anywhere else, so the dialogs keep Tab.
 //!
 //! The routing is GPUI's keymap with the contexts `Overseer` (window),
-//! `Board`, `Session`, `Terminal`, `Locks`, `StartDialog`, `Picker`,
+//! `Board`, `Conversation` (the pane beside the board), `ConvReply` (its
+//! reply box), `Session`, `Terminal`, `Locks`, `StartDialog`, `Picker`,
 //! `PlanView` and `Settings`;
 //! `key_bindings` is tested against GPUI's `Keymap` directly.
 
@@ -27,15 +31,17 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    actions, div, prelude::*, rgb, App, Context, Entity, FocusHandle, Focusable, KeyBinding,
+    actions, div, prelude::*, px, rgb, App, Context, Entity, FocusHandle, Focusable, KeyBinding,
     Subscription, Task, Window,
 };
+use overseer_proto::msg::{Answer, ConversationView};
 use overseer_proto::{
     AttentionView, BrainView, Client, CoordView, DayView, Event, Frame, LockView, Request,
     Response, SlotId, SlotInfo, SlotState, WorkView,
 };
 
 use crate::board::Dir;
+use crate::conversation_view::{Conv, SLOT_COUNT};
 use crate::daemon_info::DaemonKnown;
 use crate::locks_view::LocksState;
 use crate::picker::{Picker, PickerEvent};
@@ -111,6 +117,8 @@ actions!(
         OpenPlan,
         GoLocks,
         OpenSettings,
+        NextWaiting,
+        TogglePane,
     ]
 );
 
@@ -176,6 +184,10 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("a", AssignSelected, Some("Board")),
         KeyBinding::new("p", OpenPlan, Some("Board")),
         KeyBinding::new("l", GoLocks, Some("Board")),
+        // The pane is beside the board, not in it, so its reply box gets
+        // none of the board's plain keys; Tab is the one it shares.
+        KeyBinding::new("tab", NextWaiting, Some("Board || ConvReply")),
+        KeyBinding::new("cmd-\\", TogglePane, Some("Board || Conversation")),
         KeyBinding::new("cmd-q", Quit, None),
     ]
 }
@@ -437,8 +449,12 @@ fn app_settings(path: &std::path::Path) -> Result<(Theme, String), String> {
     Ok((theme, crate::terminal_view::editor_from_toml(&text)))
 }
 
+pub(crate) fn empty_convs() -> Vec<Conv> {
+    (0..SLOT_COUNT as SlotId).map(Conv::new).collect()
+}
+
 pub(crate) fn empty_slots() -> Vec<SlotInfo> {
-    (0..7)
+    (0..SLOT_COUNT as SlotId)
         .map(|id| SlotInfo {
             id,
             label: String::new(),
@@ -477,6 +493,17 @@ pub struct OverseerApp {
     /// Today's sessions on a shared time axis, from the daemon; see
     /// `timeline_view`.
     pub(crate) timeline: DayView,
+    /// Each slot's conversation, draft and picked answers, by slot id.
+    pub(crate) convs: Vec<Conv>,
+    /// The conversation pane beside the board is hidden; kept in `gui.toml`.
+    pub(crate) pane_hidden: bool,
+    /// The pane's reply box.
+    pub(crate) reply_focus: FocusHandle,
+    /// The pane's entries, kept at the bottom as they grow unless scrolled up.
+    pub(crate) pane_scroll: gpui::ScrollHandle,
+    /// The slot, session and entry count the pane last drew, so new entries
+    /// can be told from a redraw.
+    pub(crate) pane_seen: (SlotId, String, usize),
     /// The Today panel shows its bars, not just its one line.
     pub(crate) timeline_open: bool,
     /// The push problem text last announced; see `push_problem_note`.
@@ -591,6 +618,11 @@ impl OverseerApp {
             coord: empty_coord(),
             attention: AttentionView::default(),
             timeline: DayView::default(),
+            convs: empty_convs(),
+            pane_hidden: crate::kanban_size::pane_hidden_from(&crate::kanban_size::path()),
+            reply_focus: cx.focus_handle(),
+            pane_scroll: gpui::ScrollHandle::new(),
+            pane_seen: (SlotId::MAX, String::new(), 0),
             timeline_open: false,
             notified_push: None,
             brain_hover: false,
@@ -638,6 +670,7 @@ impl OverseerApp {
             refreshing_work: false,
         };
         app.probe_daemon(cx);
+        app.request_conversation(app.selected, cx);
         app
     }
 
@@ -751,6 +784,9 @@ impl OverseerApp {
         // Reconnecting asks for it again.
         self.attention = AttentionView::default();
         self.timeline = DayView::default();
+        for conv in &mut self.convs {
+            conv.clear();
+        }
         crate::notify::set_dock_badge(0);
         cx.notify();
         if self.reconnecting {
@@ -815,6 +851,7 @@ impl OverseerApp {
         }
         self._events = Self::listen(window, cx);
         Self::ask_for_lists(client, cx);
+        self.request_conversation(self.selected, cx);
         cx.notify();
     }
 
@@ -899,6 +936,7 @@ impl OverseerApp {
                 self.timeline = view;
                 cx.notify();
             }
+            Frame::Event(Event::ConversationChanged(view)) => self.conversation_pushed(view, cx),
             Frame::Event(Event::WorkChanged(view))
             | Frame::Response {
                 resp: Response::Work(view),
@@ -948,6 +986,9 @@ impl OverseerApp {
                 self.restarts.remove(&id);
                 self.send(req, cx);
             }
+        }
+        if let Some(conv) = self.convs.get_mut(id as usize) {
+            conv.activity_changed(info.activity.as_ref());
         }
         self.slots[id as usize] = info;
         self.forward_slots(cx);
@@ -1056,6 +1097,158 @@ impl OverseerApp {
                         this.status = Some(format!("{} ({e:#})", crate::terminal_view::LOST_DAEMON))
                     }
                     Ok(_) => {}
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Selects `id`, and asks for its conversation when that is a change.
+    pub(crate) fn select(&mut self, id: SlotId, cx: &mut Context<Self>) {
+        if self.selected != id {
+            self.selected = id;
+            self.request_conversation(id, cx);
+        }
+    }
+
+    /// Takes in a slot's conversation the daemon pushed. When it does not
+    /// fit what the slot holds, asks for the whole of it again.
+    fn conversation_pushed(&mut self, view: ConversationView, cx: &mut Context<Self>) {
+        let slot = view.slot;
+        let Some(conv) = self.convs.get_mut(slot as usize) else {
+            return;
+        };
+        if !conv.pushed(view) {
+            self.request_conversation(slot, cx);
+        }
+        cx.notify();
+    }
+
+    /// Asks the daemon for `slot`'s whole conversation. An error reply is
+    /// left alone: a slot with nothing running has no conversation to show.
+    /// A reply that an event pushed meanwhile may have overtaken is dropped
+    /// and asked for again; one that does not fit is asked for again too.
+    /// Only one is on its way per slot at a time.
+    pub(crate) fn request_conversation(&mut self, slot: SlotId, cx: &mut Context<Self>) {
+        let Some(asked) = self.convs.get_mut(slot as usize).and_then(Conv::ask) else {
+            return;
+        };
+        let client = self.client.clone();
+        cx.spawn(async move |this, cx| {
+            let reply = client.request(Request::Conversation { slot }).await;
+            let _ = this.update(cx, |this, cx| match reply {
+                Ok(Response::Conversation(view)) => {
+                    let Some(conv) = this.convs.get_mut(slot as usize) else {
+                        return;
+                    };
+                    if conv.answered(asked, view) != Some(true) {
+                        this.request_conversation(slot, cx);
+                    }
+                    cx.notify();
+                }
+                Ok(_) => {
+                    if let Some(conv) = this.convs.get_mut(slot as usize) {
+                        conv.landed(asked);
+                    }
+                }
+                Err(e) => {
+                    if let Some(conv) = this.convs.get_mut(slot as usize) {
+                        conv.landed(asked);
+                    }
+                    this.status = Some(format!("{} ({e:#})", crate::terminal_view::LOST_DAEMON));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Sends `slot`'s draft to its session. The draft is cleared once the
+    /// daemon says `Ok`, unless it was edited meanwhile; a refusal such as
+    /// `S2 moved on, not sent` shows in the slot's status.
+    pub(crate) fn send_reply(&mut self, slot: SlotId, cx: &mut Context<Self>) {
+        let activity =
+            crate::conversation_view::activity_of(self.slots.get(slot as usize)).cloned();
+        let Some(conv) = self.convs.get_mut(slot as usize) else {
+            return;
+        };
+        // Not at a prompt the pane cannot show: the session is answered there.
+        if !crate::conversation_view::reply_enabled(conv, activity.as_ref()) {
+            return;
+        }
+        let Some(req) = conv.reply_request() else {
+            cx.notify();
+            return;
+        };
+        let sent = conv.draft.text.clone();
+        cx.notify();
+        self.send_conv(slot, req, Some(sent), cx);
+    }
+
+    /// Answers `slot`'s open prompt, if it has one and nothing else is on
+    /// its way.
+    pub(crate) fn send_answer(&mut self, slot: SlotId, answer: Answer, cx: &mut Context<Self>) {
+        let Some(conv) = self.convs.get_mut(slot as usize) else {
+            return;
+        };
+        if let Some(req) = conv.answer_request(answer) {
+            conv.status = None;
+            self.send_conv(slot, req, None, cx);
+        }
+    }
+
+    /// Interrupts `slot`'s session, when Stop is offered.
+    pub(crate) fn interrupt(&mut self, slot: SlotId, cx: &mut Context<Self>) {
+        let working = crate::conversation_view::is_working(self.slots.get(slot as usize));
+        let Some(conv) = self.convs.get_mut(slot as usize) else {
+            return;
+        };
+        if let Some(req) = conv.stop_request(working) {
+            self.send_conv(slot, req, None, cx);
+        }
+    }
+
+    /// Sends a conversation request; the slot's status shows how it went
+    /// wrong. `sent` is the draft this request carries. Each holds the
+    /// slot's next one until it is answered; a stop that went through holds
+    /// Stop until the slot's activity changes.
+    fn send_conv(
+        &mut self,
+        slot: SlotId,
+        req: Request,
+        sent: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let stop = matches!(req, Request::Interrupt { .. });
+        let client = self.client.clone();
+        cx.spawn(async move |this, cx| {
+            let reply = client.request(req).await;
+            let _ = this.update(cx, |this, cx| {
+                let Some(conv) = this.convs.get_mut(slot as usize) else {
+                    return;
+                };
+                conv.sending = false;
+                match reply {
+                    Ok(Response::Ok) if stop => {
+                        let activity = this
+                            .slots
+                            .get(slot as usize)
+                            .and_then(|i| i.activity.clone());
+                        if let Some(conv) = this.convs.get_mut(slot as usize) {
+                            conv.stopped = Some(activity);
+                        }
+                    }
+                    Ok(Response::Ok) => {
+                        if sent.as_ref().is_some_and(|s| *s == conv.draft.text) {
+                            conv.draft = Default::default();
+                        }
+                    }
+                    Ok(Response::Error { message }) => conv.status = Some(message),
+                    Ok(other) => conv.status = Some(format!("unexpected reply: {other:?}")),
+                    Err(e) => {
+                        conv.status = Some(format!("{} ({e:#})", crate::terminal_view::LOST_DAEMON))
+                    }
                 }
                 cx.notify();
             });
@@ -1789,7 +1982,7 @@ impl OverseerApp {
 
     pub(crate) fn go_board(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Screen::Session(id) = self.screen {
-            self.selected = id;
+            self.select(id, cx);
         }
         self.set_screen(Screen::Board, cx);
         self.focus_when_ready = None;
@@ -1799,7 +1992,7 @@ impl OverseerApp {
 
     pub(crate) fn go_session(&mut self, id: SlotId, window: &mut Window, cx: &mut Context<Self>) {
         self.set_screen(Screen::Session(id), cx);
-        self.selected = id;
+        self.select(id, cx);
         match self.ensure_terminal(id, window, cx) {
             Some(view) => {
                 self.focus_when_ready = None;
@@ -1939,7 +2132,7 @@ impl OverseerApp {
     }
 
     pub(crate) fn open_card(&mut self, id: SlotId, window: &mut Window, cx: &mut Context<Self>) {
-        self.selected = id;
+        self.select(id, cx);
         match card_click(&self.slots[id as usize]) {
             CardClick::Open(id) => self.go_session(id, window, cx),
             CardClick::Start(id) => self.open_dialog(id, window, cx),
@@ -1947,7 +2140,7 @@ impl OverseerApp {
     }
 
     pub(crate) fn move_selection(&mut self, dir: Dir, cx: &mut Context<Self>) {
-        self.selected = crate::board::move_selection(self.selected, dir);
+        self.select(crate::board::move_selection(self.selected, dir), cx);
         cx.notify();
     }
 
@@ -2001,9 +2194,23 @@ impl Render for OverseerApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let now = now_secs();
         let screen = match self.screen {
-            Screen::Board | Screen::Session(_) => {
+            Screen::Board | Screen::Session(_) if self.pane_hidden => {
                 self.render_board(now, window, cx).into_any_element()
             }
+            // The pane beside the board, not inside it, so the reply box's
+            // key context stack has no Board.
+            Screen::Board | Screen::Session(_) => div()
+                .size_full()
+                .flex()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .h_full()
+                        .child(self.render_board(now, window, cx)),
+                )
+                .child(self.render_conversation(window, cx))
+                .into_any_element(),
             Screen::Locks => self.render_locks(now, window, cx).into_any_element(),
         };
         // Beside the board, never inside it, so the terminal's key context
@@ -2027,6 +2234,8 @@ impl Render for OverseerApp {
             .on_action(cx.listener(|this, _: &GoS4, w, cx| this.go_session(4, w, cx)))
             .on_action(cx.listener(|this, _: &GoS5, w, cx| this.go_session(5, w, cx)))
             .on_action(cx.listener(|this, _: &GoS6, w, cx| this.go_session(6, w, cx)))
+            .on_action(cx.listener(|this, _: &NextWaiting, _, cx| this.next_waiting_slot(cx)))
+            .on_action(cx.listener(|this, _: &TogglePane, window, cx| this.toggle_pane(window, cx)))
             .on_action(cx.listener(|this, _: &StartSession, window, cx| {
                 if let Some(id) = start_target(this.screen, this.selected, &this.slots) {
                     this.open_dialog(id, window, cx);
@@ -2554,6 +2763,48 @@ mod tests {
         ] {
             assert_eq!(routed(d, SETTINGS), None, "{d}");
         }
+    }
+
+    #[test]
+    fn the_pane_keys() {
+        const REPLY: &[&str] = &["Overseer", "Conversation", "ConvReply"];
+        // Tab jumps from the board and the reply box, and nowhere else: the
+        // dialogs, Settings, the picker and the terminal keep it.
+        assert_eq!(routed("tab", BOARD), Some("overseer::NextWaiting"));
+        assert_eq!(routed("tab", REPLY), Some("overseer::NextWaiting"));
+        for ctx in [TERMINAL, CHROME, DIALOG, PICKER, PLAN, SETTINGS] {
+            assert_eq!(routed("tab", ctx), None, "{ctx:?}");
+        }
+        for ctx in [BOARD, REPLY] {
+            assert_eq!(
+                routed("cmd-\\", ctx),
+                Some("overseer::TogglePane"),
+                "{ctx:?}"
+            );
+        }
+        for ctx in [TERMINAL, DIALOG, PICKER, PLAN, SETTINGS] {
+            assert_eq!(routed("cmd-\\", ctx), None, "{ctx:?}");
+        }
+        // The board's plain keys stay out of the reply box, which takes
+        // Enter, Esc and typing itself.
+        for k in [
+            "a",
+            "r",
+            "p",
+            "l",
+            "n",
+            "left",
+            "up",
+            "enter",
+            "shift-enter",
+            "escape",
+            "shift-tab",
+            "cmd-v",
+            "cmd-a",
+        ] {
+            assert_eq!(routed(k, REPLY), None, "{k}");
+        }
+        assert_eq!(routed("cmd-3", REPLY), Some("overseer::GoS3"));
     }
 
     #[test]

@@ -944,6 +944,8 @@ fn hook(slot: u8, event: HookKind) -> HookEvent {
         notification_type: None,
         run: None,
         agent_id: None,
+        transcript_path: None,
+        prompt: None,
     }
 }
 
@@ -3952,6 +3954,98 @@ async fn one_line_relay_is_typed_without_bracketed_paste() {
     let want = format!("{HELLO}\r");
     assert_eq!(stub.read_until(&want).await, want);
     c.all_delivered(2).await;
+}
+
+/// A reply from the board goes into the session the pane showed, as a
+/// paste and Return; one made in another session is refused untyped, and
+/// Stop types Esc at a working session only.
+#[tokio::test]
+async fn a_board_reply_and_stop_reach_the_shown_session() {
+    let stub = box_stub("board-reply");
+    let d = start_daemon_with(temp_socket(), stub.env()).await;
+    let mut c = Client::connect(&d.socket).await;
+    let pid = c.start_stub(2, &stub).await;
+    c.hook(HookEvent {
+        session_id: Some("demo-session".into()),
+        ..hook(2, HookKind::SessionStart)
+    })
+    .await;
+    let reply = |session: &str, text: &str| Request::Reply {
+        slot: 2,
+        session: session.into(),
+        prompt: None,
+        text: text.into(),
+    };
+    assert_eq!(
+        c.request(reply("demo-other", "hello")).await,
+        Response::Error {
+            message: "S2 moved on, not sent".into()
+        }
+    );
+    assert_eq!(
+        c.request(reply("demo-session", "hello")).await,
+        Response::Ok
+    );
+    assert_eq!(stub.read_until(&pasted("hello")).await, pasted("hello"));
+    // At rest, a stray Stop types nothing.
+    assert_eq!(
+        c.request(Request::Interrupt { slot: 2 }).await,
+        Response::Error {
+            message: "S2 is not working, not sent".into()
+        }
+    );
+    stub.set_box(Some("@working"), pid).await;
+    assert_eq!(
+        c.request(Request::Interrupt { slot: 2 }).await,
+        Response::Ok
+    );
+    let want = format!("{}\x1b", pasted("hello"));
+    assert_eq!(stub.read_until(&want).await, want);
+    assert_eq!(
+        c.request(Request::Interrupt { slot: 3 }).await,
+        Response::Error {
+            message: "S3 is not running, not sent".into()
+        }
+    );
+}
+
+/// A relay queued while the board replies to the same slot waits for the
+/// reply to be typed whole, then goes in a paste of its own.
+#[tokio::test]
+async fn a_relay_and_a_board_reply_at_once_go_in_whole_one_after_the_other() {
+    let stub = box_stub("board-and-relay");
+    let d = start_daemon_with(temp_socket(), stub.env()).await;
+    let mut c = Client::connect(&d.socket).await;
+    c.start_stub(2, &stub).await;
+    c.hook(HookEvent {
+        session_id: Some("demo-session".into()),
+        ..hook(2, HookKind::SessionStart)
+    })
+    .await;
+    // The reply goes first and is not waited for; the relay follows at once.
+    c.seq += 1;
+    let reply_seq = c.seq;
+    c.send(Frame::Request {
+        seq: reply_seq,
+        req: Request::Reply {
+            slot: 2,
+            session: "demo-session".into(),
+            prompt: None,
+            text: "from the board".into(),
+        },
+    })
+    .await;
+    assert_eq!(c.relay(None, 2, "hello").await, queued_for(2));
+    let both = format!("{}{}", pasted("from the board"), pasted(HELLO));
+    assert_eq!(stub.read_until(&both).await, both);
+    c.all_delivered(2).await;
+    let replied = loop {
+        match c.recv().await.expect("connection closed") {
+            Frame::Response { seq, resp } if seq == reply_seq => break resp,
+            _ => {}
+        }
+    };
+    assert_eq!(replied, Response::Ok);
 }
 
 // Session end: a slot's waits, unused grants and pending relays belong to
@@ -7349,4 +7443,51 @@ async fn timeline_changed_is_sent_when_a_stretch_starts() {
         Response::Timeline(v) => assert_eq!(v.rows, announced.rows),
         other => panic!("unexpected {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn a_hooked_transcript_is_followed_and_answered() {
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    assert_eq!(c.start(2).await, Response::Ok);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("demo-session.jsonl");
+    std::fs::write(
+        &path,
+        "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"fix DEMO-1\"}}\n",
+    )
+    .unwrap();
+    let in_transcript = |slot, kind| HookEvent {
+        session_id: Some("demo-session".into()),
+        transcript_path: Some(path.to_string_lossy().into_owned()),
+        ..hook(slot, kind)
+    };
+    c.hook(in_transcript(2, HookKind::SessionStart)).await;
+    let announced = timeout(WAIT * 2, async {
+        loop {
+            match c.recv().await.expect("connection closed") {
+                Frame::Event(Event::ConversationChanged(v)) if v.slot == 2 => return v,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("no conversation event");
+    assert_eq!(announced.entries_from, 0);
+    assert_eq!(announced.entries.len(), 1);
+    assert_eq!(announced.session, "demo-session");
+    match c.request(Request::Conversation { slot: 2 }).await {
+        Response::Conversation(v) => assert_eq!(v, announced),
+        other => panic!("unexpected {other:?}"),
+    }
+    // A slot that is not running does not follow its hooks.
+    c.hook(in_transcript(4, HookKind::SessionStart)).await;
+    match c.request(Request::Conversation { slot: 4 }).await {
+        Response::Conversation(v) => assert!(v.entries.is_empty() && v.session.is_empty()),
+        other => panic!("unexpected {other:?}"),
+    }
+    assert!(matches!(
+        c.request(Request::Conversation { slot: 99 }).await,
+        Response::Error { .. }
+    ));
 }

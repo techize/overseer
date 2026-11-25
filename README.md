@@ -494,6 +494,15 @@ trimming):
   new key is absent, and the review names are added to In progress.
 - Click a session card, or press Cmd+0 to Cmd+6, to open that session over the
   board. Cmd+Esc, the x button, or a click outside the panel closes it.
+- The conversation pane on the right of the board shows the selected slot's
+  conversation and the prompt it waits on as buttons (a plan is approved in
+  the session). With the pane shown, a click selects a card and a double click
+  or Enter opens it; hidden, a click opens it as before. In the reply box
+  Enter sends, Shift+Enter starts a new line, and Esc stops a working slot or
+  otherwise goes back to the board. Tab selects the next slot waiting on you;
+  Cmd+\ hides or shows the pane. The terminal stays the source of truth: a
+  send to a slot that moved on is refused (`S2 moved on, not sent`). A prompt
+  open before a daemon restart is answered in the session.
 - The `WAITING ON YOU` panel at the top of the board lists what waits on you,
   oldest first: sessions that need you or have finished their work, stuck
   relays, notices, and pull requests with a failed build, changes requested
