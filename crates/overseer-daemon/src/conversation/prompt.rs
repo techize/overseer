@@ -45,6 +45,9 @@ struct Ends {
     agent: Option<String>,
     /// Its tool call: that call's PostToolUse or transcript answer ends it.
     key: Option<String>,
+    /// `key` is a guess by tool name alone, which a call whose summary
+    /// agrees replaces.
+    loose: bool,
     /// A permission with no tool call id, by tool and summary: until its
     /// call is found in the transcript, the PostToolUse of the same tool
     /// and summary in its conversation ends it.
@@ -95,9 +98,7 @@ impl PromptState {
             return false;
         };
         self.ends = ends;
-        if self.awaits_call() {
-            self.ends.key = self.best_started(false);
-        }
+        self.adopt(false);
         if next == self.open {
             return false;
         }
@@ -130,9 +131,7 @@ impl PromptState {
                     // Started and answered within one read: the call is
                     // found before it is forgotten, but only by a summary
                     // that agrees, since a wrong guess would end the prompt.
-                    if self.awaits_call() {
-                        self.ends.key = self.best_started(true);
-                    }
+                    self.adopt(true);
                     if self.open.is_some()
                         && (self.ends.key.as_ref() == Some(id) || self.unplaced())
                     {
@@ -143,9 +142,7 @@ impl PromptState {
                 }
             }
         }
-        if self.awaits_call() {
-            self.ends.key = self.best_started(false);
-        }
+        self.adopt(false);
         was && self.open.is_none()
     }
 
@@ -193,23 +190,46 @@ impl PromptState {
                 .tool_use_id
                 .is_none()
                 .then(|| (ev.tool.clone(), ev.detail.clone())),
+            loose: false,
         };
         let id = self.next_id(ev.tool_use_id.as_deref());
         (Some(prompt(ev, id, subagent)), ends)
     }
 
-    /// An open main-conversation permission whose call is not known yet.
-    /// A subagent's calls are in its own transcript, which is not read.
+    /// An open main-conversation permission whose call is not known yet,
+    /// or only guessed by name. A subagent's calls are in its own
+    /// transcript, which is not read.
     fn awaits_call(&self) -> bool {
         self.open.as_ref().is_some_and(|p| !p.subagent)
-            && self.ends.key.is_none()
+            && (self.ends.key.is_none() || self.ends.loose)
             && self.ends.call.is_some()
     }
 
-    /// The unanswered call the open permission is most likely for: the
-    /// latest of its tool whose summary agrees with the prompt's, else
-    /// (unless `strict`) the latest of its tool.
-    fn best_started(&self, strict: bool) -> Option<String> {
+    /// Takes the call the open permission is for, if it awaits one: a
+    /// call whose summary agrees always, one of its tool by name alone
+    /// (unless `strict`) only while none is known. A guess never replaces
+    /// a guess, so the call that ends the prompt does not keep moving.
+    fn adopt(&mut self, strict: bool) {
+        if !self.awaits_call() {
+            return;
+        }
+        match self.best_started() {
+            Some((id, true)) => {
+                self.ends.key = Some(id);
+                self.ends.loose = false;
+            }
+            Some((id, false)) if !strict && self.ends.key.is_none() => {
+                self.ends.key = Some(id);
+                self.ends.loose = true;
+            }
+            _ => {}
+        }
+    }
+
+    /// The unanswered call the open permission is most likely for, and
+    /// whether its summary agrees: the latest of its tool whose summary
+    /// agrees with the prompt's, else the latest of its tool.
+    fn best_started(&self) -> Option<(String, bool)> {
         let (tool, detail) = self.ends.call.as_ref()?;
         let of_tool = || {
             self.started
@@ -219,8 +239,8 @@ impl PromptState {
         };
         of_tool()
             .find(|s| detail.as_deref().is_some_and(|d| same_start(d, &s.summary)))
-            .or_else(|| of_tool().next().filter(|_| !strict))
-            .map(|s| s.id.clone())
+            .map(|s| (s.id.clone(), true))
+            .or_else(|| of_tool().next().map(|s| (s.id.clone(), false)))
     }
 
     /// True when a PostToolUse finishes the open prompt's call: by id where
@@ -525,6 +545,32 @@ mod tests {
         assert!(s.on_hook(&permission("Bash", RM)));
         assert!(!s.on_tools(&[started("tu-4", "Bash", "ls"), finished("tu-4")]));
         assert!(s.open().is_some());
+    }
+
+    #[test]
+    fn a_guess_by_name_gives_way_to_a_call_whose_summary_agrees() {
+        let mut s = PromptState::new();
+        assert!(s.on_hook(&permission("Bash", RM)));
+        // Only another call of the tool is read: a guess by name.
+        assert!(!s.on_tools(&[started("tu-1", "Bash", "ls")]));
+        // Its own call is read later and replaces the guess.
+        assert!(!s.on_tools(&[started("tu-2", "Bash", RM)]));
+        assert!(!s.on_tools(&[finished("tu-1")]));
+        assert!(s.open().is_some());
+        assert!(s.on_tools(&[finished("tu-2")]));
+        assert!(s.open().is_none());
+        // A later call that only shares the name does not replace a guess.
+        assert!(s.on_hook(&permission("Bash", RM)));
+        assert!(!s.on_tools(&[started("tu-3", "Bash", "ls")]));
+        assert!(!s.on_tools(&[started("tu-4", "Bash", "pwd")]));
+        assert!(!s.on_tools(&[finished("tu-4")]));
+        assert!(s.on_tools(&[finished("tu-3")]));
+        // Nor does one that agrees replace a call found by its summary.
+        assert!(s.on_hook(&permission("Bash", RM)));
+        assert!(!s.on_tools(&[started("tu-5", "Bash", RM)]));
+        assert!(!s.on_tools(&[started("tu-6", "Bash", RM)]));
+        assert!(!s.on_tools(&[finished("tu-6")]));
+        assert!(s.on_tools(&[finished("tu-5")]));
     }
 
     #[test]
