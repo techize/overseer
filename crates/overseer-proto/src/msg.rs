@@ -218,9 +218,12 @@ pub enum ConvKind {
 
 /// What the board can show of a prompt.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "shown")]
 pub enum PromptShown {
     Known(PromptInfo),
-    /// A prompt Overseer cannot show; answer it in the terminal.
+    /// A prompt Overseer cannot show, or a kind this build does not know;
+    /// answer it in the terminal.
+    #[serde(other)]
     Unknown,
 }
 
@@ -252,6 +255,9 @@ pub enum Answer {
     Permission { choice: usize },
     /// One answer per question, in order.
     Questions { answers: Vec<QuestionAnswer> },
+    /// An answer kind this build does not know.
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -261,6 +267,10 @@ pub enum QuestionAnswer {
     Options { picked: Vec<usize> },
     /// Free text instead of an option.
     Other { text: String },
+    /// An answer kind this build does not know. Distinct from `Other`
+    /// above, which is free text.
+    #[serde(other)]
+    Unrecognised,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2173,6 +2183,37 @@ mod tests {
         let e: ConvEntry =
             serde_json::from_str(r#"{"at":5,"kind":{"kind":"Thinking","text":"hm"}}"#).unwrap();
         assert_eq!(e.kind, ConvKind::Other);
+    }
+
+    #[test]
+    fn unknown_answer_kinds_read_as_other() {
+        let a: Answer = serde_json::from_str(r#"{"kind":"Future","x":1}"#).unwrap();
+        assert_eq!(a, Answer::Other);
+        let q: QuestionAnswer = serde_json::from_str(r#"{"kind":"Future","x":1}"#).unwrap();
+        assert_eq!(q, QuestionAnswer::Unrecognised);
+    }
+
+    #[test]
+    fn unknown_prompt_shown_reads_as_unknown() {
+        let p: PromptShown = serde_json::from_str(r#"{"shown":"Future"}"#).unwrap();
+        assert_eq!(p, PromptShown::Unknown);
+        let p: PromptShown = serde_json::from_str(r#"{"shown":"Future","x":1}"#).unwrap();
+        assert_eq!(p, PromptShown::Unknown);
+    }
+
+    #[test]
+    fn reply_without_prompt_reads_as_none() {
+        let r: Request =
+            serde_json::from_str(r#"{"type":"Reply","slot":1,"session":"s","text":"hi"}"#).unwrap();
+        assert_eq!(
+            r,
+            Request::Reply {
+                slot: 1,
+                session: "s".into(),
+                prompt: None,
+                text: "hi".into()
+            }
+        );
     }
 
     #[test]
