@@ -15,8 +15,8 @@ const SUMMARY_KEYS: [&str; 5] = ["command", "file_path", "pattern", "description
 /// Longest tool summary, in characters.
 const SUMMARY_MAX: usize = 80;
 
-/// Longest entry text, in bytes, so a few huge pastes cannot make a full
-/// view too big to send.
+/// Longest entry text, in bytes once escaped for JSON, so a few huge
+/// pastes cannot make a full view too big to send.
 const TEXT_MAX: usize = 16 * 1024;
 
 /// Ends a text cut to [`TEXT_MAX`].
@@ -222,19 +222,29 @@ fn user_kinds(content: Option<&Value>) -> Vec<ConvKind> {
     }]
 }
 
-/// `text`, cut to [`TEXT_MAX`] bytes on a character boundary with a note
-/// saying so.
+/// `text`, cut to [`TEXT_MAX`] bytes as sent (escaped for JSON) on a
+/// character boundary, with a note saying so.
 fn capped(mut text: String) -> String {
-    if text.len() <= TEXT_MAX {
+    let mut sent = 0;
+    let Some((end, _)) = text.char_indices().find(|&(_, c)| {
+        sent += escaped_len(c);
+        sent > TEXT_MAX
+    }) else {
         return text;
-    }
-    let mut end = TEXT_MAX;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
+    };
     text.truncate(end);
     text.push_str(CUT_NOTE);
     text
+}
+
+/// The bytes `c` takes in a JSON string: a quote, a backslash and the
+/// common controls take two, other controls six (`\u0001`).
+fn escaped_len(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\u{8}' | '\u{c}' | '\n' | '\r' | '\t' => 2,
+        '\0'..='\u{1f}' => 6,
+        c => c.len_utf8(),
+    }
 }
 
 fn assistant_kinds(content: Option<&Value>) -> Vec<ConvKind> {
@@ -508,6 +518,26 @@ mod tests {
             assert!(text.len() <= TEXT_MAX + CUT_NOTE.len());
             assert!(text.ends_with("(cut, see the session)"));
         }
+        // Control characters grow six times when sent: the cut counts
+        // what is sent, not the raw bytes.
+        let noisy = "\u{1}".repeat(TEXT_MAX / 2);
+        let user = serde_json::json!({"type":"user","message":{"content":noisy}});
+        let got = entry_of(&user);
+        let ConvKind::User { text } = &got[0].kind else {
+            panic!("not text");
+        };
+        let sent = serde_json::to_string(text).unwrap().len();
+        let note = serde_json::to_string(CUT_NOTE).unwrap().len();
+        assert!(sent <= TEXT_MAX + note, "{sent}");
+        assert!(text.ends_with("(cut, see the session)"));
+        // Escaped text that fits is kept whole.
+        let quoted = "\"\\\t".repeat(TEXT_MAX / 8);
+        let said = serde_json::json!({"type":"assistant","message":{"content":[
+            {"type":"text","text":quoted}]}});
+        assert_eq!(
+            entry_of(&said)[0].kind,
+            ConvKind::Assistant { text: quoted }
+        );
         let small = serde_json::json!({"type":"user","message":{"content":"fix DEMO-1"}});
         assert_eq!(
             entry_of(&small)[0].kind,

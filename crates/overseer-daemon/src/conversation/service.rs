@@ -439,6 +439,13 @@ impl ConversationService {
         views.get(&slot)?.prompt.open().cloned()
     }
 
+    /// [`ConversationService::open_prompt`], with how long it has been open.
+    pub fn open_prompt_aged(&self, slot: SlotId) -> Option<(Prompt, Duration)> {
+        let views = self.views.lock().unwrap();
+        let prompt = &views.get(&slot)?.prompt;
+        Some((prompt.open()?.clone(), prompt.opened()?.elapsed()))
+    }
+
     /// Whether the slot's transcript shows a turn in progress: a prompt with
     /// no end of the turn or interrupt recorded after it. With the hooks
     /// saying the slot works, it is still working even when the screen

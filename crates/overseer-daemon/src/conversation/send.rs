@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use overseer_proto::msg::{slot_name, Answer, Prompt, PromptShown};
 use overseer_proto::{ActivityKind, Request, Response, SlotId, SlotState};
-use overseer_term::TermModes;
+use overseer_term::{Snapshot, TermModes};
 
 use super::keys::{answer_keys, check_reply, moved_on, unknown_prompt};
 use super::service::ConversationService;
@@ -26,6 +26,12 @@ const SCREEN_POLL: Duration = Duration::from_millis(200);
 const STOP_WITHIN: Duration = Duration::from_secs(5);
 /// How long a session has to take a reply or an answer once it is typed.
 const TAKE_WITHIN: Duration = Duration::from_secs(2);
+/// How long an answer or a reply waits for a prompt's dialog to be drawn.
+/// The hooks that open a prompt fire just before Claude Code draws it.
+const DIALOG_WITHIN: Duration = Duration::from_millis(500);
+/// A prompt open longer than this has had its dialog drawn, so the input
+/// box on screen means it was answered: nothing waits for it.
+const DIALOG_FRESH: Duration = Duration::from_secs(1);
 
 /// How long the board's typing waits, and between what.
 #[derive(Clone, Copy)]
@@ -35,6 +41,8 @@ struct Timing {
     stop_within: Duration,
     take_within: Duration,
     return_delay: Duration,
+    dialog_within: Duration,
+    dialog_fresh: Duration,
 }
 
 const TIMING: Timing = Timing {
@@ -43,7 +51,15 @@ const TIMING: Timing = Timing {
     stop_within: STOP_WITHIN,
     take_within: TAKE_WITHIN,
     return_delay: RETURN_DELAY,
+    dialog_within: DIALOG_WITHIN,
+    dialog_fresh: DIALOG_FRESH,
 };
+
+/// The key chunks that answer a prompt, typed `step` apart.
+type Keys = Vec<Vec<u8>>;
+
+/// A slot's screen and modes, when it can be read.
+type Screen = Option<(Snapshot, TermModes)>;
 
 /// A slot as the board's typing sees it at one moment.
 struct SlotNow {
@@ -53,6 +69,8 @@ struct SlotNow {
     session: Option<String>,
     /// The prompt its conversation is waiting on.
     prompt: Option<Prompt>,
+    /// How long that prompt has been open.
+    prompt_age: Option<Duration>,
     /// A hook said it is working and its transcript shows the turn in
     /// progress (see `ConversationService::turn_open`).
     in_turn: bool,
@@ -99,11 +117,13 @@ pub fn typist(
             )
         };
         let running = same && matches!(info.state, SlotState::Running { .. });
+        let (prompt, prompt_age) = conversation.open_prompt_aged(slot).unzip();
         SlotNow {
             running,
             session: running_session
                 .filter(|s| running && conversation.session(slot).as_ref() == Some(s)),
-            prompt: conversation.open_prompt(slot),
+            prompt,
+            prompt_age,
             in_turn: info
                 .activity
                 .is_some_and(|a| a.kind == ActivityKind::Working)
@@ -149,13 +169,14 @@ impl Typist {
     }
 
     /// The keys that answer the open prompt `id`, if the slot still runs
-    /// a session (`session`, once known) and waits on that prompt.
+    /// a session (`session`, once known) and waits on that prompt, with
+    /// how long it has been open.
     fn answer_check(
         &self,
         id: &str,
         answer: &Answer,
         session: Option<&str>,
-    ) -> Result<(String, Vec<Vec<u8>>), String> {
+    ) -> Result<(String, Keys, Option<Duration>), String> {
         let now = (self.now)();
         if !now.running {
             return Err(not_running(self.slot));
@@ -165,7 +186,9 @@ impl Typist {
         };
         match now.prompt {
             Some(p) if p.id == id => match p.info {
-                PromptShown::Known(info) => Ok((running, answer_keys(&info, answer)?)),
+                PromptShown::Known(info) => {
+                    Ok((running, answer_keys(&info, answer)?, now.prompt_age))
+                }
                 PromptShown::Unknown => Err(unknown_prompt(self.slot)),
             },
             _ => Err(moved_on(self.slot)),
@@ -175,12 +198,18 @@ impl Typist {
     /// Types the keys that answer prompt `id`, `step` apart. The dialog
     /// replaces the input box, so a box on screen means the prompt was
     /// answered (its tool may still run): nothing is typed, and the prompt
-    /// is dropped so its buttons go.
+    /// is dropped so its buttons go. A prompt just opened may not be drawn
+    /// yet, so for it the box counts only once [`Typist::dialog`] gives up.
     async fn answer(&self, id: &str, answer: &Answer) -> Result<(), String> {
-        let (session, _) = self.answer_check(id, answer, None)?;
+        let (session, _, _) = self.answer_check(id, answer, None)?;
         let _typing = self.lock.lock().await;
-        let (_, keys) = self.answer_check(id, answer, Some(&session))?;
-        match self.keys.screen() {
+        let (keys, screen) = self
+            .dialog(|| {
+                let (_, keys, age) = self.answer_check(id, answer, Some(&session))?;
+                Ok((keys, age))
+            })
+            .await?;
+        match screen {
             None => return Err(self.refusal("has a screen that cannot be read yet")),
             Some((snap, _)) if input_box(&snap) != InputBox::NotFound => {
                 (self.forget)(id);
@@ -208,6 +237,31 @@ impl Typist {
             (self.forget)(id);
         }
         Ok(())
+    }
+
+    /// Looks at the screen until it shows a dialog in place of the input
+    /// box, while the prompt `check` names (with its age) opened under
+    /// `dialog_fresh` ago and for at most `dialog_within`: the hooks fire
+    /// just before the dialog is drawn. With no prompt, or an older one,
+    /// one look. `check` runs before every look, and its error ends the
+    /// wait. What it gave and the last screen.
+    async fn dialog<T>(
+        &self,
+        check: impl Fn() -> Result<(T, Option<Duration>), String>,
+    ) -> Result<(T, Screen), String> {
+        let deadline = tokio::time::Instant::now() + self.timing.dialog_within;
+        loop {
+            let (got, age) = check()?;
+            let screen = self.keys.screen();
+            let drawn = screen
+                .as_ref()
+                .is_some_and(|(snap, _)| input_box(snap) == InputBox::NotFound);
+            let fresh = age.is_some_and(|a| a < self.timing.dialog_fresh);
+            if drawn || !fresh || tokio::time::Instant::now() >= deadline {
+                return Ok((got, screen));
+            }
+            tokio::time::sleep(self.timing.poll).await;
+        }
     }
 
     /// Whether, within `take_within`, prompt `id` is no longer open or the
@@ -255,9 +309,9 @@ impl Typist {
 
     /// Types `text` as the user's next message. A session in a turn (even
     /// one streaming its reply, whose screen shows no working line) or at a
-    /// prompt is stopped with Esc first (at a permission prompt that answers
-    /// No), and the text goes once the screen shows the empty box and the
-    /// turn is over.
+    /// prompt with its dialog up is stopped with Esc first (at a permission
+    /// prompt that answers No), and the text goes once the screen shows the
+    /// empty box and the turn is over.
     async fn reply(&self, session: &str, prompt: Option<&str>, text: &str) -> Result<(), String> {
         let text = strip_controls(text);
         if text.trim().is_empty() {
@@ -265,11 +319,21 @@ impl Typist {
         }
         self.reply_check(session, prompt)?;
         let _typing = self.lock.lock().await;
-        let now = self.reply_check(session, prompt)?;
-        let screen = self.keys.screen();
+        // An open prompt needs Esc only while its dialog is up: with the
+        // box back it was answered, and Esc at rest opens the rewind picker.
+        // A prompt just opened may not be drawn yet, and a Return pasted
+        // as it is drawn would pick its first choice, so it gets a moment.
+        let (now, screen) = self
+            .dialog(|| {
+                let now = self.reply_check(session, prompt)?;
+                let age = now.prompt_age;
+                Ok((now, age))
+            })
+            .await?;
         let stop = now.in_turn
-            || now.prompt.is_some()
-            || screen.as_ref().is_some_and(|(s, _)| shows_working(s));
+            || screen.as_ref().is_some_and(|(s, _)| {
+                shows_working(s) || (now.prompt.is_some() && input_box(s) == InputBox::NotFound)
+            });
         let Some((snap, modes)) = screen else {
             return Err(self.refusal(if stop {
                 "did not stop"
@@ -401,7 +465,6 @@ mod tests {
     use super::*;
     use crate::relay::screen::screen_of;
     use overseer_proto::msg::{PromptInfo, QuestionAnswer};
-    use overseer_term::Snapshot;
 
     const COLS: u16 = 60;
 
@@ -432,8 +495,6 @@ mod tests {
     fn idle() -> Option<(Snapshot, TermModes)> {
         Some(screen(None, false, true))
     }
-
-    type Screen = Option<(Snapshot, TermModes)>;
 
     /// A slot's keyboard that records what is typed, shows a set screen,
     /// and switches screens when it is sent a given key.
@@ -480,6 +541,8 @@ mod tests {
         running: bool,
         session: Option<String>,
         prompt: Option<Prompt>,
+        /// How long the prompt has been open.
+        prompt_age: Duration,
         /// The turn is in progress, until an Esc is typed when
         /// `esc_ends_turn` (as the transcript then records the interrupt).
         in_turn: bool,
@@ -491,6 +554,7 @@ mod tests {
             running: true,
             session: Some("demo-s".into()),
             prompt: None,
+            prompt_age: Duration::ZERO,
             in_turn: false,
             esc_ends_turn: true,
         }
@@ -502,6 +566,8 @@ mod tests {
         stop_within: Duration::from_millis(100),
         take_within: Duration::from_millis(50),
         return_delay: Duration::from_millis(20),
+        dialog_within: Duration::from_millis(50),
+        dialog_fresh: Duration::from_secs(1),
     };
 
     fn fake_typist(fake: &Arc<FakeSlot>, state: &Arc<Mutex<State>>) -> Typist {
@@ -524,6 +590,7 @@ mod tests {
                 SlotNow {
                     running: s.running,
                     session: s.session,
+                    prompt_age: s.prompt.as_ref().map(|_| s.prompt_age),
                     prompt: s.prompt,
                     in_turn: s.in_turn && !stopped,
                 }
@@ -1051,6 +1118,111 @@ mod tests {
         );
         assert!(blind.typed().is_empty());
         assert!(state.lock().unwrap().prompt.is_some());
+    }
+
+    #[tokio::test]
+    async fn an_answer_waits_a_moment_for_the_dialog() {
+        // The hook comes before Claude Code draws its dialog, and the
+        // click lands in between.
+        let fake = FakeSlot::showing(Some(screen(None, true, true)));
+        fake.when(b"1", idle());
+        let state = at_permission("p1");
+        let t = fake_typist(&fake, &state);
+        let sent = t.handle(answer("p1", Answer::Permission { choice: 0 }));
+        let drawn = async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            *fake.screen.lock().unwrap() = dialog();
+        };
+        let (resp, ()) = tokio::join!(sent, drawn);
+        assert_eq!(resp, Response::Ok);
+        assert_eq!(fake.typed(), chunks(&[b"1"]));
+        // Another prompt opens while it waits: nothing typed, and the new
+        // prompt stays.
+        let fake = FakeSlot::showing(Some(screen(None, true, true)));
+        let state = at_permission("p1");
+        let t = fake_typist(&fake, &state);
+        let sent = t.handle(answer("p1", Answer::Permission { choice: 0 }));
+        let replaced = async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            state.lock().unwrap().prompt = Some(permission("p2"));
+            *fake.screen.lock().unwrap() = dialog();
+        };
+        let (resp, ()) = tokio::join!(sent, replaced);
+        assert_eq!(resp, error("S2 moved on, not sent"));
+        assert!(fake.typed().is_empty());
+        assert_eq!(state.lock().unwrap().prompt, Some(permission("p2")));
+    }
+
+    #[tokio::test]
+    async fn an_old_prompt_at_the_input_box_is_refused_at_once() {
+        // Answered in the terminal a while ago; another dialog, with no
+        // hook yet, is drawn just after the click. Its keys are not p1's.
+        let fake = FakeSlot::showing(Some(screen(None, true, true)));
+        let state = at_permission("p1");
+        state.lock().unwrap().prompt_age = Duration::from_secs(5);
+        let t = fake_typist(&fake, &state);
+        let sent = t.handle(answer("p1", Answer::Permission { choice: 0 }));
+        let other = async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            *fake.screen.lock().unwrap() = dialog();
+        };
+        let (resp, ()) = tokio::join!(sent, other);
+        assert_eq!(resp, error("S2 moved on, not sent"));
+        assert!(fake.typed().is_empty());
+        assert_eq!(state.lock().unwrap().prompt, None);
+        // A reply at an old prompt with the box showing does not wait
+        // either, and types no Esc.
+        let fake = FakeSlot::showing(idle());
+        let state = at_permission("p1");
+        state.lock().unwrap().prompt_age = Duration::from_secs(5);
+        let t = fake_typist(&fake, &state);
+        let sent = t.handle(reply("demo-s", Some("p1"), "next"));
+        let other = async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            *fake.screen.lock().unwrap() = dialog();
+        };
+        let (resp, ()) = tokio::join!(sent, other);
+        assert_eq!(resp, Response::Ok);
+        assert_eq!(fake.typed(), chunks(&[b"\x1b[200~next\x1b[201~", b"\r"]));
+    }
+
+    #[tokio::test]
+    async fn a_reply_as_the_dialog_is_drawn_answers_no_first() {
+        // The hook came, the dialog is drawn just after the reply: a
+        // Return pasted then would pick Yes.
+        let fake = FakeSlot::showing(idle());
+        fake.when(b"\x1b", idle());
+        let state = at_permission("p1");
+        let t = fake_typist(&fake, &state);
+        let sent = t.handle(reply("demo-s", Some("p1"), "use demo-ws"));
+        let drawn = async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            *fake.screen.lock().unwrap() = dialog();
+        };
+        let (resp, ()) = tokio::join!(sent, drawn);
+        assert_eq!(resp, Response::Ok);
+        assert_eq!(
+            fake.typed(),
+            chunks(&[b"\x1b", b"\x1b[200~use demo-ws\x1b[201~", b"\r"])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_prompt_at_an_idle_session_gets_no_esc() {
+        // Answered in the terminal with no hook to say so: the prompt is
+        // still open but the box is back. Esc there could open the rewind
+        // picker.
+        let fake = FakeSlot::showing(idle());
+        let t = fake_typist(&fake, &at_permission("p1"));
+        assert_eq!(
+            t.handle(Request::Interrupt { slot: 2 }).await,
+            error("S2 is not working, not sent")
+        );
+        assert_eq!(
+            t.handle(reply("demo-s", Some("p1"), "next")).await,
+            Response::Ok
+        );
+        assert_eq!(fake.typed(), chunks(&[b"\x1b[200~next\x1b[201~", b"\r"]));
     }
 
     #[tokio::test]
