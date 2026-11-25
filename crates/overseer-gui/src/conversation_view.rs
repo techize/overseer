@@ -39,6 +39,9 @@ pub struct Conv {
     /// A Reply or Answer is on its way: another is not sent until it is
     /// answered.
     pub sending: bool,
+    /// A full view is on its way, asked for at this count; another is not
+    /// asked for until it lands. See `ask`.
+    pub asking: Option<u64>,
 }
 
 impl Conv {
@@ -56,6 +59,7 @@ impl Conv {
             status: None,
             events: 0,
             sending: false,
+            asking: None,
         }
     }
 
@@ -65,16 +69,31 @@ impl Conv {
         self.apply(ev)
     }
 
-    /// What `answered` needs to know when a full view is asked for.
-    pub fn asked(&self) -> u64 {
-        self.events
+    /// Asks for the full view: the count to hand back to `answered`, or
+    /// `None` when one is already on its way, so a burst of pushes that do
+    /// not fit asks once.
+    pub fn ask(&mut self) -> Option<u64> {
+        if self.asking.is_some() {
+            return None;
+        }
+        self.asking = Some(self.events);
+        self.asking
     }
 
     /// Takes in the full view asked for when the count was `asked`. A view
     /// asked for before a later push may be older than what we hold, so it
     /// is dropped: `None`, and the caller asks again. Otherwise as `apply`.
     pub fn answered(&mut self, asked: u64, ev: ConversationView) -> Option<bool> {
+        self.landed(asked);
         (self.events == asked).then(|| self.apply(ev))
+    }
+
+    /// The full view asked for at `asked` has come back, or failed: another
+    /// may be asked for.
+    pub fn landed(&mut self, asked: u64) {
+        if self.asking == Some(asked) {
+            self.asking = None;
+        }
     }
 
     /// Takes in what the daemon sent. True when it fitted; false when the
@@ -95,7 +114,7 @@ impl Conv {
     /// Forgets what the daemon said, as when the connection is lost. The
     /// draft stays: it is the user's own typing.
     /// A send on its way stays on its way, and the count goes up so a view
-    /// asked for before is dropped.
+    /// asked for before is dropped; a new connection asks afresh.
     pub fn clear(&mut self) {
         let draft = std::mem::take(&mut self.draft);
         let (events, sending) = (self.events + 1, self.sending);
@@ -342,6 +361,9 @@ pub fn next_waiting(
     }
 }
 
+/// What Tab says when it stays.
+pub const TAB_MESSAGES: [&str; 2] = ["nothing waiting", "no other slot waiting"];
+
 /// Where Tab goes from `current`, or what the status says when it stays.
 pub fn tab_target(
     attention: &AttentionView,
@@ -351,8 +373,8 @@ pub fn tab_target(
 ) -> Result<SlotId, &'static str> {
     match next_waiting(attention, slots, convs, current) {
         Some(s) => Ok(s),
-        None if waiting_order(attention, slots, convs).is_empty() => Err("nothing waiting"),
-        None => Err("no other slot waiting"),
+        None if waiting_order(attention, slots, convs).is_empty() => Err(TAB_MESSAGES[0]),
+        None => Err(TAB_MESSAGES[1]),
     }
 }
 
@@ -407,6 +429,17 @@ pub const PANE_WIDTH: f32 = 420.;
 /// The choices of a permission prompt, by the index `Answer::Permission`
 /// sends.
 pub const PERMISSION_CHOICES: [&str; 3] = ["Yes", "Yes, and don't ask again", "No"];
+
+/// The choice buttons a permission prompt shows. None for a plan approval:
+/// its options differ by mode, so a digit could approve it or change the
+/// mode; it is approved in the session, or refused with a reply.
+pub fn choice_buttons(plan: bool) -> &'static [&'static str] {
+    if plan {
+        &[]
+    } else {
+        &PERMISSION_CHOICES
+    }
+}
 
 fn is_working(info: Option<&SlotInfo>) -> bool {
     info.and_then(|i| i.activity.as_ref())
@@ -508,7 +541,13 @@ impl OverseerApp {
     pub(crate) fn next_waiting_slot(&mut self, cx: &mut Context<Self>) {
         match tab_target(&self.attention, &self.slots, &self.convs, self.selected) {
             Ok(slot) => {
-                self.status = None;
+                if self
+                    .status
+                    .as_deref()
+                    .is_some_and(|s| TAB_MESSAGES.contains(&s))
+                {
+                    self.status = None;
+                }
                 self.select(slot, cx);
             }
             Err(why) => self.status = Some(why.into()),
@@ -547,11 +586,21 @@ impl OverseerApp {
     }
 
     /// The open prompt's buttons, above the reply box.
-    fn render_prompt(&self, slot: SlotId, conv: &Conv, cx: &mut Context<Self>) -> Option<Div> {
+    fn render_prompt(
+        &self,
+        slot: SlotId,
+        conv: &Conv,
+        cx: &mut Context<Self>,
+    ) -> Option<Stateful<Div>> {
         let prompt = conv.view.prompt.as_ref()?;
         let font = self.theme.font_family.as_str();
         let sending = conv.sending;
+        // Kept to a height, so many questions cannot push the reply box away.
         let area = div()
+            .id("conv-prompt")
+            .flex_none()
+            .max_h(px(320.))
+            .overflow_y_scroll()
             .flex()
             .flex_col()
             .gap_2()
@@ -624,13 +673,19 @@ impl OverseerApp {
                 } else {
                     format!("{tool}: {summary}")
                 };
-                let choices = PERMISSION_CHOICES.iter().enumerate().map(|(i, text)| {
-                    pane_button(("conv-choice", i), *text, !sending, false).when(!sending, |b| {
-                        b.on_click(cx.listener(move |this, _, _, cx| {
-                            this.send_answer(slot, Answer::Permission { choice: i }, cx)
-                        }))
-                    })
-                });
+                let choices = choice_buttons(plan.is_some())
+                    .iter()
+                    .enumerate()
+                    .map(|(i, text)| {
+                        pane_button(("conv-choice", i), *text, !sending, false).when(
+                            !sending,
+                            |b| {
+                                b.on_click(cx.listener(move |this, _, _, cx| {
+                                    this.send_answer(slot, Answer::Permission { choice: i }, cx)
+                                }))
+                            },
+                        )
+                    });
                 area.children(plan.as_ref().map(|plan| {
                     div()
                         .id("conv-plan")
@@ -646,6 +701,27 @@ impl OverseerApp {
                         .child(line),
                 )
                 .child(div().flex().flex_wrap().gap_1().children(choices))
+                .when(plan.is_some(), |d| {
+                    d.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_sm()
+                                    .text_color(rgb(colors::ORANGE))
+                                    .child("Approve the plan in the session"),
+                            )
+                            .child(
+                                pane_button("conv-plan-open", "Open session", true, false)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.open_card(slot, window, cx)
+                                    })),
+                            ),
+                    )
+                })
             }
             PromptShown::Known(PromptInfo::Other) | PromptShown::Unknown => area
                 .child(
@@ -1203,22 +1279,49 @@ mod tests {
     #[test]
     fn a_view_asked_for_before_a_push_is_dropped() {
         let mut c = Conv::new(1);
-        let asked = c.asked();
+        let asked = c.ask().unwrap();
         assert!(c.pushed(view("s1", 0, &["a", "b", "c"])));
         // The full view left before the push and may be older.
         assert_eq!(c.answered(asked, view("s1", 0, &["a"])), None);
         assert_eq!(texts(&c.view), ["a", "b", "c"]);
         // Asked again with nothing pushed since: taken.
-        let asked = c.asked();
+        let asked = c.ask().unwrap();
         assert_eq!(
             c.answered(asked, view("s1", 0, &["a", "b", "c", "d"])),
             Some(true)
         );
         assert_eq!(texts(&c.view), ["a", "b", "c", "d"]);
         // A view asked for before the connection was lost is dropped too.
-        let asked = c.asked();
+        let asked = c.ask().unwrap();
         c.clear();
+        // The new connection asks afresh, and the old reply does not free it.
+        let again = c.ask().unwrap();
         assert_eq!(c.answered(asked, view("s1", 0, &["x"])), None);
+        assert_eq!(c.ask(), None);
+        assert_eq!(c.answered(again, view("s1", 0, &["y"])), Some(true));
+    }
+
+    #[test]
+    fn a_burst_that_does_not_fit_asks_once() {
+        let mut c = Conv::new(1);
+        c.pushed(view("s1", 0, &["a"]));
+        // Three pushes with gaps: one full view goes out.
+        assert!(!c.pushed(view("s1", 5, &["f"])));
+        let asked = c.ask().unwrap();
+        for from in [7, 9] {
+            assert!(!c.pushed(view("s1", from, &["x"])));
+            assert_eq!(c.ask(), None);
+        }
+        // It lands overtaken: dropped, and asked for once more.
+        assert_eq!(c.answered(asked, view("s1", 0, &["a"])), None);
+        let again = c.ask().unwrap();
+        assert_eq!(c.ask(), None);
+        assert_eq!(c.answered(again, view("s1", 0, &["a", "b"])), Some(true));
+        assert_eq!(texts(&c.view), ["a", "b"]);
+        // A failed ask frees the slot for the next.
+        let failed = c.ask().unwrap();
+        c.landed(failed);
+        assert!(c.ask().is_some());
     }
 
     #[test]
@@ -1276,5 +1379,19 @@ mod tests {
             [Block::Code("fn main() {}".into())]
         );
         assert_eq!(text_blocks("a\nb"), [Block::Text("a\nb".into())]);
+    }
+
+    #[test]
+    fn a_plan_shows_no_choice_buttons() {
+        assert_eq!(choice_buttons(false), PERMISSION_CHOICES);
+        assert!(choice_buttons(true).is_empty());
+        // Its reply box still answers No and says what to do instead.
+        let mut p = permission_prompt("p");
+        if let PromptShown::Known(PromptInfo::Permission { plan, .. }) = &mut p.info {
+            *plan = Some("1. Fix demo-api".into());
+        }
+        let c = with_prompt(2, Some(p));
+        assert_eq!(reply_placeholder(&c), "No, and tell it instead");
+        assert!(reply_enabled(&c));
     }
 }

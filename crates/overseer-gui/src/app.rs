@@ -1126,8 +1126,9 @@ impl OverseerApp {
     /// left alone: a slot with nothing running has no conversation to show.
     /// A reply that an event pushed meanwhile may have overtaken is dropped
     /// and asked for again; one that does not fit is asked for again too.
+    /// Only one is on its way per slot at a time.
     pub(crate) fn request_conversation(&mut self, slot: SlotId, cx: &mut Context<Self>) {
-        let Some(asked) = self.convs.get(slot as usize).map(Conv::asked) else {
+        let Some(asked) = self.convs.get_mut(slot as usize).and_then(Conv::ask) else {
             return;
         };
         let client = self.client.clone();
@@ -1143,8 +1144,15 @@ impl OverseerApp {
                     }
                     cx.notify();
                 }
-                Ok(_) => {}
+                Ok(_) => {
+                    if let Some(conv) = this.convs.get_mut(slot as usize) {
+                        conv.landed(asked);
+                    }
+                }
                 Err(e) => {
+                    if let Some(conv) = this.convs.get_mut(slot as usize) {
+                        conv.landed(asked);
+                    }
                     this.status = Some(format!("{} ({e:#})", crate::terminal_view::LOST_DAEMON));
                     cx.notify();
                 }

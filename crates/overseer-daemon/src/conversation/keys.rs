@@ -11,8 +11,10 @@ use overseer_proto::SlotId;
 const RIGHT: &[u8] = b"\x1b[C";
 /// Submits a free-text answer, and the review screen after the last question.
 const RETURN: &[u8] = b"\r";
-/// The permission choices Claude Code shows: Yes, Yes and don't ask again, No.
+/// The permission choices the board offers: Yes, Yes and don't ask again, No.
 const PERMISSION_CHOICES: usize = 3;
+/// No, in every permission dialog whatever its option count.
+const ESC: &[u8] = b"\x1b";
 /// Options are picked by one digit, so the Other row must be 9 or below.
 const MAX_DIGIT: usize = 9;
 
@@ -39,7 +41,11 @@ fn digit(row: usize) -> Result<Vec<u8>, String> {
 }
 
 /// The key chunks that answer `prompt` with `answer`, to be typed in order.
-/// A permission choice is its digit. Each question takes its digit (a
+/// Yes and Yes-and-don't-ask-again are their digits; No is Esc, which
+/// is No in every permission dialog, so a dialog with fewer options cannot
+/// turn it into something else. A plan approval takes no choice: its
+/// options differ by mode, so it is answered in the session (or by a
+/// reply, which types Esc first). Each question takes its digit (a
 /// multi-select question each picked digit, then Right to the next tab),
 /// or for free text the Other row's digit, the text and Return; a Return
 /// after the last question submits the review screen.
@@ -47,9 +53,15 @@ fn digit(row: usize) -> Result<Vec<u8>, String> {
 /// These follow Claude Code 2.1.x and are kept in this one function.
 pub fn answer_keys(prompt: &PromptInfo, answer: &Answer) -> Result<Vec<Vec<u8>>, String> {
     match (prompt, answer) {
+        (PromptInfo::Permission { plan: Some(_), .. }, Answer::Permission { .. }) => {
+            Err("a plan is approved in the session, not by a choice".into())
+        }
         (PromptInfo::Permission { .. }, Answer::Permission { choice }) => {
             if *choice >= PERMISSION_CHOICES {
                 return Err(format!("permission choice {choice} is out of range"));
+            }
+            if *choice == PERMISSION_CHOICES - 1 {
+                return Ok(vec![ESC.to_vec()]);
             }
             Ok(vec![digit(choice + 1)?])
         }
@@ -170,14 +182,26 @@ mod tests {
     }
 
     #[test]
-    fn permission_choice_is_its_digit() {
-        for (choice, key) in [(0, b"1"), (1, b"2"), (2, b"3")] {
+    fn permission_yes_is_its_digit_and_no_is_esc() {
+        for (choice, key) in [(0, &b"1"[..]), (1, b"2"), (2, b"\x1b")] {
             assert_eq!(
                 answer_keys(&permission(), &Answer::Permission { choice }),
                 Ok(keys(&[key]))
             );
         }
         assert!(answer_keys(&permission(), &Answer::Permission { choice: 3 }).is_err());
+    }
+
+    #[test]
+    fn a_plan_takes_no_choice() {
+        let plan = PromptInfo::Permission {
+            tool: "ExitPlanMode".into(),
+            summary: String::new(),
+            plan: Some("1. Fix demo-api".into()),
+        };
+        for choice in 0..3 {
+            assert!(answer_keys(&plan, &Answer::Permission { choice }).is_err());
+        }
     }
 
     #[test]

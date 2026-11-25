@@ -794,7 +794,7 @@ mod tests {
         };
         let (resp, ()) = tokio::join!(sent, ended);
         assert_eq!(resp, Response::Ok);
-        assert_eq!(fake.typed(), chunks(&[b"3"]));
+        assert_eq!(fake.typed(), chunks(&[b"\x1b"]));
     }
 
     #[tokio::test]

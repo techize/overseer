@@ -494,26 +494,14 @@ trimming):
   new key is absent, and the review names are added to In progress.
 - Click a session card, or press Cmd+0 to Cmd+6, to open that session over the
   board. Cmd+Esc, the x button, or a click outside the panel closes it.
-- The conversation pane on the right of the board (420 px wide) shows the
-  selected slot's conversation: your messages and Claude's replies, newest at
-  the bottom, with each tool call as one muted line (`Bash: cargo test`). It
-  follows new text unless you have scrolled up. With the pane shown, a click
-  on a card selects it and the pane follows; a double click, Enter, or Open
-  session in the pane header opens the session. A prompt the session waits on
-  shows as buttons above the reply box: a question's options (toggles when it
-  takes several) and Submit once every question has an answer, or a
-  permission prompt's `Yes`, `Yes, and don't ask again` and `No`, with the
-  plan text above them for a plan approval. A prompt Overseer can't show says
-  so and offers Open session. In the reply box Enter sends and Shift+Enter
-  starts a new line; at a permission prompt the reply answers No and tells
-  the session what to do instead, and at a question it is the free-text
-  answer. Stop, or Esc in the box while the slot works, interrupts it. Tab on
-  the board or in the reply box selects the next slot waiting on you
-  (`nothing waiting` when none is), and Cmd+\ hides or shows the pane; hidden,
-  a click opens a card as before, and the choice is kept in `gui.toml`. The
-  terminal stays the source of truth: every send is checked against what the
-  session shows, so a send to a slot that moved on is refused
-  (`S2 moved on, not sent`) and the text stays in the box.
+- The conversation pane on the right of the board shows the selected slot's
+  conversation and the prompt it waits on as buttons (a plan is approved in
+  the session). With the pane shown, a click selects a card and a double click
+  or Enter opens it; hidden, a click opens it as before. In the reply box
+  Enter sends, Shift+Enter starts a new line, and Esc stops a working slot or
+  otherwise goes back to the board. Tab selects the next slot waiting on you;
+  Cmd+\ hides or shows the pane. The terminal stays the source of truth: a
+  send to a slot that moved on is refused (`S2 moved on, not sent`).
 - The `WAITING ON YOU` panel at the top of the board lists what waits on you,
   oldest first: sessions that need you or have finished their work, stuck
   relays, notices, and pull requests with a failed build, changes requested
