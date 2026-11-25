@@ -47,7 +47,9 @@ pub(crate) fn slot(env: &str) -> Option<SlotId> {
 /// First line of the tool input's command, file path or pattern, cut to
 /// `DETAIL_MAX` chars (never mid-character).
 fn detail(input: &serde_json::Value) -> Option<String> {
-    let text = ["command", "file_path", "pattern"]
+    // The keys and order of the daemon's transcript summaries, so a hook's
+    // detail and a transcript call can be matched.
+    let text = ["command", "file_path", "pattern", "description", "url"]
         .iter()
         .find_map(|k| input.get(*k)?.as_str())?;
     let line = text.lines().next().unwrap_or("");
@@ -356,6 +358,17 @@ mod tests {
         assert_eq!(ev.detail.as_deref(), Some("foo"));
         let n = br#"{"tool_name":"Task","tool_input":{}}"#;
         assert_eq!(parse_hook("PostToolUse", "S0", n).unwrap().detail, None);
+    }
+
+    #[test]
+    fn detail_takes_a_description_then_a_url() {
+        let t =
+            br#"{"tool_name":"Task","tool_input":{"description":"demo-api tests","prompt":"p"}}"#;
+        let ev = parse_hook("PostToolUse", "S0", t).unwrap();
+        assert_eq!(ev.detail.as_deref(), Some("demo-api tests"));
+        let w = br#"{"tool_name":"WebFetch","tool_input":{"url":"https://demo.example.test/a"}}"#;
+        let ev = parse_hook("PostToolUse", "S0", w).unwrap();
+        assert_eq!(ev.detail.as_deref(), Some("https://demo.example.test/a"));
     }
 
     #[test]

@@ -8,13 +8,13 @@ use std::time::Duration;
 
 use overseer_proto::msg::{slot_name, Answer, Prompt, PromptShown};
 use overseer_proto::{ActivityKind, Request, Response, SlotId, SlotState};
-use overseer_term::{encode_paste, TermModes};
+use overseer_term::TermModes;
 
 use super::keys::{answer_keys, check_reply, moved_on, unknown_prompt};
 use super::service::ConversationService;
 use crate::manager::{valid_id, KeyLock, SlotManager};
 use crate::relay::courier::{
-    paste_then_return, strip_controls, Keyboard, Pasted, NO_BRACKETS, RETURN_DELAY,
+    paste_then_return, strip_controls, typed_paste, Keyboard, Pasted, NO_BRACKETS, RETURN_DELAY,
 };
 use crate::relay::screen::{input_box, shows_working, InputBox};
 
@@ -64,6 +64,8 @@ pub struct Typist {
     keys: Arc<dyn Keyboard>,
     lock: KeyLock,
     now: Box<dyn Fn() -> SlotNow + Send + Sync>,
+    /// Drops the open prompt of this id, when the screen shows it is gone.
+    forget: Box<dyn Fn(&str) + Send + Sync>,
     timing: Timing,
 }
 
@@ -83,6 +85,8 @@ pub fn typist(
         (keys, m.key_lock(slot))
     };
     let (manager, conversation, ours) = (manager.clone(), conversation.clone(), keys.clone());
+    let forgets = conversation.clone();
+    let forget = Box::new(move |id: &str| forgets.forget_prompt(slot, id));
     let now = Box::new(move || {
         let (info, same, running_session) = {
             let m = manager.lock().unwrap();
@@ -109,6 +113,7 @@ pub fn typist(
         keys,
         lock,
         now,
+        forget,
         timing: TIMING,
     })
 }
@@ -165,11 +170,22 @@ impl Typist {
         }
     }
 
-    /// Types the keys that answer prompt `id`, `step` apart.
+    /// Types the keys that answer prompt `id`, `step` apart. The dialog
+    /// replaces the input box, so a box on screen means the prompt was
+    /// answered (its tool may still run): nothing is typed, and the prompt
+    /// is dropped so its buttons go.
     async fn answer(&self, id: &str, answer: &Answer) -> Result<(), String> {
         let (session, _) = self.answer_check(id, answer, None)?;
         let _typing = self.lock.lock().await;
         let (_, keys) = self.answer_check(id, answer, Some(&session))?;
+        match self.keys.screen() {
+            None => return Err(self.refusal("has a screen that cannot be read yet")),
+            Some((snap, _)) if input_box(&snap) != InputBox::NotFound => {
+                (self.forget)(id);
+                return Err(moved_on(self.slot));
+            }
+            Some(_) => {}
+        }
         for (i, chunk) in keys.iter().enumerate() {
             if i > 0 {
                 tokio::time::sleep(self.timing.step).await;
@@ -182,25 +198,34 @@ impl Typist {
                 ));
             }
         }
-        if self.answered(id).await {
-            Ok(())
-        } else {
-            Err(format!("{} did not take the answer", slot_name(self.slot)))
+        if !self.answered(id, true).await {
+            return Err(format!("{} did not take the answer", slot_name(self.slot)));
         }
+        // No hook says a permission was answered; the screen just did.
+        if matches!(answer, Answer::Permission { .. }) {
+            (self.forget)(id);
+        }
+        Ok(())
     }
 
     /// Whether, within `take_within`, prompt `id` is no longer open or the
-    /// screen shows the empty input box.
-    async fn answered(&self, id: &str) -> bool {
+    /// input box comes back. `box_gone` says the box was off the screen
+    /// before the keys; a box counts only once it has been seen gone.
+    async fn answered(&self, id: &str, mut box_gone: bool) -> bool {
         let deadline = tokio::time::Instant::now() + self.timing.take_within;
         loop {
             tokio::time::sleep(self.timing.poll).await;
             let gone = (self.now)().prompt.is_none_or(|p| p.id != id);
-            let empty = self
-                .keys
-                .screen()
-                .is_some_and(|(snap, _)| input_box(&snap) == InputBox::Empty);
-            if gone || empty {
+            let found = self.keys.screen().map(|(snap, _)| input_box(&snap));
+            let back = match found {
+                Some(InputBox::NotFound) => {
+                    box_gone = true;
+                    false
+                }
+                Some(_) => box_gone,
+                None => false,
+            };
+            if gone || back {
                 return true;
             }
             if tokio::time::Instant::now() >= deadline {
@@ -277,7 +302,7 @@ impl Typist {
             }
             modes
         };
-        let paste = encode_paste(&text, &modes);
+        let paste = typed_paste(&text, &modes);
         match paste_then_return(self.keys.clone(), paste, self.timing.return_delay).await {
             Ok(Pasted::Whole) => {}
             Ok(Pasted::NoReturn(e)) | Err(e) => {
@@ -334,13 +359,23 @@ impl Typist {
     }
 
     /// Types Esc, which stops a working session or answers a prompt No.
+    /// Only while the screen shows the working line or a prompt is open: a
+    /// second Esc at a stopped session opens Claude Code's rewind picker.
     async fn interrupt(&self) -> Result<(), String> {
         if !(self.now)().running {
             return Err(not_running(self.slot));
         }
         let _typing = self.lock.lock().await;
-        if !(self.now)().running {
+        let now = (self.now)();
+        if !now.running {
             return Err(not_running(self.slot));
+        }
+        let working = self
+            .keys
+            .screen()
+            .is_some_and(|(snap, _)| shows_working(&snap));
+        if !working && now.prompt.is_none() {
+            return Err(self.refusal("is not working"));
         }
         self.keys
             .write(b"\x1b")
@@ -453,6 +488,13 @@ mod tests {
     };
 
     fn fake_typist(fake: &Arc<FakeSlot>, state: &Arc<Mutex<State>>) -> Typist {
+        let forgets = state.clone();
+        let forget = Box::new(move |id: &str| {
+            let mut s = forgets.lock().unwrap();
+            if s.prompt.as_ref().is_some_and(|p| p.id == id) {
+                s.prompt = None;
+            }
+        });
         let state = state.clone();
         Typist {
             slot: 2,
@@ -467,6 +509,7 @@ mod tests {
                     working: s.working,
                 }
             }),
+            forget,
             timing: FAST,
         }
     }
@@ -518,7 +561,7 @@ mod tests {
 
     #[tokio::test]
     async fn interrupt_types_escape() {
-        let fake = FakeSlot::showing(idle());
+        let fake = FakeSlot::showing(Some(screen(None, true, true)));
         let state = Arc::new(Mutex::new(at_rest()));
         let t = fake_typist(&fake, &state);
         assert_eq!(t.handle(Request::Interrupt { slot: 2 }).await, Response::Ok);
@@ -695,7 +738,12 @@ mod tests {
 
     #[tokio::test]
     async fn an_answer_types_its_keys_at_the_shown_prompt() {
-        let fake = FakeSlot::showing(idle());
+        let fake = FakeSlot::showing(Some(screen_of(
+            b"Which repo?\r\n  1. demo-api\r\n  2. demo-ws\r\n",
+            COLS,
+            12,
+        )));
+        fake.when(b"\r", idle());
         let questions = Prompt {
             id: "q1".into(),
             subagent: false,
@@ -811,5 +859,117 @@ mod tests {
             error("S2 has text in its input box, not sent")
         );
         assert_eq!(fake.typed(), chunks(&[b"\x1b"]));
+    }
+
+    #[tokio::test]
+    async fn interrupt_needs_the_working_line_or_a_prompt() {
+        // Stopped by an earlier Esc: no hook says so, so the slot still
+        // reads as working, but the screen shows it at rest.
+        let fake = FakeSlot::showing(idle());
+        let state = Arc::new(Mutex::new(State {
+            working: true,
+            ..at_rest()
+        }));
+        let t = fake_typist(&fake, &state);
+        assert_eq!(
+            t.handle(Request::Interrupt { slot: 2 }).await,
+            error("S2 is not working, not sent")
+        );
+        // A screen that cannot be read is not typed at either.
+        let blind = FakeSlot::showing(None);
+        let t = fake_typist(&blind, &state);
+        assert_eq!(
+            t.handle(Request::Interrupt { slot: 2 }).await,
+            error("S2 is not working, not sent")
+        );
+        assert!(fake.typed().is_empty() && blind.typed().is_empty());
+        // At a prompt, Esc answers it No.
+        let fake = FakeSlot::showing(dialog());
+        let t = fake_typist(&fake, &at_permission("p1"));
+        assert_eq!(t.handle(Request::Interrupt { slot: 2 }).await, Response::Ok);
+        assert_eq!(fake.typed(), chunks(&[b"\x1b"]));
+    }
+
+    #[tokio::test]
+    async fn an_answer_at_the_input_box_is_refused_and_the_prompt_dropped() {
+        // Approved in the terminal: the tool runs, the prompt is still open.
+        for subagent in [false, true] {
+            let fake = FakeSlot::showing(Some(screen(None, true, true)));
+            let state = at_permission("p1");
+            state.lock().unwrap().prompt.as_mut().unwrap().subagent = subagent;
+            let t = fake_typist(&fake, &state);
+            for choice in [0, 2] {
+                state.lock().unwrap().prompt = Some(Prompt {
+                    subagent,
+                    ..permission("p1")
+                });
+                assert_eq!(
+                    t.handle(answer("p1", Answer::Permission { choice })).await,
+                    error("S2 moved on, not sent")
+                );
+                assert_eq!(state.lock().unwrap().prompt, None);
+            }
+            assert!(fake.typed().is_empty());
+        }
+        // A screen that cannot be read is not typed at.
+        let blind = FakeSlot::showing(None);
+        let state = at_permission("p1");
+        let t = fake_typist(&blind, &state);
+        assert_eq!(
+            t.handle(answer("p1", Answer::Permission { choice: 0 }))
+                .await,
+            error("S2 has a screen that cannot be read yet, not sent")
+        );
+        assert!(blind.typed().is_empty());
+        assert!(state.lock().unwrap().prompt.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_box_that_never_went_is_not_an_answer() {
+        let fake = FakeSlot::showing(idle());
+        let t = fake_typist(&fake, &at_permission("p1"));
+        assert!(!t.answered("p1", false).await);
+        // Gone, then back: taken.
+        let fake = FakeSlot::showing(dialog());
+        let t = fake_typist(&fake, &at_permission("p1"));
+        let looked = t.answered("p1", false);
+        let back = async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            *fake.screen.lock().unwrap() = idle();
+        };
+        let (taken, ()) = tokio::join!(looked, back);
+        assert!(taken);
+    }
+
+    #[tokio::test]
+    async fn a_taken_permission_answer_drops_the_prompt() {
+        let fake = FakeSlot::showing(dialog());
+        fake.when(b"1", Some(screen(None, true, true)));
+        let state = at_permission("p1");
+        let t = fake_typist(&fake, &state);
+        assert_eq!(
+            t.handle(answer("p1", Answer::Permission { choice: 0 }))
+                .await,
+            Response::Ok
+        );
+        assert_eq!(state.lock().unwrap().prompt, None);
+        // A second click finds nothing to answer.
+        assert_eq!(
+            t.handle(answer("p1", Answer::Permission { choice: 2 }))
+                .await,
+            error("S2 moved on, not sent")
+        );
+        assert_eq!(fake.typed(), chunks(&[b"1"]));
+    }
+
+    #[tokio::test]
+    async fn a_reply_without_bracketed_paste_types_no_tab_or_delete() {
+        let fake = FakeSlot::showing(Some(screen(None, false, false)));
+        let t = fake_typist(&fake, &Arc::new(Mutex::new(at_rest())));
+        assert_eq!(
+            t.handle(reply("demo-s", None, "a\tb\x7fc")).await,
+            Response::Ok
+        );
+        assert_eq!(fake.typed(), chunks(&[b"a    bc", b"\r"]));
     }
 }

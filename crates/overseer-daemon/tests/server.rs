@@ -3958,13 +3958,13 @@ async fn one_line_relay_is_typed_without_bracketed_paste() {
 
 /// A reply from the board goes into the session the pane showed, as a
 /// paste and Return; one made in another session is refused untyped, and
-/// Stop types Esc.
+/// Stop types Esc at a working session only.
 #[tokio::test]
 async fn a_board_reply_and_stop_reach_the_shown_session() {
     let stub = box_stub("board-reply");
     let d = start_daemon_with(temp_socket(), stub.env()).await;
     let mut c = Client::connect(&d.socket).await;
-    c.start_stub(2, &stub).await;
+    let pid = c.start_stub(2, &stub).await;
     c.hook(HookEvent {
         session_id: Some("demo-session".into()),
         ..hook(2, HookKind::SessionStart)
@@ -3987,6 +3987,14 @@ async fn a_board_reply_and_stop_reach_the_shown_session() {
         Response::Ok
     );
     assert_eq!(stub.read_until(&pasted("hello")).await, pasted("hello"));
+    // At rest, a stray Stop types nothing.
+    assert_eq!(
+        c.request(Request::Interrupt { slot: 2 }).await,
+        Response::Error {
+            message: "S2 is not working, not sent".into()
+        }
+    );
+    stub.set_box(Some("@working"), pid).await;
     assert_eq!(
         c.request(Request::Interrupt { slot: 2 }).await,
         Response::Ok

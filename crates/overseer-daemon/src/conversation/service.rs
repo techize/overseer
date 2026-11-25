@@ -9,8 +9,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use overseer_proto::msg::{ConvEntry, ConversationView, HookEvent, HookKind, Prompt};
+use overseer_proto::msg::{
+    ConvEntry, ConversationView, HookEvent, HookKind, Prompt, PromptInfo, PromptShown,
+};
 use overseer_proto::{Event, SlotId};
+use overseer_term::Snapshot;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::MissedTickBehavior;
 
@@ -18,6 +21,8 @@ use super::parse::{Fed, Tail};
 use super::prompt::PromptState;
 use crate::ledger::Ledger;
 use crate::manager::{SlotManager, SLOT_COUNT};
+use crate::relay::courier::Keyboard;
+use crate::relay::screen::{input_box, shows_working, InputBox};
 
 /// Entries kept per slot; older ones are dropped.
 pub const KEEP: usize = 200;
@@ -33,10 +38,18 @@ const POLL: Duration = Duration::from_secs(1);
 /// The session a slot is running, if it is running one.
 type Running = Box<dyn Fn(SlotId) -> Option<String> + Send + Sync>;
 
+/// A slot's screen, when it can be read.
+type Screen = Box<dyn Fn(SlotId) -> Option<Snapshot> + Send + Sync>;
+
+/// Polls in a row whose screen shows an open permission answered before
+/// it is dropped.
+const ANSWERED_LOOKS: u8 = 2;
+
 /// Holds each slot's conversation and announces it when it changes.
 pub struct ConversationService {
     ledger: Arc<Ledger>,
     running: Running,
+    screen: Screen,
     events: broadcast::Sender<Event>,
     views: Mutex<HashMap<SlotId, SlotView>>,
     /// One per slot, held across a read so a hook and the poll never read
@@ -56,6 +69,12 @@ struct SlotView {
     entries: Vec<ConvEntry>,
     prompt: PromptState,
     sent: Sent,
+    /// The session and file to store, for the next read to write off the
+    /// async runtime.
+    store: Option<(String, PathBuf)>,
+    /// The open permission whose screen looked answered, and on how many
+    /// polls in a row.
+    answered_looks: Option<(String, u8)>,
 }
 
 /// What the app was last sent of a slot.
@@ -95,8 +114,13 @@ impl ConversationService {
         manager: Arc<Mutex<SlotManager>>,
         events: broadcast::Sender<Event>,
     ) -> Arc<Self> {
+        let looks = manager.clone();
         let running = Box::new(move |slot| manager.lock().unwrap().running_session(slot));
-        let (svc, wake) = Self::new(ledger, running, events);
+        let screen = Box::new(move |slot| {
+            let slot = looks.lock().unwrap().slot(slot)?;
+            Keyboard::screen(&*slot).map(|(snap, _)| snap)
+        });
+        let (svc, wake) = Self::new(ledger, running, screen, events);
         let loaded = svc.load();
         tokio::spawn(svc.clone().run(wake, loaded, POLL));
         svc
@@ -105,12 +129,14 @@ impl ConversationService {
     fn new(
         ledger: Arc<Ledger>,
         running: Running,
+        screen: Screen,
         events: broadcast::Sender<Event>,
     ) -> (Arc<Self>, mpsc::UnboundedReceiver<SlotId>) {
         let (wake, rx) = mpsc::unbounded_channel();
         let svc = Arc::new(ConversationService {
             ledger,
             running,
+            screen,
             events,
             views: Mutex::new(HashMap::new()),
             readers: Mutex::new(HashMap::new()),
@@ -165,6 +191,7 @@ impl ConversationService {
                 _ = tick.tick() => {
                     for slot in self.running_slots() {
                         self.refresh(slot).await;
+                        self.look(slot);
                     }
                 }
                 Some(slot) = wake.recv() => self.refresh(slot).await,
@@ -191,7 +218,6 @@ impl ConversationService {
             ev.event,
             HookKind::PostToolUse | HookKind::Stop | HookKind::UserPromptSubmit
         ) && ev.agent_id.is_none();
-        let mut store = None;
         let mut reset = false;
         {
             let mut views = self.views.lock().unwrap();
@@ -220,7 +246,7 @@ impl ConversationService {
                     view.prompt.clear();
                     view.sent.full = true;
                     if let (Some(path), false) = (&view.path, view.session.is_empty()) {
-                        store = Some((view.session.clone(), path.clone()));
+                        view.store = Some((view.session.clone(), path.clone()));
                     }
                     read = true;
                     reset = true;
@@ -235,11 +261,6 @@ impl ConversationService {
                 self.publish(ev.slot, view);
             }
             read |= asked;
-        }
-        if let Some((session, path)) = store {
-            if let Err(e) = self.ledger.put_transcript(ev.slot, &session, &path) {
-                tracing::warn!("conversation: S{} transcript not stored: {e:#}", ev.slot);
-            }
         }
         if read {
             // Nobody waiting is only a test without the task.
@@ -264,12 +285,13 @@ impl ConversationService {
                 return;
             };
             match &view.path {
-                Some(path) => (path.clone(), view.generation),
+                Some(path) => (path.clone(), view.generation, view.store.take()),
                 // No file to read, but a reset still clears the app's view.
                 None => return self.publish(slot, view),
             }
         };
-        let (path, generation) = target;
+        let (path, generation, store) = target;
+        let ledger = self.ledger.clone();
         if held.generation != generation {
             *held = Reader {
                 generation,
@@ -278,6 +300,11 @@ impl ConversationService {
         }
         // Kept until the read is applied, so reads apply in order.
         let read = tokio::task::spawn_blocking(move || {
+            if let Some((session, path)) = store {
+                if let Err(e) = ledger.put_transcript(slot, &session, &path) {
+                    tracing::warn!("conversation: S{slot} transcript not stored: {e:#}");
+                }
+            }
             let read = read_new(&path, &mut held.tail);
             (held, read)
         })
@@ -352,6 +379,53 @@ impl ConversationService {
             entries_from: 0,
             entries: view.map(|v| v.entries.clone()).unwrap_or_default(),
             prompt: view.and_then(|v| v.prompt.open().cloned()),
+        }
+    }
+
+    /// Drops the slot's open prompt `id`, as when the screen shows its
+    /// dialog has gone, and tells the app.
+    pub fn forget_prompt(&self, slot: SlotId, id: &str) {
+        let mut views = self.views.lock().unwrap();
+        if let Some(view) = views.get_mut(&slot) {
+            if view.prompt.forget(id) {
+                self.publish(slot, view);
+            }
+        }
+    }
+
+    /// Drops an open permission the slot's screen shows answered in the
+    /// terminal: no hook says so, but the input box and the working line
+    /// are back, here on [`ANSWERED_LOOKS`] polls in a row.
+    fn look(&self, slot: SlotId) {
+        let permission = |p: &Prompt| {
+            matches!(p.info, PromptShown::Known(PromptInfo::Permission { .. }))
+                .then(|| p.id.clone())
+        };
+        let Some(id) = self.open_prompt(slot).as_ref().and_then(permission) else {
+            return;
+        };
+        let answered = (self.screen)(slot)
+            .is_some_and(|snap| input_box(&snap) != InputBox::NotFound && shows_working(&snap));
+        let mut views = self.views.lock().unwrap();
+        let Some(view) = views.get_mut(&slot) else {
+            return;
+        };
+        let still = view.prompt.open().is_some_and(|p| p.id == id);
+        if !answered || !still {
+            view.answered_looks = None;
+            return;
+        }
+        let looks = match &view.answered_looks {
+            Some((was, n)) if *was == id => n + 1,
+            _ => 1,
+        };
+        if looks < ANSWERED_LOOKS {
+            view.answered_looks = Some((id, looks));
+            return;
+        }
+        view.answered_looks = None;
+        if view.prompt.forget(&id) {
+            self.publish(slot, view);
         }
     }
 
@@ -476,26 +550,37 @@ mod tests {
         ledger: Arc<Ledger>,
         svc: Arc<ConversationService>,
         rx: broadcast::Receiver<Event>,
+        /// What slot 2's screen shows.
+        screen: Shown,
     }
+
+    type Shown = Arc<Mutex<Option<Snapshot>>>;
 
     /// A service whose slot 2 runs [`SESSION`], with no poll task: tests
     /// read with `refresh`.
     fn fixture() -> Fixture {
         let ledger = Arc::new(Ledger::in_memory());
         let dir = tempfile::tempdir().unwrap();
-        let (svc, rx) = service(ledger.clone());
+        let screen = Shown::default();
+        let (svc, rx) = service(ledger.clone(), screen.clone());
         Fixture {
             dir,
             ledger,
             svc,
             rx,
+            screen,
         }
     }
 
-    fn service(ledger: Arc<Ledger>) -> (Arc<ConversationService>, broadcast::Receiver<Event>) {
+    fn service(
+        ledger: Arc<Ledger>,
+        shown: Shown,
+    ) -> (Arc<ConversationService>, broadcast::Receiver<Event>) {
         let (events, rx) = broadcast::channel(64);
         let running = Box::new(|slot| (slot == 2).then(|| SESSION.to_string()));
-        let (svc, _wake) = ConversationService::new(ledger, running, events);
+        let screen =
+            Box::new(move |slot| (slot == 2).then(|| shown.lock().unwrap().clone()).flatten());
+        let (svc, _wake) = ConversationService::new(ledger, running, screen, events);
         (svc, rx)
     }
 
@@ -661,7 +746,7 @@ mod tests {
         let stale = dir.path().join("stale.jsonl");
         write(&stale, &["old"]);
         ledger.put_transcript(3, "demo-old", &stale).unwrap();
-        let (svc, mut rx) = service(ledger);
+        let (svc, mut rx) = service(ledger, Shown::default());
         assert_eq!(svc.load(), vec![2]);
         svc.refresh(2).await;
         assert_eq!(texts(&svc.current(2).entries), ["before the restart"]);
@@ -787,5 +872,106 @@ mod tests {
         assert_eq!(views.len(), 1);
         assert_eq!(views[0].entries_from, 0);
         assert_eq!(texts(&views[0].entries), ["new"]);
+    }
+
+    fn permission_request(path: &Path) -> HookEvent {
+        let rm = "rm -rf /tmp/demo/target";
+        HookEvent {
+            tool: Some("Bash".into()),
+            detail: Some(rm.into()),
+            prompt: Some(PromptInfo::Permission {
+                tool: "Bash".into(),
+                summary: rm.into(),
+                plan: None,
+            }),
+            ..hook(HookKind::PermissionRequest, path)
+        }
+    }
+
+    /// Claude Code's screen with the empty input box, under the working
+    /// line when `working`; else a permission dialog.
+    fn claude_screen(working: Option<bool>) -> Snapshot {
+        let rule = "\u{2500}".repeat(60);
+        let body = match working {
+            None => "Do you want to proceed?\r\n  1. Yes\r\n".to_string(),
+            Some(working) => format!(
+                "{}\r\n\r\n{rule}\r\n\u{276f} \r\n{rule}\r\n",
+                if working {
+                    "\u{273b} Churning\u{2026} (4s \u{b7} 323 tokens)"
+                } else {
+                    "Working on DEMO-12 in demo-api"
+                }
+            ),
+        };
+        crate::relay::screen::screen_of(format!("\x1b[2J\x1b[H{body}").as_bytes(), 60, 12).0
+    }
+
+    #[tokio::test]
+    async fn a_permission_answered_in_the_terminal_is_dropped_on_two_looks() {
+        let mut f = fixture();
+        let path = f.dir.path().join("one.jsonl");
+        write(&path, &["build demo-api"]);
+        f.svc.hook(&hook(HookKind::SessionStart, &path));
+        f.svc.refresh(2).await;
+        f.svc.hook(&permission_request(&path));
+        sent(&mut f.rx);
+        // The dialog shows, or nothing can be read: kept.
+        for shown in [
+            Some(claude_screen(None)),
+            None,
+            Some(claude_screen(Some(false))),
+        ] {
+            *f.screen.lock().unwrap() = shown;
+            f.svc.look(2);
+            f.svc.look(2);
+            assert!(f.svc.open_prompt(2).is_some());
+        }
+        // One look at the box and the working line is not enough, and a
+        // dialog between starts the count again.
+        *f.screen.lock().unwrap() = Some(claude_screen(Some(true)));
+        f.svc.look(2);
+        *f.screen.lock().unwrap() = Some(claude_screen(None));
+        f.svc.look(2);
+        *f.screen.lock().unwrap() = Some(claude_screen(Some(true)));
+        f.svc.look(2);
+        assert!(f.svc.open_prompt(2).is_some());
+        assert!(sent(&mut f.rx).is_empty());
+        f.svc.look(2);
+        assert_eq!(f.svc.open_prompt(2), None);
+        let views = sent(&mut f.rx);
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].prompt, None);
+    }
+
+    #[tokio::test]
+    async fn forgetting_a_prompt_tells_the_app() {
+        let mut f = fixture();
+        let path = f.dir.path().join("one.jsonl");
+        write(&path, &["build demo-api"]);
+        f.svc.hook(&hook(HookKind::SessionStart, &path));
+        f.svc.refresh(2).await;
+        f.svc.hook(&permission_request(&path));
+        sent(&mut f.rx);
+        f.svc.forget_prompt(2, "n9");
+        assert!(sent(&mut f.rx).is_empty());
+        f.svc.forget_prompt(2, "n1");
+        assert_eq!(f.svc.open_prompt(2), None);
+        let views = sent(&mut f.rx);
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].prompt, None);
+    }
+
+    #[tokio::test]
+    async fn the_transcript_is_stored_by_the_read_not_the_hook() {
+        let f = fixture();
+        let path = f.dir.path().join("one.jsonl");
+        write(&path, &["hello"]);
+        f.svc.hook(&hook(HookKind::SessionStart, &path));
+        assert_eq!(f.ledger.transcript(2).unwrap(), None);
+        f.svc.refresh(2).await;
+        assert_eq!(
+            f.ledger.transcript(2).unwrap(),
+            Some((SESSION.to_string(), path))
+        );
     }
 }

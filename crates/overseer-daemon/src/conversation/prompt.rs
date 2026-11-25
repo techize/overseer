@@ -133,7 +133,9 @@ impl PromptState {
                     if self.awaits_call() {
                         self.ends.key = self.best_started(true);
                     }
-                    if self.open.is_some() && self.ends.key.as_ref() == Some(id) {
+                    if self.open.is_some()
+                        && (self.ends.key.as_ref() == Some(id) || self.unplaced())
+                    {
                         self.open = None;
                         self.ends = Ends::default();
                     }
@@ -159,6 +161,24 @@ impl PromptState {
     /// The prompt the session is waiting on.
     pub fn open(&self) -> Option<&Prompt> {
         self.open.as_ref()
+    }
+
+    /// Drops prompt `id` if it is the open one, as when the screen shows
+    /// its dialog has gone. True when it was open.
+    pub fn forget(&mut self, id: &str) -> bool {
+        if self.open.as_ref().is_none_or(|p| p.id != id) {
+            return false;
+        }
+        self.open = None;
+        self.ends = Ends::default();
+        true
+    }
+
+    /// An open prompt with nothing known of its tool call: a permission
+    /// notification with no request. Any main-conversation call finishing
+    /// ends it, since the notification may come after the call it was for.
+    fn unplaced(&self) -> bool {
+        self.open.is_some() && self.ends.key.is_none() && self.ends.call.is_none()
     }
 
     /// The prompt a `PermissionRequest` opens and what ends it. Claude Code
@@ -206,13 +226,16 @@ impl PromptState {
     /// True when a PostToolUse finishes the open prompt's call: by id where
     /// known (the id is unique, so a subagent's own call clears the
     /// subagent prompt it raised), else by tool and summary in the same
-    /// conversation.
+    /// conversation. A prompt with no call at all ends with any main call.
     fn ended_by(&self, ev: &HookEvent) -> bool {
         if self.open.is_none() {
             return false;
         }
-        if self.ends.key.is_some() && self.ends.key == ev.tool_use_id {
-            return true;
+        if let Some(key) = &self.ends.key {
+            return ev.tool_use_id.as_ref() == Some(key);
+        }
+        if self.unplaced() {
+            return ev.agent_id.is_none();
         }
         self.ends.call.as_ref().is_some_and(|(tool, detail)| {
             self.ends.agent == ev.agent_id && *tool == ev.tool && *detail == ev.detail
@@ -538,5 +561,46 @@ mod tests {
         assert_eq!(s.started[0].id, "tu-5");
         s.clear();
         assert!(s.started.is_empty());
+    }
+
+    #[test]
+    fn a_known_call_is_ended_by_its_own_id_only() {
+        let mut s = PromptState::new();
+        assert!(s.on_hook(&permission("Bash", RM)));
+        assert!(!s.on_tools(&[started("tu-1", "Bash", RM)]));
+        // A parallel call of the same tool and summary is not this one.
+        assert!(!s.on_hook(&post("Bash", RM, "tu-2")));
+        assert!(s.open().is_some());
+        assert!(s.on_hook(&post("Bash", RM, "tu-1")));
+        assert!(s.open().is_none());
+    }
+
+    #[test]
+    fn a_prompt_with_no_call_ends_with_the_next_main_call() {
+        let note = HookEvent {
+            notification_type: Some(PERMISSION_PROMPT.into()),
+            ..ev(HookKind::Notification)
+        };
+        let mut s = PromptState::new();
+        assert!(s.on_hook(&note));
+        // A subagent's call is not the main conversation's.
+        assert!(!s.on_hook(&sub("ag-1", post("Bash", RM, "tu-1"))));
+        assert!(s.on_hook(&post("Bash", RM, "tu-2")));
+        assert!(s.open().is_none());
+        // Or its answer in the transcript.
+        assert!(s.on_hook(&note));
+        assert!(s.on_tools(&[finished("tu-3")]));
+        assert!(s.open().is_none());
+    }
+
+    #[test]
+    fn forget_drops_only_the_named_prompt() {
+        let mut s = PromptState::new();
+        assert!(s.on_hook(&permission("Bash", RM)));
+        assert!(!s.forget("n9"));
+        assert!(s.open().is_some());
+        assert!(s.forget("n1"));
+        assert!(s.open().is_none());
+        assert!(!s.forget("n1"));
     }
 }

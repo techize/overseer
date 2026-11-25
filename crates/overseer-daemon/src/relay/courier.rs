@@ -169,12 +169,22 @@ fn speaks_for_itself(text: &str) -> bool {
     digits > 0 && rest[digits..].starts_with(" has released")
 }
 
-/// `text` without C0 control characters other than newline and tab, so a
-/// relay can never type a key such as Escape or Ctrl-C.
+/// `text` without control characters other than newline and tab, so a
+/// relay can never type a key such as Escape, Ctrl-C or Delete.
 pub fn strip_controls(text: &str) -> String {
     text.chars()
-        .filter(|&c| c >= ' ' || c == '\n' || c == '\t')
+        .filter(|&c| (c >= ' ' && c != '\x7f') || c == '\n' || c == '\t')
         .collect()
+}
+
+/// The bytes that type `text` with `modes`. Without bracketed paste a Tab
+/// is a key (it switches Claude Code's mode), so it goes as spaces.
+pub fn typed_paste(text: &str, modes: &TermModes) -> Vec<u8> {
+    if modes.bracketed_paste {
+        encode_paste(text, modes)
+    } else {
+        encode_paste(&text.replace('\t', "    "), modes)
+    }
 }
 
 /// The text typed into slot `to` for `relays`, one paragraph each.
@@ -514,7 +524,7 @@ impl Courier {
             return Err(NO_BRACKETS);
         }
         self.locks.set_held(id, None);
-        let paste = encode_paste(&text, &modes);
+        let paste = typed_paste(&text, &modes);
         match paste_then_return(slot.clone(), paste, RETURN_DELAY).await {
             Ok(Pasted::Whole) => {}
             // The text is in the box now; without its Return it still went.
@@ -718,9 +728,20 @@ mod tests {
     fn strip_controls_keeps_only_newline_and_tab() {
         assert_eq!(
             strip_controls("a\x1b[201~b\x03c\r\nd\te\x00\x7f"),
-            "a[201~bc\nd\te\x7f"
+            "a[201~bc\nd\te"
         );
         assert_eq!(strip_controls("plain text"), "plain text");
+    }
+
+    #[test]
+    fn a_tab_is_typed_as_spaces_without_bracketed_paste() {
+        let plain = TermModes::default();
+        assert_eq!(typed_paste("a\tb", &plain), b"a    b");
+        let bracketed = TermModes {
+            bracketed_paste: true,
+            ..TermModes::default()
+        };
+        assert_eq!(typed_paste("a\tb", &bracketed), b"\x1b[200~a\tb\x1b[201~");
     }
 
     #[test]

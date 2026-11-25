@@ -15,6 +15,13 @@ const SUMMARY_KEYS: [&str; 5] = ["command", "file_path", "pattern", "description
 /// Longest tool summary, in characters.
 const SUMMARY_MAX: usize = 80;
 
+/// Longest entry text, in bytes, so a few huge pastes cannot make a full
+/// view too big to send.
+const TEXT_MAX: usize = 16 * 1024;
+
+/// Ends a text cut to [`TEXT_MAX`].
+const CUT_NOTE: &str = "\n\n(cut, see the session)";
+
 /// A main-conversation tool call starting or getting its answer, read from
 /// the transcript. Used to tell when a prompt is over, even one that ended
 /// with no hook (a denial ends the turn without one).
@@ -85,10 +92,11 @@ impl Tail {
     }
 }
 
-/// The entries one transcript line carries. Side chains, meta lines, thinking,
-/// tool results and every other line type give nothing.
+/// The entries one transcript line carries. Side chains, meta lines, the
+/// summary `/compact` leaves, thinking, tool results and every other line
+/// type give nothing.
 pub fn entry_of(line: &Value) -> Vec<ConvEntry> {
-    if flag(line, "isSidechain") || flag(line, "isMeta") {
+    if flag(line, "isSidechain") || flag(line, "isMeta") || flag(line, "isCompactSummary") {
         return Vec::new();
     }
     let at = line
@@ -153,13 +161,31 @@ fn user_kinds(content: Option<&Value>) -> Vec<ConvKind> {
             .collect(),
         _ => Vec::new(),
     };
-    let kept: Vec<&str> = texts.into_iter().filter(|t| !skipped(t)).collect();
+    let kept: Vec<&str> = texts
+        .into_iter()
+        .filter(|t| !skipped(t) && !t.trim().is_empty())
+        .collect();
     if kept.is_empty() {
         return Vec::new();
     }
     vec![ConvKind::User {
-        text: kept.join("\n\n"),
+        text: capped(kept.join("\n\n")),
     }]
+}
+
+/// `text`, cut to [`TEXT_MAX`] bytes on a character boundary with a note
+/// saying so.
+fn capped(mut text: String) -> String {
+    if text.len() <= TEXT_MAX {
+        return text;
+    }
+    let mut end = TEXT_MAX;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text.push_str(CUT_NOTE);
+    text
 }
 
 fn assistant_kinds(content: Option<&Value>) -> Vec<ConvKind> {
@@ -170,7 +196,7 @@ fn assistant_kinds(content: Option<&Value>) -> Vec<ConvKind> {
         .iter()
         .filter_map(|b| match b.get("type").and_then(Value::as_str)? {
             "text" => Some(ConvKind::Assistant {
-                text: b.get("text").and_then(Value::as_str)?.to_string(),
+                text: capped(b.get("text").and_then(Value::as_str)?.to_string()),
             }),
             "tool_use" => Some(ConvKind::Tool {
                 name: b.get("name").and_then(Value::as_str)?.to_string(),
@@ -344,5 +370,42 @@ mod tests {
         let input = format!("not json\n{{\"type\":5}}\n[1]\n{}", FIXTURE);
         let got = Tail::new().feed(input.as_bytes());
         assert_eq!(got.len(), 3);
+    }
+
+    #[test]
+    fn compact_summaries_and_empty_user_lines_are_left_out() {
+        let compact = r#"{"type":"user","isCompactSummary":true,"message":{"content":"This session is being continued from a previous conversation."}}"#;
+        let empty = r#"{"type":"user","message":{"content":""}}"#;
+        let blank = r#"{"type":"user","message":{"content":[{"type":"text","text":"  \n"}]}}"#;
+        for line in [compact, empty, blank] {
+            assert!(
+                entry_of(&serde_json::from_str(line).unwrap()).is_empty(),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn huge_texts_are_cut_with_a_note() {
+        // Multi-byte, so the cut must find a character boundary.
+        let big = "\u{e9}".repeat(TEXT_MAX);
+        let user = serde_json::json!({"type":"user","message":{"content":big}});
+        let said = serde_json::json!({"type":"assistant","message":{"content":[
+            {"type":"text","text":big}]}});
+        for line in [user, said] {
+            let got = entry_of(&line);
+            let (ConvKind::User { text } | ConvKind::Assistant { text }) = &got[0].kind else {
+                panic!("not text");
+            };
+            assert!(text.len() <= TEXT_MAX + CUT_NOTE.len());
+            assert!(text.ends_with("(cut, see the session)"));
+        }
+        let small = serde_json::json!({"type":"user","message":{"content":"fix DEMO-1"}});
+        assert_eq!(
+            entry_of(&small)[0].kind,
+            ConvKind::User {
+                text: "fix DEMO-1".into()
+            }
+        );
     }
 }

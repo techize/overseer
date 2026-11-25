@@ -501,7 +501,8 @@ trimming):
   Enter sends, Shift+Enter starts a new line, and Esc stops a working slot or
   otherwise goes back to the board. Tab selects the next slot waiting on you;
   Cmd+\ hides or shows the pane. The terminal stays the source of truth: a
-  send to a slot that moved on is refused (`S2 moved on, not sent`).
+  send to a slot that moved on is refused (`S2 moved on, not sent`). A prompt
+  open before a daemon restart is answered in the session.
 - The `WAITING ON YOU` panel at the top of the board lists what waits on you,
   oldest first: sessions that need you or have finished their work, stuck
   relays, notices, and pull requests with a failed build, changes requested
