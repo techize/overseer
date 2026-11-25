@@ -14,7 +14,7 @@ use overseer_proto::{Event, SlotId};
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::MissedTickBehavior;
 
-use super::parse::Tail;
+use super::parse::{Fed, Tail};
 use super::prompt::PromptState;
 use crate::ledger::Ledger;
 use crate::manager::{SlotManager, SLOT_COUNT};
@@ -79,11 +79,11 @@ struct Reader {
 enum Read {
     /// No file yet, or it could not be read: try again later.
     Missing,
-    /// Entries from lines after the last read.
-    More(Vec<ConvEntry>),
+    /// What the lines after the last read held.
+    More(Fed),
     /// The file was shorter than what was read before, so it was read
     /// again from the start.
-    Restarted(Vec<ConvEntry>),
+    Restarted(Fed),
 }
 
 impl ConversationService {
@@ -184,13 +184,15 @@ impl ConversationService {
 
     /// Applies a hook event of the slot's current run. A new transcript or
     /// session starts the slot's conversation over; an event that ends a
-    /// tool call or a turn reads the transcript.
+    /// tool call or a turn, or opens a permission prompt (whose call is
+    /// found in the transcript), reads the transcript.
     pub fn hook(&self, ev: &HookEvent) {
         let mut read = matches!(
             ev.event,
             HookKind::PostToolUse | HookKind::Stop | HookKind::UserPromptSubmit
         ) && ev.agent_id.is_none();
         let mut store = None;
+        let mut reset = false;
         {
             let mut views = self.views.lock().unwrap();
             let view = views.entry(ev.slot).or_default();
@@ -221,13 +223,18 @@ impl ConversationService {
                         store = Some((view.session.clone(), path.clone()));
                     }
                     read = true;
+                    reset = true;
                 }
             }
-            view.prompt.on_hook(ev);
-            // A read announces the prompt with its entries.
-            if !read {
+            let changed = view.prompt.on_hook(ev);
+            let asked =
+                changed && ev.event == HookKind::PermissionRequest && view.prompt.open().is_some();
+            // A read after a reset or a finished call announces the prompt
+            // with its entries; a new prompt is shown at once.
+            if !reset && (asked || !read) {
                 self.publish(ev.slot, view);
             }
+            read |= asked;
         }
         if let Some((session, path)) = store {
             if let Err(e) = self.ledger.put_transcript(ev.slot, &session, &path) {
@@ -290,11 +297,15 @@ impl ConversationService {
         if view.generation == generation {
             match read {
                 Read::Missing => {}
-                Read::More(entries) => append(view, entries),
-                Read::Restarted(entries) => {
+                Read::More(fed) => {
+                    append(view, fed.entries);
+                    view.prompt.on_tools(&fed.tools);
+                }
+                Read::Restarted(fed) => {
                     view.entries.clear();
                     view.sent.full = true;
-                    append(view, entries);
+                    append(view, fed.entries);
+                    view.prompt.on_tools(&fed.tools);
                 }
             }
         }
@@ -396,9 +407,9 @@ fn read_new(path: &Path, tail: &mut Tail) -> Read {
     match read {
         Ok((true, bytes)) => {
             *tail = Tail::new();
-            Read::Restarted(tail.feed(&bytes))
+            Read::Restarted(tail.read(&bytes))
         }
-        Ok((false, bytes)) => Read::More(tail.feed(&bytes)),
+        Ok((false, bytes)) => Read::More(tail.read(&bytes)),
         Err(e) => {
             tracing::warn!("conversation: {} not read: {e}", path.display());
             Read::Missing
@@ -625,7 +636,7 @@ mod tests {
         let body: String = (0..200).map(|n| line(&format!("line {n}"))).collect();
         std::fs::write(&path, &body).unwrap();
         let mut tail = Tail::new();
-        assert!(matches!(read_new(&path, &mut tail), Read::More(e) if e.len() == 200));
+        assert!(matches!(read_new(&path, &mut tail), Read::More(f) if f.entries.len() == 200));
         let offset = tail.offset();
         // A directory opens but does not read, and is shorter than the
         // offset: the read fails and the tail is untouched.
@@ -636,7 +647,7 @@ mod tests {
         assert_eq!(tail.offset(), offset);
         // Once the file reads, a shorter one starts over.
         write(&path, &["new"]);
-        assert!(matches!(read_new(&path, &mut tail), Read::Restarted(e) if e.len() == 1));
+        assert!(matches!(read_new(&path, &mut tail), Read::Restarted(f) if f.entries.len() == 1));
     }
 
     #[tokio::test]
@@ -707,6 +718,53 @@ mod tests {
         assert_eq!(open.id, "n1");
         assert!(matches!(open.info, PromptShown::Known(_)));
         assert_eq!(f.svc.open_prompt(2), Some(open));
+    }
+
+    #[tokio::test]
+    async fn a_denied_permission_clears_from_the_transcript() {
+        let mut f = fixture();
+        let path = f.dir.path().join("one.jsonl");
+        write(&path, &["clean up"]);
+        f.svc.hook(&hook(HookKind::SessionStart, &path));
+        f.svc.refresh(2).await;
+        let rm = "rm -rf /tmp/demo/target";
+        let call = serde_json::json!({"type":"assistant","message":{"content":[
+            {"type":"tool_use","id":"tu-1","name":"Bash","input":{"command":rm}}]}});
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(format!("{call}\n").as_bytes())
+            .unwrap();
+        let ask = HookEvent {
+            tool: Some("Bash".into()),
+            detail: Some(rm.into()),
+            prompt: Some(PromptInfo::Permission {
+                tool: "Bash".into(),
+                summary: rm.into(),
+                plan: None,
+            }),
+            ..hook(HookKind::PermissionRequest, &path)
+        };
+        f.svc.hook(&ask);
+        f.svc.refresh(2).await;
+        assert!(f.svc.open_prompt(2).is_some());
+        sent(&mut f.rx);
+        // Denied: the answer is written and no hook fires.
+        let denial = serde_json::json!({"type":"user","message":{"content":[
+            {"type":"tool_result","tool_use_id":"tu-1","is_error":true,
+             "content":"The user doesn't want to proceed with this tool use."}]}});
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(format!("{denial}\n").as_bytes())
+            .unwrap();
+        f.svc.refresh(2).await;
+        assert_eq!(f.svc.open_prompt(2), None);
+        let views = sent(&mut f.rx);
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].prompt, None);
     }
 
     #[tokio::test]

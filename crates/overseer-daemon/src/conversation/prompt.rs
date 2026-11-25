@@ -1,9 +1,11 @@
 //! Which prompt a slot's session is waiting on, followed from its hook
-//! events.
+//! events and the tool calls its transcript records.
 
-use std::collections::HashMap;
+use std::collections::VecDeque;
 
 use overseer_proto::msg::{HookEvent, HookKind, Prompt, PromptInfo, PromptShown};
+
+use super::parse::ToolEvent;
 
 /// The tool Claude Code uses to ask the user a question with options.
 const ASK_USER_QUESTION: &str = "AskUserQuestion";
@@ -11,40 +13,29 @@ const ASK_USER_QUESTION: &str = "AskUserQuestion";
 /// The notification Claude Code sends when it draws a permission dialog.
 const PERMISSION_PROMPT: &str = "permission_prompt";
 
+/// Unanswered tool calls remembered per slot; a call that never gets an
+/// answer is forgotten once this many newer ones started.
+const STARTED_MAX: usize = 32;
+
 /// The prompt a slot is waiting on, if any.
 #[derive(Debug, Default)]
 pub struct PromptState {
     open: Option<Prompt>,
     /// What ends the open prompt.
     ends: Ends,
-    /// The latest `PreToolUse` of each conversation, keyed by `agent_id`
-    /// (`None` for the main one).
-    last_call: HashMap<Option<String>, Call>,
+    /// Main-conversation tool calls the transcript started and has not
+    /// answered yet, oldest first.
+    started: VecDeque<Started>,
     /// Numbers the ids of prompts that came with no `tool_use_id`.
     counter: u64,
 }
 
-/// One tool call as a hook saw it.
-#[derive(Debug, Clone, PartialEq)]
-struct Call {
-    id: Option<String>,
-    tool: Option<String>,
-    detail: Option<String>,
-}
-
-impl Call {
-    fn of(ev: &HookEvent) -> Call {
-        Call {
-            id: ev.tool_use_id.clone(),
-            tool: ev.tool.clone(),
-            detail: ev.detail.clone(),
-        }
-    }
-
-    /// The same tool with the same input summary.
-    fn same_call(&self, other: &Call) -> bool {
-        self.tool == other.tool && self.detail == other.detail
-    }
+/// A tool call the transcript started.
+#[derive(Debug, Clone)]
+struct Started {
+    id: String,
+    name: String,
+    summary: String,
 }
 
 /// How the open prompt ends, beyond the turn ending or a new prompt.
@@ -52,15 +43,12 @@ impl Call {
 struct Ends {
     /// The conversation it was raised in.
     agent: Option<String>,
-    /// Its tool call: the PostToolUse with this id ends it.
-    id: Option<String>,
-    /// A permission with no tool call id: the PostToolUse of the same tool
+    /// Its tool call: that call's PostToolUse or transcript answer ends it.
+    key: Option<String>,
+    /// A permission with no tool call id, by tool and summary: until its
+    /// call is found in the transcript, the PostToolUse of the same tool
     /// and summary in its conversation ends it.
-    call: Option<Call>,
-    /// A permission whose request carried no id: any later PreToolUse of
-    /// its conversation that is not its own call ends it (the session moved
-    /// on, after a denial say).
-    moved_on: bool,
+    call: Option<(Option<String>, Option<String>)>,
 }
 
 impl PromptState {
@@ -72,24 +60,13 @@ impl PromptState {
     pub fn on_hook(&mut self, ev: &HookEvent) -> bool {
         let main = ev.agent_id.is_none();
         let next = match ev.event {
-            HookKind::PreToolUse => {
-                let moved_on = self.open.is_some()
-                    && self.ends.moved_on
-                    && self.ends.agent == ev.agent_id
-                    && self.ends.id != ev.tool_use_id;
-                self.last_call.insert(ev.agent_id.clone(), Call::of(ev));
-                if main && ev.tool.as_deref() == Some(ASK_USER_QUESTION) {
-                    let id = self.next_id(ev.tool_use_id.as_deref());
-                    let ends = Ends {
-                        id: Some(id.clone()),
-                        ..Ends::default()
-                    };
-                    Some((Some(self.prompt(ev, id, false)), ends))
-                } else if moved_on {
-                    Some((None, Ends::default()))
-                } else {
-                    None
-                }
+            HookKind::PreToolUse if main && ev.tool.as_deref() == Some(ASK_USER_QUESTION) => {
+                let id = self.next_id(ev.tool_use_id.as_deref());
+                let ends = Ends {
+                    key: Some(id.clone()),
+                    ..Ends::default()
+                };
+                Some((Some(prompt(ev, id, false)), ends))
             }
             HookKind::PermissionRequest if ev.tool.as_deref() != Some(ASK_USER_QUESTION) => {
                 Some(self.permission(ev))
@@ -118,6 +95,9 @@ impl PromptState {
             return false;
         };
         self.ends = ends;
+        if self.awaits_call() {
+            self.ends.key = self.best_started(false);
+        }
         if next == self.open {
             return false;
         }
@@ -125,12 +105,55 @@ impl PromptState {
         true
     }
 
-    /// Forgets the open prompt, for a new session. Ids keep counting, so a
-    /// new session's prompt never reuses an earlier one's id.
+    /// Applies the tool calls a transcript read found. An answered call
+    /// ends the prompt it belongs to; a permission prompt with no call id
+    /// takes the call it is for from the unanswered ones. True when the
+    /// open prompt changed.
+    pub fn on_tools(&mut self, tools: &[ToolEvent]) -> bool {
+        let was = self.open.is_some();
+        for tool in tools {
+            match tool {
+                ToolEvent::Started { id, name, summary } => {
+                    if self.started.iter().any(|s| s.id == *id) {
+                        continue;
+                    }
+                    self.started.push_back(Started {
+                        id: id.clone(),
+                        name: name.clone(),
+                        summary: summary.clone(),
+                    });
+                    if self.started.len() > STARTED_MAX {
+                        self.started.pop_front();
+                    }
+                }
+                ToolEvent::Finished { id } => {
+                    // Started and answered within one read: the call is
+                    // found before it is forgotten, but only by a summary
+                    // that agrees, since a wrong guess would end the prompt.
+                    if self.awaits_call() {
+                        self.ends.key = self.best_started(true);
+                    }
+                    if self.open.is_some() && self.ends.key.as_ref() == Some(id) {
+                        self.open = None;
+                        self.ends = Ends::default();
+                    }
+                    self.started.retain(|s| s.id != *id);
+                }
+            }
+        }
+        if self.awaits_call() {
+            self.ends.key = self.best_started(false);
+        }
+        was && self.open.is_none()
+    }
+
+    /// Forgets the open prompt and the unanswered calls, for a new
+    /// session. Ids keep counting, so a new session's prompt never reuses
+    /// an earlier one's id.
     pub fn clear(&mut self) {
         self.open = None;
         self.ends = Ends::default();
-        self.last_call.clear();
+        self.started.clear();
     }
 
     /// The prompt the session is waiting on.
@@ -139,60 +162,61 @@ impl PromptState {
     }
 
     /// The prompt a `PermissionRequest` opens and what ends it. Claude Code
-    /// sends no `tool_use_id` with it, so the call is the conversation's
-    /// latest PreToolUse when that was the same tool and input; that hook
-    /// only covers some tools, so failing that the call is matched by tool
-    /// and summary when it finishes.
+    /// sends no `tool_use_id` with it, so the call is found later in the
+    /// transcript, or matched by tool and summary when it finishes.
     fn permission(&mut self, ev: &HookEvent) -> (Option<Prompt>, Ends) {
-        let agent = ev.agent_id.clone();
-        let subagent = agent.is_some();
-        if let Some(id) = &ev.tool_use_id {
-            let ends = Ends {
-                agent,
-                id: Some(id.clone()),
-                ..Ends::default()
-            };
-            return (Some(self.prompt(ev, id.clone(), subagent)), ends);
-        }
-        let this = Call::of(ev);
-        let adopted = self
-            .last_call
-            .get(&agent)
-            .filter(|pre| pre.same_call(&this))
-            .and_then(|pre| pre.id.clone());
+        let subagent = ev.agent_id.is_some();
         let ends = Ends {
-            agent,
-            id: adopted.clone(),
-            call: adopted.is_none().then_some(this),
-            moved_on: true,
+            agent: ev.agent_id.clone(),
+            key: ev.tool_use_id.clone(),
+            call: ev
+                .tool_use_id
+                .is_none()
+                .then(|| (ev.tool.clone(), ev.detail.clone())),
         };
-        let id = self.next_id(adopted.as_deref());
-        (Some(self.prompt(ev, id, subagent)), ends)
+        let id = self.next_id(ev.tool_use_id.as_deref());
+        (Some(prompt(ev, id, subagent)), ends)
     }
 
-    /// True when a PostToolUse finishes the open prompt's call. Matched by
-    /// the call's id where known, not the tool name, since parallel calls
-    /// can finish while a dialog is open. The id is unique, so a subagent's
-    /// own call clears the subagent prompt it raised.
+    /// An open main-conversation permission whose call is not known yet.
+    /// A subagent's calls are in its own transcript, which is not read.
+    fn awaits_call(&self) -> bool {
+        self.open.as_ref().is_some_and(|p| !p.subagent)
+            && self.ends.key.is_none()
+            && self.ends.call.is_some()
+    }
+
+    /// The unanswered call the open permission is most likely for: the
+    /// latest of its tool whose summary agrees with the prompt's, else
+    /// (unless `strict`) the latest of its tool.
+    fn best_started(&self, strict: bool) -> Option<String> {
+        let (tool, detail) = self.ends.call.as_ref()?;
+        let of_tool = || {
+            self.started
+                .iter()
+                .rev()
+                .filter(|s| Some(&s.name) == tool.as_ref())
+        };
+        of_tool()
+            .find(|s| detail.as_deref().is_some_and(|d| same_start(d, &s.summary)))
+            .or_else(|| of_tool().next().filter(|_| !strict))
+            .map(|s| s.id.clone())
+    }
+
+    /// True when a PostToolUse finishes the open prompt's call: by id where
+    /// known (the id is unique, so a subagent's own call clears the
+    /// subagent prompt it raised), else by tool and summary in the same
+    /// conversation.
     fn ended_by(&self, ev: &HookEvent) -> bool {
         if self.open.is_none() {
             return false;
         }
-        if self.ends.id.is_some() && self.ends.id == ev.tool_use_id {
+        if self.ends.key.is_some() && self.ends.key == ev.tool_use_id {
             return true;
         }
-        self.ends
-            .call
-            .as_ref()
-            .is_some_and(|call| self.ends.agent == ev.agent_id && call.same_call(&Call::of(ev)))
-    }
-
-    fn prompt(&self, ev: &HookEvent, id: String, subagent: bool) -> Prompt {
-        let info = match &ev.prompt {
-            Some(PromptInfo::Other) | None => PromptShown::Unknown,
-            Some(info) => PromptShown::Known(info.clone()),
-        };
-        Prompt { id, subagent, info }
+        self.ends.call.as_ref().is_some_and(|(tool, detail)| {
+            self.ends.agent == ev.agent_id && *tool == ev.tool && *detail == ev.detail
+        })
     }
 
     /// The `tool_use_id`, or the next `n<counter>`.
@@ -205,6 +229,22 @@ impl PromptState {
             }
         }
     }
+}
+
+fn prompt(ev: &HookEvent, id: String, subagent: bool) -> Prompt {
+    let info = match &ev.prompt {
+        Some(PromptInfo::Other) | None => PromptShown::Unknown,
+        Some(info) => PromptShown::Known(info.clone()),
+    };
+    Prompt { id, subagent, info }
+}
+
+/// Two summaries of one input agree: both non-empty and equal over the
+/// shorter one, since the hook and the transcript cut them differently.
+fn same_start(a: &str, b: &str) -> bool {
+    let (a, b) = (a.trim(), b.trim());
+    let n = a.chars().count().min(b.chars().count());
+    n > 0 && a.chars().take(n).eq(b.chars().take(n))
 }
 
 #[cfg(test)]
@@ -266,21 +306,25 @@ mod tests {
         }
     }
 
-    fn call(kind: HookKind, tool: &str, detail: &str, id: &str) -> HookEvent {
+    fn post(tool: &str, detail: &str, id: &str) -> HookEvent {
         HookEvent {
             tool: Some(tool.into()),
             detail: Some(detail.into()),
             tool_use_id: Some(id.into()),
-            ..ev(kind)
+            ..ev(HookKind::PostToolUse)
         }
     }
 
-    fn pre(tool: &str, detail: &str, id: &str) -> HookEvent {
-        call(HookKind::PreToolUse, tool, detail, id)
+    fn started(id: &str, name: &str, summary: &str) -> ToolEvent {
+        ToolEvent::Started {
+            id: id.into(),
+            name: name.into(),
+            summary: summary.into(),
+        }
     }
 
-    fn post(tool: &str, detail: &str, id: &str) -> HookEvent {
-        call(HookKind::PostToolUse, tool, detail, id)
+    fn finished(id: &str) -> ToolEvent {
+        ToolEvent::Finished { id: id.into() }
     }
 
     const RM: &str = "rm -rf /tmp/demo/target";
@@ -305,13 +349,13 @@ mod tests {
     #[test]
     fn another_tools_post_tool_use_keeps_the_prompt() {
         let mut s = PromptState::new();
-        assert!(!s.on_hook(&pre("Bash", RM, "tu-1")));
         assert!(s.on_hook(&permission("Bash", RM)));
         assert!(!s.on_hook(&post("Bash", "ls", "tu-2")));
-        assert_eq!(s.open().unwrap().id, "tu-1");
+        assert!(!s.on_hook(&post("Edit", RM, "tu-3")));
+        assert_eq!(s.open().unwrap().id, "n1");
         // A PostToolUse with no id clears nothing either.
         assert!(!s.on_hook(&ev(HookKind::PostToolUse)));
-        assert_eq!(s.open().unwrap().id, "tu-1");
+        assert!(s.open().is_some());
     }
 
     #[test]
@@ -328,19 +372,19 @@ mod tests {
     #[test]
     fn subagent_permission_is_shown_as_subagent() {
         let mut s = PromptState::new();
-        assert!(!s.on_hook(&sub("ag-1", pre("Bash", RM, "tu-7"))));
         assert!(s.on_hook(&sub("ag-1", permission("Bash", RM))));
         let open = s.open().unwrap();
         assert!(open.subagent);
-        assert_eq!(open.id, "tu-7");
         // Other subagent events are not followed: its question is not shown,
         // and its Stop does not clear the main terminal's prompt.
         let mut other = PromptState::new();
         assert!(!other.on_hook(&sub("ag-1", question("tu-8"))));
         assert!(other.open().is_none());
         assert!(!s.on_hook(&sub("ag-1", ev(HookKind::Stop))));
-        // The main conversation's next call is not the subagent moving on.
-        assert!(!s.on_hook(&pre("Edit", "/tmp/demo/a.rs", "tu-9")));
+        // A main call of the same tool is not the subagent's.
+        assert!(!s.on_tools(&[started("tu-9", "Bash", RM)]));
+        assert!(!s.on_tools(&[finished("tu-9")]));
+        assert!(!s.on_hook(&post("Bash", RM, "tu-9")));
         // Its own tool call finishing clears it.
         assert!(s.on_hook(&sub("ag-1", post("Bash", RM, "tu-7"))));
         assert!(s.open().is_none());
@@ -360,10 +404,9 @@ mod tests {
         // While a prompt is open the notification changes nothing.
         assert!(!s.on_hook(&note));
         let mut known = PromptState::new();
-        assert!(!known.on_hook(&pre("Bash", RM, "tu-1")));
         assert!(known.on_hook(&permission("Bash", RM)));
         assert!(!known.on_hook(&note));
-        assert_eq!(known.open().unwrap().id, "tu-1");
+        assert!(matches!(known.open().unwrap().info, PromptShown::Known(_)));
         // Another notification type opens nothing.
         let idle = HookEvent {
             notification_type: Some("idle_prompt".into()),
@@ -410,27 +453,10 @@ mod tests {
     }
 
     #[test]
-    fn permission_without_id_takes_the_pre_tool_use_id() {
-        let mut s = PromptState::new();
-        assert!(!s.on_hook(&pre("Bash", "cargo test", "tu-5")));
-        assert!(s.on_hook(&permission("Bash", "cargo test")));
-        assert_eq!(s.open().unwrap().id, "tu-5");
-        // A repeat of the request is the same prompt.
-        assert!(!s.on_hook(&permission("Bash", "cargo test")));
-        assert!(s.on_hook(&post("Bash", "cargo test", "tu-5")));
-        assert!(s.open().is_none());
-        // A PreToolUse of another call is not taken.
-        assert!(!s.on_hook(&pre("Bash", "ls", "tu-6")));
-        assert!(s.on_hook(&permission("Bash", RM)));
-        assert_eq!(s.open().unwrap().id, "n1");
-    }
-
-    #[test]
     fn permission_without_id_clears_on_matching_post_tool_use() {
         let mut s = PromptState::new();
         let url = "https://demo.example.test/a";
         assert!(s.on_hook(&permission("WebFetch", url)));
-        assert_eq!(s.open().unwrap().id, "n1");
         // Another call of the tool, or the same call in a subagent, is not it.
         assert!(!s.on_hook(&post("WebFetch", "https://demo.example.test/b", "tu-1")));
         assert!(!s.on_hook(&sub("ag-1", post("WebFetch", url, "tu-2"))));
@@ -440,24 +466,77 @@ mod tests {
     }
 
     #[test]
-    fn a_later_pre_tool_use_clears_a_denied_permission() {
+    fn a_denied_permission_clears_from_the_transcript() {
         let mut s = PromptState::new();
-        assert!(!s.on_hook(&pre("Bash", RM, "tu-1")));
         assert!(s.on_hook(&permission("Bash", RM)));
-        // Its own call again, or a subagent's call, is no move.
-        assert!(!s.on_hook(&pre("Bash", RM, "tu-1")));
-        assert!(!s.on_hook(&sub("ag-1", pre("Bash", "ls", "tu-2"))));
-        assert_eq!(s.open().unwrap().id, "tu-1");
-        // Denied, the session goes on to another call.
-        assert!(s.on_hook(&pre("Edit", "/tmp/demo/a.rs", "tu-3")));
+        let id = s.open().unwrap().id.clone();
+        // Another call starting and finishing is not this one.
+        assert!(!s.on_tools(&[started("tu-1", "Read", "/tmp/demo/a.rs")]));
+        assert!(!s.on_tools(&[finished("tu-1")]));
+        assert!(!s.on_tools(&[started("tu-2", "Bash", RM)]));
+        // Found, but the id the pane saw stays.
+        assert_eq!(s.open().unwrap().id, id);
+        // The denial is the call's tool_result.
+        assert!(s.on_tools(&[finished("tu-2")]));
         assert!(s.open().is_none());
-        // The same for one matched by tool and summary.
-        assert!(s.on_hook(&permission("WebFetch", "https://demo.example.test")));
-        assert!(s.on_hook(&pre("Bash", "ls", "tu-4")));
+    }
+
+    #[test]
+    fn an_approved_permission_clears_when_its_result_is_written() {
+        let mut s = PromptState::new();
+        assert!(s.on_hook(&permission("Bash", RM)));
+        // Started and answered within one read.
+        assert!(s.on_tools(&[started("tu-1", "Bash", RM), finished("tu-1")]));
         assert!(s.open().is_none());
-        // A question is not cleared by another call starting.
-        assert!(s.on_hook(&question("tu-5")));
-        assert!(!s.on_hook(&pre("Bash", "ls", "tu-6")));
-        assert_eq!(s.open().unwrap().id, "tu-5");
+        // Of two of its tool, the one whose summary agrees is taken; the
+        // transcript's summary may be cut shorter than the hook's.
+        let long = format!("{RM} && echo {}", "x".repeat(80));
+        assert!(s.on_hook(&permission("Bash", &long)));
+        let cut: String = long.chars().take(40).collect();
+        let tools = [started("tu-2", "Bash", &cut), started("tu-3", "Bash", "ls")];
+        assert!(!s.on_tools(&tools));
+        assert!(!s.on_tools(&[finished("tu-3")]));
+        assert!(s.on_tools(&[finished("tu-2")]));
+        // In one read, another call of the tool finishing is not taken for
+        // it by name alone.
+        assert!(s.on_hook(&permission("Bash", RM)));
+        assert!(!s.on_tools(&[started("tu-4", "Bash", "ls"), finished("tu-4")]));
+        assert!(s.open().is_some());
+    }
+
+    #[test]
+    fn a_tool_started_before_the_hook_is_still_adopted() {
+        let mut s = PromptState::new();
+        assert!(!s.on_tools(&[started("tu-1", "Bash", RM)]));
+        assert!(s.on_hook(&permission("Bash", RM)));
+        assert!(s.on_tools(&[finished("tu-1")]));
+        assert!(s.open().is_none());
+        // An answered call is not taken by a later prompt.
+        assert!(s.on_hook(&permission("Bash", RM)));
+        assert!(!s.on_tools(&[finished("tu-1")]));
+        assert!(s.open().is_some());
+    }
+
+    #[test]
+    fn a_question_clears_from_its_transcript_result() {
+        let mut s = PromptState::new();
+        assert!(s.on_hook(&question("tu-1")));
+        assert!(!s.on_tools(&[started("tu-1", ASK_USER_QUESTION, "")]));
+        assert!(!s.on_tools(&[finished("tu-2")]));
+        assert!(s.on_tools(&[finished("tu-1")]));
+        assert!(s.open().is_none());
+    }
+
+    #[test]
+    fn unanswered_calls_are_bounded_and_cleared() {
+        let mut s = PromptState::new();
+        let many: Vec<ToolEvent> = (0..STARTED_MAX + 5)
+            .map(|n| started(&format!("tu-{n}"), "Bash", RM))
+            .collect();
+        s.on_tools(&many);
+        assert_eq!(s.started.len(), STARTED_MAX);
+        assert_eq!(s.started[0].id, "tu-5");
+        s.clear();
+        assert!(s.started.is_empty());
     }
 }

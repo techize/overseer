@@ -15,6 +15,29 @@ const SUMMARY_KEYS: [&str; 5] = ["command", "file_path", "pattern", "description
 /// Longest tool summary, in characters.
 const SUMMARY_MAX: usize = 80;
 
+/// A main-conversation tool call starting or getting its answer, read from
+/// the transcript. Used to tell when a prompt is over, even one that ended
+/// with no hook (a denial ends the turn without one).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolEvent {
+    /// A `tool_use` block of an assistant line. `summary` is the one a
+    /// `Tool` entry shows.
+    Started {
+        id: String,
+        name: String,
+        summary: String,
+    },
+    /// A `tool_result` block: the call was answered, approved or not.
+    Finished { id: String },
+}
+
+/// What some bytes of a transcript held.
+#[derive(Debug, Default, PartialEq)]
+pub struct Fed {
+    pub entries: Vec<ConvEntry>,
+    pub tools: Vec<ToolEvent>,
+}
+
 /// Follows a transcript file as it grows. Feed it the new bytes; it hands back
 /// the entries from every complete line.
 #[derive(Debug, Default)]
@@ -37,9 +60,14 @@ impl Tail {
     /// Takes the next bytes of the file. An unterminated last line waits for
     /// its newline. Lines that are not JSON, or not a shape we know, are skipped.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<ConvEntry> {
+        self.read(bytes).entries
+    }
+
+    /// [`Tail::feed`], with the tool calls the lines started and finished.
+    pub fn read(&mut self, bytes: &[u8]) -> Fed {
         self.offset += bytes.len() as u64;
         self.partial.extend_from_slice(bytes);
-        let mut out = Vec::new();
+        let mut out = Fed::default();
         let mut start = 0;
         while let Some(i) = self.partial[start..].iter().position(|&b| b == b'\n') {
             let mut line = &self.partial[start..start + i];
@@ -48,7 +76,8 @@ impl Tail {
                 line = stripped;
             }
             if let Ok(value) = serde_json::from_slice::<Value>(line) {
-                out.extend(entry_of(&value));
+                out.entries.extend(entry_of(&value));
+                out.tools.extend(tools_of(&value));
             }
         }
         self.partial.drain(..start);
@@ -76,6 +105,33 @@ pub fn entry_of(line: &Value) -> Vec<ConvEntry> {
     kinds
         .into_iter()
         .map(|kind| ConvEntry { at, kind })
+        .collect()
+}
+
+/// The tool calls one transcript line starts or finishes. Side chains are a
+/// subagent's, and give nothing.
+pub fn tools_of(line: &Value) -> Vec<ToolEvent> {
+    if flag(line, "isSidechain") {
+        return Vec::new();
+    }
+    let Some(Value::Array(blocks)) = line.pointer("/message/content") else {
+        return Vec::new();
+    };
+    let text = |b: &Value, k: &str| b.get(k).and_then(Value::as_str).map(String::from);
+    let kind = line.get("type").and_then(Value::as_str);
+    blocks
+        .iter()
+        .filter_map(|b| match (kind, b.get("type").and_then(Value::as_str)) {
+            (Some("assistant"), Some("tool_use")) => Some(ToolEvent::Started {
+                id: text(b, "id")?,
+                name: text(b, "name")?,
+                summary: summary_of(b.get("input")),
+            }),
+            (Some("user"), Some("tool_result")) => Some(ToolEvent::Finished {
+                id: text(b, "tool_use_id")?,
+            }),
+            _ => None,
+        })
         .collect()
 }
 
@@ -236,6 +292,39 @@ mod tests {
     fn tool_results_are_left_out() {
         let line = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#;
         assert!(entry_of(&serde_json::from_str(line).unwrap()).is_empty());
+    }
+
+    #[test]
+    fn tool_calls_start_and_finish() {
+        let result = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"The user doesn't want to proceed with this tool use."}]}}"#;
+        let input = format!("{FIXTURE}{result}\n");
+        let fed = Tail::new().read(input.as_bytes());
+        assert_eq!(fed.entries.len(), 3);
+        assert_eq!(
+            fed.tools,
+            [
+                ToolEvent::Started {
+                    id: "t1".into(),
+                    name: "Bash".into(),
+                    summary: "cargo test".into()
+                },
+                ToolEvent::Finished { id: "t1".into() },
+            ]
+        );
+    }
+
+    #[test]
+    fn side_chain_tools_and_text_give_no_tool_events() {
+        let side = r#"{"type":"assistant","isSidechain":true,"message":{"content":[{"type":"tool_use","id":"s1","name":"Bash","input":{}}]}}"#;
+        let side_result = r#"{"type":"user","isSidechain":true,"message":{"content":[{"type":"tool_result","tool_use_id":"s1"}]}}"#;
+        let text = r#"{"type":"user","message":{"content":"run demo-api"}}"#;
+        let no_id = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{}}]}}"#;
+        for line in [side, side_result, text, no_id] {
+            assert!(
+                tools_of(&serde_json::from_str(line).unwrap()).is_empty(),
+                "{line}"
+            );
+        }
     }
 
     #[test]
