@@ -18,13 +18,13 @@ use std::path::Path;
 
 use gpui::{div, prelude::*, px, rgb, Context, FontWeight, Window};
 use overseer_proto::{
-    slot_name, Activity, ActivityKind, BrainView, ClaimKind, CoordView, ItemKind, LockView,
-    PlanState, QueueEntry, QueueState, RelayState, Sender, SlotId, SlotInfo, SlotState,
+    slot_name, Activity, ActivityKind, BrainView, BuildState, ClaimKind, CoordView, ItemKind,
+    LockView, PlanState, QueueEntry, QueueState, RelayState, Sender, SlotId, SlotInfo, SlotState,
     SourceStatus, WorkItem, WorkView, PRS_OFF,
 };
 
 use crate::app::{colors, open_external, OverseerApp};
-use crate::sprint_view::{is_http_url, slot_branches, slot_prs};
+use crate::sprint_view::{is_http_url, slot_branches};
 
 // ---------------------------------------------------------------------------
 // Pure logic
@@ -266,6 +266,68 @@ pub fn card_press(pane_shown: bool, clicks: usize) -> CardPress {
     } else {
         CardPress::Open
     }
+}
+
+/// An open PR on a slot's branch, as its header shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeaderPr {
+    pub repo: String,
+    pub id: u64,
+    /// Its page, when the source gave a web link.
+    pub url: Option<String>,
+    pub build: Option<BuildState>,
+}
+
+/// The line under a slot card's title (#85): the ticket the slot works,
+/// its branch, and the open PRs on that branch with their CI state. A
+/// field Overseer does not have is left out; `None` when it has none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeaderLine {
+    /// The first ticket the slot owns: key and title.
+    pub ticket: Option<(String, String)>,
+    pub branch: Option<String>,
+    pub prs: Vec<HeaderPr>,
+}
+
+/// The header line for slot `id`, given the repo and branch its checkout
+/// is on (from `slot_branches`, so only for a Running or Resumable slot).
+pub fn header_line(
+    work: &WorkView,
+    id: SlotId,
+    on: Option<&(String, String)>,
+) -> Option<HeaderLine> {
+    let ticket = owned_by(work, id)
+        .into_iter()
+        .find(|i| i.kind == ItemKind::Ticket)
+        .map(|t| (t.key.clone(), t.title.trim().to_string()));
+    let prs: Vec<HeaderPr> = on
+        .map(|on| {
+            crate::sprint_view::slot_prs(work, on)
+                .into_iter()
+                .map(|p| HeaderPr {
+                    repo: p.repo.clone(),
+                    id: p.id,
+                    url: p.url.clone().filter(|u| is_http_url(u)),
+                    build: p.build,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let branch = on.map(|(_, b)| b.clone());
+    (ticket.is_some() || branch.is_some()).then_some(HeaderLine {
+        ticket,
+        branch,
+        prs,
+    })
+}
+
+/// A PR's CI mark and its colour: none while the build is unknown.
+pub fn build_mark(build: Option<BuildState>) -> Option<(&'static str, u32)> {
+    Some(match build? {
+        BuildState::Passed => ("✓", colors::GREEN),
+        BuildState::Failed => ("✗", colors::RED),
+        BuildState::Running => ("●", colors::ORANGE),
+    })
 }
 
 /// `S1` or `S1 · label`.
@@ -813,6 +875,79 @@ fn lock_pill(target: String) -> gpui::Div {
         .child(target)
 }
 
+/// The slot's header line: the ticket key, then its title (cut first when
+/// the card is narrow), the branch (cut next), and each PR on the branch
+/// with its CI mark, a link to the PR's page.
+fn render_header_line(id: SlotId, l: HeaderLine, cx: &mut Context<OverseerApp>) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .min_w(px(0.))
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .text_xs()
+        .children(l.ticket.map(|(key, title)| {
+            div()
+                .flex()
+                .flex_1()
+                .min_w(px(0.))
+                .gap_1()
+                .child(
+                    div()
+                        .flex_none()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(colors::ACCENT))
+                        .child(key),
+                )
+                .child(
+                    div()
+                        .min_w(px(0.))
+                        .truncate()
+                        .text_color(rgb(colors::TEXT_DIM))
+                        .child(title),
+                )
+        }))
+        .children(l.branch.map(|b| {
+            div()
+                .min_w(px(0.))
+                .truncate()
+                .text_color(rgb(colors::MUTED))
+                .child(format!("⎇ {b}"))
+        }))
+        .children(l.prs.into_iter().map(|p| {
+            let HeaderPr {
+                repo,
+                id: pr_id,
+                url,
+                build,
+            } = p;
+            div()
+                .id(gpui::ElementId::Name(
+                    format!("card-pr-{id}-{repo}-{pr_id}").into(),
+                ))
+                .flex()
+                .flex_none()
+                .gap_1()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(colors::ACCENT))
+                .child(format!("PR #{pr_id}"))
+                .children(
+                    build_mark(build).map(|(mark, color)| div().text_color(rgb(color)).child(mark)),
+                )
+                .when_some(url, |d, url| {
+                    d.cursor_pointer()
+                        .hover(|s| s.underline())
+                        // Not also the card behind it.
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            open_external(url.clone(), "the pull request");
+                            this.pr_seen(repo.clone(), pr_id, cx);
+                        }))
+                })
+        }))
+}
+
 impl OverseerApp {
     fn render_card(&self, id: SlotId, now: i64, cx: &mut Context<Self>) -> impl IntoElement {
         let info = &self.slots[id as usize];
@@ -820,23 +955,9 @@ impl OverseerApp {
         let empty = m.tone == Tone::Empty;
         let selected = self.selected == id;
         let edge = edge_color(m.tone);
-        // The open PRs on this slot's branch, each a link to its page.
-        let prs: Vec<(String, u64, Option<String>)> =
-            slot_branches(std::slice::from_ref(info), overseer_proto::git::repo_branch)
-                .first()
-                .map(|(_, on)| {
-                    slot_prs(&self.work, on)
-                        .into_iter()
-                        .map(|p| {
-                            (
-                                p.repo.clone(),
-                                p.id,
-                                p.url.clone().filter(|u| is_http_url(u)),
-                            )
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+        // The ticket, branch and PRs line under the title.
+        let on = slot_branches(std::slice::from_ref(info), overseer_proto::git::repo_branch);
+        let line = header_line(&self.work, id, on.first().map(|(_, on)| on));
         div()
             .id(("card", id as usize))
             .flex_1()
@@ -885,26 +1006,6 @@ impl OverseerApp {
                             .flex()
                             .flex_none()
                             .gap_2()
-                            .children(prs.into_iter().map(|(repo, pr_id, url)| {
-                                div()
-                                    .id(gpui::ElementId::Name(
-                                        format!("card-pr-{id}-{repo}-{pr_id}").into(),
-                                    ))
-                                    .text_xs()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(colors::ACCENT))
-                                    .child(format!("PR #{pr_id}"))
-                                    .when_some(url, |d, url| {
-                                        d.cursor_pointer()
-                                            .hover(|s| s.underline())
-                                            // Not also the card behind it.
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                cx.stop_propagation();
-                                                open_external(url.clone(), "the pull request");
-                                                this.pr_seen(repo.clone(), pr_id, cx);
-                                            }))
-                                    })
-                            }))
                             .children(empty.then(|| {
                                 div()
                                     .id(("card-assign", id as usize))
@@ -928,6 +1029,7 @@ impl OverseerApp {
                             ),
                     ),
             )
+            .children(line.map(|l| render_header_line(id, l, cx)))
             .children((!m.pills.is_empty()).then(|| {
                 div()
                     .flex()
@@ -1862,6 +1964,64 @@ mod tests {
 
     fn work(items: Vec<WorkItem>) -> WorkView {
         WorkView { items, ..no_work() }
+    }
+
+    #[test]
+    fn header_line_has_ticket_branch_and_prs_and_skips_what_is_missing() {
+        use overseer_proto::PullRequest;
+        let mut v = work(vec![
+            item("ov-3", ItemKind::Bead, None, Some(2)),
+            item("DEMO-12", ItemKind::Ticket, None, Some(2)),
+        ]);
+        let pr = |id, branch: &str, build| PullRequest {
+            repo: "demo-api".into(),
+            id,
+            title: format!("PR {id}"),
+            branch: branch.into(),
+            url: Some(format!("https://bitbucket.example.test/demo-api/pr/{id}")),
+            author: None,
+            created: None,
+            ticket: None,
+            approvals: None,
+            comments: None,
+            build,
+            head: None,
+        };
+        v.prs = vec![
+            pr(7, "feature/DEMO-12", Some(BuildState::Failed)),
+            pr(8, "main", None),
+        ];
+        let on = ("demo-api".to_string(), "feature/DEMO-12".to_string());
+        let line = header_line(&v, 2, Some(&on)).unwrap();
+        let title = v.items[1].title.clone();
+        assert_eq!(line.ticket, Some(("DEMO-12".to_string(), title)));
+        assert_eq!(line.branch.as_deref(), Some("feature/DEMO-12"));
+        assert_eq!(
+            line.prs,
+            [HeaderPr {
+                repo: "demo-api".into(),
+                id: 7,
+                url: Some("https://bitbucket.example.test/demo-api/pr/7".into()),
+                build: Some(BuildState::Failed),
+            }]
+        );
+        // No checkout read: the ticket alone, and no PRs.
+        let line = header_line(&v, 2, None).unwrap();
+        assert!(line.branch.is_none() && line.prs.is_empty() && line.ticket.is_some());
+        // A branch with no ticket and no PR.
+        let main = ("demo-api".to_string(), "demo-ws".to_string());
+        let line = header_line(&v, 3, Some(&main)).unwrap();
+        assert_eq!((line.ticket, line.prs.len()), (None, 0));
+        // Nothing known: no line at all.
+        assert_eq!(header_line(&v, 3, None), None);
+    }
+
+    #[test]
+    fn build_marks_follow_the_ci_state() {
+        assert_eq!(build_mark(None), None);
+        assert_eq!(build_mark(Some(BuildState::Passed)).unwrap().0, "✓");
+        assert_eq!(build_mark(Some(BuildState::Failed)).unwrap().0, "✗");
+        assert_eq!(build_mark(Some(BuildState::Running)).unwrap().0, "●");
     }
 
     #[test]
