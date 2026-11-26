@@ -53,6 +53,7 @@ impl Conv {
                 entries_from: 0,
                 entries: Vec::new(),
                 prompt: None,
+                context: None,
             },
             draft: TextField::default(),
             picks: Vec::new(),
@@ -388,6 +389,7 @@ pub fn apply(conv: &mut ConversationView, ev: ConversationView) -> bool {
     conv.session = ev.session;
     conv.entries_from = 0;
     conv.prompt = ev.prompt;
+    conv.context = ev.context;
     joins
 }
 
@@ -516,6 +518,7 @@ mod tests {
             entries_from: from,
             entries: texts.iter().map(|t| entry(t)).collect(),
             prompt: None,
+            context: None,
         }
     }
 

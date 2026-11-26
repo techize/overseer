@@ -494,6 +494,11 @@ trimming):
   new key is absent, and the review names are added to In progress.
 - Click a session card, or press Cmd+0 to Cmd+6, to open that session over the
   board. Cmd+Esc, the x button, or a click outside the panel closes it.
+- Under each session card's title is one line with the ticket, the branch,
+  its open PRs with their CI state, and `ctx 42%`: how full the session's
+  context is, from the token counts in its transcript. It turns orange at 80%
+  and red at 90%, near where Claude Code compacts. The window is taken to be
+  200K tokens until a session uses more, then 1M.
 - The conversation pane on the right of the board shows the selected slot's
   conversation and the prompt it waits on as buttons (a plan is approved in
   the session). With the pane shown, a click selects a card and a double click
