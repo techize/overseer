@@ -547,7 +547,7 @@ trimming):
   long wait for you, which is not counted as work. Hover a bar for its times
   and the log that covers it; click a row to open that session. The panel
   is hidden until a session has run today. `overseer ctl timeline` prints
-  the same day as text.
+  the same day as text. `overseer ctl eod` prints the end-of-day draft (`--target <hours>` for a long day, `--json` for scripts).
 - When a slot's session ends (it exits, is stopped, or you decline to resume
   it), Overseer releases every item it owned and logs it, and drops a status
   request it never answered. The next plan or ticket click finds those items
