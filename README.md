@@ -509,6 +509,17 @@ trimming):
   run, Esc to close. A bug report asks what happened, runs
   `overseer ctl bug-report` (with the slot's screen when you picked one) and
   opens the file it writes, to read before posting.
+- End of day, in the board's header or the palette, opens today's draft. It
+  says `Running the checks...` while the daemon runs the session index and
+  the split script, then shows the problems (a click opens the log file or
+  goes to the slot), the minutes per ticket, and the hours per epic with the
+  hours `from sessions` beside each. The day's target and each epic's hours
+  have - and + buttons that move them a quarter hour; changing the target
+  runs the split again for it. Approve is on only when the hours make the
+  target and the split worked. It writes the day's time log and allocation
+  file (asking first if they exist) and shows the `jc push` command to copy;
+  nothing is sent anywhere. Run again rebuilds the draft, asking first when
+  you have changed the hours. Esc or Close closes it.
 - Under each session card's title is one line with the ticket, the branch,
   its open PRs with their CI state, and `ctx 42%`: how full the session's
   context is, from the token counts in its transcript. It turns orange at 80%
