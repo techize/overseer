@@ -2,6 +2,7 @@
 //! state. Pure, so the daemon can rerun it on every change and on a tick.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -38,7 +39,62 @@ pub struct Inputs<'a> {
     pub author_set: bool,
     /// Today's timeline, for the unlogged gaps.
     pub day: &'a DayView,
+    /// What the last git look found in each slot's folder.
+    pub git: &'a HashMap<SlotId, GitFacts>,
+    pub nudges: Nudges,
     pub now: i64,
+}
+
+/// What the attention task takes from the settings, read once at start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Options {
+    /// `pr_author` is set, so the PR list is already the user's own.
+    pub author_set: bool,
+    pub nudges: Nudges,
+}
+
+impl Options {
+    pub fn of(c: &crate::config::Config) -> Options {
+        Options {
+            author_set: !c.pr_author.trim().is_empty(),
+            nudges: Nudges::of(c),
+        }
+    }
+}
+
+/// When stalled work is nudged. Each is off at 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Nudges {
+    /// Seconds idle with uncommitted changes.
+    pub idle_secs: i64,
+    /// Seconds with no push, comment or build change on a PR.
+    pub quiet_secs: i64,
+    /// Commits behind the remote's main branch.
+    pub behind: u32,
+}
+
+impl Nudges {
+    pub fn of(c: &crate::config::Config) -> Nudges {
+        let secs = |n: u64, unit: i64| i64::try_from(n).unwrap_or(i64::MAX).saturating_mul(unit);
+        Nudges {
+            idle_secs: secs(c.stall_idle_mins, 60),
+            quiet_secs: secs(c.pr_quiet_hours, 3600),
+            behind: u32::try_from(c.behind_main_commits).unwrap_or(u32::MAX),
+        }
+    }
+}
+
+/// What a look at a slot's folder found. `None` where git could not say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GitFacts {
+    /// Changed or untracked files.
+    pub dirty: Option<bool>,
+    /// Commits the remote's main branch has that the folder's HEAD lacks,
+    /// as last fetched.
+    pub behind: Option<u32>,
+    /// When the daemon first saw `behind` over the nudge's threshold, since
+    /// git keeps no such time; kept by [`GitLook`].
+    pub behind_since: Option<i64>,
 }
 
 /// Everything waiting on you, oldest first.
@@ -49,6 +105,9 @@ pub fn derive(i: &Inputs) -> Vec<AttentionItem> {
     }
     notice_items(i, &mut items);
     gap_items(i, &mut items);
+    for s in i.slots {
+        behind_items(i, s, &mut items);
+    }
     for pr in &i.work.prs {
         pr_items(i, pr, &mut items);
     }
@@ -79,6 +138,8 @@ pub struct Readiness {
     pub items: bool,
     /// The day's timeline was built.
     pub day: bool,
+    /// Every slot's folder has been looked at once.
+    pub git: bool,
 }
 
 /// What has been read since `started` (unix seconds). Slots, locks and
@@ -94,6 +155,7 @@ pub fn readiness(work: &WorkView, day: &DayView, started: i64) -> Readiness {
         prs: read("prs"),
         items: read("beads") && (jira_off || read("jira")),
         day: !day.day.is_empty(),
+        git: false,
     }
 }
 
@@ -112,6 +174,8 @@ fn settled(ready: Readiness, key: &str) -> bool {
         | AttentionKind::PrComments => ready.prs,
         AttentionKind::Waiting => ready.items,
         AttentionKind::LogGap => ready.day,
+        AttentionKind::PrQuiet => ready.prs,
+        AttentionKind::Uncommitted | AttentionKind::BehindMain => ready.git,
         // Read before the first list, or a kind nothing raises any more.
         AttentionKind::NeedsYou
         | AttentionKind::RelayStuck
@@ -236,7 +300,7 @@ impl AttentionService {
         true
     }
 
-    /// Starts the task that keeps the list current. `author_set` is read
+    /// Starts the task that keeps the list current. `opts` is read
     /// once: settings only take effect when the daemon restarts. The day
     /// comes from `timeline`'s announcements, and from `timeline` itself
     /// when one was missed; it is never asked to rebuild.
@@ -247,8 +311,9 @@ impl AttentionService {
         store: Arc<WorkStore>,
         timeline: Arc<TimelineService>,
         events: broadcast::Sender<Event>,
-        author_set: bool,
+        opts: Options,
     ) -> Arc<AttentionService> {
+        let Options { author_set, nudges } = opts;
         let svc = Arc::new(AttentionService::new(ledger.clone(), events.clone()));
         let started = unix_now();
         // Subscribe before seeding so no change falls between the two.
@@ -259,6 +324,7 @@ impl AttentionService {
         let task = svc.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(TICK);
+            let mut look = GitLook::default();
             loop {
                 tokio::select! {
                     _ = tick.tick() => {}
@@ -288,6 +354,10 @@ impl AttentionService {
                     .iter()
                     .filter_map(|s| Some((s.id, repo_branch(s.cwd.as_deref()?)?)))
                     .collect();
+                if nudges.idle_secs > 0 || nudges.behind > 0 {
+                    look.refresh(&slots, nudges.behind, unix_now()).await;
+                }
+                let git = look.facts();
                 let items = derive(&Inputs {
                     slots: &slots,
                     locks: &lock_view,
@@ -296,13 +366,104 @@ impl AttentionService {
                     branches: &branches,
                     author_set,
                     day: &day,
+                    git: &git,
+                    nudges,
                     now: unix_now(),
                 });
-                task.publish(items, readiness(&work, &day, started));
+                let mut ready = readiness(&work, &day, started);
+                ready.git = look.ready;
+                task.publish(items, ready);
             }
         });
         svc
     }
+}
+
+/// Seconds between looks at one slot's folder.
+const LOOK_EVERY: i64 = 60;
+/// Longest one git command may take before it counts as unknown.
+const GIT_TIMEOUT: Duration = Duration::from_secs(10);
+/// The remote's main branch, first that exists.
+const MAIN_REFS: [&str; 3] = ["origin/HEAD", "origin/main", "origin/master"];
+
+/// The last look at each slot's folder, refreshed at most every
+/// [`LOOK_EVERY`] seconds, or at once when the folder changes.
+#[derive(Debug, Default)]
+pub struct GitLook {
+    seen: HashMap<SlotId, (PathBuf, i64, GitFacts)>,
+    /// Every slot with a folder has been looked at once.
+    pub ready: bool,
+}
+
+impl GitLook {
+    /// Looks again at each slot folder whose look is due, and forgets slots
+    /// with no folder. `behind_over` is the nudge's threshold, to keep the
+    /// time a slot first went over it.
+    pub async fn refresh(&mut self, slots: &[SlotInfo], behind_over: u32, now: i64) {
+        self.seen
+            .retain(|id, _| slots.iter().any(|s| s.id == *id && s.cwd.is_some()));
+        for s in slots {
+            let Some(cwd) = s.cwd.as_deref() else {
+                continue;
+            };
+            let last = self.seen.get(&s.id).filter(|(p, _, _)| p == cwd);
+            if last.is_some_and(|&(_, at, _)| now.saturating_sub(at) < LOOK_EVERY) {
+                continue;
+            }
+            let was = last.and_then(|(_, _, f)| f.behind_since);
+            let mut facts = look_at(cwd).await;
+            let over = facts
+                .behind
+                .is_some_and(|n| behind_over > 0 && n > behind_over);
+            facts.behind_since = over.then(|| was.unwrap_or(now));
+            self.seen.insert(s.id, (cwd.to_path_buf(), now, facts));
+        }
+        self.ready = true;
+    }
+
+    pub fn facts(&self) -> HashMap<SlotId, GitFacts> {
+        self.seen.iter().map(|(&id, (_, _, f))| (id, *f)).collect()
+    }
+}
+
+/// Whether `cwd` has uncommitted changes and how far it is behind the
+/// remote's main branch. Read-only: `status` takes no optional locks, so a
+/// commit the session makes at the same moment never finds the index
+/// locked. Nothing is fetched.
+pub async fn look_at(cwd: &Path) -> GitFacts {
+    let dirty = git(cwd, &["--no-optional-locks", "status", "--porcelain"])
+        .await
+        .map(|out| !out.trim().is_empty());
+    let mut behind = None;
+    for main in MAIN_REFS {
+        let range = format!("HEAD..{main}");
+        if let Some(out) = git(cwd, &["rev-list", "--count", &range]).await {
+            behind = out.trim().parse().ok();
+            break;
+        }
+    }
+    GitFacts {
+        dirty,
+        behind,
+        behind_since: None,
+    }
+}
+
+/// `git args` in `cwd`: its output when it succeeds in time.
+async fn git(cwd: &Path, args: &[&str]) -> Option<String> {
+    let run = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    let out = tokio::time::timeout(GIT_TIMEOUT, run).await.ok()?.ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 fn item(kind: AttentionKind, slot: SlotId, since: i64, text: &str) -> AttentionItem {
@@ -329,6 +490,9 @@ fn kind_name(kind: AttentionKind) -> &'static str {
         AttentionKind::PrChangesRequested => "pr_changes_requested",
         AttentionKind::PrComments => "pr_comments",
         AttentionKind::LogGap => "log_gap",
+        AttentionKind::Uncommitted => "uncommitted",
+        AttentionKind::PrQuiet => "pr_quiet",
+        AttentionKind::BehindMain => "behind_main",
         AttentionKind::Other => "other",
     }
 }
@@ -363,6 +527,18 @@ fn slot_items(i: &Inputs, s: &SlotInfo, out: &mut Vec<AttentionItem>) {
                 s.id,
                 a.since,
                 "finished, waiting for you",
+            ));
+        }
+    }
+    let dirty = i.git.get(&s.id).and_then(|g| g.dirty) == Some(true);
+    if let Some(a) = act.filter(|a| a.kind == ActivityKind::Idle && dirty) {
+        let since = a.since.saturating_add(i.nudges.idle_secs);
+        if i.nudges.idle_secs > 0 && i.now >= since {
+            out.push(item(
+                AttentionKind::Uncommitted,
+                s.id,
+                since,
+                "idle with uncommitted changes",
             ));
         }
     }
@@ -490,6 +666,18 @@ fn pr_items(i: &Inputs, pr: &PullRequest, out: &mut Vec<AttentionItem>) {
             "changes requested".into(),
         );
     }
+    if i.nudges.quiet_secs > 0 {
+        let quiet = seen
+            .active_since
+            .map(|at| at.saturating_add(i.nudges.quiet_secs))
+            .filter(|&since| i.now >= since);
+        let hours = i.nudges.quiet_secs / 3600;
+        let what = match hours {
+            1 => "no push, comment or build in an hour".to_string(),
+            h => format!("no push, comment or build in {h} hours"),
+        };
+        push(AttentionKind::PrQuiet, quiet, what);
+    }
     // No stored count yet means nothing has been seen to count from.
     let counts = pr.comments.zip(seen.comments).filter(|(n, base)| n > base);
     if let Some((n, base)) = counts {
@@ -499,6 +687,31 @@ fn pr_items(i: &Inputs, pr: &PullRequest, out: &mut Vec<AttentionItem>) {
         };
         push(AttentionKind::PrComments, seen.comments_since, what);
     }
+}
+
+/// A slot whose folder is more than the set number of commits behind the
+/// remote's main branch, timed from when the daemon first saw it so.
+/// Only a running or resumable slot, whose work is still going.
+fn behind_items(i: &Inputs, s: &SlotInfo, out: &mut Vec<AttentionItem>) {
+    if !matches!(
+        s.state,
+        SlotState::Running { .. } | SlotState::Resumable { .. }
+    ) {
+        return;
+    }
+    let Some(facts) = i.git.get(&s.id) else {
+        return;
+    };
+    let Some(n) = facts
+        .behind
+        .filter(|&n| i.nudges.behind > 0 && n > i.nudges.behind)
+    else {
+        return;
+    };
+    let slot = s.id;
+    let since = facts.behind_since.unwrap_or(i.now);
+    let text = format!("{n} commits behind main");
+    out.push(item(AttentionKind::BehindMain, slot, since, &text));
 }
 
 /// The slot working on `pr`: its repo and branch exactly equal the PR's
@@ -635,6 +848,7 @@ mod tests {
             build_failed_since: None,
             changes_since: None,
             comments_since: None,
+            active_since: None,
         }
     }
 
@@ -646,6 +860,8 @@ mod tests {
         branches: HashMap<SlotId, (String, String)>,
         author_set: bool,
         day: DayView,
+        git: HashMap<SlotId, GitFacts>,
+        nudges: Nudges,
         now: i64,
     }
 
@@ -659,6 +875,8 @@ mod tests {
                 branches: HashMap::new(),
                 author_set: true,
                 day: DayView::default(),
+                git: HashMap::new(),
+                nudges: Nudges::default(),
                 now: NOW,
             }
         }
@@ -672,6 +890,8 @@ mod tests {
                 branches: &self.branches,
                 author_set: self.author_set,
                 day: &self.day,
+                git: &self.git,
+                nudges: self.nudges,
                 now: self.now,
             })
         }
@@ -862,6 +1082,7 @@ mod tests {
         prs: true,
         items: true,
         day: true,
+        git: true,
     };
 
     #[test]
@@ -1489,5 +1710,218 @@ mod tests {
                 "needs_you:3"
             ]
         );
+    }
+
+    fn nudges() -> Nudges {
+        Nudges {
+            idle_secs: 1800,
+            quiet_secs: 24 * 3600,
+            behind: 20,
+        }
+    }
+
+    fn facts(dirty: Option<bool>, behind: Option<u32>, since: Option<i64>) -> GitFacts {
+        GitFacts {
+            dirty,
+            behind,
+            behind_since: since,
+        }
+    }
+
+    #[test]
+    fn an_idle_slot_with_uncommitted_changes_is_nudged_until_they_go() {
+        let mut w = World::new();
+        w.nudges = nudges();
+        w.slots = vec![slot(2, act(ActivityKind::Idle, NOW - 1799))];
+        w.git.insert(2, facts(Some(true), Some(0), None));
+        assert!(w.derive().is_empty(), "idle for under 30 minutes");
+
+        w.slots = vec![slot(2, act(ActivityKind::Idle, NOW - 1800))];
+        let items = w.derive();
+        assert_eq!(items.len(), 1);
+        let i = &items[0];
+        assert_eq!(i.key, "uncommitted:2");
+        assert_eq!(
+            (i.kind, i.slot, i.since),
+            (AttentionKind::Uncommitted, Some(2), NOW)
+        );
+        assert_eq!(i.text, "idle with uncommitted changes");
+
+        // Clears when the tree is clean, when git could not say, and when
+        // the slot is working again.
+        w.git.insert(2, facts(Some(false), Some(0), None));
+        assert!(w.derive().is_empty(), "clean tree");
+        w.git.insert(2, facts(None, None, None));
+        assert!(w.derive().is_empty(), "unknown");
+        w.git.insert(2, facts(Some(true), Some(0), None));
+        w.slots = vec![slot(2, act(ActivityKind::Working, NOW - 5000))];
+        assert!(w.derive().is_empty(), "working");
+
+        w.slots = vec![slot(2, act(ActivityKind::Idle, NOW - 5000))];
+        w.nudges.idle_secs = 0;
+        assert!(w.derive().is_empty(), "turned off");
+    }
+
+    #[test]
+    fn an_idle_slot_with_a_clean_tree_raises_nothing() {
+        let mut w = World::new();
+        w.nudges = nudges();
+        w.slots = vec![slot(1, act(ActivityKind::Idle, NOW - 9000))];
+        w.git.insert(1, facts(Some(false), Some(0), None));
+        assert!(w.derive().is_empty());
+    }
+
+    #[test]
+    fn a_quiet_pr_is_nudged_until_something_happens_on_it() {
+        let mut w = World::new();
+        w.nudges = nudges();
+        w.work = work(vec![], vec![], vec![pr("demo-api", 7, "feature/DEMO-7")]);
+        let mut s = seen("demo-api", 7);
+        s.active_since = Some(NOW - 24 * 3600 + 1);
+        w.seen = vec![s.clone()];
+        assert!(w.derive().is_empty(), "quiet for under a day");
+
+        s.active_since = Some(NOW - 24 * 3600);
+        w.seen = vec![s.clone()];
+        let items = w.derive();
+        assert_eq!(items.len(), 1);
+        let i = &items[0];
+        assert_eq!(i.key, "pr_quiet:demo-api#7");
+        assert_eq!((i.kind, i.since), (AttentionKind::PrQuiet, NOW));
+        assert_eq!(i.pr, Some(("demo-api".into(), 7)));
+        assert_eq!(
+            i.text,
+            "DEMO-7 change: no push, comment or build in 24 hours"
+        );
+
+        // A push, comment or build moves the time and clears it.
+        s.active_since = Some(NOW - 60);
+        w.seen = vec![s.clone()];
+        assert!(w.derive().is_empty(), "active again");
+
+        s.active_since = None;
+        w.seen = vec![s.clone()];
+        assert!(w.derive().is_empty(), "no time kept yet");
+
+        s.active_since = Some(1);
+        w.seen = vec![s];
+        w.nudges.quiet_secs = 0;
+        assert!(w.derive().is_empty(), "turned off");
+    }
+
+    #[test]
+    fn a_slot_far_behind_main_is_nudged_until_it_catches_up() {
+        let mut w = World::new();
+        w.nudges = nudges();
+        w.slots = vec![slot(3, act(ActivityKind::Working, NOW - 10))];
+        w.git.insert(3, facts(Some(false), Some(20), None));
+        assert!(w.derive().is_empty(), "20 is not more than 20");
+
+        w.git
+            .insert(3, facts(Some(false), Some(21), Some(NOW - 300)));
+        let items = w.derive();
+        assert_eq!(items.len(), 1);
+        let i = &items[0];
+        assert_eq!(i.key, "behind_main:3");
+        assert_eq!(
+            (i.kind, i.slot, i.since),
+            (AttentionKind::BehindMain, Some(3), NOW - 300)
+        );
+        assert_eq!(i.text, "21 commits behind main");
+
+        let mut gone = slot(3, None);
+        gone.state = SlotState::Exited {
+            code: Some(0),
+            at: 1,
+        };
+        w.slots = vec![gone];
+        assert!(w.derive().is_empty(), "a slot that has exited");
+
+        w.slots = vec![slot(3, None)];
+        w.git.insert(3, facts(Some(false), Some(2), None));
+        assert!(w.derive().is_empty(), "caught up");
+        w.git.insert(3, facts(Some(false), None, None));
+        assert!(w.derive().is_empty(), "unknown");
+
+        w.git.insert(3, facts(Some(false), Some(500), Some(1)));
+        w.nudges.behind = 0;
+        assert!(w.derive().is_empty(), "turned off");
+    }
+
+    /// `git args` in `dir`, which must succeed.
+    fn run_git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=Demo", "-c", "user.email=demo@example.test"])
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "init.defaultBranch=main",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn git_look_finds_changes_and_how_far_behind_a_folder_is() {
+        let tmp = tempfile::tempdir().unwrap();
+        let upstream = tmp.path().join("upstream");
+        let work = tmp.path().join("work");
+        std::fs::create_dir(&upstream).unwrap();
+        run_git(&upstream, &["init", "-q"]);
+        run_git(&upstream, &["commit", "-q", "--allow-empty", "-m", "one"]);
+        run_git(tmp.path(), &["clone", "-q", "upstream", "work"]);
+
+        let mut s = slot(1, None);
+        s.cwd = Some(work.clone());
+        let none = slot(2, None);
+        let mut look = GitLook::default();
+        assert!(!look.ready);
+        look.refresh(&[s.clone(), none.clone()], 2, 1000).await;
+        assert!(look.ready);
+        assert_eq!(
+            look.facts().get(&1),
+            Some(&facts(Some(false), Some(0), None))
+        );
+        assert!(!look.facts().contains_key(&2), "a slot with no folder");
+
+        for n in ["two", "three", "four"] {
+            run_git(&upstream, &["commit", "-q", "--allow-empty", "-m", n]);
+        }
+        run_git(&work, &["fetch", "-q"]);
+        std::fs::write(work.join("draft.txt"), "x").unwrap();
+        look.refresh(&[s.clone()], 2, 1030).await;
+        assert_eq!(
+            look.facts()[&1],
+            facts(Some(false), Some(0), None),
+            "not due again for a minute"
+        );
+        look.refresh(&[s.clone()], 2, 1060).await;
+        assert_eq!(look.facts()[&1], facts(Some(true), Some(3), Some(1060)));
+        look.refresh(&[s.clone()], 2, 1120).await;
+        assert_eq!(
+            look.facts()[&1].behind_since,
+            Some(1060),
+            "the first time over is kept"
+        );
+
+        run_git(&work, &["merge", "-q", "--ff-only", "origin/main"]);
+        std::fs::remove_file(work.join("draft.txt")).unwrap();
+        look.refresh(&[s.clone()], 2, 1180).await;
+        assert_eq!(look.facts()[&1], facts(Some(false), Some(0), None));
+
+        // A folder that is not a repo is unknown, not clean.
+        let mut plain = s;
+        plain.cwd = Some(tmp.path().to_path_buf());
+        look.refresh(&[plain], 2, 1240).await;
+        assert_eq!(look.facts()[&1], facts(None, None, None));
     }
 }

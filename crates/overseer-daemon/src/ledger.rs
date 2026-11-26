@@ -226,7 +226,14 @@ const V12_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS slot_transcripts (
 const V13_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS attention_dismissed (
     key TEXT PRIMARY KEY, since INTEGER NOT NULL, text TEXT NOT NULL)";
 
-const VERSION: i64 = 13;
+/// What each PR last showed of its head, raw comment count and build, and
+/// when one of them last changed, for the quiet-PR nudge.
+const V14_SCHEMA: &str = "ALTER TABLE pr_seen ADD COLUMN head TEXT;
+ALTER TABLE pr_seen ADD COLUMN comments_read INTEGER;
+ALTER TABLE pr_seen ADD COLUMN build TEXT;
+ALTER TABLE pr_seen ADD COLUMN active_since INTEGER";
+
+const VERSION: i64 = 14;
 
 /// Reports and state changes kept per slot.
 const REPORTS_PER_SLOT: i64 = 200;
@@ -240,7 +247,7 @@ fn migrate(conn: &Connection) -> Result<()> {
     if version >= VERSION {
         return Ok(());
     }
-    let steps: [(i64, &str); 13] = [
+    let steps: [(i64, &str); 14] = [
         (1, SESSIONS_SCHEMA),
         (2, V2_SCHEMA),
         (3, V3_SCHEMA),
@@ -254,6 +261,7 @@ fn migrate(conn: &Connection) -> Result<()> {
         (11, V11_SCHEMA),
         (12, V12_SCHEMA),
         (13, V13_SCHEMA),
+        (14, V14_SCHEMA),
     ];
     let mut batch = String::from("BEGIN;\n");
     for (n, sql) in steps {
@@ -658,6 +666,9 @@ pub struct PrSeen {
     pub build_failed_since: Option<i64>,
     pub changes_since: Option<i64>,
     pub comments_since: Option<i64>,
+    /// When the PR's head, comment count or build last changed, or it was
+    /// first seen; `None` only for a row from before this was kept.
+    pub active_since: Option<i64>,
 }
 
 /// Notes the PRs seen in one poll at `now`. A PR with no row is inserted with
@@ -675,7 +686,9 @@ pub struct PrSeen {
 /// time), rows for repos not in it are deleted too, since those PRs leave the
 /// board. Pass `None` when the list of targets is incomplete (the repo list
 /// read failed), so a transient failure keeps the rows of repos that were
-/// merely not listed.
+/// merely not listed. `active_since` is set to `now` when the PR is first
+/// seen and whenever a head, comment count or build read this poll differs
+/// from the last one read; a value the poll could not read changes nothing.
 pub(crate) fn record_prs_on(
     conn: &Connection,
     prs: &[PullRequest],
@@ -687,10 +700,21 @@ pub(crate) fn record_prs_on(
         let failed = pr.build == Some(BuildState::Failed);
         let changes = pr.approvals.is_some_and(|a| a.changes_requested);
         let count = pr.comments.map(i64::from);
+        let build = pr.build.map(|b| enum_name(&b));
         conn.execute(
-            "INSERT INTO pr_seen (repo, id, comments, at, build_failed_since, changes_since)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO pr_seen (repo, id, comments, at, build_failed_since, changes_since,
+                                  head, comments_read, build, active_since)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?9, ?3, ?10, ?4)
              ON CONFLICT(repo, id) DO UPDATE SET
+               active_since = CASE
+                 WHEN active_since IS NULL
+                   OR (?9 IS NOT NULL AND head IS NOT NULL AND ?9 <> head)
+                   OR (?3 IS NOT NULL AND comments_read IS NOT NULL AND ?3 <> comments_read)
+                   OR (?10 IS NOT NULL AND build IS NOT NULL AND ?10 <> build)
+                 THEN ?4 ELSE active_since END,
+               head = COALESCE(?9, head),
+               comments_read = COALESCE(?3, comments_read),
+               build = COALESCE(?10, build),
                build_failed_since = CASE WHEN NOT ?7 THEN build_failed_since
                  WHEN ?5 IS NULL THEN NULL
                  ELSE COALESCE(build_failed_since, ?5) END,
@@ -715,6 +739,8 @@ pub(crate) fn record_prs_on(
                 changes.then_some(now),
                 pr.build.is_some(),
                 pr.approvals.is_some(),
+                pr.head,
+                build,
             ],
         )?;
     }
@@ -752,7 +778,8 @@ pub(crate) fn mark_pr_seen_on(conn: &Connection, repo: &str, id: u64, comments: 
 /// Every PR's seen row.
 pub(crate) fn pr_seen_on(conn: &Connection) -> Result<Vec<PrSeen>> {
     let mut stmt = conn.prepare(
-        "SELECT repo, id, comments, build_failed_since, changes_since, comments_since
+        "SELECT repo, id, comments, build_failed_since, changes_since, comments_since,
+                active_since
          FROM pr_seen ORDER BY repo, id",
     )?;
     let rows = stmt.query_map([], |r| {
@@ -763,6 +790,7 @@ pub(crate) fn pr_seen_on(conn: &Connection) -> Result<Vec<PrSeen>> {
             build_failed_since: r.get(3)?,
             changes_since: r.get(4)?,
             comments_since: r.get(5)?,
+            active_since: r.get(6)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -2258,6 +2286,42 @@ mod tests {
     }
 
     #[test]
+    fn pr_seen_active_since_moves_with_a_push_a_comment_or_a_build_only() {
+        let l = Ledger::in_memory();
+        let active = |l: &Ledger| l.pr_seen().unwrap()[0].active_since;
+        let mut pr = demo_pr("demo-api", 1, Some(2));
+        pr.head = Some("aaa".into());
+        pr.build = Some(BuildState::Running);
+        rec(&l, &[pr.clone()], &["demo-api"], 10);
+        assert_eq!(active(&l), Some(10));
+        rec(&l, &[pr.clone()], &["demo-api"], 20);
+        assert_eq!(active(&l), Some(10), "nothing changed");
+        // A poll that could not read them changes nothing.
+        let unread = PullRequest {
+            head: None,
+            build: None,
+            comments: None,
+            ..pr.clone()
+        };
+        rec(&l, &[unread], &["demo-api"], 30);
+        assert_eq!(active(&l), Some(10), "unread values");
+        pr.build = Some(BuildState::Passed);
+        rec(&l, &[pr.clone()], &["demo-api"], 40);
+        assert_eq!(active(&l), Some(40), "build");
+        pr.comments = Some(3);
+        rec(&l, &[pr.clone()], &["demo-api"], 50);
+        assert_eq!(active(&l), Some(50), "comment");
+        pr.head = Some("bbb".into());
+        rec(&l, &[pr.clone()], &["demo-api"], 60);
+        assert_eq!(active(&l), Some(60), "push");
+        // Marking comments seen is not activity.
+        l.transaction(|c| mark_pr_seen_on(c, "demo-api", 1, 3))
+            .unwrap();
+        rec(&l, &[pr], &["demo-api"], 70);
+        assert_eq!(active(&l), Some(60), "marked seen");
+    }
+
+    #[test]
     fn pr_seen_first_sighting_records_without_new_comments() {
         let l = Ledger::in_memory();
         rec(&l, &[demo_pr("demo-api", 1, Some(5))], &["demo-api"], 10);
@@ -2470,6 +2534,30 @@ mod tests {
     }
 
     #[test]
+    fn v13_ledger_upgrades_to_v14_and_starts_pr_activity_on_the_next_poll() {
+        let path = temp_db("migrate-v14");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(&format!(
+                "{SESSIONS_SCHEMA};\n{V2_SCHEMA};\n{V3_SCHEMA};\n{V4_SCHEMA};\n{V5_SCHEMA};\n{V6_SCHEMA};\n{V7_SCHEMA};\n{V8_SCHEMA};\n{V9_SCHEMA};\n{V10_SCHEMA};\n{V11_SCHEMA};\n{V12_SCHEMA};\n{V13_SCHEMA};\nPRAGMA user_version = 13;"
+            ))
+            .unwrap();
+            conn.execute(
+                "INSERT INTO pr_seen (repo, id, comments, at) VALUES ('demo-api', 1, 2, 5)",
+                [],
+            )
+            .unwrap();
+        }
+        let l = Ledger::open(&path).unwrap();
+        assert_eq!(user_version(&l), 14);
+        let rows = l.pr_seen().unwrap();
+        assert_eq!((rows[0].comments, rows[0].active_since), (Some(2), None));
+        rec(&l, &[demo_pr("demo-api", 1, Some(2))], &["demo-api"], 50);
+        assert_eq!(l.pr_seen().unwrap()[0].active_since, Some(50));
+    }
+
+    #[test]
     fn v12_ledger_upgrades_to_v13_with_attention_dismissed() {
         let path = temp_db("migrate-v13");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -2486,7 +2574,7 @@ mod tests {
             .unwrap();
         }
         let l = Ledger::open(&path).unwrap();
-        assert_eq!(user_version(&l), 13);
+        assert_eq!(user_version(&l), VERSION);
         assert!(l.transcript(2).unwrap().is_some());
         assert!(l.attention_dismissed().unwrap().is_empty());
         l.dismiss_attention("needs_you:2", 100, "permission prompt")

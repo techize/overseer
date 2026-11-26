@@ -459,7 +459,7 @@ pub async fn run_until(
         store.clone(),
         day_timeline.clone(),
         events.clone(),
-        !cfg.settings.pr_author.trim().is_empty(),
+        crate::attention::Options::of(&cfg.settings),
     );
     let plans = Arc::new(PlanCtx {
         manager: manager.clone(),

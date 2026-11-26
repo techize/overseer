@@ -94,6 +94,7 @@ const BRAIN: &str = "Notes";
 const COMMANDS: &str = "Commands";
 const TERMINAL: &str = "Terminal";
 const EDITOR: &str = "Editor";
+const NUDGES: &str = "Nudges";
 
 const fn daemon(
     key: &'static str,
@@ -254,6 +255,27 @@ pub const CATALOGUE: &[Spec] = &[
     daemon("worktree_root", LOCKS, SettingKind::Path, |c| {
         path(&c.worktree_root)
     }),
+    daemon_note(
+        "stall_idle_mins",
+        NUDGES,
+        SettingKind::Int { min: 0, max: 10080 },
+        "Minutes idle with uncommitted changes before a slot is nudged; 0 is off",
+        |c| int(c.stall_idle_mins),
+    ),
+    daemon_note(
+        "pr_quiet_hours",
+        NUDGES,
+        SettingKind::Int { min: 0, max: 720 },
+        "Hours with no push, comment or build before a PR is nudged; 0 is off",
+        |c| int(c.pr_quiet_hours),
+    ),
+    daemon_note(
+        "behind_main_commits",
+        NUDGES,
+        SettingKind::Int { min: 0, max: 10000 },
+        "Commits behind the last fetched main before a slot is nudged; 0 is off",
+        |c| int(c.behind_main_commits),
+    ),
     daemon("user_name", BRAIN, EMPTY_OK, |c| text(&c.user_name)),
     daemon("notes_dir", BRAIN, SettingKind::Path, |c| {
         path(&c.brain_dir)
