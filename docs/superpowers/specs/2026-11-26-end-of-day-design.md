@@ -120,11 +120,22 @@ naming the log. The `fit` line is shown under the hours.
 | `eod_split_command` | `["python3", "Claude/tools/day-minutes.py", "--date", "{date}", "--out", "{out}"]` | Writes the split as JSON to `{out}`. Empty turns the button off. |
 | `eod_time_log` | `06-Daily/{yyyy}/{mm}-{Month}/{yyyy}-{mm}-{dd}-time-log.md` | The approved note, under the notes folder. |
 | `eod_allocation_file` | `~/.jira-clockify/allocations/{yyyy}-{mm}-{dd}.json` | Where the approved hours go for `jc push`. Empty skips it. |
+| `eod_target_arg` | `["--target", "{hours}"]` | Added to the split command when the user sets the day's target; `{hours}` is the target in hours (`9`, `8.75`). Empty means the target cannot be changed. |
 
 The defaults point at the 2ndBrain layout. When Overseer owns the notes
 folder (`~/OverseerNotes`), the two command defaults are cleared, as
 `sync_command` is, so the button says the end of day is not set up and names
 the key to set.
+
+**The day's target.** Some days run past the usual day, and the user books
+more than the default (9 hours, say). The overlay shows the day's target
+with its own − and + buttons, in quarter hours, starting at the script's
+default (`target_hours` from the last run). Changing it runs the split again
+with the new target (`eod_target_arg`, filled with the hours, is added to
+the split command), so the script does the BAU fill or the scaling for the
+new day and Approve still needs the total to match. Run again keeps the
+target the user set. `overseer ctl eod --target 9` does the same. With
+`eod_target_arg` empty the target cannot be changed and its buttons are off.
 
 **Editing hours.** Each epic row has − and + buttons that move it a quarter
 hour, never below zero, and shows the script's derived hours beside it. The
@@ -155,7 +166,8 @@ the user asked for this one file by clicking Approve. It is not committed;
 the user's own sync picks it up. When Overseer refused the notes folder
 (`notes_refused`), the button is off and says why.
 
-**Protocol.** `Request::EndOfDay` returns `Response::EndOfDay(DayDraft)`.
+**Protocol.** `Request::EndOfDay { target_quarters }` (None for the
+script's default) returns `Response::EndOfDay(DayDraft)`.
 `Request::SaveDay { id, hours, replace }` returns `Response::DaySaved { paths }`
 or `Response::Error`; a refusal because a file exists is its own response,
 `Response::DayExists { paths }`, so the app can ask. New types in the proto
