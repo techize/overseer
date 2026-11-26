@@ -7730,3 +7730,118 @@ async fn a_drop_gets_a_free_branch_and_refuses_s0_and_unknown_tickets() {
         other => panic!("{other:?}"),
     }
 }
+
+/// Writes the demo end-of-day scripts into `notes`: the index one leaves an
+/// `indexed` file, the split one writes a fixed split to its `--out` arg.
+fn demo_eod_scripts(notes: &std::path::Path) {
+    let tools = notes.join("Claude/tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    std::fs::write(tools.join("demo-index.sh"), "touch indexed\n").unwrap();
+    std::fs::write(
+        tools.join("demo-split.sh"),
+        r#"out=""
+while [ $# -gt 0 ]; do
+  if [ "$1" = "--out" ]; then out="$2"; fi
+  shift
+done
+cat > "$out" <<'JSON'
+{"date": "2026-01-02", "target_hours": 7.5,
+ "epics": [{"key": "DEMO-9", "summary": "Demo epic", "hours": 5.0},
+           {"key": "DEMO-8", "summary": "Demo BAU", "hours": 2.5}],
+ "derivation": {"sessions": [], "unknown_times": [], "bad_times": [],
+   "ticket_minutes": {"DEMO-1": 120.0, "DEMO-2": 60.0},
+   "ticket_epic": {"DEMO-1": "DEMO-9", "DEMO-2": "DEMO-8"},
+   "fit": "gap 4.50h to BAU DEMO-8"}}
+JSON
+"#,
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn end_of_day_runs_the_scripts_and_saves() {
+    let notes = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    demo_eod_scripts(notes.path());
+    let alloc = out.path().join("alloc/{yyyy}-{mm}-{dd}.json");
+    let settings = overseer_daemon::Config {
+        brain_dir: notes.path().to_path_buf(),
+        eod_index_command: vec!["sh".into(), "Claude/tools/demo-index.sh".into()],
+        eod_split_command: [
+            "sh",
+            "Claude/tools/demo-split.sh",
+            "--date",
+            "{date}",
+            "--out",
+            "{out}",
+        ]
+        .map(String::from)
+        .to_vec(),
+        eod_allocation_file: alloc.display().to_string(),
+        ..offline_settings()
+    };
+    let d = start_daemon_cfg(temp_socket(), overseer_daemon::EnvSource::Inherit, settings).await;
+    let mut c = Client::connect(&d.socket).await;
+    let draft = match c
+        .request(Request::EndOfDay {
+            target_quarters: None,
+        })
+        .await
+    {
+        Response::EndOfDay(d) => d,
+        other => panic!("{other:?}"),
+    };
+    assert!(notes.path().join("indexed").exists());
+    assert!(draft.split_ok, "{:?}", draft.problems);
+    assert_eq!(draft.target_quarters, 30);
+    assert!(!draft.target_fixed);
+    let keys: Vec<_> = draft
+        .epics
+        .iter()
+        .map(|e| (e.key.as_str(), e.quarters))
+        .collect();
+    assert_eq!(keys, vec![("DEMO-9", 20), ("DEMO-8", 10)]);
+    let hours: Vec<(String, u32)> = draft
+        .epics
+        .iter()
+        .map(|e| (e.key.clone(), e.quarters))
+        .collect();
+    let saved = c
+        .request(Request::SaveDay {
+            id: draft.id,
+            hours: hours.clone(),
+            replace: false,
+        })
+        .await;
+    let Response::DaySaved {
+        time_log,
+        allocation: Some(allocation),
+        push: Some(push),
+    } = saved
+    else {
+        panic!("{saved:?}");
+    };
+    let note = std::path::PathBuf::from(&time_log);
+    assert!(note.starts_with(notes.path()), "{time_log}");
+    assert!(std::fs::read_to_string(&note)
+        .unwrap()
+        .contains(&format!("# Time log {}", draft.day)));
+    let a: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&allocation).unwrap()).unwrap();
+    assert_eq!(a["epics"][0]["key"], "DEMO-9");
+    assert_eq!(a["epics"][0]["hours"], 5.0);
+    assert_eq!(a["epics"][1]["hours"], 2.5);
+    assert!(push.starts_with("jc push "), "{push}");
+    // A second save finds the files and asks first.
+    let again = c
+        .request(Request::SaveDay {
+            id: draft.id,
+            hours,
+            replace: false,
+        })
+        .await;
+    assert!(
+        matches!(&again, Response::DayExists { paths } if paths.len() == 2),
+        "{again:?}"
+    );
+}
