@@ -471,6 +471,7 @@ pub async fn run_until(
         brain_dir: cfg.settings.brain_dir.clone(),
         current_session: cfg.settings.current_session.clone(),
         state_dir: state_dir.clone(),
+        repos: cfg.settings.pr_repos.clone(),
     });
     let shutdown = Arc::new(Notify::new());
     let mut conns = JoinSet::new();
@@ -1386,6 +1387,47 @@ fn handle_frame(
                 outbox.send(Frame::Response { seq, resp });
             });
         }
+        // A ticket dropped on a slot (#87): the draft runs git to find a
+        // free branch, and the start creates a worktree, so both are
+        // answered from tasks.
+        Frame::Request {
+            seq,
+            req: Request::PrepareStart { slot, key, repo },
+        } => {
+            let (coord, plans) = (ctx.coord.clone(), ctx.plans.clone());
+            let outbox = outbox.clone();
+            store.spawn(async move {
+                let resp = tokio::task::spawn_blocking(move || {
+                    coord.prepare_start(slot, &key, repo, &plans)
+                })
+                .await
+                .unwrap_or_else(|e| Response::Error {
+                    message: format!("draft failed: {e}"),
+                });
+                outbox.send(Frame::Response { seq, resp });
+            });
+        }
+        Frame::Request {
+            seq,
+            req:
+                Request::StartTicket {
+                    slot,
+                    key,
+                    repo,
+                    branch,
+                },
+        } => {
+            let (coord, plans, courier) =
+                (ctx.coord.clone(), ctx.plans.clone(), ctx.courier.clone());
+            let outbox = outbox.clone();
+            store.spawn(async move {
+                let resp = coord
+                    .start_ticket(slot, &key, repo, &branch, &plans, unix_now())
+                    .await;
+                courier.poke();
+                outbox.send(Frame::Response { seq, resp });
+            });
+        }
         // Resolving targets can run git or kubectl (bounded by
         // `RESOLVE_WITHIN`), so it too is answered from a task.
         Frame::Request {
@@ -1876,6 +1918,9 @@ fn handle_request(
         // Answered in `handle_frame` from a task (it runs git and starts
         // sessions); this arm only keeps the match whole.
         Request::DecidePlan { .. } => err("not answered here".into()),
+        Request::PrepareStart { .. } | Request::StartTicket { .. } => {
+            err("not answered here".into())
+        }
         // Always Ok: a hook runs inside Claude and must never see a failure
         // because of the daemon's state.
         Request::Hook(ev) => {

@@ -15,6 +15,7 @@ pub mod reconnect;
 pub mod session;
 pub mod settings_view;
 pub mod sprint_view;
+pub mod start_card;
 pub mod start_dialog;
 pub mod startup_error;
 pub mod terminal_view;

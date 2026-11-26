@@ -826,6 +826,23 @@ pub enum Request {
     Kickoff {
         slot: SlotId,
     },
+    /// What dropping ticket `key` on `slot` would do, with nothing done
+    /// yet: `Response::StartDraft`. `repo` picks the repo; `None` takes the
+    /// last one used.
+    PrepareStart {
+        slot: SlotId,
+        key: String,
+        #[serde(default)]
+        repo: Option<PathBuf>,
+    },
+    /// Starts `slot` on ticket `key` in a new worktree of `repo` on
+    /// `branch`, with the start brief as its first prompt.
+    StartTicket {
+        slot: SlotId,
+        key: String,
+        repo: PathBuf,
+        branch: String,
+    },
     ClearNotices {
         slot: SlotId,
     },
@@ -1049,6 +1066,22 @@ pub struct PlanTarget {
     pub target: String,
     #[serde(default)]
     pub reason: Option<String>,
+}
+
+/// What starting a slot on a ticket would do, for the confirm card.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StartDraft {
+    pub slot: SlotId,
+    pub key: String,
+    pub title: String,
+    /// The repos a worktree can come from, the chosen one among them.
+    pub repos: Vec<PathBuf>,
+    pub repo: PathBuf,
+    /// A branch no other branch or worktree folder has yet.
+    pub branch: String,
+    pub worktree: PathBuf,
+    /// The first prompt the session starts with.
+    pub brief: String,
 }
 
 /// A git worktree a plan has made for a slot: `<worktree_root>/<repo>-<ticket>`.
@@ -1358,6 +1391,8 @@ pub enum Response {
     NeedsConfirm {
         message: String,
     },
+    /// The answer to `PrepareStart`.
+    StartDraft(StartDraft),
     Text {
         text: String,
     },
