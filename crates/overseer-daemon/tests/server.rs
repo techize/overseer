@@ -4730,12 +4730,21 @@ impl PlanRig {
     }
 
     async fn daemon_at(&self, socket: PathBuf) -> Daemon {
+        self.daemon_with(socket, |_| {}).await
+    }
+
+    async fn daemon_with(
+        &self,
+        socket: PathBuf,
+        adjust: impl FnOnce(&mut overseer_daemon::Config),
+    ) -> Daemon {
         let state_dir = socket.parent().unwrap().join("state");
-        let settings = overseer_daemon::Config {
+        let mut settings = overseer_daemon::Config {
             worktree_root: self.worktrees.clone(),
             current_session: self.s.dir.join("CURRENT_SESSION.md"),
             ..self.s.settings()
         };
+        adjust(&mut settings);
         let cfg = DaemonConfig {
             socket: socket.clone(),
             default_command: vec![self.bin.to_string_lossy().into_owned()],
@@ -7555,4 +7564,169 @@ async fn a_hooked_transcript_is_followed_and_answered() {
         c.request(Request::Conversation { slot: 99 }).await,
         Response::Error { .. }
     ));
+}
+
+/// A rig whose `pr_repos` is its `demo-api`, the repo a dropped ticket
+/// starts in. The PR source runs a command that lists nothing.
+async fn drop_rig(name: &str) -> (PlanRig, Daemon, Client) {
+    let rig = PlanRig::new(name);
+    let repo = rig.repo.clone();
+    let d = rig
+        .daemon_with(temp_socket(), move |c| {
+            c.pr_repos = vec![repo];
+            c.pr_command = vec!["/usr/bin/true".into()];
+        })
+        .await;
+    let mut c = Client::connect(&d.socket).await;
+    c.refresh().await;
+    (rig, d, c)
+}
+
+fn draft_of(resp: Response) -> overseer_proto::StartDraft {
+    match resp {
+        Response::StartDraft(d) => d,
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_dropped_ticket_starts_in_its_own_worktree() {
+    let (rig, _d, mut c) = drop_rig("drop").await;
+    let draft = draft_of(
+        c.request(Request::PrepareStart {
+            slot: 4,
+            key: "DEMO-12".into(),
+            repo: None,
+        })
+        .await,
+    );
+    let wt = rig.worktrees.join("demo-api-demo-12-widget-wiring");
+    assert_eq!(draft.slot, 4);
+    assert_eq!(draft.title, "Widget wiring");
+    assert_eq!(draft.repos, std::slice::from_ref(&rig.repo));
+    assert_eq!(draft.repo, rig.repo);
+    assert_eq!(draft.branch, "demo-12-widget-wiring");
+    assert_eq!(draft.worktree, wt);
+    assert!(draft.brief.starts_with("You are S4."), "{}", draft.brief);
+    assert!(draft.brief.contains("DEMO-12"), "{}", draft.brief);
+    assert!(
+        draft.brief.contains(&wt.display().to_string()),
+        "{}",
+        draft.brief
+    );
+    assert!(
+        draft.brief.contains("acceptance criteria"),
+        "{}",
+        draft.brief
+    );
+    // A draft changes nothing.
+    assert!(!wt.exists());
+    assert_eq!(item(&c.work().await, "DEMO-12").owner, None);
+
+    let resp = c
+        .request(Request::StartTicket {
+            slot: 4,
+            key: "DEMO-12".into(),
+            repo: draft.repo.clone(),
+            branch: draft.branch.clone(),
+        })
+        .await;
+    let text = match resp {
+        Response::Text { text } => text,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        text.lines().collect::<Vec<_>>(),
+        [
+            "S4: assigned DEMO-12".to_string(),
+            format!("S4: worktree {} created", wt.display()),
+            format!("S4: started in {}", wt.display()),
+        ]
+    );
+    assert_eq!(item(&c.work().await, "DEMO-12").owner, Some(4));
+    rig.starts_reach(1).await;
+    let prompt = rig.calls();
+    let prompt = prompt.split_once(" -- ").unwrap().1;
+    assert!(prompt.contains("acceptance criteria"), "{prompt}");
+
+    // S4 is busy now: another drop on it is refused with what it runs.
+    match c
+        .request(Request::PrepareStart {
+            slot: 4,
+            key: "DEMO-7".into(),
+            repo: None,
+        })
+        .await
+    {
+        Response::Error { message } => assert_eq!(message, "S4 is running DEMO-12"),
+        other => panic!("{other:?}"),
+    }
+    // The branch is taken, so the next draft for DEMO-12 elsewhere gets a
+    // suffix; DEMO-12 is S4's, so it is refused all the same.
+    match c
+        .request(Request::PrepareStart {
+            slot: 5,
+            key: "DEMO-12".into(),
+            repo: None,
+        })
+        .await
+    {
+        Response::Error { message } => assert!(message.contains("S4"), "{message}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_drop_gets_a_free_branch_and_refuses_s0_and_unknown_tickets() {
+    let (rig, _d, mut c) = drop_rig("drop-free").await;
+    // DEMO-7 has no title, so its branch is the key alone; that one and
+    // the worktree folder for `-2` are taken.
+    git_in(&rig.repo, &["branch", "demo-7"]);
+    std::fs::create_dir_all(rig.worktrees.join("demo-api-demo-7-2")).unwrap();
+    let resp = c
+        .request(Request::PrepareStart {
+            slot: 2,
+            key: "DEMO-7".into(),
+            repo: None,
+        })
+        .await;
+    let draft = draft_of(resp);
+    assert_eq!(draft.branch, "demo-7-3");
+    assert_eq!(draft.worktree, rig.worktrees.join("demo-api-demo-7-3"));
+
+    for (slot, key, want) in [
+        (
+            0,
+            "DEMO-7",
+            "S0 is the coordinator; drop a ticket on S1 to S6",
+        ),
+        (2, "DEMO-999", "DEMO-999 is not on the board"),
+    ] {
+        match c
+            .request(Request::PrepareStart {
+                slot,
+                key: key.into(),
+                repo: None,
+            })
+            .await
+        {
+            Response::Error { message } => assert_eq!(message, want),
+            other => panic!("{other:?}"),
+        }
+    }
+    // A repo that is not offered is refused at start.
+    match c
+        .request(Request::StartTicket {
+            slot: 2,
+            key: "DEMO-7".into(),
+            repo: rig.work5.clone(),
+            branch: "demo-7".into(),
+        })
+        .await
+    {
+        Response::Error { message } => {
+            assert!(message.contains("is not one of the repos"), "{message}")
+        }
+        other => panic!("{other:?}"),
+    }
 }

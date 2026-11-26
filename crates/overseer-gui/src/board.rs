@@ -25,6 +25,7 @@ use overseer_proto::{
 
 use crate::app::{colors, open_external, OverseerApp};
 use crate::sprint_view::{is_http_url, slot_branches};
+use crate::start_card::DraggedTicket;
 
 // ---------------------------------------------------------------------------
 // Pure logic
@@ -840,6 +841,13 @@ fn tone_color(tone: Tone) -> u32 {
 }
 
 /// The card's left edge: the badge colour while the slot runs.
+/// Whether a ticket dropped on slot `id` in `state` can start there: a
+/// worker slot with no session. Only the look of the drop; the daemon
+/// decides.
+pub(crate) fn drop_takes(id: SlotId, state: &SlotState) -> bool {
+    id != 0 && matches!(state, SlotState::Empty | SlotState::Exited { .. })
+}
+
 fn edge_color(tone: Tone) -> u32 {
     match tone {
         Tone::Running
@@ -958,6 +966,7 @@ impl OverseerApp {
         // The ticket, branch and PRs line under the title.
         let on = slot_branches(std::slice::from_ref(info), overseer_proto::git::repo_branch);
         let line = header_line(&self.work, id, on.first().map(|(_, on)| on));
+        let drop_free = drop_takes(id, &info.state);
         div()
             .id(("card", id as usize))
             .flex_1()
@@ -1098,6 +1107,20 @@ impl OverseerApp {
             }))
             .cursor_pointer()
             .hover(|s| s.bg(rgb(colors::CARD_HOVER)))
+            // A ticket dragged from the kanban: a free worker slot lights up
+            // to take it, a busy one or S0 shows it would refuse (#87).
+            .drag_over::<DraggedTicket>(move |style, _, _, _| {
+                if drop_free {
+                    style
+                        .border_color(rgb(colors::ACCENT))
+                        .bg(rgb(colors::ACCENT_BG))
+                } else {
+                    style.border_color(rgb(colors::ORANGE))
+                }
+            })
+            .on_drop(cx.listener(move |this, d: &DraggedTicket, window, cx| {
+                this.drop_ticket(id, d.key.clone(), window, cx)
+            }))
             .on_click(cx.listener(
                 move |this, ev: &gpui::ClickEvent, window, cx| match card_press(
                     !this.pane_hidden,
@@ -1964,6 +1987,24 @@ mod tests {
 
     fn work(items: Vec<WorkItem>) -> WorkView {
         WorkView { items, ..no_work() }
+    }
+
+    #[test]
+    fn only_a_free_worker_slot_takes_a_dropped_ticket() {
+        let exited = SlotState::Exited {
+            code: Some(0),
+            at: 0,
+        };
+        let running = SlotState::Running { pid: 1, since: 0 };
+        let resumable = SlotState::Resumable {
+            session_id: "s".into(),
+            at: 0,
+        };
+        assert!(drop_takes(3, &SlotState::Empty));
+        assert!(drop_takes(3, &exited));
+        assert!(!drop_takes(3, &running));
+        assert!(!drop_takes(3, &resumable));
+        assert!(!drop_takes(0, &SlotState::Empty));
     }
 
     #[test]

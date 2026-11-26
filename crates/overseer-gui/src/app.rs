@@ -52,6 +52,7 @@ use crate::session::{
 use crate::session::{incarnation, keep_view, restart_begin, restart_on_change, Incarnation};
 use crate::session::{reply_note, EntryAction, EntryKind, PanelEntry, RestartPlan};
 use crate::settings_view::{SettingsEvent, SettingsPanel};
+use crate::start_card::{StartCard, StartCardEvent};
 use crate::start_dialog::{DialogEvent, Prefill, StartDialog};
 use crate::{FrameHub, TerminalView, Theme};
 
@@ -142,8 +143,8 @@ pub(crate) fn locks_return(from: Screen) -> Option<SlotId> {
 }
 
 /// Navigation keys work anywhere in the window except the start dialog, the
-/// picker, the plan view and Settings.
-const NAV: &str = "Overseer && !StartDialog && !Picker && !PlanView && !Settings";
+/// picker, the drop-to-start card, the plan view and Settings.
+const NAV: &str = "Overseer && !StartDialog && !Picker && !StartCard && !PlanView && !Settings";
 
 pub fn key_bindings() -> Vec<KeyBinding> {
     let nav = Some(NAV);
@@ -538,6 +539,8 @@ pub struct OverseerApp {
     picker: Option<(Entity<Picker>, Subscription)>,
     /// The open plan approval view.
     plan_view: Option<(Entity<PlanView>, Subscription)>,
+    /// The confirm card for a ticket dropped on a slot.
+    start_card: Option<(Entity<StartCard>, Subscription)>,
     /// Plan views closed with a decision still on its way, kept for the
     /// answer.
     plan_leaving: Vec<(Entity<PlanView>, Subscription)>,
@@ -642,6 +645,7 @@ impl OverseerApp {
             dialog: None,
             picker: None,
             plan_view: None,
+            start_card: None,
             plan_leaving: Vec::new(),
             settings: None,
             settings_leaving: Vec::new(),
@@ -824,6 +828,9 @@ impl OverseerApp {
         }
         if let Some((p, _)) = &self.picker {
             p.update(cx, |p, _| p.set_client(client.clone()));
+        }
+        if let Some((c, _)) = &self.start_card {
+            c.update(cx, |c, _| c.set_client(client.clone()));
         }
         if let Some((v, _)) = &self.plan_view {
             v.update(cx, |v, _| v.set_client(client.clone()));
@@ -1596,11 +1603,12 @@ impl OverseerApp {
             .unwrap_or_default()
     }
 
-    /// The start dialog, the picker, the plan view or Settings is up;
-    /// navigation waits for it.
+    /// The start dialog, the picker, the drop-to-start card, the plan view
+    /// or Settings is up; navigation waits for it.
     pub(crate) fn modal_open(&self) -> bool {
         self.dialog.is_some()
             || self.picker.is_some()
+            || self.start_card.is_some()
             || self.plan_view.is_some()
             || self.settings.is_some()
     }
@@ -1886,6 +1894,81 @@ impl OverseerApp {
             });
         })
         .detach();
+    }
+
+    /// A ticket dropped on a slot card (#87): ask the daemon for the draft,
+    /// then show it on the confirm card. A refusal (the slot is busy, the
+    /// ticket is another slot's) goes to the status line.
+    pub(crate) fn drop_ticket(
+        &mut self,
+        slot: SlotId,
+        key: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.modal_open() || !self.slots_known {
+            return;
+        }
+        self.status = None;
+        let client = self.client.clone();
+        let req = Request::PrepareStart {
+            slot,
+            key,
+            repo: None,
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            let reply = client.request(req).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                match reply {
+                    Ok(Response::StartDraft(draft)) if !this.modal_open() => {
+                        this.open_start_card(draft, window, cx)
+                    }
+                    // Something else opened meanwhile; nothing was done.
+                    Ok(Response::StartDraft(_)) => {}
+                    Ok(Response::Error { message }) => this.status = Some(message),
+                    Ok(other) => {
+                        this.status = Some(format!("unexpected reply to the drop: {other:?}"))
+                    }
+                    Err(e) => {
+                        this.status = Some(format!("{} ({e:#})", crate::terminal_view::LOST_DAEMON))
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn open_start_card(
+        &mut self,
+        draft: overseer_proto::StartDraft,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let client = self.client.clone();
+        let card = cx.new(|cx| StartCard::new(draft, client, cx));
+        let sub = cx.subscribe_in(
+            &card,
+            window,
+            |this, _card, ev: &StartCardEvent, window, cx| {
+                match ev {
+                    StartCardEvent::Started { slot, text } => {
+                        this.start_card = None;
+                        this.status = Some(text.lines().collect::<Vec<_>>().join("; "));
+                        this.select(*slot, cx);
+                        this.restore_focus(window, cx);
+                    }
+                    StartCardEvent::Closed => {
+                        this.start_card = None;
+                        this.restore_focus(window, cx);
+                    }
+                }
+                cx.notify();
+            },
+        );
+        window.focus(&card.focus_handle(cx));
+        self.start_card = Some((card, sub));
+        cx.notify();
     }
 
     /// A click on a ticket card that is not Done.
@@ -2262,6 +2345,7 @@ impl Render for OverseerApp {
             .children(popover)
             .children(self.dialog.as_ref().map(|(d, _)| d.clone()))
             .children(self.picker.as_ref().map(|(p, _)| p.clone()))
+            .children(self.start_card.as_ref().map(|(c, _)| c.clone()))
             .children(self.plan_view.as_ref().map(|(p, _)| p.clone()))
             .children(self.settings.as_ref().map(|(s, _)| s.clone()))
     }

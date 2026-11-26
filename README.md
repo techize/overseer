@@ -548,6 +548,17 @@ trimming):
   Cmd+click opens its ticket folder, and hovering shows its details. A click
   on a Done card still opens its folder. A PR row with a session chip opens
   that session, and Cmd+click on any PR row opens it in the browser.
+- Drag a ticket card onto a free slot's card (S1 to S6, with no session) to
+  start it there in its own worktree. A confirm card shows the repo (Left and
+  Right pick another from `pr_repos` and the repos slots work in; the last one
+  used comes first), the branch (`demo-12-short-title`, with `-2` and so on
+  when that name or its folder is taken), the worktree path under
+  `worktree_root` and the brief. Nothing happens until Start; Cancel or Esc
+  leaves the board as it was. A busy slot refuses the drop and the status
+  line says why ("S2 is running DEMO-7"). The brief comes from
+  `roles/start.md` in the state folder, which you can edit; it tells the
+  session to read the full ticket, description and acceptance criteria,
+  before it starts.
 - A running session waiting for its next prompt shows Your turn, and the
   header counts them ("1 your turn") beside Needs you.
 - The header ends with each work source, its count and the time of its last

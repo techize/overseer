@@ -25,6 +25,6 @@ pub use msg::{
     LockView, NotesRemote, Notice, Plan, PlanDecision, PlanRecord, PlanSlot, PlanState, PlanTarget,
     PlanWorktree, PullRequest, QueueEntry, QueueState, Relay, RelayKind, RelayState, Report,
     ReportKind, Request, Response, Sender, SlotId, SlotInfo, SlotState, SourceStatus, Span,
-    SpanKind, SprintDay, Stage, Summary, TokenKind, Wait, WorkItem, WorkView, WriteCheck,
-    CHECK_ENV, EVENT_TYPES, JIRA_OFF, PRS_OFF, UNKNOWN_STATUS,
+    SpanKind, SprintDay, Stage, StartDraft, Summary, TokenKind, Wait, WorkItem, WorkView,
+    WriteCheck, CHECK_ENV, EVENT_TYPES, JIRA_OFF, PRS_OFF, UNKNOWN_STATUS,
 };

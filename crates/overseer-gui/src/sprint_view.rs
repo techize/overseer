@@ -751,6 +751,10 @@ fn ticket_card(
     let click_key = c.key.clone();
     let owner = c.slot;
     let folder = c.folder.clone();
+    let dragged = crate::start_card::DraggedTicket {
+        key: c.key.clone(),
+        title: c.title.to_string(),
+    };
     div()
         .id(ElementId::Name(format!("kanban-{}", c.key).into()))
         .flex_none()
@@ -835,6 +839,8 @@ fn ticket_card(
         .cursor_pointer()
         .hover(|s| s.bg(rgb(colors::CARD_HOVER)))
         .tooltip(move |_, cx| cx.new(|_| HoverCard(hover.clone())).into())
+        // Dropped on a free slot's card, it starts there (#87).
+        .on_drag(dragged, |d, _, _, cx| cx.new(|_| d.clone()))
         .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
             // Cmd+click keeps the ticket-folder shortcut.
             if ev.modifiers().platform {

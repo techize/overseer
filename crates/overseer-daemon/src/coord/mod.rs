@@ -5,6 +5,7 @@
 //! `Event::CoordChanged`.
 
 pub mod plan;
+pub mod start;
 pub mod worktree;
 
 use std::collections::HashMap;
@@ -34,6 +35,11 @@ pub struct CoordService {
     events: broadcast::Sender<Event>,
     /// The name plan notices use for the person who approves.
     user: String,
+    /// The repo the last drop-to-start used, offered first next time.
+    last_repo: std::sync::Mutex<Option<std::path::PathBuf>>,
+    /// Held while a dropped ticket starts, so two drops on one slot cannot
+    /// both find it free.
+    starting: tokio::sync::Mutex<()>,
 }
 
 fn error(message: impl Into<String>) -> Response {
@@ -71,6 +77,8 @@ impl CoordService {
             ledger,
             events,
             user,
+            last_repo: std::sync::Mutex::new(None),
+            starting: tokio::sync::Mutex::new(()),
         })
     }
 

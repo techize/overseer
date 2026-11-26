@@ -18,6 +18,8 @@ const BRAIN_RULES_COORDINATOR: &str = include_str!("roles/brain_coordinator.md")
 const KICKOFF: &str = include_str!("roles/kickoff.md");
 /// The prompt built from a slot's assigned work items.
 pub const ASSIGNMENT: &str = include_str!("roles/assignment.md");
+/// The brief for a ticket dropped onto a free slot from the board.
+pub const START: &str = include_str!("roles/start.md");
 
 /// Stable hashes (FNV-1a 64 over the text with trailing whitespace removed)
 /// of role files Overseer shipped before and since replaced. A file on disk
@@ -150,6 +152,12 @@ pub fn assignment_template(state_dir: &Path) -> io::Result<String> {
         ASSIGNMENT,
         PREVIOUS_ASSIGNMENT,
     )?;
+    std::fs::read_to_string(path)
+}
+
+/// The drop-to-start brief from `<state>/roles/start.md`.
+pub fn start_template(state_dir: &Path) -> io::Result<String> {
+    let path = ensure_template(&state_dir.join("roles"), "start.md", START, &[])?;
     std::fs::read_to_string(path)
 }
 

@@ -77,6 +77,8 @@ pub struct PlanCtx {
     pub current_session: PathBuf,
     /// Holds `roles/assignment.md`, the kickoff template.
     pub state_dir: PathBuf,
+    /// `config.pr_repos`: the repos a ticket dropped on a slot can start in.
+    pub repos: Vec<PathBuf>,
 }
 
 /// Whether `ticket` can be part of a folder and branch name:
@@ -289,7 +291,7 @@ fn error(message: impl Into<String>) -> Response {
 }
 
 impl PlanCtx {
-    fn state_of(&self, slot: SlotId) -> SlotState {
+    pub(super) fn state_of(&self, slot: SlotId) -> SlotState {
         self.manager.lock().unwrap().list()[slot as usize]
             .state
             .clone()
@@ -467,7 +469,7 @@ impl CoordService {
 
     /// One slot's steps (Ruling 5). A failing step ends this slot's part
     /// with one line saying so; the next slot goes on.
-    async fn run_slot(
+    pub(super) async fn run_slot(
         &self,
         plan: i64,
         ps: &PlanSlot,
