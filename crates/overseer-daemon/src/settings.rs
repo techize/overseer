@@ -288,6 +288,10 @@ pub const CATALOGUE: &[Spec] = &[
     }),
     daemon("journal_path", BRAIN, NOT_EMPTY, |c| text(&c.journal_path)),
     daemon("session_note", BRAIN, NOT_EMPTY, |c| text(&c.session_note)),
+    daemon("eod_time_log", BRAIN, NOT_EMPTY, |c| text(&c.eod_time_log)),
+    daemon("eod_allocation_file", BRAIN, NOT_EMPTY, |c| {
+        text(&c.eod_allocation_file)
+    }),
     daemon("shared_files", BRAIN, SettingKind::List, |c| {
         list(&c.shared_files)
     }),
@@ -347,6 +351,27 @@ pub const CATALOGUE: &[Spec] = &[
         SettingKind::List,
         COMMAND_NOTE,
         Some(|c| list(&c.sync_command)),
+    ),
+    read_only(
+        "eod_index_command",
+        COMMANDS,
+        SettingKind::List,
+        COMMAND_NOTE,
+        Some(|c| list(&c.eod_index_command)),
+    ),
+    read_only(
+        "eod_split_command",
+        COMMANDS,
+        SettingKind::List,
+        COMMAND_NOTE,
+        Some(|c| list(&c.eod_split_command)),
+    ),
+    read_only(
+        "eod_target_arg",
+        COMMANDS,
+        SettingKind::List,
+        COMMAND_NOTE,
+        Some(|c| list(&c.eod_target_arg)),
     ),
     app("terminal.font_family", TERMINAL, NOT_EMPTY),
     app(

@@ -426,7 +426,8 @@ unsaved edits the first `Esc` only warns).
   stores it in the Keychain. They show only whether a token is found, never
   the token itself.
 - Read-only here: `brain_writer` (it has a setup checklist), `jira_command`,
-  `bd_command` and `sync_command` (a typo turns a source off) and
+  `bd_command`, `sync_command`, `eod_index_command`, `eod_split_command` and
+  `eod_target_arg` (a typo turns a source off) and
   `terminal.ansi` (the 16 colours). Change them in `config.toml`; Open opens
   each file that exists in your text editor. `targets.toml` is shown with the
   number of patterns the daemon read from it.
@@ -454,6 +455,11 @@ group for the notes keys). They apply after a daemon restart.
 | `ticket_pattern` | `""` | Empty: built from your Jira project keys, as `(DEMO|OPS)-\d+`. |
 | `user_name` | first word of your macOS full name | The name used in prompts and messages. |
 | `notes_dir` (alias `brain_dir`) | `~/Repos/2ndBrain` if it exists, else `~/OverseerNotes` | The notes folder. Overseer owns a folder only when it holds the `.overseer-notes` marker; it creates one itself only for the default `~/OverseerNotes`. |
+| `eod_index_command` | `["python3", "Claude/tools/session-index.py"]` | End of day: the command, run in the notes folder, that rebuilds the session index. Cleared for an Overseer-owned folder. |
+| `eod_split_command` | `["python3", "Claude/tools/day-minutes.py", "--date", "{date}", "--out", "{out}"]` | End of day: the command, run in the notes folder, that splits the day's minutes across tickets and writes them to `{out}`. Cleared for an Overseer-owned folder. |
+| `eod_time_log` | `06-Daily/{yyyy}/{mm}-{Month}/{yyyy}-{mm}-{dd}-time-log.md` | End of day: where the day's time log is written, under the notes folder. |
+| `eod_allocation_file` | `~/.jira-clockify/allocations/{yyyy}-{mm}-{dd}.json` | End of day: where the approved allocation file is written. |
+| `eod_target_arg` | `["--target", "{hours}"]` | End of day: added to the split command when the day's target changes; `{hours}` is the target in hours (`9`, `8.75`). Not cleared for an owned folder. |
 
 The tokens are not config keys. Set them in Settings (Keychain) or in the
 environment:

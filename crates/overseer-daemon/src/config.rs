@@ -68,6 +68,18 @@ pub struct Config {
     pub notes_merge_theirs: Vec<String>,
     /// Run in `brain_dir` after the queue drains; skipped when the file is missing.
     pub sync_command: Vec<String>,
+    /// End of day: run in `brain_dir` to rebuild the session index.
+    pub eod_index_command: Vec<String>,
+    /// End of day: run in `brain_dir` to split the day's minutes; `{date}`
+    /// and `{out}` are filled in.
+    pub eod_split_command: Vec<String>,
+    /// End of day: where the day's time log is written, under `brain_dir`.
+    pub eod_time_log: String,
+    /// End of day: where the allocation file is written; `~` is the home folder.
+    pub eod_allocation_file: String,
+    /// End of day: added to the split command when the day's target changes;
+    /// `{hours}` is the target in hours.
+    pub eod_target_arg: Vec<String>,
     pub bd_command: Vec<String>,
     /// Where plans put their git worktrees: `<worktree_root>/<repo>-<ticket>`.
     pub worktree_root: PathBuf,
@@ -175,6 +187,18 @@ impl Default for Config {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            eod_index_command: strings(&["python3", "Claude/tools/session-index.py"]),
+            eod_split_command: strings(&[
+                "python3",
+                "Claude/tools/day-minutes.py",
+                "--date",
+                "{date}",
+                "--out",
+                "{out}",
+            ]),
+            eod_time_log: "06-Daily/{yyyy}/{mm}-{Month}/{yyyy}-{mm}-{dd}-time-log.md".to_string(),
+            eod_allocation_file: "~/.jira-clockify/allocations/{yyyy}-{mm}-{dd}.json".to_string(),
+            eod_target_arg: strings(&["--target", "{hours}"]),
             bd_command: vec!["bd".to_string()],
             worktree_root: PathBuf::from("~/Repos/.worktrees"),
             sprint_name: String::new(),
@@ -372,6 +396,13 @@ impl Config {
             // The default runs a script that lives in the maintainer's vault.
             if !set("sync_command") {
                 config.sync_command.clear();
+            }
+            // The default commands are scripts in the maintainer's vault.
+            if !set("eod_index_command") {
+                config.eod_index_command.clear();
+            }
+            if !set("eod_split_command") {
+                config.eod_split_command.clear();
             }
         }
         config.jira_site = site_host(&config.jira_site);
@@ -736,6 +767,62 @@ mod tests {
         assert!(err.is_none());
         assert!(c.notes_owned);
         assert_eq!(c.sync_command, vec!["demo-sync".to_string()]);
+    }
+
+    #[test]
+    fn eod_defaults() {
+        let h = vault_home();
+        let (c, err) = Config::load_with(&missing(), &h.0, Some("Demo Person"));
+        assert!(err.is_none());
+        assert_eq!(
+            c.eod_index_command,
+            vec!["python3", "Claude/tools/session-index.py"]
+        );
+        assert_eq!(
+            c.eod_split_command,
+            vec![
+                "python3",
+                "Claude/tools/day-minutes.py",
+                "--date",
+                "{date}",
+                "--out",
+                "{out}"
+            ]
+        );
+        assert_eq!(
+            c.eod_time_log,
+            "06-Daily/{yyyy}/{mm}-{Month}/{yyyy}-{mm}-{dd}-time-log.md"
+        );
+        assert_eq!(
+            c.eod_allocation_file,
+            "~/.jira-clockify/allocations/{yyyy}-{mm}-{dd}.json"
+        );
+        assert_eq!(c.eod_target_arg, vec!["--target", "{hours}"]);
+    }
+
+    #[test]
+    fn owned_folder_clears_the_eod_commands() {
+        let h = fresh_home();
+        let (c, _) = Config::load_with(&missing(), &h.0, Some("Demo Person"));
+        assert!(c.notes_owned);
+        assert!(c.eod_index_command.is_empty());
+        assert!(c.eod_split_command.is_empty());
+        assert_eq!(
+            c.eod_time_log,
+            "06-Daily/{yyyy}/{mm}-{Month}/{yyyy}-{mm}-{dd}-time-log.md"
+        );
+        assert_eq!(c.eod_target_arg, vec!["--target", "{hours}"]);
+    }
+
+    #[test]
+    fn owned_folder_keeps_a_set_eod_split_command() {
+        let h = fresh_home();
+        let (_d, p) = write("eod_split_command = [\"demo-split\", \"{out}\"]\n");
+        let (c, err) = Config::load_with(&p, &h.0, None);
+        assert!(err.is_none());
+        assert!(c.notes_owned);
+        assert_eq!(c.eod_split_command, vec!["demo-split", "{out}"]);
+        assert!(c.eod_index_command.is_empty());
     }
 
     #[test]
