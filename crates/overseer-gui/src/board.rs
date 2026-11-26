@@ -187,6 +187,23 @@ fn refresh_button(busy: bool, cx: &mut Context<OverseerApp>) -> impl IntoElement
         .child(if busy { "Refreshing..." } else { "Refresh" })
 }
 
+/// Opens the command palette, for the mouse; Cmd+K does the same.
+fn palette_button(cx: &mut Context<OverseerApp>) -> impl IntoElement {
+    div()
+        .id("open-palette")
+        .px_2()
+        .rounded(px(4.))
+        .border_1()
+        .border_color(rgb(colors::BUTTON_BORDER))
+        .bg(rgb(colors::BUTTON))
+        .text_xs()
+        .text_color(rgb(colors::TEXT))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(colors::CARD_HOVER)))
+        .on_click(cx.listener(|this, _, window, cx| this.open_palette(window, cx)))
+        .child("\u{2318}K")
+}
+
 /// Longest source error the header shows before cutting it.
 const MAX_SOURCE_MESSAGE: usize = 40;
 
@@ -1307,6 +1324,7 @@ impl OverseerApp {
                                     }))
                                     .child(source_line(&self.work, local_hhmm)),
                             )
+                            .child(palette_button(cx))
                             .child(refresh_button(self.refreshing_work, cx)),
                     ),
             )

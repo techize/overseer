@@ -18,11 +18,13 @@
 //! - `Tab` on the board or in the conversation pane's reply box selects the
 //!   next waiting slot; `Cmd+\` on the board or in the pane hides or shows
 //!   the pane. Neither is bound anywhere else, so the dialogs keep Tab.
+//! - `Cmd+K` opens the command palette (`palette`) anywhere navigation
+//!   works, the terminal included.
 //!
 //! The routing is GPUI's keymap with the contexts `Overseer` (window),
 //! `Board`, `Conversation` (the pane beside the board), `ConvReply` (its
 //! reply box), `Session`, `Terminal`, `Locks`, `StartDialog`, `Picker`,
-//! `PlanView` and `Settings`;
+//! `Palette`, `PlanView` and `Settings`;
 //! `key_bindings` is tested against GPUI's `Keymap` directly.
 
 use std::collections::{HashMap, HashSet};
@@ -44,6 +46,7 @@ use crate::board::Dir;
 use crate::conversation_view::{Conv, SLOT_COUNT};
 use crate::daemon_info::DaemonKnown;
 use crate::locks_view::LocksState;
+use crate::palette::{Command, Palette, PaletteEvent};
 use crate::picker::{Picker, PickerEvent};
 use crate::plan_view::{PlanEvent, PlanView};
 use crate::session::{
@@ -120,6 +123,7 @@ actions!(
         OpenSettings,
         NextWaiting,
         TogglePane,
+        OpenPalette,
     ]
 );
 
@@ -143,8 +147,10 @@ pub(crate) fn locks_return(from: Screen) -> Option<SlotId> {
 }
 
 /// Navigation keys work anywhere in the window except the start dialog, the
-/// picker, the drop-to-start card, the plan view and Settings.
-const NAV: &str = "Overseer && !StartDialog && !Picker && !StartCard && !PlanView && !Settings";
+/// picker, the command palette, the drop-to-start card, the plan view and
+/// Settings.
+const NAV: &str =
+    "Overseer && !StartDialog && !Picker && !Palette && !StartCard && !PlanView && !Settings";
 
 pub fn key_bindings() -> Vec<KeyBinding> {
     let nav = Some(NAV);
@@ -160,6 +166,7 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-n", StartSession, nav),
         KeyBinding::new("cmd-shift-l", GoLocks, nav),
         KeyBinding::new("cmd-,", OpenSettings, nav),
+        KeyBinding::new("cmd-k", OpenPalette, nav),
         // Not from the terminal: there Esc closes the find bar or goes to
         // Claude Code.
         // Nor from an open Holds or Relays entry row, which takes Esc itself.
@@ -537,6 +544,8 @@ pub struct OverseerApp {
     terminals: HashMap<SlotId, TermEntry>,
     dialog: Option<(Entity<StartDialog>, Subscription)>,
     picker: Option<(Entity<Picker>, Subscription)>,
+    /// The command palette, while it is up.
+    palette: Option<(Entity<Palette>, Subscription)>,
     /// The open plan approval view.
     plan_view: Option<(Entity<PlanView>, Subscription)>,
     /// The confirm card for a ticket dropped on a slot.
@@ -644,6 +653,7 @@ impl OverseerApp {
             terminals: HashMap::new(),
             dialog: None,
             picker: None,
+            palette: None,
             plan_view: None,
             start_card: None,
             plan_leaving: Vec::new(),
@@ -1608,6 +1618,7 @@ impl OverseerApp {
     pub(crate) fn modal_open(&self) -> bool {
         self.dialog.is_some()
             || self.picker.is_some()
+            || self.palette.is_some()
             || self.start_card.is_some()
             || self.plan_view.is_some()
             || self.settings.is_some()
@@ -1782,6 +1793,59 @@ impl OverseerApp {
         window.focus(&picker.focus_handle(cx));
         self.picker = Some((picker, sub));
         cx.notify();
+    }
+
+    /// The command palette: Cmd+K, or the board's Cmd+K button.
+    pub(crate) fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal_open() {
+            return;
+        }
+        self.status = None;
+        let on = crate::sprint_view::slot_branches(&self.slots, overseer_proto::git::repo_branch);
+        let rows = crate::palette::rows(&self.slots, &self.work, &on, self.attention.count());
+        let home = self.home.clone();
+        let palette = cx.new(|cx| Palette::new(rows, home, cx));
+        let sub = cx.subscribe_in(
+            &palette,
+            window,
+            |this, _, ev: &PaletteEvent, window, cx| {
+                this.palette = None;
+                match ev {
+                    PaletteEvent::Closed => this.restore_focus(window, cx),
+                    PaletteEvent::Run(c) => this.run_command(c.clone(), window, cx),
+                }
+                cx.notify();
+            },
+        );
+        window.focus(&palette.focus_handle(cx));
+        self.palette = Some((palette, sub));
+        cx.notify();
+    }
+
+    /// Does what a palette row says.
+    fn run_command(&mut self, c: Command, window: &mut Window, cx: &mut Context<Self>) {
+        match c {
+            Command::OpenSlot(id) => self.go_session(id, window, cx),
+            Command::Message(id) => {
+                self.go_session(id, window, cx);
+                self.open_message(id, window, cx);
+            }
+            Command::OpenUrl(url) => {
+                open_external(url, "the pull request");
+                self.restore_focus(window, cx);
+            }
+            Command::OpenFolder(folder) => {
+                open_external(folder, "the ticket folder");
+                self.restore_focus(window, cx);
+            }
+            Command::NextWaiting => {
+                self.restore_focus(window, cx);
+                self.next_waiting_slot(cx);
+            }
+            Command::Locks => self.go_locks(window, cx),
+            // The palette asks what happened and writes the report itself.
+            Command::BugReport(_) => self.restore_focus(window, cx),
+        }
     }
 
     /// After assigning to a slot with no session: fetch its kickoff and
@@ -2332,6 +2396,9 @@ impl Render for OverseerApp {
             .on_action(cx.listener(|this, _: &GoS6, w, cx| this.go_session(6, w, cx)))
             .on_action(cx.listener(|this, _: &NextWaiting, _, cx| this.next_waiting_slot(cx)))
             .on_action(cx.listener(|this, _: &TogglePane, window, cx| this.toggle_pane(window, cx)))
+            .on_action(
+                cx.listener(|this, _: &OpenPalette, window, cx| this.open_palette(window, cx)),
+            )
             .on_action(cx.listener(|this, _: &StartSession, window, cx| {
                 if let Some(id) = start_target(this.screen, this.selected, &this.slots) {
                     this.open_dialog(id, window, cx);
@@ -2345,6 +2412,7 @@ impl Render for OverseerApp {
             .children(popover)
             .children(self.dialog.as_ref().map(|(d, _)| d.clone()))
             .children(self.picker.as_ref().map(|(p, _)| p.clone()))
+            .children(self.palette.as_ref().map(|(p, _)| p.clone()))
             .children(self.start_card.as_ref().map(|(c, _)| c.clone()))
             .children(self.plan_view.as_ref().map(|(p, _)| p.clone()))
             .children(self.settings.as_ref().map(|(s, _)| s.clone()))
@@ -2494,6 +2562,45 @@ mod tests {
             assert_eq!(routed(k, PICKER), None, "{k}");
         }
         assert_eq!(routed("cmd-q", PICKER), Some("overseer::Quit"));
+    }
+
+    #[test]
+    fn cmd_k_opens_the_palette_wherever_navigation_works() {
+        const REPLY: &[&str] = &["Overseer", "Conversation", "ConvReply"];
+        for ctx in [TERMINAL, CHROME, BOARD, REPLY] {
+            assert_eq!(
+                routed("cmd-k", ctx),
+                Some("overseer::OpenPalette"),
+                "{ctx:?}"
+            );
+        }
+        for ctx in [DIALOG, PICKER, PLAN, SETTINGS] {
+            assert_eq!(routed("cmd-k", ctx), None, "{ctx:?}");
+        }
+        // The plain key stays with the terminal and the reply box.
+        assert_eq!(routed("k", TERMINAL), None);
+    }
+
+    #[test]
+    fn the_palette_keeps_its_keys() {
+        const PALETTE: &[&str] = &["Overseer", "Palette"];
+        for k in [
+            "a",
+            "l",
+            "p",
+            "up",
+            "down",
+            "enter",
+            "escape",
+            "tab",
+            "cmd-k",
+            "cmd-1",
+            "cmd-n",
+            "cmd-escape",
+        ] {
+            assert_eq!(routed(k, PALETTE), None, "{k}");
+        }
+        assert_eq!(routed("cmd-q", PALETTE), Some("overseer::Quit"));
     }
 
     #[test]
