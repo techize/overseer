@@ -410,6 +410,8 @@ pub fn allocation_json(raw: &Value, d: &DayDraft, hours: &[(String, u32)]) -> Va
 /// The last draft whose split worked, kept for `save`.
 struct Stored {
     id: u64,
+    /// When the run started: the day the saved files are named for.
+    ran_at: i64,
     raw: Value,
     draft: DayDraft,
 }
@@ -474,11 +476,18 @@ impl EndOfDay {
 
     /// A service already holding `draft` with the split `raw` (tests).
     #[cfg(test)]
-    fn with_draft(cfg: &crate::Config, home: PathBuf, raw: Value, draft: DayDraft) -> Self {
+    fn with_draft(
+        cfg: &crate::Config,
+        home: PathBuf,
+        ran_at: i64,
+        raw: Value,
+        draft: DayDraft,
+    ) -> Self {
         let tmp = home.join("tmp");
         let eod = Self::build(cfg, home, BaseEnv::ready(Vec::new()), None, tmp);
         *eod.last.lock().unwrap() = Some(Stored {
             id: draft.id,
+            ran_at,
             raw,
             draft,
         });
@@ -506,6 +515,7 @@ impl EndOfDay {
         // A failed run leaves nothing to save, so an older draft is stale too.
         *self.last.lock().unwrap() = raw.map(|raw| Stored {
             id,
+            ran_at: now,
             raw,
             draft: d.clone(),
         });
@@ -644,10 +654,14 @@ impl EndOfDay {
                 hours_text(d.target_quarters)
             ));
         }
-        let note = self.notes.join(fill_template(&self.time_log, now, 0, ""));
+        // Named for the run's day, which the content and `--date-str` use,
+        // even when the save comes after midnight.
+        let note = self
+            .notes
+            .join(fill_template(&self.time_log, s.ran_at, 0, ""));
         let alloc = (!self.allocation_file.is_empty()).then(|| {
             expand_home(
-                &fill_template(&self.allocation_file, now, 0, ""),
+                &fill_template(&self.allocation_file, s.ran_at, 0, ""),
                 &self.home,
             )
         });
@@ -860,7 +874,7 @@ mod tests {
         let raw: Value = serde_json::from_str(SPLIT).unwrap();
         let split = read_split(SPLIT, &cfg.brain_dir).unwrap();
         let d = draft(7, "2026-01-02", Ok(split), vec![]);
-        EndOfDay::with_draft(&cfg, dir.join("home"), raw, d)
+        EndOfDay::with_draft(&cfg, dir.join("home"), noon(), raw, d)
     }
 
     fn hours(h: &[(&str, u32)]) -> Vec<(String, u32)> {
@@ -1072,5 +1086,33 @@ printf '{"target_hours": %s, "epics": [], "derivation": {"unknown_times": ["demo
         assert!(d.problems[0].text.contains("eod_split_command"));
         let r = eod.save(d.id, &[], false, noon());
         assert!(matches!(r, Response::Error { .. }));
+    }
+
+    #[test]
+    fn a_save_after_midnight_names_the_files_for_the_runs_day() {
+        let dir = tempfile::tempdir().unwrap();
+        let eod = stored(dir.path());
+        let next_day = noon() + 13 * 3600;
+        let h = hours(&[("DEMO-9", 20), ("DEMO-8", 10)]);
+        let r = eod.save(7, &h, false, next_day);
+        let note = dir
+            .path()
+            .join("notes/06-Daily/2026/01-January/2026-01-02-time-log.md");
+        assert_eq!(
+            r,
+            Response::DaySaved {
+                time_log: note.display().to_string(),
+                allocation: Some("~/alloc/2026-01-02.json".into()),
+                push: Some(
+                    "jc push ~/alloc/2026-01-02.json --date-str 2026-01-02 --non-interactive"
+                        .into()
+                ),
+            }
+        );
+        assert!(dir.path().join("home/alloc/2026-01-02.json").exists());
+        assert!(!dir.path().join("home/alloc/2026-01-03.json").exists());
+        assert!(std::fs::read_to_string(&note)
+            .unwrap()
+            .contains("Approved at 01:00"));
     }
 }
