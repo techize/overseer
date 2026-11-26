@@ -59,6 +59,9 @@ pub struct Fed {
     pub tools: Vec<ToolEvent>,
     /// The last line that began or ended a turn, if any did.
     pub turn: Option<Turn>,
+    /// The context the last main-conversation assistant line used, in
+    /// tokens, if any line said.
+    pub context: Option<u64>,
 }
 
 /// Follows a transcript file as it grows. Feed it the new bytes; it hands back
@@ -102,6 +105,7 @@ impl Tail {
                 out.entries.extend(entry_of(&value));
                 out.tools.extend(tools_of(&value));
                 out.turn = turn_of(&value).or(out.turn);
+                out.context = context_of(&value).or(out.context);
             }
         }
         self.partial.drain(..start);
@@ -158,6 +162,27 @@ pub fn tools_of(line: &Value) -> Vec<ToolEvent> {
             _ => None,
         })
         .collect()
+}
+
+/// The context an assistant line's request used: its input tokens, the ones
+/// written to the cache and the ones read from it. Side chains are a
+/// subagent's own context and give nothing, and so does a line without
+/// usage.
+pub fn context_of(line: &Value) -> Option<u64> {
+    if flag(line, "isSidechain") || line.get("type").and_then(Value::as_str) != Some("assistant") {
+        return None;
+    }
+    let usage = line.pointer("/message/usage")?.as_object()?;
+    let fields = [
+        "input_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+    ];
+    let found: Vec<u64> = fields
+        .iter()
+        .filter_map(|k| usage.get(*k).and_then(Value::as_u64))
+        .collect();
+    (!found.is_empty()).then(|| found.iter().sum())
 }
 
 /// Whether one transcript line begins or ends a main-conversation turn. A
@@ -278,6 +303,50 @@ fn summary_of(input: Option<&Value>) -> String {
             first.chars().take(SUMMARY_MAX).collect()
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+
+    fn line(s: &str) -> Value {
+        serde_json::from_str(s).unwrap()
+    }
+
+    #[test]
+    fn context_is_the_input_and_cache_tokens_of_an_assistant_line() {
+        let l = line(
+            r#"{"type":"assistant","message":{"usage":{"input_tokens":12,"cache_creation_input_tokens":300,"cache_read_input_tokens":41000,"output_tokens":900}}}"#,
+        );
+        assert_eq!(context_of(&l), Some(41312));
+        let some = line(r#"{"type":"assistant","message":{"usage":{"input_tokens":5}}}"#);
+        assert_eq!(context_of(&some), Some(5));
+        for none in [
+            r#"{"type":"assistant","message":{"usage":{"output_tokens":9}}}"#,
+            r#"{"type":"assistant","message":{"content":[]}}"#,
+            r#"{"type":"assistant","isSidechain":true,"message":{"usage":{"input_tokens":5}}}"#,
+            r#"{"type":"user","message":{"usage":{"input_tokens":5}}}"#,
+        ] {
+            assert_eq!(context_of(&line(none)), None, "{none}");
+        }
+    }
+
+    #[test]
+    fn a_read_keeps_the_last_context_seen() {
+        let mut t = Tail::new();
+        let text = concat!(
+            r#"{"type":"assistant","message":{"usage":{"input_tokens":10}}}"#,
+            "\n",
+            r#"{"type":"assistant","isSidechain":true,"message":{"usage":{"input_tokens":99999}}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"usage":{"input_tokens":20,"cache_read_input_tokens":5}}}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":"next"}}"#,
+            "\n",
+        );
+        assert_eq!(t.read(text.as_bytes()).context, Some(25));
+        assert_eq!(t.read(b"{\"type\":\"user\"}\n").context, None);
+    }
 }
 
 #[cfg(test)]

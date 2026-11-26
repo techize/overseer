@@ -245,6 +245,10 @@ pub struct ConversationView {
     pub entries_from: usize,
     pub entries: Vec<ConvEntry>,
     pub prompt: Option<Prompt>,
+    /// The context the session's last request used, in tokens, once its
+    /// transcript has said.
+    #[serde(default)]
+    pub context: Option<u64>,
 }
 
 /// Your answer to a prompt.
@@ -2187,6 +2191,7 @@ mod tests {
                     }],
                 }),
             }),
+            context: Some(41_312),
         }
     }
 

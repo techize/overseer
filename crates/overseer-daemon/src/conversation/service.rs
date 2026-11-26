@@ -78,6 +78,8 @@ struct SlotView {
     /// The transcript's last mark began a turn, or a prompt was submitted
     /// since: no end of the turn or interrupt has been recorded after it.
     turn_open: bool,
+    /// The context the session's last request used, in tokens.
+    context: Option<u64>,
 }
 
 /// What the app was last sent of a slot.
@@ -86,6 +88,7 @@ struct Sent {
     /// Entries it holds.
     len: usize,
     prompt: Option<Prompt>,
+    context: Option<u64>,
     /// Its entries no longer match ours (a reset or a trim): send them all.
     full: bool,
 }
@@ -248,6 +251,7 @@ impl ConversationService {
                     view.entries.clear();
                     view.prompt.clear();
                     view.turn_open = false;
+                    view.context = None;
                     view.sent.full = true;
                     if let (Some(path), false) = (&view.path, view.session.is_empty()) {
                         view.store = Some((view.session.clone(), path.clone()));
@@ -335,6 +339,7 @@ impl ConversationService {
                 Read::Restarted(fed) => {
                     view.entries.clear();
                     view.turn_open = false;
+                    view.context = None;
                     view.sent.full = true;
                     apply_fed(view, fed);
                 }
@@ -351,7 +356,7 @@ impl ConversationService {
             0
         } else if view.entries.len() > view.sent.len {
             view.sent.len
-        } else if prompt != view.sent.prompt {
+        } else if prompt != view.sent.prompt || view.context != view.sent.context {
             view.entries.len()
         } else {
             return;
@@ -359,6 +364,7 @@ impl ConversationService {
         view.sent = Sent {
             len: view.entries.len(),
             prompt: prompt.clone(),
+            context: view.context,
             full: false,
         };
         // Nobody listening is fine.
@@ -370,6 +376,7 @@ impl ConversationService {
                 entries_from: from,
                 entries: view.entries[from..].to_vec(),
                 prompt,
+                context: view.context,
             }));
     }
 
@@ -383,6 +390,7 @@ impl ConversationService {
             entries_from: 0,
             entries: view.map(|v| v.entries.clone()).unwrap_or_default(),
             prompt: view.and_then(|v| v.prompt.open().cloned()),
+            context: view.and_then(|v| v.context),
         }
     }
 
@@ -469,6 +477,9 @@ fn apply_fed(view: &mut SlotView, fed: Fed) {
     view.prompt.on_tools(&fed.tools);
     if let Some(turn) = fed.turn {
         view.turn_open = turn == Turn::Began;
+    }
+    if fed.context.is_some() {
+        view.context = fed.context;
     }
 }
 
@@ -622,6 +633,49 @@ mod tests {
             }
         }
         out
+    }
+
+    #[tokio::test]
+    async fn the_context_used_is_sent_when_it_changes() {
+        let mut f = fixture();
+        let path = f.dir.path().join("ctx.jsonl");
+        write(&path, &["fix DEMO-1"]);
+        f.svc.hook(&hook(HookKind::SessionStart, &path));
+        f.svc.refresh(2).await;
+        let usage = |n: u64| {
+            format!(
+                "{}\n",
+                serde_json::json!({"type":"assistant","message":{"usage":{"input_tokens":n}}})
+            )
+        };
+        let raw = |line: String| {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(line.as_bytes()).unwrap();
+        };
+        raw(usage(41_000));
+        f.svc.refresh(2).await;
+        // The same context again sends nothing new.
+        raw(usage(41_000));
+        f.svc.refresh(2).await;
+        let views = sent(&mut f.rx);
+        assert_eq!(
+            views.iter().map(|v| v.context).collect::<Vec<_>>(),
+            [None, Some(41_000)]
+        );
+        assert!(views[1].entries.is_empty());
+        assert_eq!(f.svc.current(2).context, Some(41_000));
+        // A new session starts with none.
+        let next = f.dir.path().join("next.jsonl");
+        write(&next, &["again"]);
+        let mut ev = hook(HookKind::SessionStart, &next);
+        ev.session_id = Some("another-session".into());
+        f.svc.hook(&ev);
+        f.svc.refresh(2).await;
+        assert_eq!(f.svc.current(2).context, None);
     }
 
     #[tokio::test]

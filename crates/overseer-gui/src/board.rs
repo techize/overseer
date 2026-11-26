@@ -280,22 +280,27 @@ pub struct HeaderPr {
 }
 
 /// The line under a slot card's title (#85): the ticket the slot works,
-/// its branch, and the open PRs on that branch with their CI state. A
-/// field Overseer does not have is left out; `None` when it has none.
+/// its branch, the open PRs on that branch with their CI state, and how
+/// full its context is. A field Overseer does not have is left out; `None`
+/// when it has none.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeaderLine {
     /// The first ticket the slot owns: key and title.
     pub ticket: Option<(String, String)>,
     pub branch: Option<String>,
     pub prs: Vec<HeaderPr>,
+    /// Tokens of context the session's last request used.
+    pub context: Option<u64>,
 }
 
 /// The header line for slot `id`, given the repo and branch its checkout
-/// is on (from `slot_branches`, so only for a Running or Resumable slot).
+/// is on (from `slot_branches`, so only for a Running or Resumable slot)
+/// and the context its transcript last gave.
 pub fn header_line(
     work: &WorkView,
     id: SlotId,
     on: Option<&(String, String)>,
+    context: Option<u64>,
 ) -> Option<HeaderLine> {
     let ticket = owned_by(work, id)
         .into_iter()
@@ -315,11 +320,35 @@ pub fn header_line(
         })
         .unwrap_or_default();
     let branch = on.map(|(_, b)| b.clone());
-    (ticket.is_some() || branch.is_some()).then_some(HeaderLine {
+    (ticket.is_some() || branch.is_some() || context.is_some()).then_some(HeaderLine {
         ticket,
         branch,
         prs,
+        context,
     })
+}
+
+/// The usual context window, in tokens. A session past it has the larger
+/// one, `LARGE_WINDOW`.
+const WINDOW: u64 = 200_000;
+const LARGE_WINDOW: u64 = 1_000_000;
+
+/// `ctx 42%` and its colour: orange from 80%, red from 90%, where Claude
+/// Code is close to compacting. The window is taken to be 200K tokens until
+/// the context passes that, then 1M.
+pub fn context_chip(tokens: u64) -> (String, u32) {
+    let window = if tokens > WINDOW {
+        LARGE_WINDOW
+    } else {
+        WINDOW
+    };
+    let pct = (tokens.saturating_mul(100) / window).min(100);
+    let color = match pct {
+        90.. => colors::RED,
+        80.. => colors::ORANGE,
+        _ => colors::MUTED,
+    };
+    (format!("ctx {pct}%"), color)
 }
 
 /// A PR's CI mark and its colour: none while the build is unknown.
@@ -954,6 +983,14 @@ fn render_header_line(id: SlotId, l: HeaderLine, cx: &mut Context<OverseerApp>) 
                         }))
                 })
         }))
+        .children(l.context.map(|t| {
+            let (text, color) = context_chip(t);
+            div()
+                .flex_none()
+                .ml_auto()
+                .text_color(rgb(color))
+                .child(text)
+        }))
 }
 
 impl OverseerApp {
@@ -965,7 +1002,13 @@ impl OverseerApp {
         let edge = edge_color(m.tone);
         // The ticket, branch and PRs line under the title.
         let on = slot_branches(std::slice::from_ref(info), overseer_proto::git::repo_branch);
-        let line = header_line(&self.work, id, on.first().map(|(_, on)| on));
+        let context = matches!(
+            info.state,
+            SlotState::Running { .. } | SlotState::Resumable { .. }
+        )
+        .then(|| self.convs.get(id as usize).and_then(|c| c.view.context))
+        .flatten();
+        let line = header_line(&self.work, id, on.first().map(|(_, on)| on), context);
         let drop_free = drop_takes(id, &info.state);
         div()
             .id(("card", id as usize))
@@ -2008,6 +2051,20 @@ mod tests {
     }
 
     #[test]
+    fn context_chip_is_a_share_of_the_window_and_warns_near_full() {
+        assert_eq!(context_chip(0), ("ctx 0%".into(), colors::MUTED));
+        assert_eq!(context_chip(84_000), ("ctx 42%".into(), colors::MUTED));
+        assert_eq!(context_chip(160_000), ("ctx 80%".into(), colors::ORANGE));
+        assert_eq!(context_chip(179_999), ("ctx 89%".into(), colors::ORANGE));
+        assert_eq!(context_chip(180_000), ("ctx 90%".into(), colors::RED));
+        assert_eq!(context_chip(200_000), ("ctx 100%".into(), colors::RED));
+        // Past 200K the session has the 1M window.
+        assert_eq!(context_chip(200_001), ("ctx 20%".into(), colors::MUTED));
+        assert_eq!(context_chip(950_000), ("ctx 95%".into(), colors::RED));
+        assert_eq!(context_chip(2_000_000).0, "ctx 100%");
+    }
+
+    #[test]
     fn header_line_has_ticket_branch_and_prs_and_skips_what_is_missing() {
         use overseer_proto::PullRequest;
         let mut v = work(vec![
@@ -2033,7 +2090,7 @@ mod tests {
             pr(8, "main", None),
         ];
         let on = ("demo-api".to_string(), "feature/DEMO-12".to_string());
-        let line = header_line(&v, 2, Some(&on)).unwrap();
+        let line = header_line(&v, 2, Some(&on), None).unwrap();
         let title = v.items[1].title.clone();
         assert_eq!(line.ticket, Some(("DEMO-12".to_string(), title)));
         assert_eq!(line.branch.as_deref(), Some("feature/DEMO-12"));
@@ -2047,14 +2104,20 @@ mod tests {
             }]
         );
         // No checkout read: the ticket alone, and no PRs.
-        let line = header_line(&v, 2, None).unwrap();
+        let line = header_line(&v, 2, None, None).unwrap();
         assert!(line.branch.is_none() && line.prs.is_empty() && line.ticket.is_some());
         // A branch with no ticket and no PR.
         let main = ("demo-api".to_string(), "demo-ws".to_string());
-        let line = header_line(&v, 3, Some(&main)).unwrap();
+        let line = header_line(&v, 3, Some(&main), None).unwrap();
         assert_eq!((line.ticket, line.prs.len()), (None, 0));
         // Nothing known: no line at all.
-        assert_eq!(header_line(&v, 3, None), None);
+        assert_eq!(header_line(&v, 3, None, None), None);
+        // The context alone is a line too.
+        let line = header_line(&v, 3, None, Some(50_000)).unwrap();
+        assert_eq!(
+            (line.ticket, line.branch, line.context),
+            (None, None, Some(50_000))
+        );
     }
 
     #[test]
