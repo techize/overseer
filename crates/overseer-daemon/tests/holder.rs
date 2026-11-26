@@ -214,7 +214,11 @@ fn exit_comes_after_the_whole_tail() {
         }
     };
     assert_eq!(code, Some(3));
-    write_frame(&mut s, &Frame::ExitSeen).unwrap();
+    // The holder waits 5s for ExitSeen from its last write to the socket,
+    // but frames it wrote can sit in the socket buffer much longer at this
+    // pace. On a slow runner it gives up first, writes the exit file and
+    // closes, so this write may meet a broken pipe; both endings are right.
+    let _ = write_frame(&mut s, &Frame::ExitSeen);
     let text = String::from_utf8_lossy(&seen).replace('\r', "");
     // The terminal echoes the line typed above.
     let text = text.strip_prefix("go\n").unwrap_or(&text).to_string();
