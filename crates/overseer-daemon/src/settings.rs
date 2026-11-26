@@ -289,7 +289,7 @@ pub const CATALOGUE: &[Spec] = &[
     daemon("journal_path", BRAIN, NOT_EMPTY, |c| text(&c.journal_path)),
     daemon("session_note", BRAIN, NOT_EMPTY, |c| text(&c.session_note)),
     daemon("eod_time_log", BRAIN, NOT_EMPTY, |c| text(&c.eod_time_log)),
-    daemon("eod_allocation_file", BRAIN, NOT_EMPTY, |c| {
+    daemon("eod_allocation_file", BRAIN, EMPTY_OK, |c| {
         text(&c.eod_allocation_file)
     }),
     daemon("shared_files", BRAIN, SettingKind::List, |c| {

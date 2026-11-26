@@ -7739,13 +7739,14 @@ fn demo_eod_scripts(notes: &std::path::Path) {
     std::fs::write(tools.join("demo-index.sh"), "touch indexed\n").unwrap();
     std::fs::write(
         tools.join("demo-split.sh"),
-        r#"out=""
+        r#"out=""; date=""
 while [ $# -gt 0 ]; do
   if [ "$1" = "--out" ]; then out="$2"; fi
+  if [ "$1" = "--date" ]; then date="$2"; fi
   shift
 done
-cat > "$out" <<'JSON'
-{"date": "2026-01-02", "target_hours": 7.5,
+cat > "$out" <<JSON
+{"date": "$date", "target_hours": 7.5,
  "epics": [{"key": "DEMO-9", "summary": "Demo epic", "hours": 5.0},
            {"key": "DEMO-8", "summary": "Demo BAU", "hours": 2.5}],
  "derivation": {"sessions": [], "unknown_times": [], "bad_times": [],

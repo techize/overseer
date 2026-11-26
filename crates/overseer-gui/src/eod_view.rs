@@ -528,7 +528,7 @@ impl EodView {
 
     fn render_hours(&self, d: &DayDraft, h: &Hours, cx: &mut Context<Self>) -> gpui::Div {
         let idle = self.busy == Busy::Idle;
-        let target_on = idle && !d.target_fixed;
+        let target_on = idle && !d.target_fixed && d.split_ok;
         let header_color = if h.left() == 0 {
             colors::GREEN
         } else {
@@ -565,14 +565,14 @@ impl EodView {
                 .items_center()
                 .gap_2()
                 .child(heading("Hours per epic"))
-                .child(
+                .children(d.split_ok.then(|| {
                     div()
                         .pt_1()
                         .text_xs()
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(rgb(header_color))
-                        .child(hours_header(h)),
-                )
+                        .child(hours_header(h))
+                }))
                 .child(div().ml_auto().child(target)),
         );
         if d.epics.is_empty() {

@@ -435,6 +435,9 @@ pub struct EndOfDay {
     /// Where the split writes its `{out}` file.
     tmp: PathBuf,
     next_id: AtomicU64,
+    /// Held for a whole run, so runs queue instead of overlapping: the index
+    /// script rewrites files the next run would read.
+    running: tokio::sync::Mutex<()>,
     last: Mutex<Option<Stored>>,
 }
 
@@ -469,7 +472,13 @@ impl EndOfDay {
             env,
             timeline,
             tmp,
-            next_id: AtomicU64::new(1),
+            // Seeded from the clock, so ids from before a restart never match.
+            next_id: AtomicU64::new(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(1, |d| d.as_millis() as u64),
+            ),
+            running: tokio::sync::Mutex::new(()),
             last: Mutex::new(None),
         }
     }
@@ -498,6 +507,7 @@ impl EndOfDay {
     /// the draft. `target_quarters` is passed to the split only when
     /// `eod_target_arg` is set.
     pub async fn run(&self, now: i64, target_quarters: Option<u32>) -> DayDraft {
+        let _queued = self.running.lock().await;
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let day = ymd(&local_date(now));
         let (mut d, raw) = match self.off_reason() {
@@ -626,7 +636,13 @@ impl EndOfDay {
             Ok(_) => {
                 let json = read
                     .map_err(|e| vec![problem(format!("the split wrote no output file: {e}"))])?;
-                read_split(&json, &self.notes).map_err(|e| vec![problem(e)])
+                let split = read_split(&json, &self.notes).map_err(|e| vec![problem(e)])?;
+                match split.raw.get("date").and_then(Value::as_str) {
+                    Some(date) if date != day => Err(vec![problem(format!(
+                        "The split was for {date}, not {day}."
+                    ))]),
+                    _ => Ok(split),
+                }
             }
         }
     }
@@ -646,11 +662,11 @@ impl EndOfDay {
                 return err(format!("{key} is not an epic in the draft"));
             }
         }
-        let total: u32 = hours.iter().map(|(_, q)| q).sum();
-        if total != d.target_quarters {
+        let total: u64 = hours.iter().map(|(_, q)| u64::from(*q)).sum();
+        if total != u64::from(d.target_quarters) {
             return err(format!(
                 "the hours add up to {} h, not the day's {} h",
-                hours_text(total),
+                hours_text(u32::try_from(total).unwrap_or(u32::MAX)),
                 hours_text(d.target_quarters)
             ));
         }
@@ -971,6 +987,52 @@ mod tests {
     }
 
     #[test]
+    fn a_total_that_overflows_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let eod = stored(dir.path());
+        let big = u32::MAX - 5;
+        let r = eod.save(
+            7,
+            &hours(&[("DEMO-9", big), ("DEMO-8", big)]),
+            false,
+            noon(),
+        );
+        assert!(
+            matches!(&r, Response::Error { message } if message.contains("not the day's 7.50 h")),
+            "{r:?}"
+        );
+        assert!(!dir.path().join("notes").exists());
+    }
+
+    #[test]
+    fn an_empty_allocation_file_saves_the_note_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::Config {
+            brain_dir: dir.path().join("notes"),
+            eod_allocation_file: String::new(),
+            ..crate::Config::default()
+        };
+        let raw: Value = serde_json::from_str(SPLIT).unwrap();
+        let split = read_split(SPLIT, &cfg.brain_dir).unwrap();
+        let d = draft(7, "2026-01-02", Ok(split), vec![]);
+        let eod = EndOfDay::with_draft(&cfg, dir.path().join("home"), noon(), raw, d);
+        let r = eod.save(7, &hours(&[("DEMO-9", 20), ("DEMO-8", 10)]), false, noon());
+        let note = dir
+            .path()
+            .join("notes/06-Daily/2026/01-January/2026-01-02-time-log.md");
+        assert_eq!(
+            r,
+            Response::DaySaved {
+                time_log: note.display().to_string(),
+                allocation: None,
+                push: None,
+            }
+        );
+        assert!(note.exists());
+        assert!(!dir.path().join("home/alloc").exists());
+    }
+
+    #[test]
     fn an_existing_file_needs_replace() {
         let dir = tempfile::tempdir().unwrap();
         let eod = stored(dir.path());
@@ -1073,6 +1135,56 @@ printf '{"target_hours": %s, "epics": [], "derivation": {"unknown_times": ["demo
         let d = fixed.run(noon(), Some(36)).await;
         assert_eq!(d.target_quarters, 30);
         assert!(d.target_fixed);
+    }
+
+    #[tokio::test]
+    async fn a_split_for_another_day_is_a_failed_split() {
+        let notes = tempfile::tempdir().unwrap();
+        let tools = notes.path().join("Claude/tools");
+        std::fs::create_dir_all(&tools).unwrap();
+        std::fs::write(tools.join("demo-index.sh"), "exit 0\n").unwrap();
+        std::fs::write(
+            tools.join("demo-split.sh"),
+            r#"out="$2"
+printf '{"date": "2025-12-31", "target_hours": 7.5, "epics": []}' > "$out"
+"#,
+        )
+        .unwrap();
+        let eod = running(notes.path(), &[]);
+        let d = eod.run(noon(), None).await;
+        assert!(!d.split_ok);
+        assert_eq!(d.problems.len(), 1);
+        assert_eq!(
+            d.problems[0].text,
+            "The split was for 2025-12-31, not 2026-01-02."
+        );
+    }
+
+    #[tokio::test]
+    async fn runs_queue_instead_of_overlapping() {
+        let notes = tempfile::tempdir().unwrap();
+        let tools = notes.path().join("Claude/tools");
+        std::fs::create_dir_all(&tools).unwrap();
+        let marks = notes.path().join("marks.txt");
+        // The index script marks its start, waits, then marks its end.
+        std::fs::write(
+            tools.join("demo-index.sh"),
+            "echo start >> marks.txt\nsleep 0.3\necho end >> marks.txt\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tools.join("demo-split.sh"),
+            r#"out="$2"
+printf '{"target_hours": 7.5, "epics": []}' > "$out"
+"#,
+        )
+        .unwrap();
+        let eod = running(notes.path(), &[]);
+        let (a, b) = tokio::join!(eod.run(noon(), None), eod.run(noon(), None));
+        assert!(a.split_ok && b.split_ok);
+        assert_ne!(a.id, b.id);
+        let text = std::fs::read_to_string(marks).unwrap();
+        assert_eq!(text, "start\nend\nstart\nend\n");
     }
 
     #[tokio::test]

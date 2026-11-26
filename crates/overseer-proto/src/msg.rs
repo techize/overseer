@@ -1633,7 +1633,7 @@ pub struct DayProblem {
     /// The slot the problem belongs to, if any.
     #[serde(default)]
     pub slot: Option<SlotId>,
-    /// A file to look at, shown with the home folder as `~`.
+    /// A file to look at, as an absolute path (the client shows it with `~`).
     #[serde(default)]
     pub path: Option<String>,
 }
@@ -1669,7 +1669,7 @@ pub struct DayDraft {
     pub day: String,
     /// The day's total in quarter-hours.
     pub target_quarters: u32,
-    /// Whether the epic quarters add up to the target.
+    /// Whether the split ran and its output was read.
     pub split_ok: bool,
     /// True when the day's target cannot be changed.
     #[serde(default)]

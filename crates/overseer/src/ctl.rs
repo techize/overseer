@@ -937,8 +937,6 @@ fn attention_lines(v: &AttentionView, now: i64, all: bool) -> Vec<String> {
         .collect()
 }
 
-/// One line per stretch, then one indented line per gap, unlogged or
-/// waiting span. Span kinds this build does not know are left out.
 /// Turn a target in hours into quarter hours, refusing anything that is not a
 /// positive whole number of quarter hours.
 fn target_to_quarters(hours: f64) -> anyhow::Result<u32> {
@@ -1007,6 +1005,8 @@ pub fn format_draft(d: &DayDraft) -> Vec<String> {
     out
 }
 
+/// One line per stretch, then one indented line per gap, unlogged or
+/// waiting span. Span kinds this build does not know are left out.
 fn timeline_lines(v: &DayView, clock: impl Fn(i64) -> String) -> Vec<String> {
     let mut out = Vec::new();
     for row in &v.rows {
