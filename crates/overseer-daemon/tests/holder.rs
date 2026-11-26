@@ -204,9 +204,17 @@ fn exit_comes_after_the_whole_tail() {
     let mut s = h.connect();
     let mut seen = skip_greeting(&mut s).into_bytes();
     write_frame(&mut s, &Frame::Input(b"go\n".to_vec())).unwrap();
+    // Slow for 2s, well past the holder's 1s drain wait with the queue still
+    // full, then at full speed. The slow part is bounded by time, not by
+    // frames: a runner with a coarse sleep took over 30s to read 3ms at a
+    // time, and the holder stops waiting for ExitSeen 30s after the child
+    // exits (STALL_LIMIT), closing the connection before Exit or before
+    // this test's ExitSeen.
+    let slow_until = Instant::now() + Duration::from_secs(2);
     let code = loop {
-        // About 3s for a full queue, well past the holder's 1s drain wait.
-        std::thread::sleep(Duration::from_millis(3));
+        if Instant::now() < slow_until {
+            std::thread::sleep(Duration::from_millis(3));
+        }
         match frame(&mut s) {
             Frame::Output(b) => seen.extend(b),
             Frame::Exit { code, .. } => break code,
@@ -214,11 +222,7 @@ fn exit_comes_after_the_whole_tail() {
         }
     };
     assert_eq!(code, Some(3));
-    // The holder waits 5s for ExitSeen from its last write to the socket,
-    // but frames it wrote can sit in the socket buffer much longer at this
-    // pace. On a slow runner it gives up first, writes the exit file and
-    // closes, so this write may meet a broken pipe; both endings are right.
-    let _ = write_frame(&mut s, &Frame::ExitSeen);
+    write_frame(&mut s, &Frame::ExitSeen).unwrap();
     let text = String::from_utf8_lossy(&seen).replace('\r', "");
     // The terminal echoes the line typed above.
     let text = text.strip_prefix("go\n").unwrap_or(&text).to_string();
