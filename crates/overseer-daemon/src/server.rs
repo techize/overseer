@@ -1634,6 +1634,10 @@ fn handle_request(
             }
         }
         Request::Timeline => Response::Timeline(ctx.timeline.current()),
+        // The end-of-day draft is wired in by a later task.
+        Request::EndOfDay { .. } | Request::SaveDay { .. } => Response::Error {
+            message: "end of day is not available yet".into(),
+        },
         Request::Conversation { slot } if !valid_id(slot) => err(format!("invalid slot id {slot}")),
         Request::Conversation { slot } => Response::Conversation(ctx.conversation.current(slot)),
         // Answered in `handle_frame` from a task of their own (they wait on
