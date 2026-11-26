@@ -506,7 +506,13 @@ trimming):
 - The `WAITING ON YOU` panel at the top of the board lists what waits on you,
   oldest first: sessions that need you or have finished their work, stuck
   relays, notices, and pull requests with a failed build, changes requested
-  or new comments. The Dock icon shows the count. Click a session row to open
+  or new comments. It also nudges stalled work: a session idle for
+  `stall_idle_mins` (30) with uncommitted changes in its folder, a pull
+  request with no push, comment or build change for `pr_quiet_hours` (24),
+  and a slot whose branch is more than `behind_main_commits` (20) commits
+  behind the remote's main branch as last fetched (Overseer never fetches).
+  Each is off at `0` and clears when its condition does. The Dock icon shows
+  the count. Click a session row to open
   it; a pull request row opens the PR and marks it seen, as clicking it in the
   Open PRs panel does. The x on a hovered row dismisses it, also from the
   Dock count, until it changes: a new occurrence or a new text brings it

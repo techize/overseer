@@ -96,6 +96,15 @@ pub struct Config {
     /// Lists the workspace's repos; `{workspace}` in any element is
     /// replaced by `pr_workspace`.
     pub pr_repos_command: Vec<String>,
+    /// Minutes a slot may sit idle with uncommitted changes before it is
+    /// nudged; 0 turns this off.
+    pub stall_idle_mins: u64,
+    /// Hours an open PR may go without a push, comment or build change
+    /// before it is nudged; 0 turns this off.
+    pub pr_quiet_hours: u64,
+    /// Commits a slot's branch may fall behind the remote's main branch, as
+    /// last fetched, before it is nudged; 0 turns this off.
+    pub behind_main_commits: u64,
     /// Jira status names for each board stage, matched case-insensitively.
     pub stage_todo: Vec<String>,
     pub stage_blocked: Vec<String>,
@@ -196,6 +205,9 @@ impl Default for Config {
                 "--output",
                 "json",
             ]),
+            stall_idle_mins: 30,
+            pr_quiet_hours: 24,
+            behind_main_commits: 20,
             stage_todo: strings(&["Backlog", "Prioritised Backlog", "To Do"]),
             stage_blocked: strings(&["Blocked", "Waiting", "On Hold"]),
             stage_next: strings(&["Next", "Selected for Development"]),

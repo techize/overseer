@@ -1438,6 +1438,12 @@ pub enum AttentionKind {
     PrComments,
     /// A session ran for a while with nothing written to its log.
     LogGap,
+    /// A slot idle for a while with uncommitted changes in its folder.
+    Uncommitted,
+    /// An open PR with no push, comment or build change for a while.
+    PrQuiet,
+    /// A slot's branch is many commits behind the remote's main branch.
+    BehindMain,
     /// A kind this build does not know, so a newer daemon cannot break an
     /// older client. Clients leave these out of what they show.
     #[serde(other)]
