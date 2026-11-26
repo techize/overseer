@@ -9,6 +9,7 @@ pub mod daemon_info;
 pub mod kanban_size;
 pub mod locks_view;
 pub mod notify;
+pub mod palette;
 pub mod picker;
 pub mod plan_view;
 pub mod reconnect;

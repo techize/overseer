@@ -494,6 +494,15 @@ trimming):
   new key is absent, and the review names are added to In progress.
 - Click a session card, or press Cmd+0 to Cmd+6, to open that session over the
   board. Cmd+Esc, the x button, or a click outside the panel closes it.
+- Cmd+K, or the Cmd+K button in the board's header, opens the command
+  palette from the board or a session, the terminal included. It lists the
+  common moves: open a slot, message a running slot, open a slot's ticket
+  folder or any open PR, go to the next waiting item, the Locks view, and
+  file a bug report. Type to filter (fuzzy, on slot names, labels, ticket
+  keys, branches and PR titles), Up and Down to move, Enter or a click to
+  run, Esc to close. A bug report asks what happened, runs
+  `overseer ctl bug-report` (with the slot's screen when you picked one) and
+  opens the file it writes, to read before posting.
 - Under each session card's title is one line with the ticket, the branch,
   its open PRs with their CI state, and `ctx 42%`: how full the session's
   context is, from the token counts in its transcript. It turns orange at 80%
