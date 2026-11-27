@@ -506,6 +506,11 @@ pub struct OverseerApp {
     pub(crate) convs: Vec<Conv>,
     /// The conversation pane beside the board is hidden; kept in `gui.toml`.
     pub(crate) pane_hidden: bool,
+    /// The pane's width, dragged by its left edge; kept in `gui.toml`.
+    pub(crate) pane_width: f32,
+    /// While the pane's edge is dragged: where the pointer went down and
+    /// the pane's width then.
+    pub(crate) pane_drag: Option<(f32, f32)>,
     /// The pane's reply box.
     pub(crate) reply_focus: FocusHandle,
     /// The pane's entries, kept at the bottom as they grow unless scrolled up.
@@ -635,6 +640,8 @@ impl OverseerApp {
             timeline: DayView::default(),
             convs: empty_convs(),
             pane_hidden: crate::kanban_size::pane_hidden_from(&crate::kanban_size::path()),
+            pane_width: crate::kanban_size::pane_width_from(&crate::kanban_size::path()),
+            pane_drag: None,
             reply_focus: cx.focus_handle(),
             pane_scroll: gpui::ScrollHandle::new(),
             pane_seen: (SlotId::MAX, String::new(), 0),
@@ -2425,6 +2432,15 @@ impl Render for OverseerApp {
             // The pane beside the board, not inside it, so the reply box's
             // key context stack has no Board.
             Screen::Board | Screen::Session(_) => div()
+                .on_mouse_move(cx.listener(|this, ev: &gpui::MouseMoveEvent, window, cx| {
+                    this.drag_pane(ev, window, cx)
+                }))
+                .on_mouse_up(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, _: &gpui::MouseUpEvent, window, cx| {
+                        this.end_pane_drag(window, cx)
+                    }),
+                )
                 .size_full()
                 .flex()
                 .child(

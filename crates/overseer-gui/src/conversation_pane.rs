@@ -17,9 +17,6 @@ use crate::conversation_view::{
     unseen_prompt, Block, Conv, ReplyKey, TAB_MESSAGES,
 };
 
-/// The pane's width beside the board.
-pub const PANE_WIDTH: f32 = 420.;
-
 /// A button; `on` marks a picked option.
 fn pane_button(
     id: impl Into<ElementId>,
@@ -114,6 +111,57 @@ impl OverseerApp {
             self.status = Some(format!("cannot save whether the pane shows: {e}"));
         }
         cx.notify();
+    }
+
+    /// Sets the pane's width and saves it; a failed save only costs the
+    /// width on the next start, so it goes to the status line.
+    pub(crate) fn set_pane_width(&mut self, width: f32) {
+        self.pane_width = width;
+        let path = crate::kanban_size::path();
+        if let Err(e) = crate::kanban_size::save_pane_width(&path, width) {
+            self.status = Some(format!("cannot save the pane width: {e}"));
+        }
+    }
+
+    /// The pane's width as drawn in `window`: the board keeps its room.
+    fn pane_drawn_width(&self, window: &Window) -> f32 {
+        let window_w: f32 = window.viewport_size().width.into();
+        self.pane_width.min(crate::kanban_size::pane_max(window_w))
+    }
+
+    /// The pointer moved while the pane's edge is held: resize it. A move
+    /// with the button already up (released outside the window) ends the drag.
+    pub(crate) fn drag_pane(
+        &mut self,
+        ev: &gpui::MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((start_x, start_w)) = self.pane_drag else {
+            return;
+        };
+        if !ev.dragging() {
+            self.end_pane_drag(window, cx);
+            return;
+        }
+        let window_w: f32 = window.viewport_size().width.into();
+        let x: f32 = ev.position.x.into();
+        self.pane_width = crate::kanban_size::pane_dragged(
+            start_w,
+            start_x,
+            x,
+            crate::kanban_size::pane_max(window_w),
+        );
+        cx.notify();
+    }
+
+    /// The edge was let go: keep the width the pane was drawn at.
+    pub(crate) fn end_pane_drag(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pane_drag.take().is_some() {
+            let w = self.pane_drawn_width(window);
+            self.set_pane_width(w);
+            cx.notify();
+        }
     }
 
     /// Tab: selects the next waiting slot, or says why not.
@@ -508,10 +556,39 @@ impl OverseerApp {
             .status
             .clone()
             .map(|s| div().text_xs().text_color(rgb(colors::ORANGE)).child(s));
+        // The left edge: drag to resize, double click for the default width.
+        let handle = div()
+            .id("pane-resize")
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .left(px(-3.))
+            .w(px(6.))
+            .cursor(gpui::CursorStyle::ResizeLeftRight)
+            .when(self.pane_drag.is_some(), |d| d.bg(rgb(colors::ACCENT)))
+            .hover(|s| s.bg(rgb(colors::BORDER)))
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, ev: &gpui::MouseDownEvent, window, cx| {
+                    let x: f32 = ev.position.x.into();
+                    this.pane_drag = Some((x, this.pane_drawn_width(window)));
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .on_click(cx.listener(|this, ev: &gpui::ClickEvent, _, cx| {
+                if ev.click_count() == 2 {
+                    this.pane_drag = None;
+                    this.set_pane_width(crate::kanban_size::PANE_WIDTH);
+                    cx.notify();
+                }
+            }));
+        let width = self.pane_drawn_width(window);
         div()
             .key_context("Conversation")
+            .relative()
             .flex_none()
-            .w(px(PANE_WIDTH))
+            .w(px(width))
             .h_full()
             .flex()
             .flex_col()
@@ -526,6 +603,7 @@ impl OverseerApp {
             .child(reply)
             .child(actions)
             .children(status)
+            .child(handle)
             .into_any_element()
     }
 }
