@@ -4,18 +4,16 @@
 use std::collections::VecDeque;
 use std::time::Instant;
 
-use overseer_proto::msg::{HookEvent, HookKind, Prompt, PromptInfo, PromptShown};
+use overseer_proto::msg::{HookEvent, HookKind, Prompt, PromptInfo, PromptShown, Question};
 
-use super::parse::ToolEvent;
-
-/// The tool Claude Code uses to ask the user a question with options.
-const ASK_USER_QUESTION: &str = "AskUserQuestion";
+use super::parse::{ToolEvent, ASK_USER_QUESTION};
 
 /// The notification Claude Code sends when it draws a permission dialog.
 const PERMISSION_PROMPT: &str = "permission_prompt";
 
 /// Unanswered tool calls remembered per slot; a call that never gets an
-/// answer is forgotten once this many newer ones started.
+/// answer is forgotten once this many newer ones started. Also how many
+/// ended prompts are remembered.
 const STARTED_MAX: usize = 32;
 
 /// The prompt a slot is waiting on, if any.
@@ -31,6 +29,9 @@ pub struct PromptState {
     counter: u64,
     /// When the open prompt opened.
     opened: Option<Instant>,
+    /// Ids of prompts that ended, newest last, so a transcript read that
+    /// lags the hooks does not open one again.
+    ended: VecDeque<String>,
 }
 
 /// A tool call the transcript started.
@@ -55,6 +56,10 @@ struct Ends {
     /// call is found in the transcript, the PostToolUse of the same tool
     /// and summary in its conversation ends it.
     call: Option<(Option<String>, Option<String>)>,
+    /// Opened from the transcript, with no hook: a question asked before
+    /// the daemon started. The end of its turn ends it too, since no hook
+    /// is sure to.
+    recovered: bool,
 }
 
 impl PromptState {
@@ -106,7 +111,7 @@ impl PromptState {
             return false;
         }
         self.opened = next.is_some().then(Instant::now);
-        self.open = next;
+        self.set_open(next);
         true
     }
 
@@ -115,12 +120,20 @@ impl PromptState {
     /// takes the call it is for from the unanswered ones. True when the
     /// open prompt changed.
     pub fn on_tools(&mut self, tools: &[ToolEvent]) -> bool {
-        let was = self.open.is_some();
+        let was = self.open_id();
         for tool in tools {
             match tool {
-                ToolEvent::Started { id, name, summary } => {
+                ToolEvent::Started {
+                    id,
+                    name,
+                    summary,
+                    questions,
+                } => {
                     if self.started.iter().any(|s| s.id == *id) {
                         continue;
+                    }
+                    if let Some(questions) = questions {
+                        self.recover(id, questions);
                     }
                     self.started.push_back(Started {
                         id: id.clone(),
@@ -139,7 +152,7 @@ impl PromptState {
                     if self.open.is_some()
                         && (self.ends.key.as_ref() == Some(id) || self.unplaced())
                     {
-                        self.open = None;
+                        self.set_open(None);
                         self.ends = Ends::default();
                     }
                     self.started.retain(|s| s.id != *id);
@@ -147,7 +160,19 @@ impl PromptState {
             }
         }
         self.adopt(false);
-        was && self.open.is_none()
+        was != self.open_id()
+    }
+
+    /// The transcript recorded the end of a turn: a question opened from
+    /// the transcript is over, as a hook would have said. True when the
+    /// open prompt changed.
+    pub fn turn_ended(&mut self) -> bool {
+        if self.open.is_none() || !self.ends.recovered {
+            return false;
+        }
+        self.set_open(None);
+        self.ends = Ends::default();
+        true
     }
 
     /// Forgets the open prompt and the unanswered calls, for a new
@@ -157,6 +182,7 @@ impl PromptState {
         self.open = None;
         self.ends = Ends::default();
         self.started.clear();
+        self.ended.clear();
     }
 
     /// The prompt the session is waiting on.
@@ -175,9 +201,49 @@ impl PromptState {
         if self.open.as_ref().is_none_or(|p| p.id != id) {
             return false;
         }
-        self.open = None;
+        self.set_open(None);
         self.ends = Ends::default();
         true
+    }
+
+    /// Opens the question of an `AskUserQuestion` call the transcript
+    /// shows, when no prompt is open and it has not ended: the PreToolUse
+    /// that would have opened it came before the daemon started. Keyed by
+    /// its call id, as its hook would have, so its answer ends it.
+    fn recover(&mut self, id: &str, questions: &[Question]) {
+        if self.open.is_some() || self.ended.iter().any(|e| e == id) {
+            return;
+        }
+        self.ends = Ends {
+            key: Some(id.to_string()),
+            recovered: true,
+            ..Ends::default()
+        };
+        self.opened = Some(Instant::now());
+        self.open = Some(Prompt {
+            id: id.to_string(),
+            subagent: false,
+            info: PromptShown::Known(PromptInfo::Question {
+                questions: questions.to_vec(),
+            }),
+        });
+    }
+
+    /// Replaces the open prompt, remembering the one it ends.
+    fn set_open(&mut self, next: Option<Prompt>) {
+        if let Some(old) = self.open.take() {
+            if next.as_ref().is_none_or(|n| n.id != old.id) {
+                self.ended.push_back(old.id);
+                if self.ended.len() > STARTED_MAX {
+                    self.ended.pop_front();
+                }
+            }
+        }
+        self.open = next;
+    }
+
+    fn open_id(&self) -> Option<String> {
+        self.open.as_ref().map(|p| p.id.clone())
     }
 
     /// An open prompt with nothing known of its tool call: a permission
@@ -200,6 +266,7 @@ impl PromptState {
                 .is_none()
                 .then(|| (ev.tool.clone(), ev.detail.clone())),
             loose: false,
+            recovered: false,
         };
         let id = self.next_id(ev.tool_use_id.as_deref());
         (Some(prompt(ev, id, subagent)), ends)
@@ -302,7 +369,6 @@ fn same_start(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use overseer_proto::msg::Question;
 
     fn ev(event: HookKind) -> HookEvent {
         HookEvent {
@@ -333,12 +399,7 @@ mod tests {
             tool: Some(ASK_USER_QUESTION.into()),
             tool_use_id: Some(id.into()),
             prompt: Some(PromptInfo::Question {
-                questions: vec![Question {
-                    header: "Deploy".into(),
-                    question: "Deploy demo-api now?".into(),
-                    options: vec!["Yes".into(), "No".into()],
-                    multi: false,
-                }],
+                questions: demo_questions(),
             }),
             ..ev(HookKind::PreToolUse)
         }
@@ -372,6 +433,26 @@ mod tests {
             id: id.into(),
             name: name.into(),
             summary: summary.into(),
+            questions: None,
+        }
+    }
+
+    fn demo_questions() -> Vec<Question> {
+        vec![Question {
+            header: "Deploy".into(),
+            question: "Deploy demo-api now?".into(),
+            options: vec!["Yes".into(), "No".into()],
+            multi: false,
+        }]
+    }
+
+    /// An `AskUserQuestion` call as the transcript records it.
+    fn asked(id: &str) -> ToolEvent {
+        ToolEvent::Started {
+            id: id.into(),
+            name: ASK_USER_QUESTION.into(),
+            summary: String::new(),
+            questions: Some(demo_questions()),
         }
     }
 
@@ -672,5 +753,75 @@ mod tests {
         assert!(s.forget("n1"));
         assert!(s.open().is_none());
         assert!(!s.forget("n1"));
+    }
+
+    #[test]
+    fn an_unanswered_question_in_the_transcript_opens_after_a_restart() {
+        // A new daemon reads the transcript from the start and gets no
+        // PreToolUse for the question asked before it started.
+        let mut s = PromptState::new();
+        let read = [
+            started("tu-1", "Bash", RM),
+            finished("tu-1"),
+            asked("tu-2"),
+            finished("tu-2"),
+            asked("tu-3"),
+        ];
+        assert!(s.on_tools(&read));
+        let open = s.open().unwrap();
+        // The id the hook would have given it, so an answer is keyed alike.
+        assert_eq!(open.id, "tu-3");
+        assert!(!open.subagent);
+        assert_eq!(
+            open.info,
+            PromptShown::Known(PromptInfo::Question {
+                questions: demo_questions()
+            })
+        );
+        assert!(s.opened().is_some());
+        // Its answer ends it, by the transcript or the hook.
+        assert!(s.on_tools(&[finished("tu-3")]));
+        assert!(s.open().is_none());
+        assert!(s.on_tools(&[asked("tu-4")]));
+        assert!(s.on_hook(&post(ASK_USER_QUESTION, "", "tu-4")));
+        assert!(s.open().is_none());
+    }
+
+    #[test]
+    fn a_question_from_the_transcript_never_overrides_the_hooks() {
+        // Already open from its hook: the transcript's copy is no change.
+        let mut s = PromptState::new();
+        assert!(s.on_hook(&question("tu-1")));
+        assert!(!s.on_tools(&[asked("tu-1")]));
+        assert_eq!(s.open().unwrap().id, "tu-1");
+        // Another prompt open: it stays.
+        let mut p = PromptState::new();
+        assert!(p.on_hook(&permission("Bash", RM)));
+        assert!(!p.on_tools(&[asked("tu-2")]));
+        assert_eq!(p.open().unwrap().id, "n1");
+        // Answered by its hook before the transcript read shows the call:
+        // the late call does not open it again.
+        let mut late = PromptState::new();
+        assert!(late.on_hook(&question("tu-3")));
+        assert!(late.on_hook(&post(ASK_USER_QUESTION, "", "tu-3")));
+        assert!(!late.on_tools(&[asked("tu-3")]));
+        assert!(late.open().is_none());
+        // Nor one the screen showed had gone.
+        assert!(late.on_tools(&[asked("tu-4")]));
+        assert!(late.forget("tu-4"));
+        assert!(!late.on_tools(&[asked("tu-4")]));
+        assert!(late.open().is_none());
+    }
+
+    #[test]
+    fn a_question_from_the_transcript_ends_with_its_turn() {
+        let mut s = PromptState::new();
+        assert!(s.on_tools(&[asked("tu-1")]));
+        assert!(s.turn_ended());
+        assert!(s.open().is_none());
+        // A prompt its hook opened is left to the hooks.
+        assert!(s.on_hook(&question("tu-2")));
+        assert!(!s.turn_ended());
+        assert!(s.open().is_some());
     }
 }

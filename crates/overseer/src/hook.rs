@@ -64,37 +64,9 @@ pub fn prompt_of(event: &str, json: &serde_json::Value) -> Option<PromptInfo> {
     let tool = json.get("tool_name")?.as_str()?;
     let input = json.get("tool_input").unwrap_or(&serde_json::Value::Null);
     match event {
-        "PreToolUse" if tool == "AskUserQuestion" => {
-            let text = |q: &serde_json::Value, k: &str| {
-                q.get(k)
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_owned()
-            };
-            let questions = input
-                .get("questions")?
-                .as_array()?
-                .iter()
-                .map(|q| Question {
-                    header: text(q, "header"),
-                    question: text(q, "question"),
-                    options: q
-                        .get("options")
-                        .and_then(|o| o.as_array())
-                        .map(|o| {
-                            o.iter()
-                                .filter_map(|o| Some(o.get("label")?.as_str()?.to_owned()))
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                    multi: q
-                        .get("multiSelect")
-                        .and_then(|m| m.as_bool())
-                        .unwrap_or(false),
-                })
-                .collect();
-            Some(PromptInfo::Question { questions })
-        }
+        "PreToolUse" if tool == "AskUserQuestion" => Some(PromptInfo::Question {
+            questions: Question::list_of(input)?,
+        }),
         "PermissionRequest" => Some(PromptInfo::Permission {
             tool: tool.to_owned(),
             summary: detail(input).unwrap_or_else(|| tool.to_owned()),

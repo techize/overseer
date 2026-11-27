@@ -477,6 +477,9 @@ fn apply_fed(view: &mut SlotView, fed: Fed) {
     view.prompt.on_tools(&fed.tools);
     if let Some(turn) = fed.turn {
         view.turn_open = turn == Turn::Began;
+        if turn == Turn::Ended {
+            view.prompt.turn_ended();
+        }
     }
     if fed.context.is_some() {
         view.context = fed.context;
@@ -838,6 +841,42 @@ mod tests {
         assert_eq!(sent(&mut rx).len(), 1);
         assert!(svc.current(3).entries.is_empty());
         assert_eq!(svc.session(3), None);
+    }
+
+    #[tokio::test]
+    async fn restart_shows_the_question_still_open() {
+        let ledger = Arc::new(Ledger::in_memory());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("one.jsonl");
+        write(&path, &["deploy DEMO-1"]);
+        append_json(
+            &path,
+            serde_json::json!({"type":"assistant","message":{"role":"assistant",
+                "stop_reason":"tool_use","content":[{"type":"tool_use","id":"tu-q1",
+                "name":"AskUserQuestion","input":{"questions":[{"header":"Deploy",
+                "question":"Deploy demo-api now?","multiSelect":false,
+                "options":[{"label":"Yes"},{"label":"No"}]}]}}]}}),
+        );
+        ledger.put_transcript(2, SESSION, &path).unwrap();
+        // A new daemon: no PreToolUse comes for the question.
+        let (svc, mut rx) = service(ledger, Shown::default());
+        assert_eq!(svc.load(), vec![2]);
+        svc.refresh(2).await;
+        let open = svc.open_prompt(2).expect("the question is open");
+        assert_eq!(open.id, "tu-q1");
+        let PromptShown::Known(PromptInfo::Question { questions }) = &open.info else {
+            panic!("not a question: {:?}", open.info);
+        };
+        assert_eq!(questions[0].options, ["Yes", "No"]);
+        assert_eq!(sent(&mut rx).last().unwrap().prompt, Some(open));
+        // Its answer in the transcript ends it.
+        append_json(
+            &path,
+            serde_json::json!({"type":"user","message":{"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"tu-q1","content":"Yes"}]}}),
+        );
+        svc.refresh(2).await;
+        assert_eq!(svc.open_prompt(2), None);
     }
 
     #[tokio::test]

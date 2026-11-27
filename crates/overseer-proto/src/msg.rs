@@ -181,13 +181,49 @@ pub enum PromptInfo {
 }
 
 /// One question in an `AskUserQuestion` call.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Question {
     pub header: String,
     pub question: String,
     pub options: Vec<String>,
     /// More than one option may be picked.
     pub multi: bool,
+}
+
+impl Question {
+    /// The questions of an `AskUserQuestion` call's input, as the hook gets
+    /// it and the transcript records it. None when it has no question list.
+    pub fn list_of(input: &serde_json::Value) -> Option<Vec<Question>> {
+        let text = |q: &serde_json::Value, k: &str| {
+            q.get(k)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let questions = input
+            .get("questions")?
+            .as_array()?
+            .iter()
+            .map(|q| Question {
+                header: text(q, "header"),
+                question: text(q, "question"),
+                options: q
+                    .get("options")
+                    .and_then(|o| o.as_array())
+                    .map(|o| {
+                        o.iter()
+                            .filter_map(|o| Some(o.get("label")?.as_str()?.to_owned()))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                multi: q
+                    .get("multiSelect")
+                    .and_then(|m| m.as_bool())
+                    .unwrap_or(false),
+            })
+            .collect();
+        Some(questions)
+    }
 }
 
 /// One line of a slot's conversation.
