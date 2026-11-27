@@ -41,6 +41,10 @@ type Running = Box<dyn Fn(SlotId) -> Option<String> + Send + Sync>;
 /// A slot's screen, when it can be read.
 type Screen = Box<dyn Fn(SlotId) -> Option<Snapshot> + Send + Sync>;
 
+/// Told that a slot's transcript recorded the end of a turn or an
+/// interrupt; see [`SlotManager::turn_ended`].
+type TurnEnded = Box<dyn Fn(SlotId) + Send + Sync>;
+
 /// Polls in a row whose screen shows an open permission answered before
 /// it is dropped.
 const ANSWERED_LOOKS: u8 = 2;
@@ -50,6 +54,7 @@ pub struct ConversationService {
     ledger: Arc<Ledger>,
     running: Running,
     screen: Screen,
+    turn_ended: TurnEnded,
     events: broadcast::Sender<Event>,
     views: Mutex<HashMap<SlotId, SlotView>>,
     /// One per slot, held across a read so a hook and the poll never read
@@ -121,12 +126,14 @@ impl ConversationService {
         events: broadcast::Sender<Event>,
     ) -> Arc<Self> {
         let looks = manager.clone();
+        let ends = manager.clone();
+        let turn_ended = Box::new(move |slot| ends.lock().unwrap().turn_ended(slot));
         let running = Box::new(move |slot| manager.lock().unwrap().running_session(slot));
         let screen = Box::new(move |slot| {
             let slot = looks.lock().unwrap().slot(slot)?;
             Keyboard::screen(&*slot).map(|(snap, _)| snap)
         });
-        let (svc, wake) = Self::new(ledger, running, screen, events);
+        let (svc, wake) = Self::new(ledger, running, screen, turn_ended, events);
         let loaded = svc.load();
         tokio::spawn(svc.clone().run(wake, loaded, POLL));
         svc
@@ -136,6 +143,7 @@ impl ConversationService {
         ledger: Arc<Ledger>,
         running: Running,
         screen: Screen,
+        turn_ended: TurnEnded,
         events: broadcast::Sender<Event>,
     ) -> (Arc<Self>, mpsc::UnboundedReceiver<SlotId>) {
         let (wake, rx) = mpsc::unbounded_channel();
@@ -143,6 +151,7 @@ impl ConversationService {
             ledger,
             running,
             screen,
+            turn_ended,
             events,
             views: Mutex::new(HashMap::new()),
             readers: Mutex::new(HashMap::new()),
@@ -332,10 +341,11 @@ impl ConversationService {
             return;
         };
         // A reset since the read began: the next read starts the new file.
+        let mut ended = false;
         if view.generation == generation {
             match read {
                 Read::Missing => {}
-                Read::More(fed) => apply_fed(view, fed),
+                Read::More(fed) => ended = apply_fed(view, fed),
                 Read::Restarted(fed) => {
                     view.entries.clear();
                     view.turn_open = false;
@@ -346,6 +356,11 @@ impl ConversationService {
             }
         }
         self.publish(slot, view);
+        drop(views);
+        // Outside the views' lock, so the manager's is never taken under it.
+        if ended {
+            (self.turn_ended)(slot);
+        }
     }
 
     /// Sends what the app lacks of the view, if anything: everything after
@@ -472,18 +487,21 @@ impl ConversationService {
 }
 
 /// Takes in what a read found: its entries, tool calls and turn mark.
-fn apply_fed(view: &mut SlotView, fed: Fed) {
+/// Whether its last mark ends the turn (an end or an interrupt).
+fn apply_fed(view: &mut SlotView, fed: Fed) -> bool {
     append(view, fed.entries);
     view.prompt.on_tools(&fed.tools);
+    let ended = fed.turn == Some(Turn::Ended);
     if let Some(turn) = fed.turn {
         view.turn_open = turn == Turn::Began;
-        if turn == Turn::Ended {
+        if ended {
             view.prompt.turn_ended();
         }
     }
     if fed.context.is_some() {
         view.context = fed.context;
     }
+    ended
 }
 
 /// Adds entries. Past [`KEEP`] and [`SLACK`] the oldest are dropped down
@@ -596,7 +614,11 @@ mod tests {
         rx: broadcast::Receiver<Event>,
         /// What slot 2's screen shows.
         screen: Shown,
+        /// The slots told their turn ended, in order.
+        ended: Ended,
     }
+
+    type Ended = Arc<Mutex<Vec<SlotId>>>;
 
     type Shown = Arc<Mutex<Option<Snapshot>>>;
 
@@ -606,25 +628,29 @@ mod tests {
         let ledger = Arc::new(Ledger::in_memory());
         let dir = tempfile::tempdir().unwrap();
         let screen = Shown::default();
-        let (svc, rx) = service(ledger.clone(), screen.clone());
+        let ended = Ended::default();
+        let (svc, rx) = service(ledger.clone(), screen.clone(), ended.clone());
         Fixture {
             dir,
             ledger,
             svc,
             rx,
             screen,
+            ended,
         }
     }
 
     fn service(
         ledger: Arc<Ledger>,
         shown: Shown,
+        ended: Ended,
     ) -> (Arc<ConversationService>, broadcast::Receiver<Event>) {
         let (events, rx) = broadcast::channel(64);
         let running = Box::new(|slot| (slot == 2).then(|| SESSION.to_string()));
         let screen =
             Box::new(move |slot| (slot == 2).then(|| shown.lock().unwrap().clone()).flatten());
-        let (svc, _wake) = ConversationService::new(ledger, running, screen, events);
+        let turn_ended = Box::new(move |slot| ended.lock().unwrap().push(slot));
+        let (svc, _wake) = ConversationService::new(ledger, running, screen, turn_ended, events);
         (svc, rx)
     }
 
@@ -833,7 +859,7 @@ mod tests {
         let stale = dir.path().join("stale.jsonl");
         write(&stale, &["old"]);
         ledger.put_transcript(3, "demo-old", &stale).unwrap();
-        let (svc, mut rx) = service(ledger, Shown::default());
+        let (svc, mut rx) = service(ledger, Shown::default(), Ended::default());
         assert_eq!(svc.load(), vec![2]);
         svc.refresh(2).await;
         assert_eq!(texts(&svc.current(2).entries), ["before the restart"]);
@@ -859,7 +885,7 @@ mod tests {
         );
         ledger.put_transcript(2, SESSION, &path).unwrap();
         // A new daemon: no PreToolUse comes for the question.
-        let (svc, mut rx) = service(ledger, Shown::default());
+        let (svc, mut rx) = service(ledger, Shown::default(), Ended::default());
         assert_eq!(svc.load(), vec![2]);
         svc.refresh(2).await;
         let open = svc.open_prompt(2).expect("the question is open");
@@ -1103,6 +1129,7 @@ mod tests {
         f.svc.refresh(2).await;
         // Streaming: nothing after the prompt yet.
         assert!(f.svc.turn_open(2));
+        assert!(f.ended.lock().unwrap().is_empty());
         append_json(
             &path,
             serde_json::json!({"type":"user","message":{"content":[
@@ -1110,6 +1137,10 @@ mod tests {
         );
         f.svc.refresh(2).await;
         assert!(!f.svc.turn_open(2));
+        // The interrupt is passed on, once: no hook follows an Esc (#123).
+        assert_eq!(*f.ended.lock().unwrap(), [2]);
+        f.svc.refresh(2).await;
+        assert_eq!(*f.ended.lock().unwrap(), [2]);
         // A prompt submitted opens it before the transcript has the line.
         f.svc.hook(&hook(HookKind::UserPromptSubmit, &path));
         assert!(f.svc.turn_open(2));

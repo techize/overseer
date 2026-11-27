@@ -12,7 +12,7 @@ use overseer_proto::{
 };
 use tokio::sync::broadcast;
 
-use crate::activity::apply;
+use crate::activity::{after_turn, apply};
 use crate::env::BaseEnv;
 use crate::holder::{
     activity_path, client, end_by_pid, exit_path, holder_gone, holder_state, pid_path, socket_path,
@@ -897,6 +897,23 @@ impl SlotManager {
             });
         }
         let next = apply(entry.activity.as_ref(), ev, unix_now());
+        if entry.set_activity(next) {
+            let _ = self.events.send(Event::SlotChanged(entry.info()));
+        }
+    }
+
+    /// The slot's transcript recorded the end of a turn or an interrupt: a
+    /// running slot still marked Needs you was answered (see
+    /// [`after_turn`]).
+    pub fn turn_ended(&self, id: SlotId) {
+        let mut slots = self.slots.lock().unwrap();
+        let Some(entry) = slots.get_mut(id as usize).and_then(Option::as_mut) else {
+            return;
+        };
+        if !matches!(entry.slot.info().state, SlotState::Running { .. }) {
+            return;
+        }
+        let next = after_turn(entry.activity.as_ref(), unix_now());
         if entry.set_activity(next) {
             let _ = self.events.send(Event::SlotChanged(entry.info()));
         }
