@@ -7566,6 +7566,61 @@ async fn a_hooked_transcript_is_followed_and_answered() {
     ));
 }
 
+/// A prompt answered No (or Esc) fires no hook; the interrupt the transcript
+/// records is what takes the slot off Needs you (#123).
+#[tokio::test]
+async fn an_interrupt_in_the_transcript_answers_needs_you() {
+    let d = start_daemon().await;
+    let mut c = Client::connect(&d.socket).await;
+    assert_eq!(c.start(2).await, Response::Ok);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("demo-session.jsonl");
+    std::fs::write(
+        &path,
+        "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"fix DEMO-1\"}}\n",
+    )
+    .unwrap();
+    let in_transcript = |kind| HookEvent {
+        session_id: Some("demo-session".into()),
+        transcript_path: Some(path.to_string_lossy().into_owned()),
+        ..hook(2, kind)
+    };
+    c.hook(in_transcript(HookKind::SessionStart)).await;
+    c.hook(in_transcript(HookKind::UserPromptSubmit)).await;
+    let mut note = in_transcript(HookKind::Notification);
+    note.notification = Some("Claude needs your permission".into());
+    c.hook(note).await;
+    let asked = loop {
+        let info = c.next_change(2).await;
+        if info.activity.as_ref().map(|a| a.kind) == Some(ActivityKind::NeedsYou) {
+            break info;
+        }
+    };
+    assert_eq!(activity_of(&asked).kind, ActivityKind::NeedsYou);
+
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
+    std::io::Write::write_all(
+        &mut f,
+        b"{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"[Request interrupted by user]\"}]}}\n",
+    )
+    .unwrap();
+    let answered = timeout(WAIT * 2, async {
+        loop {
+            let info = c.next_change(2).await;
+            if info.activity.as_ref().map(|a| a.kind) != Some(ActivityKind::NeedsYou) {
+                return info;
+            }
+        }
+    })
+    .await
+    .expect("still needs you after the interrupt");
+    assert_eq!(activity_of(&answered).kind, ActivityKind::Idle);
+    assert_eq!(c.list().await[2].activity, answered.activity);
+}
+
 /// A rig whose `pr_repos` is its `demo-api`, the repo a dropped ticket
 /// starts in. The PR source runs a command that lists nothing.
 async fn drop_rig(name: &str) -> (PlanRig, Daemon, Client) {

@@ -49,6 +49,24 @@ pub fn apply(prev: Option<&Activity>, ev: &HookEvent, now: i64) -> Option<Activi
     })
 }
 
+/// The activity after the slot's transcript records the end of a turn or an
+/// interrupt at `now`. A prompt answered No (or dismissed with Esc) fires no
+/// hook, so `NeedsYou` would stay until the next prompt; the transcript's
+/// interrupt line is the only sign it was answered (#123). Anything else is
+/// left to the hooks.
+pub fn after_turn(prev: Option<&Activity>, now: i64) -> Option<Activity> {
+    match prev {
+        Some(p) if p.kind == ActivityKind::NeedsYou => Some(Activity {
+            kind: ActivityKind::Idle,
+            since: now,
+            now_doing: None,
+            reason: None,
+            idle_wait: false,
+        }),
+        _ => prev.cloned(),
+    }
+}
+
 /// A `Notification` that only says the session is waiting for input, not a
 /// permission or question prompt: its type is `idle_prompt`, or, with no
 /// type, its message says it is waiting for your input.
@@ -224,6 +242,21 @@ mod tests {
             let a = apply(Some(&prev), &ev(kind), 12).unwrap();
             assert_eq!(a, act(ActivityKind::Idle, 12), "{kind:?}");
         }
+    }
+
+    #[test]
+    fn a_turn_end_answers_a_prompt_and_leaves_the_rest() {
+        let mut asked = act(ActivityKind::NeedsYou, 5);
+        asked.reason = Some("Claude needs your permission".into());
+        assert_eq!(
+            after_turn(Some(&asked), 30),
+            Some(act(ActivityKind::Idle, 30))
+        );
+        for kind in [ActivityKind::Working, ActivityKind::Idle] {
+            let prev = act(kind, 5);
+            assert_eq!(after_turn(Some(&prev), 30), Some(prev), "{kind:?}");
+        }
+        assert_eq!(after_turn(None, 30), None);
     }
 
     #[test]
