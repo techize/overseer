@@ -187,6 +187,23 @@ fn refresh_button(busy: bool, cx: &mut Context<OverseerApp>) -> impl IntoElement
         .child(if busy { "Refreshing..." } else { "Refresh" })
 }
 
+/// Opens the end-of-day overlay; the palette's End of day does the same.
+fn eod_button(cx: &mut Context<OverseerApp>) -> impl IntoElement {
+    div()
+        .id("open-eod")
+        .px_2()
+        .rounded(px(4.))
+        .border_1()
+        .border_color(rgb(colors::BUTTON_BORDER))
+        .bg(rgb(colors::BUTTON))
+        .text_xs()
+        .text_color(rgb(colors::TEXT))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(colors::CARD_HOVER)))
+        .on_click(cx.listener(|this, _, window, cx| this.open_eod(window, cx)))
+        .child("End of day")
+}
+
 /// Opens the command palette, for the mouse; Cmd+K does the same.
 fn palette_button(cx: &mut Context<OverseerApp>) -> impl IntoElement {
     div()
@@ -1324,6 +1341,7 @@ impl OverseerApp {
                                     }))
                                     .child(source_line(&self.work, local_hhmm)),
                             )
+                            .child(eod_button(cx))
                             .child(palette_button(cx))
                             .child(refresh_button(self.refreshing_work, cx)),
                     ),

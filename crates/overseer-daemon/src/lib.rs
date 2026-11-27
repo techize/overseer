@@ -7,6 +7,7 @@ pub mod config;
 pub mod conversation;
 pub mod coord;
 pub mod env;
+pub mod eod;
 pub mod holder;
 pub mod launch;
 pub mod ledger;

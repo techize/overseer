@@ -25,6 +25,7 @@ use crate::conversation::service::ConversationService;
 use crate::coord::plan::PlanCtx;
 use crate::coord::CoordService;
 use crate::env::{BaseEnv, EnvSource};
+use crate::eod::EndOfDay;
 use crate::launch::RoleDirs;
 use crate::ledger::Ledger;
 use crate::locks::{owned_items, LockService};
@@ -461,6 +462,13 @@ pub async fn run_until(
         events.clone(),
         crate::attention::Options::of(&cfg.settings),
     );
+    let eod = EndOfDay::new(
+        &cfg.settings,
+        crate::config::home_from_env(),
+        env.clone(),
+        day_timeline.clone(),
+        state_dir.join("tmp"),
+    );
     let plans = Arc::new(PlanCtx {
         manager: manager.clone(),
         store: store.clone(),
@@ -497,6 +505,7 @@ pub async fn run_until(
                             attention: attention.clone(),
                             timeline: day_timeline.clone(),
                             conversation: conversation.clone(),
+                            eod: eod.clone(),
                         },
                         shutdown.clone(),
                         env.clone(),
@@ -1106,6 +1115,7 @@ struct Services {
     attention: Arc<AttentionService>,
     timeline: Arc<TimelineService>,
     conversation: Arc<ConversationService>,
+    eod: Arc<EndOfDay>,
 }
 
 async fn handle_conn(
@@ -1128,6 +1138,7 @@ async fn handle_conn(
         attention,
         timeline,
         conversation,
+        eod,
     } = services;
     let (mut rd, mut wr) = stream.into_split();
     let (out_tx, mut out_rx) = mpsc::channel::<Frame>(OUTBOUND_QUEUE);
@@ -1237,6 +1248,7 @@ async fn handle_conn(
                         attention: &attention,
                         timeline: &timeline,
                         conversation: &conversation,
+                        eod: &eod,
                     };
                     handle_frame(f, &ctx, &outbox, &shutdown, &mut streams)
                 }
@@ -1284,6 +1296,7 @@ struct Ctx<'a> {
     attention: &'a Arc<AttentionService>,
     timeline: &'a Arc<TimelineService>,
     conversation: &'a Arc<ConversationService>,
+    eod: &'a Arc<EndOfDay>,
 }
 
 fn handle_frame(
@@ -1425,6 +1438,35 @@ fn handle_frame(
                     .start_ticket(slot, &key, repo, &branch, &plans, unix_now())
                     .await;
                 courier.poke();
+                outbox.send(Frame::Response { seq, resp });
+            });
+        }
+        // The end of day runs the notes folder's scripts (up to 180 s each)
+        // and writes files, so both requests are answered from tasks.
+        Frame::Request {
+            seq,
+            req: Request::EndOfDay { target_quarters },
+        } => {
+            let eod = ctx.eod.clone();
+            let outbox = outbox.clone();
+            store.spawn(async move {
+                let resp = Response::EndOfDay(eod.run(unix_now(), target_quarters).await);
+                outbox.send(Frame::Response { seq, resp });
+            });
+        }
+        Frame::Request {
+            seq,
+            req: Request::SaveDay { id, hours, replace },
+        } => {
+            let eod = ctx.eod.clone();
+            let outbox = outbox.clone();
+            store.spawn(async move {
+                let resp =
+                    tokio::task::spawn_blocking(move || eod.save(id, &hours, replace, unix_now()))
+                        .await
+                        .unwrap_or_else(|e| Response::Error {
+                            message: format!("saving the day failed: {e}"),
+                        });
                 outbox.send(Frame::Response { seq, resp });
             });
         }
@@ -1915,12 +1957,14 @@ fn handle_request(
             let owned = ctx.coord.gather(ctx.plans);
             ctx.coord.propose(from, plan, &owned.facts(), unix_now())
         }
-        // Answered in `handle_frame` from a task (it runs git and starts
-        // sessions); this arm only keeps the match whole.
+        // Answered in `handle_frame` from a task (they run git, start
+        // sessions or run the end-of-day scripts); this arm only keeps the
+        // match whole.
         Request::DecidePlan { .. } => err("not answered here".into()),
-        Request::PrepareStart { .. } | Request::StartTicket { .. } => {
-            err("not answered here".into())
-        }
+        Request::PrepareStart { .. }
+        | Request::StartTicket { .. }
+        | Request::EndOfDay { .. }
+        | Request::SaveDay { .. } => err("not answered here".into()),
         // Always Ok: a hook runs inside Claude and must never see a failure
         // because of the daemon's state.
         Request::Hook(ev) => {

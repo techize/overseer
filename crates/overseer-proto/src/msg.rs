@@ -739,6 +739,19 @@ pub enum Request {
     },
     /// Today's timeline of what each slot did and where its log has gaps.
     Timeline,
+    /// Build the end-of-day draft: today's hours per ticket and epic.
+    /// `target_quarters` books a day other than the default length.
+    EndOfDay {
+        #[serde(default)]
+        target_quarters: Option<u32>,
+    },
+    /// Write draft `id` with the chosen quarter-hours per epic key.
+    /// `replace` overwrites files that already exist for the day.
+    SaveDay {
+        id: u64,
+        hours: Vec<(String, u32)>,
+        replace: bool,
+    },
     /// Mark a pull request's current comments and build as seen.
     PrSeen {
         repo: String,
@@ -1384,6 +1397,18 @@ pub enum Response {
     Ok,
     Attention(AttentionView),
     Timeline(DayView),
+    /// The end-of-day draft.
+    EndOfDay(DayDraft),
+    /// The day was written. Paths are shown with the home folder as `~`.
+    DaySaved {
+        time_log: String,
+        allocation: Option<String>,
+        push: Option<String>,
+    },
+    /// Files for the day already exist and `replace` was not set.
+    DayExists {
+        paths: Vec<String>,
+    },
     Conversation(ConversationView),
     Slots(Vec<SlotInfo>),
     Error {
@@ -1601,6 +1626,65 @@ impl DayView {
     }
 }
 
+/// Something the end-of-day draft could not settle on its own.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DayProblem {
+    pub text: String,
+    /// The slot the problem belongs to, if any.
+    #[serde(default)]
+    pub slot: Option<SlotId>,
+    /// A file to look at, as an absolute path (the client shows it with `~`).
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+/// Minutes worked on one ticket today.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TicketMinutes {
+    pub ticket: String,
+    pub minutes: f64,
+    /// The epic the ticket rolls up to, if known.
+    #[serde(default)]
+    pub epic: Option<String>,
+}
+
+/// Hours for one epic: the quarter-hours chosen and the hours derived from
+/// the logs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EpicHours {
+    pub key: String,
+    pub summary: String,
+    pub quarters: u32,
+    pub derived_hours: f64,
+    #[serde(default)]
+    pub tickets: Vec<String>,
+}
+
+/// The end-of-day draft: what the logs say about today, ready to adjust and
+/// save.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DayDraft {
+    pub id: u64,
+    /// Local date, `YYYY-MM-DD`.
+    pub day: String,
+    /// The day's total in quarter-hours.
+    pub target_quarters: u32,
+    /// Whether the split ran and its output was read.
+    pub split_ok: bool,
+    /// True when the day's target cannot be changed.
+    #[serde(default)]
+    pub target_fixed: bool,
+    #[serde(default)]
+    pub problems: Vec<DayProblem>,
+    #[serde(default)]
+    pub tickets: Vec<TicketMinutes>,
+    #[serde(default)]
+    pub epics: Vec<EpicHours>,
+    /// A note on how well the split fits the target.
+    #[serde(default)]
+    pub fit: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1683,6 +1767,83 @@ mod tests {
         let resp = Response::Timeline(demo_day());
         let back: Response = serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
         assert_eq!(back, resp);
+    }
+
+    #[test]
+    fn end_of_day_messages_round_trip() {
+        let req = Request::SaveDay {
+            id: 3,
+            hours: vec![("DEMO-1".into(), 30)],
+            replace: false,
+        };
+        let back: Request = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        assert_eq!(back, req);
+        for req in [
+            Request::EndOfDay {
+                target_quarters: Some(36),
+            },
+            Request::EndOfDay {
+                target_quarters: None,
+            },
+        ] {
+            let back: Request =
+                serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+            assert_eq!(back, req);
+        }
+        let bare: Request = serde_json::from_str(r#"{"type":"EndOfDay"}"#).unwrap();
+        assert_eq!(
+            bare,
+            Request::EndOfDay {
+                target_quarters: None
+            }
+        );
+        let draft = DayDraft {
+            id: 3,
+            day: "2026-01-02".into(),
+            target_quarters: 30,
+            split_ok: true,
+            target_fixed: true,
+            problems: vec![DayProblem {
+                text: "log gap".into(),
+                slot: Some(2),
+                path: Some("~/logs/a.log".into()),
+            }],
+            tickets: vec![TicketMinutes {
+                ticket: "DEMO-1".into(),
+                minutes: 90.5,
+                epic: Some("DEMO-9".into()),
+            }],
+            epics: vec![EpicHours {
+                key: "DEMO-9".into(),
+                summary: "Demo epic".into(),
+                quarters: 30,
+                derived_hours: 7.5,
+                tickets: vec!["DEMO-1".into()],
+            }],
+            fit: Some("fits".into()),
+        };
+        for resp in [
+            Response::EndOfDay(draft),
+            Response::DaySaved {
+                time_log: "~/time.csv".into(),
+                allocation: None,
+                push: Some("pushed".into()),
+            },
+            Response::DayExists {
+                paths: vec!["~/a".into()],
+            },
+        ] {
+            let back: Response =
+                serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
+            assert_eq!(back, resp);
+        }
+        let d: DayDraft = serde_json::from_str(
+            r#"{"id":1,"day":"2026-01-02","target_quarters":30,"split_ok":false}"#,
+        )
+        .unwrap();
+        assert!(d.problems.is_empty() && d.tickets.is_empty() && d.epics.is_empty());
+        assert_eq!(d.fit, None);
+        assert!(!d.target_fixed);
     }
 
     #[test]

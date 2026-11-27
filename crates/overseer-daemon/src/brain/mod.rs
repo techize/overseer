@@ -1906,14 +1906,14 @@ async fn worker(svc: Weak<BrainService>, wake: Arc<Notify>) {
     }
 }
 
-struct RunOut {
-    code: i32,
-    stdout: String,
-    stderr: String,
+pub(crate) struct RunOut {
+    pub(crate) code: i32,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
 }
 
 /// Runs `program args` in `cwd` with `OVERSEER_COMMIT=1`, killed after `limit`.
-async fn run_program(
+pub(crate) async fn run_program(
     program: &Path,
     args: &[String],
     cwd: &Path,

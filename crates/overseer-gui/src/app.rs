@@ -45,6 +45,7 @@ use overseer_proto::{
 use crate::board::Dir;
 use crate::conversation_view::{Conv, SLOT_COUNT};
 use crate::daemon_info::DaemonKnown;
+use crate::eod_view::{EodEvent, EodView};
 use crate::locks_view::LocksState;
 use crate::palette::{Command, Palette, PaletteEvent};
 use crate::picker::{Picker, PickerEvent};
@@ -147,10 +148,10 @@ pub(crate) fn locks_return(from: Screen) -> Option<SlotId> {
 }
 
 /// Navigation keys work anywhere in the window except the start dialog, the
-/// picker, the command palette, the drop-to-start card, the plan view and
-/// Settings.
-const NAV: &str =
-    "Overseer && !StartDialog && !Picker && !Palette && !StartCard && !PlanView && !Settings";
+/// picker, the command palette, the drop-to-start card, the plan view,
+/// Settings and the end-of-day overlay.
+const NAV: &str = "Overseer && !StartDialog && !Picker && !Palette && !StartCard && !PlanView \
+     && !Settings && !EodView";
 
 pub fn key_bindings() -> Vec<KeyBinding> {
     let nav = Some(NAV);
@@ -550,6 +551,8 @@ pub struct OverseerApp {
     plan_view: Option<(Entity<PlanView>, Subscription)>,
     /// The confirm card for a ticket dropped on a slot.
     start_card: Option<(Entity<StartCard>, Subscription)>,
+    /// The end-of-day overlay, while it is up.
+    eod: Option<(Entity<EodView>, Subscription)>,
     /// Plan views closed with a decision still on its way, kept for the
     /// answer.
     plan_leaving: Vec<(Entity<PlanView>, Subscription)>,
@@ -656,6 +659,7 @@ impl OverseerApp {
             palette: None,
             plan_view: None,
             start_card: None,
+            eod: None,
             plan_leaving: Vec::new(),
             settings: None,
             settings_leaving: Vec::new(),
@@ -841,6 +845,9 @@ impl OverseerApp {
         }
         if let Some((c, _)) = &self.start_card {
             c.update(cx, |c, _| c.set_client(client.clone()));
+        }
+        if let Some((v, _)) = &self.eod {
+            v.update(cx, |v, _| v.set_client(client.clone()));
         }
         if let Some((v, _)) = &self.plan_view {
             v.update(cx, |v, _| v.set_client(client.clone()));
@@ -1613,13 +1620,14 @@ impl OverseerApp {
             .unwrap_or_default()
     }
 
-    /// The start dialog, the picker, the drop-to-start card, the plan view
-    /// or Settings is up; navigation waits for it.
+    /// The start dialog, the picker, the drop-to-start card, the plan view,
+    /// Settings or the end-of-day overlay is up; navigation waits for it.
     pub(crate) fn modal_open(&self) -> bool {
         self.dialog.is_some()
             || self.picker.is_some()
             || self.palette.is_some()
             || self.start_card.is_some()
+            || self.eod.is_some()
             || self.plan_view.is_some()
             || self.settings.is_some()
     }
@@ -1843,9 +1851,41 @@ impl OverseerApp {
                 self.next_waiting_slot(cx);
             }
             Command::Locks => self.go_locks(window, cx),
+            Command::EndOfDay => self.open_eod(window, cx),
             // The palette asks what happened and writes the report itself.
             Command::BugReport(_) => self.restore_focus(window, cx),
         }
+    }
+
+    /// The end-of-day overlay: the board's End of day button, or the
+    /// palette. It asks the daemon for today's draft as it opens.
+    pub(crate) fn open_eod(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal_open() {
+            return;
+        }
+        self.status = None;
+        let client = self.client.clone();
+        let home = self.home.clone();
+        let view = cx.new(|cx| EodView::new(client, home, cx));
+        let sub = cx.subscribe_in(&view, window, |this, _, ev: &EodEvent, window, cx| {
+            match ev {
+                EodEvent::Closed => {
+                    this.eod = None;
+                    this.restore_focus(window, cx);
+                }
+                EodEvent::OpenSlot(id) => {
+                    this.eod = None;
+                    this.go_session(*id, window, cx);
+                }
+                // The overlay stays up, to run the checks again after the
+                // fix.
+                EodEvent::OpenPath(path) => open_external(path.clone(), "the log file"),
+            }
+            cx.notify();
+        });
+        window.focus(&view.focus_handle(cx));
+        self.eod = Some((view, sub));
+        cx.notify();
     }
 
     /// After assigning to a slot with no session: fetch its kickoff and
@@ -2414,6 +2454,7 @@ impl Render for OverseerApp {
             .children(self.picker.as_ref().map(|(p, _)| p.clone()))
             .children(self.palette.as_ref().map(|(p, _)| p.clone()))
             .children(self.start_card.as_ref().map(|(c, _)| c.clone()))
+            .children(self.eod.as_ref().map(|(v, _)| v.clone()))
             .children(self.plan_view.as_ref().map(|(p, _)| p.clone()))
             .children(self.settings.as_ref().map(|(s, _)| s.clone()))
     }
@@ -2601,6 +2642,28 @@ mod tests {
             assert_eq!(routed(k, PALETTE), None, "{k}");
         }
         assert_eq!(routed("cmd-q", PALETTE), Some("overseer::Quit"));
+    }
+
+    #[test]
+    fn the_end_of_day_view_keeps_its_keys() {
+        const EOD: &[&str] = &["Overseer", "EodView"];
+        for k in [
+            "a",
+            "l",
+            "p",
+            "up",
+            "down",
+            "enter",
+            "escape",
+            "tab",
+            "cmd-k",
+            "cmd-1",
+            "cmd-n",
+            "cmd-escape",
+        ] {
+            assert_eq!(routed(k, EOD), None, "{k}");
+        }
+        assert_eq!(routed("cmd-q", EOD), Some("overseer::Quit"));
     }
 
     #[test]

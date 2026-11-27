@@ -426,7 +426,8 @@ unsaved edits the first `Esc` only warns).
   stores it in the Keychain. They show only whether a token is found, never
   the token itself.
 - Read-only here: `brain_writer` (it has a setup checklist), `jira_command`,
-  `bd_command` and `sync_command` (a typo turns a source off) and
+  `bd_command` and `sync_command` (a typo in one of these turns a source
+  off), `eod_index_command`, `eod_split_command`, `eod_target_arg` and
   `terminal.ansi` (the 16 colours). Change them in `config.toml`; Open opens
   each file that exists in your text editor. `targets.toml` is shown with the
   number of patterns the daemon read from it.
@@ -454,6 +455,11 @@ group for the notes keys). They apply after a daemon restart.
 | `ticket_pattern` | `""` | Empty: built from your Jira project keys, as `(DEMO|OPS)-\d+`. |
 | `user_name` | first word of your macOS full name | The name used in prompts and messages. |
 | `notes_dir` (alias `brain_dir`) | `~/Repos/2ndBrain` if it exists, else `~/OverseerNotes` | The notes folder. Overseer owns a folder only when it holds the `.overseer-notes` marker; it creates one itself only for the default `~/OverseerNotes`. |
+| `eod_index_command` | `["python3", "Claude/tools/session-index.py"]` | End of day: the command, run in the notes folder, that rebuilds the session index. Cleared for an Overseer-owned folder. |
+| `eod_split_command` | `["python3", "Claude/tools/day-minutes.py", "--date", "{date}", "--out", "{out}"]` | End of day: the command, run in the notes folder, that splits the day's minutes across tickets and writes them to `{out}`. Cleared for an Overseer-owned folder. Empty turns End of day off. |
+| `eod_time_log` | `06-Daily/{yyyy}/{mm}-{Month}/{yyyy}-{mm}-{dd}-time-log.md` | End of day: where the day's time log is written, under the notes folder. |
+| `eod_allocation_file` | `~/.jira-clockify/allocations/{yyyy}-{mm}-{dd}.json` | End of day: where the approved allocation file is written. Empty skips the allocation file. |
+| `eod_target_arg` | `["--target", "{hours}"]` | End of day: added to the split command when the day's target changes; `{hours}` is the target in hours (`9`, `8.75`). Not cleared for an owned folder. |
 
 The tokens are not config keys. Set them in Settings (Keychain) or in the
 environment:
@@ -503,6 +509,17 @@ trimming):
   run, Esc to close. A bug report asks what happened, runs
   `overseer ctl bug-report` (with the slot's screen when you picked one) and
   opens the file it writes, to read before posting.
+- End of day, in the board's header or the palette, opens today's draft. It
+  says `Running the checks...` while the daemon runs the session index and
+  the split script, then shows the problems (a click opens the log file or
+  goes to the slot), the minutes per ticket, and the hours per epic with the
+  hours `from sessions` beside each. The day's target and each epic's hours
+  have - and + buttons that move them a quarter hour; changing the target
+  runs the split again for it. Approve is on only when the hours make the
+  target and the split worked. It writes the day's time log and allocation
+  file (asking first if they exist) and shows the `jc push` command to copy;
+  nothing is sent anywhere. Run again rebuilds the draft, asking first when
+  you have changed the hours. Esc or Close closes it.
 - Under each session card's title is one line with the ticket, the branch,
   its open PRs with their CI state, and `ctx 42%`: how full the session's
   context is, from the token counts in its transcript. It turns orange at 80%
@@ -542,6 +559,8 @@ trimming):
   and the log that covers it; click a row to open that session. The panel
   is hidden until a session has run today. `overseer ctl timeline` prints
   the same day as text.
+- `overseer ctl eod` prints the end-of-day draft (`--target <hours>` for a
+  long day, `--json` for scripts).
 - When a slot's session ends (it exits, is stopped, or you decline to resume
   it), Overseer releases every item it owned and logs it, and drops a status
   request it never answered. The next plan or ticket click finds those items

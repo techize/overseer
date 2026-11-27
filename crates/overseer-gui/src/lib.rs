@@ -6,6 +6,7 @@ pub mod board;
 pub mod conversation_pane;
 pub mod conversation_view;
 pub mod daemon_info;
+pub mod eod_view;
 pub mod kanban_size;
 pub mod locks_view;
 pub mod notify;

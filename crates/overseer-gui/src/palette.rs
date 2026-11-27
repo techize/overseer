@@ -41,6 +41,8 @@ pub enum Command {
     BugReport(Option<SlotId>),
     NextWaiting,
     Locks,
+    /// The end-of-day overlay.
+    EndOfDay,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,6 +150,11 @@ pub fn rows(slots: &[SlotInfo], work: &WorkView, on: &[SlotBranch], waiting: usi
         "Locks",
         "every held target and its queue",
         Command::Locks,
+    ));
+    out.push(row(
+        "End of day",
+        "check today's logs and approve the hours",
+        Command::EndOfDay,
     ));
     out.push(row(
         "File a bug report\u{2026}",
@@ -740,6 +747,7 @@ mod tests {
                 "Open PR #7 Add the export",
                 "Open PR #8 Add the export",
                 "Locks",
+                "End of day",
                 "File a bug report\u{2026}",
                 "File a bug report for S0\u{2026}",
                 "File a bug report for S2\u{2026}",

@@ -12,9 +12,9 @@ use overseer_proto::paths::{log_dir, socket_path};
 use overseer_proto::settings::{parse_text, Applies, SettingEdit, SettingsView};
 use overseer_proto::{
     age_text, build_notice, local_hhmm, slot_name, ActivityKind, AttentionKind, AttentionView,
-    BoardView, BrainRun, BrainView, ClaimKind, Client, DaemonInfo, DayView, ItemKind, LockView,
-    Plan, PlanDecision, PlanRecord, PlanState, QueueState, RelayState, Request, Response, SlotId,
-    SlotInfo, SlotState, SpanKind, WorkItem, WorkView,
+    BoardView, BrainRun, BrainView, ClaimKind, Client, DaemonInfo, DayDraft, DayView, ItemKind,
+    LockView, Plan, PlanDecision, PlanRecord, PlanState, QueueState, RelayState, Request, Response,
+    SlotId, SlotInfo, SlotState, SpanKind, WorkItem, WorkView,
 };
 
 #[derive(Subcommand)]
@@ -154,6 +154,15 @@ pub enum CtlCmd {
         /// Print the raw DayView as JSON.
         #[arg(long)]
         json: bool,
+    },
+    /// Today's end-of-day draft: problems, minutes per ticket, hours per epic.
+    Eod {
+        /// Print the raw DayDraft as JSON.
+        #[arg(long)]
+        json: bool,
+        /// The day's total in hours, in whole quarter hours (for example 9 or 8.75).
+        #[arg(long)]
+        target: Option<f64>,
     },
     /// Everything on the board: summary, slots, work, locks, pending plan.
     Board {
@@ -928,6 +937,74 @@ fn attention_lines(v: &AttentionView, now: i64, all: bool) -> Vec<String> {
         .collect()
 }
 
+/// Turn a target in hours into quarter hours, refusing anything that is not a
+/// positive whole number of quarter hours.
+fn target_to_quarters(hours: f64) -> anyhow::Result<u32> {
+    let quarters = hours * 4.0;
+    if !quarters.is_finite()
+        || quarters < 1.0
+        || quarters.fract() != 0.0
+        || quarters > f64::from(u32::MAX)
+    {
+        bail!("the target must be a positive whole number of quarter hours, such as 9 or 8.75");
+    }
+    Ok(quarters as u32)
+}
+
+/// The end-of-day draft as text: problems, minutes per ticket, then the hours
+/// per epic with the total, or a note that the split did not run.
+pub fn format_draft(d: &DayDraft) -> Vec<String> {
+    let mut out = vec![format!("End of day {}", d.day)];
+    if !d.problems.is_empty() {
+        out.push("Problems".into());
+        for p in &d.problems {
+            let mut line = format!("  {}", p.text);
+            if let Some(s) = p.slot {
+                line.push_str(&format!("  ({})", slot_name(s)));
+            }
+            if let Some(path) = &p.path {
+                line.push_str(&format!("  {}", tilde(Path::new(path))));
+            }
+            out.push(line);
+        }
+    }
+    if !d.tickets.is_empty() {
+        out.push("Minutes per ticket".into());
+        for t in &d.tickets {
+            let epic = t
+                .epic
+                .as_deref()
+                .map(|e| format!("  ({e})"))
+                .unwrap_or_default();
+            out.push(format!("  {}  {:.0} min{epic}", t.ticket, t.minutes));
+        }
+    }
+    if !d.split_ok {
+        out.push("No hours: the split did not run.".into());
+        return out;
+    }
+    out.push("Hours per epic".into());
+    for e in &d.epics {
+        out.push(format!(
+            "  {}  {}  {:.2} h (from sessions {:.2} h)",
+            e.key,
+            e.summary,
+            f64::from(e.quarters) / 4.0,
+            e.derived_hours
+        ));
+    }
+    let total: u32 = d.epics.iter().map(|e| e.quarters).sum();
+    out.push(format!(
+        "Total {:.2} of {:.2} h",
+        f64::from(total) / 4.0,
+        f64::from(d.target_quarters) / 4.0
+    ));
+    if let Some(fit) = &d.fit {
+        out.push(fit.clone());
+    }
+    out
+}
+
 /// One line per stretch, then one indented line per gap, unlogged or
 /// waiting span. Span kinds this build does not know are left out.
 fn timeline_lines(v: &DayView, clock: impl Fn(i64) -> String) -> Vec<String> {
@@ -1454,6 +1531,26 @@ pub async fn run(cmd: CtlCmd) -> anyhow::Result<()> {
             Response::Error { message } => bail!("{message}"),
             other => bail!("unexpected reply: {other:?}"),
         },
+        CtlCmd::Eod { json, target } => {
+            let target_quarters = target.map(target_to_quarters).transpose()?;
+            match client
+                .request(Request::EndOfDay { target_quarters })
+                .await?
+            {
+                Response::EndOfDay(d) => {
+                    if json {
+                        println!("{}", serde_json::to_string(&d)?);
+                    } else {
+                        for l in format_draft(&d) {
+                            println!("{l}");
+                        }
+                    }
+                    Ok(())
+                }
+                Response::Error { message } => bail!("{message}"),
+                other => bail!("unexpected reply: {other:?}"),
+            }
+        }
         CtlCmd::Plan { json, action } => run_plan(&client, json, action).await,
         CtlCmd::Settings { json, action } => run_settings(&client, json, action).await,
         CtlCmd::Summary { text } => print_brain_text(
@@ -2197,6 +2294,91 @@ mod tests {
                 json: false,
                 all: true
             }
+        ));
+    }
+
+    #[test]
+    fn the_draft_prints_problems_tickets_and_hours() {
+        use overseer_proto::{DayProblem, EpicHours, TicketMinutes};
+        let mut d = DayDraft {
+            id: 1,
+            day: "2026-11-26".into(),
+            target_quarters: 30,
+            split_ok: true,
+            problems: vec![
+                DayProblem {
+                    text: "No log for the afternoon".into(),
+                    slot: Some(2),
+                    path: None,
+                },
+                DayProblem {
+                    text: "Log is empty".into(),
+                    slot: None,
+                    path: Some("/nonexistent-demo/log.md".into()),
+                },
+            ],
+            tickets: vec![TicketMinutes {
+                ticket: "DEMO-2".into(),
+                minutes: 90.0,
+                epic: Some("DEMO-1".into()),
+            }],
+            epics: vec![
+                EpicHours {
+                    key: "DEMO-1".into(),
+                    summary: "Demo epic".into(),
+                    quarters: 13,
+                    derived_hours: 3.1,
+                    tickets: vec!["DEMO-2".into()],
+                },
+                EpicHours {
+                    key: "DEMO-9".into(),
+                    summary: "Other epic".into(),
+                    quarters: 17,
+                    derived_hours: 4.0,
+                    tickets: vec![],
+                },
+            ],
+            fit: Some("Close to the logs".into()),
+            target_fixed: false,
+        };
+        let text = format_draft(&d).join("\n");
+        assert!(text.contains("Problems"), "{text}");
+        assert!(text.contains(&format!("({})", slot_name(2))), "{text}");
+        assert!(text.contains("/nonexistent-demo/log.md"), "{text}");
+        assert!(text.contains("Minutes per ticket"), "{text}");
+        assert!(text.contains("DEMO-2  90 min"), "{text}");
+        assert!(
+            text.contains("DEMO-1  Demo epic  3.25 h (from sessions 3.10 h)"),
+            "{text}"
+        );
+        assert!(text.contains("Total 7.50 of 7.50 h"), "{text}");
+        assert!(text.contains("Close to the logs"), "{text}");
+        d.split_ok = false;
+        let text = format_draft(&d).join("\n");
+        assert!(text.contains("No hours: the split did not run."), "{text}");
+        assert!(!text.contains("Total"), "{text}");
+    }
+
+    #[test]
+    fn the_eod_target_must_be_whole_quarter_hours() {
+        assert_eq!(target_to_quarters(9.0).unwrap(), 36);
+        assert_eq!(target_to_quarters(8.75).unwrap(), 35);
+        assert!(target_to_quarters(8.8).is_err());
+        assert!(target_to_quarters(0.0).is_err());
+        assert!(target_to_quarters(-1.0).is_err());
+        assert!(target_to_quarters(f64::NAN).is_err());
+    }
+
+    #[test]
+    fn ctl_eod_parses_target_and_json() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["x", "eod", "--target", "9", "--json"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            CtlCmd::Eod {
+                json: true,
+                target: Some(t)
+            } if t == 9.0
         ));
     }
 
