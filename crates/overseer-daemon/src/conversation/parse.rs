@@ -1,7 +1,7 @@
 //! Turns Claude Code transcript lines into conversation entries. Pure: the
 //! caller reads the file and feeds the bytes.
 
-use overseer_proto::msg::{ConvEntry, ConvKind};
+use overseer_proto::msg::{ConvEntry, ConvKind, Question};
 use serde_json::Value;
 
 use crate::work::sources::parse_iso_time;
@@ -11,6 +11,9 @@ const SKIPPED_PREFIXES: [&str; 3] = ["<system-reminder>", "<command-", "<local-c
 
 /// Tool input keys that make a good one-line summary, best first.
 const SUMMARY_KEYS: [&str; 5] = ["command", "file_path", "pattern", "description", "url"];
+
+/// The tool Claude Code uses to ask the user a question with options.
+pub const ASK_USER_QUESTION: &str = "AskUserQuestion";
 
 /// Longest tool summary, in characters.
 const SUMMARY_MAX: usize = 80;
@@ -28,11 +31,13 @@ const CUT_NOTE: &str = "\n\n(cut, see the session)";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolEvent {
     /// A `tool_use` block of an assistant line. `summary` is the one a
-    /// `Tool` entry shows.
+    /// `Tool` entry shows; `questions` are an `AskUserQuestion` call's,
+    /// so a question still open is known without its hook.
     Started {
         id: String,
         name: String,
         summary: String,
+        questions: Option<Vec<Question>>,
     },
     /// A `tool_result` block: the call was answered, approved or not.
     Finished { id: String },
@@ -151,11 +156,18 @@ pub fn tools_of(line: &Value) -> Vec<ToolEvent> {
     blocks
         .iter()
         .filter_map(|b| match (kind, b.get("type").and_then(Value::as_str)) {
-            (Some("assistant"), Some("tool_use")) => Some(ToolEvent::Started {
-                id: text(b, "id")?,
-                name: text(b, "name")?,
-                summary: summary_of(b.get("input")),
-            }),
+            (Some("assistant"), Some("tool_use")) => {
+                let name = text(b, "name")?;
+                let questions = (name == ASK_USER_QUESTION)
+                    .then(|| Question::list_of(b.get("input")?))
+                    .flatten();
+                Some(ToolEvent::Started {
+                    id: text(b, "id")?,
+                    name,
+                    summary: summary_of(b.get("input")),
+                    questions,
+                })
+            }
             (Some("user"), Some("tool_result")) => Some(ToolEvent::Finished {
                 id: text(b, "tool_use_id")?,
             }),
@@ -460,10 +472,30 @@ mod tests {
                 ToolEvent::Started {
                     id: "t1".into(),
                     name: "Bash".into(),
-                    summary: "cargo test".into()
+                    summary: "cargo test".into(),
+                    questions: None,
                 },
                 ToolEvent::Finished { id: "t1".into() },
             ]
+        );
+    }
+
+    #[test]
+    fn a_question_call_carries_its_questions() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"q1","name":"AskUserQuestion","input":{"questions":[{"header":"Deploy","question":"Deploy demo-api now?","multiSelect":false,"options":[{"label":"Yes","description":"ship it"},{"label":"No"}]}]}}]}}"#;
+        assert_eq!(
+            tools_of(&serde_json::from_str(line).unwrap()),
+            [ToolEvent::Started {
+                id: "q1".into(),
+                name: ASK_USER_QUESTION.into(),
+                summary: String::new(),
+                questions: Some(vec![Question {
+                    header: "Deploy".into(),
+                    question: "Deploy demo-api now?".into(),
+                    options: vec!["Yes".into(), "No".into()],
+                    multi: false,
+                }]),
+            }]
         );
     }
 
