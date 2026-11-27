@@ -211,21 +211,27 @@ impl OverseerApp {
                         Some(QuestionAnswer::Options { picked }) => picked,
                         _ => &[],
                     };
+                    // Picking is local, so it works while a send is on its
+                    // way; only Submit waits for it.
                     let options = q.options.iter().enumerate().map(|(oi, text)| {
                         pane_button(
                             ("conv-option", qi * 1000 + oi),
                             text.clone(),
-                            !sending,
+                            true,
                             picked.contains(&oi),
                         )
-                        .when(!sending, |b| {
-                            b.on_click(cx.listener(move |this, _, _, cx| {
-                                if let Some(c) = this.convs.get_mut(slot as usize) {
-                                    c.toggle(qi, oi);
-                                }
-                                cx.notify();
-                            }))
-                        })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let picked = this
+                                .convs
+                                .get_mut(slot as usize)
+                                .is_some_and(|c| c.toggle(qi, oi));
+                            if !picked {
+                                tracing::warn!(
+                                    "S{slot}: option {oi} of question {qi} clicked but not picked"
+                                );
+                            }
+                            cx.notify();
+                        }))
                     });
                     let header = if q.multi {
                         format!("{} (pick any)", q.header)
@@ -242,12 +248,15 @@ impl OverseerApp {
                         .into_any_element()
                 });
                 let ready = conv.submit_answer().filter(|_| !sending);
-                let submit = pane_button("conv-submit", "Submit", ready.is_some(), false)
-                    .when_some(ready, |b, answer| {
+                let label = if sending { "Sending\u{2026}" } else { "Submit" };
+                let submit = pane_button("conv-submit", label, ready.is_some(), false).when_some(
+                    ready,
+                    |b, answer| {
                         b.on_click(cx.listener(move |this, _, _, cx| {
                             this.send_answer(slot, answer.clone(), cx)
                         }))
-                    });
+                    },
+                );
                 area.children(rows).child(div().flex().child(submit))
             }
             PromptShown::Known(PromptInfo::Permission {

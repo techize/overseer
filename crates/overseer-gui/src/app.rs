@@ -1258,6 +1258,26 @@ impl OverseerApp {
         cx: &mut Context<Self>,
     ) {
         let stop = matches!(req, Request::Interrupt { .. });
+        let Some(id) = self.convs.get(slot as usize).map(|c| c.sends) else {
+            return;
+        };
+        // A reply that never comes must not hold the pane for good.
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(crate::conversation_view::SEND_TIMEOUT)
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                let timed_out = this
+                    .convs
+                    .get_mut(slot as usize)
+                    .is_some_and(|c| c.send_timed_out(id));
+                if timed_out {
+                    tracing::warn!("S{slot}: send {id} had no reply, let go");
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
         let client = self.client.clone();
         cx.spawn(async move |this, cx| {
             let reply = client.request(req).await;
@@ -1265,7 +1285,12 @@ impl OverseerApp {
                 let Some(conv) = this.convs.get_mut(slot as usize) else {
                     return;
                 };
-                conv.sending = false;
+                if !conv.send_landed(id) {
+                    return;
+                }
+                if conv.status.as_deref() == Some(crate::conversation_view::SEND_TIMED_OUT) {
+                    conv.status = None;
+                }
                 match reply {
                     Ok(Response::Ok) if stop => {
                         let activity = this
