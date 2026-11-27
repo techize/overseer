@@ -33,8 +33,11 @@ pub struct Conv {
     /// before the latest one can be told apart; see `answered`.
     pub events: u64,
     /// A Reply, Answer or Interrupt is on its way: another is not sent
-    /// until it is answered.
+    /// until it is answered, or until it times out (`send_timed_out`).
     pub sending: bool,
+    /// Counts the sends made, so the reply or timer of an older one cannot
+    /// release a newer one.
+    pub sends: u64,
     /// A stop went through while the slot's activity was this. No hook
     /// follows an Esc, so the slot still reads as working: Stop stays
     /// hidden until the activity changes.
@@ -60,6 +63,7 @@ impl Conv {
             status: None,
             events: 0,
             sending: false,
+            sends: 0,
             stopped: None,
             asking: None,
         }
@@ -119,11 +123,12 @@ impl Conv {
     /// asked for before is dropped; a new connection asks afresh.
     pub fn clear(&mut self) {
         let draft = std::mem::take(&mut self.draft);
-        let (events, sending) = (self.events + 1, self.sending);
+        let (events, sending, sends) = (self.events + 1, self.sending, self.sends);
         *self = Conv::new(self.view.slot);
         self.draft = draft;
         self.events = events;
         self.sending = sending;
+        self.sends = sends;
     }
 
     /// The request that sends the draft to the session this view shows, tied
@@ -140,7 +145,7 @@ impl Conv {
             return None;
         }
         self.status = None;
-        self.sending = true;
+        self.begin_send();
         Some(Request::Reply {
             slot: self.view.slot,
             session: self.view.session.clone(),
@@ -162,7 +167,7 @@ impl Conv {
         if !self.can_stop(working) {
             return None;
         }
-        self.sending = true;
+        self.begin_send();
         self.status = None;
         Some(Request::Interrupt {
             slot: self.view.slot,
@@ -187,13 +192,40 @@ impl Conv {
         if self.sending {
             return None;
         }
-        let prompt = self.view.prompt.as_ref()?;
-        self.sending = true;
+        let prompt = self.view.prompt.as_ref()?.id.clone();
+        self.begin_send();
         Some(Request::Answer {
             slot: self.view.slot,
-            prompt: prompt.id.clone(),
+            prompt,
             answer,
         })
+    }
+
+    fn begin_send(&mut self) {
+        self.sending = true;
+        self.sends += 1;
+    }
+
+    /// The reply to send `id` came: true when it is the latest send, which
+    /// is then no longer on its way. An older send's reply changes nothing.
+    pub fn send_landed(&mut self, id: u64) -> bool {
+        if id != self.sends {
+            return false;
+        }
+        self.sending = false;
+        true
+    }
+
+    /// Send `id` has had no reply for `SEND_TIMEOUT`: when it is still the
+    /// one on its way it is let go, so the pane is not held for good, and
+    /// `status` says so. True when it was.
+    pub fn send_timed_out(&mut self, id: u64) -> bool {
+        if !self.sending || id != self.sends {
+            return false;
+        }
+        self.sending = false;
+        self.status = Some(SEND_TIMED_OUT.to_owned());
+        true
     }
 }
 
@@ -207,17 +239,27 @@ impl Conv {
     }
 
     /// Picks option `option` of question `question`: a multi-select
-    /// question toggles it, any other takes it in place of its pick.
-    pub fn toggle(&mut self, question: usize, option: usize) {
-        let Some(multi) = self
-            .questions()
-            .and_then(|q| q.get(question))
-            .map(|q| q.multi)
-        else {
-            return;
+    /// question toggles it, any other takes it in place of its pick. Picks
+    /// that do not fit the questions shown are started afresh first, so a
+    /// shown option can always be picked. False when there is no such
+    /// question to pick for.
+    pub fn toggle(&mut self, question: usize, option: usize) -> bool {
+        let Some(questions) = self.questions() else {
+            return false;
         };
+        let Some(multi) = questions.get(question).map(|q| q.multi) else {
+            return false;
+        };
+        let fits = self.picks.len() == questions.len()
+            && self
+                .picks
+                .iter()
+                .all(|p| matches!(p, QuestionAnswer::Options { .. }));
+        if !fits {
+            self.picks = blank_picks(&self.view);
+        }
         let Some(QuestionAnswer::Options { picked }) = self.picks.get_mut(question) else {
-            return;
+            return false;
         };
         if !multi {
             *picked = vec![option];
@@ -227,6 +269,7 @@ impl Conv {
             picked.push(option);
             picked.sort_unstable();
         }
+        true
     }
 
     /// The whole prompt's answer, once every question has a pick.
@@ -360,6 +403,14 @@ pub fn text_blocks(text: &str) -> Vec<Block> {
 pub(crate) fn slot_label(slot: SlotId) -> String {
     overseer_proto::slot_name(slot)
 }
+
+/// How long a send waits for the daemon's reply before the pane lets it go.
+/// The daemon's own waits for typing are a few seconds at most.
+pub const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What the pane says when a send had no reply in `SEND_TIMEOUT`.
+pub const SEND_TIMED_OUT: &str =
+    "No reply from the daemon in 30 s. Check the session before sending again.";
 
 /// One empty pick per question of the open prompt.
 fn blank_picks(view: &ConversationView) -> Vec<QuestionAnswer> {
@@ -1070,5 +1121,57 @@ mod tests {
         let c = with_prompt(2, Some(p));
         assert_eq!(reply_placeholder(&c), "No, and tell it instead");
         assert!(reply_enabled(&c, None));
+    }
+
+    #[test]
+    fn a_pick_rebuilds_picks_that_do_not_fit_the_questions() {
+        let mut c = with_prompt(1, Some(question_prompt("p1", 2)));
+        c.picks.clear();
+        assert!(c.toggle(1, 1));
+        assert_eq!(
+            c.picks,
+            [
+                QuestionAnswer::Options { picked: vec![] },
+                QuestionAnswer::Options { picked: vec![1] },
+            ]
+        );
+        // Nothing to pick: no prompt, or a question it does not have.
+        assert!(!c.toggle(5, 0));
+        let mut none = with_prompt(1, None);
+        assert!(!none.toggle(0, 0));
+    }
+
+    #[test]
+    fn options_are_picked_while_a_send_is_on_its_way() {
+        let mut c = with_prompt(1, Some(question_prompt("p1", 1)));
+        c.draft.set("hello");
+        assert!(c.reply_request().is_some());
+        assert!(c.toggle(0, 1));
+        assert_eq!(c.picks, [QuestionAnswer::Options { picked: vec![1] }]);
+    }
+
+    #[test]
+    fn a_send_with_no_reply_times_out() {
+        let mut c = with_prompt(1, Some(question_prompt("p1", 1)));
+        c.draft.set("hello");
+        assert!(c.reply_request().is_some());
+        let first = c.sends;
+        assert!(c.send_timed_out(first));
+        assert!(!c.sending);
+        assert_eq!(c.status.as_deref(), Some(SEND_TIMED_OUT));
+        assert!(!c.send_timed_out(first), "only once");
+        // Its late reply still lands while nothing newer was sent.
+        assert!(c.send_landed(first));
+        // A newer send is not released by the older one's timer or reply.
+        assert!(c.reply_request().is_some());
+        assert!(!c.send_timed_out(first));
+        assert!(!c.send_landed(first));
+        assert!(c.sending);
+        assert!(c.send_landed(c.sends));
+        assert!(!c.sending);
+        // Losing the connection keeps the count.
+        let sends = c.sends;
+        c.clear();
+        assert_eq!(c.sends, sends);
     }
 }
